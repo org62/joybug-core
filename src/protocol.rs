@@ -13,6 +13,8 @@ mod request_response {
         Continue,
         SetBreakpoint { addr: u64 },
         Launch { command: String },
+        ReadMemory { pid: u32, address: u64, size: usize },
+        WriteMemory { pid: u32, address: u64, data: Vec<u8> },
         // ... add more as needed
     }
 
@@ -22,6 +24,8 @@ mod request_response {
         Ack,
         Error { message: String },
         Event { event: DebugEvent },
+        MemoryData { data: Vec<u8> },
+        WriteAck,
         // ... add more as needed
     }
 

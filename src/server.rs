@@ -64,6 +64,20 @@ pub async fn run_server() -> anyhow::Result<()> {
                                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                                 }
                             }
+                            Ok(DebuggerRequest::ReadMemory { pid, address, size }) => {
+                                let mut plat = platform.lock().await;
+                                match plat.read_memory(pid, address, size).await {
+                                    Ok(data) => DebuggerResponse::MemoryData { data },
+                                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                                }
+                            }
+                            Ok(DebuggerRequest::WriteMemory { pid, address, data }) => {
+                                let mut plat = platform.lock().await;
+                                match plat.write_memory(pid, address, &data).await {
+                                    Ok(_) => DebuggerResponse::WriteAck,
+                                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                                }
+                            }
                             Err(e) => DebuggerResponse::Error { message: format!("Invalid request: {}", e) },
                         };
                         let resp_json = serde_json::to_vec(&resp).unwrap();

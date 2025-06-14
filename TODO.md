@@ -1,0 +1,5 @@
+- [x] How to implemement memory read write?
+- [ ] Context get/set
+- [ ] Multiple clients one server test
+    - [ ] Dropped connection test
+- [ ] symbols + tracing

@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 use crate::interfaces::{PlatformAPI, PlatformError};
 use async_trait::async_trait;
-use windows_sys::Win32::System::Diagnostics::Debug::{WaitForDebugEvent, ContinueDebugEvent, DEBUG_EVENT};
+use windows_sys::Win32::System::Diagnostics::Debug::{WaitForDebugEvent, ContinueDebugEvent, DEBUG_EVENT, ReadProcessMemory, WriteProcessMemory};
 use windows_sys::Win32::System::Threading::{CreateProcessW, STARTUPINFOW, PROCESS_INFORMATION, DEBUG_PROCESS, INFINITE};
-use windows_sys::Win32::Foundation::{FALSE, GetLastError, DBG_CONTINUE};
+use windows_sys::Win32::Foundation::{FALSE, GetLastError, DBG_CONTINUE, INVALID_HANDLE_VALUE};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
@@ -182,5 +182,59 @@ impl PlatformAPI for WindowsPlatform {
         }
         // Return a typed event for process started
         Ok(Some(crate::protocol::DebugEvent::ProcessStarted { pid: process_info.dwProcessId }))
+    }
+
+    async fn read_memory(&mut self, pid: u32, address: u64, size: usize) -> Result<Vec<u8>, PlatformError> {
+        unsafe {
+            let handle = if let Some(ref info) = self.process_info {
+                if info.0.dwProcessId == pid && info.0.hProcess != std::ptr::null_mut() && info.0.hProcess != INVALID_HANDLE_VALUE {
+                    info.0.hProcess
+                } else {
+                    return Err(PlatformError::OsError("No valid process handle for memory read".to_string()));
+                }
+            } else {
+                return Err(PlatformError::OsError("No process handle for memory read".to_string()));
+            };
+            let mut buffer = vec![0u8; size];
+            let mut bytes_read = 0;
+            let ok = ReadProcessMemory(
+                handle,
+                address as *const std::ffi::c_void,
+                buffer.as_mut_ptr() as *mut std::ffi::c_void,
+                size,
+                &mut bytes_read,
+            );
+            if ok == 0 {
+                return Err(PlatformError::OsError("ReadProcessMemory failed".to_string()));
+            }
+            buffer.truncate(bytes_read);
+            Ok(buffer)
+        }
+    }
+
+    async fn write_memory(&mut self, pid: u32, address: u64, data: &[u8]) -> Result<(), PlatformError> {
+        unsafe {
+            let handle = if let Some(ref info) = self.process_info {
+                if info.0.dwProcessId == pid && info.0.hProcess != std::ptr::null_mut() && info.0.hProcess != INVALID_HANDLE_VALUE {
+                    info.0.hProcess
+                } else {
+                    return Err(PlatformError::OsError("No valid process handle for memory write".to_string()));
+                }
+            } else {
+                return Err(PlatformError::OsError("No process handle for memory write".to_string()));
+            };
+            let mut bytes_written = 0;
+            let ok = WriteProcessMemory(
+                handle,
+                address as *mut std::ffi::c_void,
+                data.as_ptr() as *const std::ffi::c_void,
+                data.len(),
+                &mut bytes_written,
+            );
+            if ok == 0 || bytes_written != data.len() {
+                return Err(PlatformError::OsError("WriteProcessMemory failed".to_string()));
+            }
+            Ok(())
+        }
     }
 } 
