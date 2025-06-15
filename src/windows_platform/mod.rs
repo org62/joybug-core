@@ -1,4 +1,5 @@
-#![allow(dead_code)]
+mod utils;
+
 use crate::interfaces::{PlatformAPI, PlatformError};
 use windows_sys::Win32::System::Diagnostics::Debug::{
     FORMAT_MESSAGE_FROM_SYSTEM,
@@ -152,13 +153,15 @@ impl PlatformAPI for WindowsPlatform {
             }
             CREATE_PROCESS_DEBUG_EVENT => {
                 let info = unsafe { debug_event.u.CreateProcessInfo };
-                trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), base_of_image = %format!("0x{:X}", info.lpBaseOfImage as u64), "ProcessCreated event");
+                let image_file_name = utils::get_path_from_handle(info.hFile).or(Some(String::from("<unknown>")));
+                let size_of_image = utils::get_module_size_from_address(info.hProcess, info.lpBaseOfImage as usize).map(|sz| sz as u64);
+                trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), base_of_image = %format!("0x{:X}", info.lpBaseOfImage as u64), image_file_name = ?image_file_name, size_of_image = ?size_of_image, "ProcessCreated event");
                 Some(crate::protocol::DebugEvent::ProcessCreated {
                     pid: debug_event.dwProcessId,
                     tid: debug_event.dwThreadId,
-                    image_file_name: None, // Not trivial to get here
+                    image_file_name,
                     base_of_image: info.lpBaseOfImage as u64,
-                    size_of_image: None, // Not trivial to get here
+                    size_of_image,
                 })
             }
             EXIT_PROCESS_DEBUG_EVENT => {
@@ -189,13 +192,19 @@ impl PlatformAPI for WindowsPlatform {
             }
             LOAD_DLL_DEBUG_EVENT => {
                 let info = unsafe { debug_event.u.LoadDll };
-                trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), base_of_dll = %format!("0x{:X}", info.lpBaseOfDll as u64), "DllLoaded event");
+                let dll_name = utils::get_path_from_handle(info.hFile).or(Some(String::from("<unknown>")));
+                let size_of_dll = if let Some(ref process_info) = self.process_info {
+                    utils::get_module_size_from_address(process_info.0.hProcess, info.lpBaseOfDll as usize).map(|sz| sz as u64)
+                } else {
+                    None
+                };
+                trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), base_of_dll = %format!("0x{:X}", info.lpBaseOfDll as u64), dll_name = ?dll_name, size_of_dll = ?size_of_dll, "DllLoaded event");
                 Some(crate::protocol::DebugEvent::DllLoaded {
                     pid: debug_event.dwProcessId,
                     tid: debug_event.dwThreadId,
-                    dll_name: None, // Not trivial to get here
+                    dll_name,
                     base_of_dll: info.lpBaseOfDll as u64,
-                    size_of_dll: None, // Not trivial to get here
+                    size_of_dll,
                 })
             }
             UNLOAD_DLL_DEBUG_EVENT => {
