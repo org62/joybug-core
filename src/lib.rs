@@ -18,4 +18,14 @@ impl interfaces::PlatformAPI for DummyPlatform {
 
 pub async fn run() -> anyhow::Result<()> {
     server::run_server().await
+}
+
+pub fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .without_time()
+        .with_env_filter(filter)
+        .init();
 } 
