@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 use crate::interfaces::{PlatformAPI, PlatformError};
-use async_trait::async_trait;
 use windows_sys::Win32::System::Diagnostics::Debug::{
     FORMAT_MESSAGE_FROM_SYSTEM,
     FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -13,6 +12,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     UNLOAD_DLL_DEBUG_EVENT,
     OUTPUT_DEBUG_STRING_EVENT,
     RIP_EVENT,
+    CONTEXT_FULL_AMD64,
     CONTEXT,
     DEBUG_EVENT,
     ContinueDebugEvent,
@@ -95,15 +95,15 @@ impl WindowsPlatform {
     }
 }
 
-#[async_trait]
 impl PlatformAPI for WindowsPlatform {
-    async fn attach(&mut self, pid: u32) -> Result<(), PlatformError> {
+    fn attach(&mut self, pid: u32) -> Result<(), PlatformError> {
         trace!(pid, "WindowsPlatform::attach called");
         self.pid = Some(pid);
         Ok(())
     }
 
-    async fn continue_exec(&mut self, pid: u32, tid: u32) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
+    fn continue_exec(&mut self, pid: u32, tid: u32) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
+        println!("[windows_platform] continue_exec thread id: {:?}", std::thread::current().id());
         trace!(pid, tid, "WindowsPlatform::continue_exec called");
         let cont_res = unsafe {
             ContinueDebugEvent(pid, tid, DBG_CONTINUE)
@@ -127,26 +127,32 @@ impl PlatformAPI for WindowsPlatform {
                 let ex_info = unsafe { debug_event.u.Exception };
                 let ex_record = ex_info.ExceptionRecord;
                 if ex_record.ExceptionCode == windows_sys::Win32::Foundation::EXCEPTION_BREAKPOINT {
-                    trace!(pid=debug_event.dwProcessId, tid=debug_event.dwThreadId, address=ex_record.ExceptionAddress as u64, "Breakpoint event");
+                    trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), address = %format!("0x{:X}", ex_record.ExceptionAddress as u64), "Breakpoint event");
                     Some(crate::protocol::DebugEvent::Breakpoint {
                         pid: debug_event.dwProcessId,
                         tid: debug_event.dwThreadId,
                         address: ex_record.ExceptionAddress as u64,
                     })
                 } else {
-                    trace!(pid=debug_event.dwProcessId, tid=debug_event.dwThreadId, code=ex_record.ExceptionCode as u32, address=ex_record.ExceptionAddress as u64, first_chance=ex_info.dwFirstChance == 1, "Exception event");
+                    let mut params = Vec::new();
+                    let num_params = ex_record.NumberParameters as usize;
+                    for i in 0..num_params {
+                        params.push(ex_record.ExceptionInformation[i] as u64);
+                    }
+                    trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), code = %format!("0x{:X}", ex_record.ExceptionCode as u32), address = %format!("0x{:X}", ex_record.ExceptionAddress as u64), first_chance = ex_info.dwFirstChance == 1, parameters = ?params, "Exception event");
                     Some(crate::protocol::DebugEvent::Exception {
                         pid: debug_event.dwProcessId,
                         tid: debug_event.dwThreadId,
                         code: ex_record.ExceptionCode as u32,
                         address: ex_record.ExceptionAddress as u64,
                         first_chance: ex_info.dwFirstChance == 1,
+                        parameters: params,
                     })
                 }
             }
             CREATE_PROCESS_DEBUG_EVENT => {
                 let info = unsafe { debug_event.u.CreateProcessInfo };
-                trace!(pid=debug_event.dwProcessId, tid=debug_event.dwThreadId, base_of_image=info.lpBaseOfImage as u64, "ProcessCreated event");
+                trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), base_of_image = %format!("0x{:X}", info.lpBaseOfImage as u64), "ProcessCreated event");
                 Some(crate::protocol::DebugEvent::ProcessCreated {
                     pid: debug_event.dwProcessId,
                     tid: debug_event.dwThreadId,
@@ -157,7 +163,7 @@ impl PlatformAPI for WindowsPlatform {
             }
             EXIT_PROCESS_DEBUG_EVENT => {
                 let info = unsafe { debug_event.u.ExitProcess };
-                trace!(pid=debug_event.dwProcessId, exit_code=info.dwExitCode, "ProcessExited event");
+                trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), exit_code = %format!("0x{:X}", info.dwExitCode), "ProcessExited event");
                 Some(crate::protocol::DebugEvent::ProcessExited {
                     pid: debug_event.dwProcessId,
                     exit_code: info.dwExitCode,
@@ -165,7 +171,7 @@ impl PlatformAPI for WindowsPlatform {
             }
             CREATE_THREAD_DEBUG_EVENT => {
                 let info = unsafe { debug_event.u.CreateThread };
-                trace!(pid=debug_event.dwProcessId, tid=debug_event.dwThreadId, start_address=info.lpStartAddress.map_or(0, |addr| addr as usize as u64), "ThreadCreated event");
+                trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), start_address = %format!("0x{:X}", info.lpStartAddress.map_or(0, |addr| addr as usize as u64)), "ThreadCreated event");
                 Some(crate::protocol::DebugEvent::ThreadCreated {
                     pid: debug_event.dwProcessId,
                     tid: debug_event.dwThreadId,
@@ -174,7 +180,7 @@ impl PlatformAPI for WindowsPlatform {
             }
             EXIT_THREAD_DEBUG_EVENT => {
                 let info = unsafe { debug_event.u.ExitThread };
-                trace!(pid=debug_event.dwProcessId, tid=debug_event.dwThreadId, exit_code=info.dwExitCode, "ThreadExited event");
+                trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), exit_code = %format!("0x{:X}", info.dwExitCode), "ThreadExited event");
                 Some(crate::protocol::DebugEvent::ThreadExited {
                     pid: debug_event.dwProcessId,
                     tid: debug_event.dwThreadId,
@@ -194,7 +200,7 @@ impl PlatformAPI for WindowsPlatform {
             }
             UNLOAD_DLL_DEBUG_EVENT => {
                 let info = unsafe { debug_event.u.UnloadDll };
-                trace!(pid=debug_event.dwProcessId, tid=debug_event.dwThreadId, base_of_dll=info.lpBaseOfDll as u64, "DllUnloaded event");
+                trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), base_of_dll = %format!("0x{:X}", info.lpBaseOfDll as u64), "DllUnloaded event");
                 Some(crate::protocol::DebugEvent::DllUnloaded {
                     pid: debug_event.dwProcessId,
                     tid: debug_event.dwThreadId,
@@ -202,7 +208,7 @@ impl PlatformAPI for WindowsPlatform {
                 })
             }
             OUTPUT_DEBUG_STRING_EVENT => {
-                trace!(pid=debug_event.dwProcessId, tid=debug_event.dwThreadId, "OutputDebugString event");
+                trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), "OutputDebugString event");
                 Some(crate::protocol::DebugEvent::Output {
                     pid: debug_event.dwProcessId,
                     tid: debug_event.dwThreadId,
@@ -211,7 +217,7 @@ impl PlatformAPI for WindowsPlatform {
             }
             RIP_EVENT => {
                 let info = unsafe { debug_event.u.RipInfo };
-                trace!(pid=debug_event.dwProcessId, tid=debug_event.dwThreadId, error=info.dwError, event_type=info.dwType, "RipEvent");
+                trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), error = %format!("0x{:X}", info.dwError), event_type = %format!("0x{:X}", info.dwType), "RipEvent");
                 Some(crate::protocol::DebugEvent::RipEvent {
                     pid: debug_event.dwProcessId,
                     tid: debug_event.dwThreadId,
@@ -227,12 +233,13 @@ impl PlatformAPI for WindowsPlatform {
         Ok(event)
     }
 
-    async fn set_breakpoint(&mut self, addr: u64) -> Result<(), PlatformError> {
+    fn set_breakpoint(&mut self, addr: u64) -> Result<(), PlatformError> {
         trace!(addr, "WindowsPlatform::set_breakpoint called");
         Err(PlatformError::NotImplemented)
     }
 
-    async fn launch(&mut self, command: &str) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
+    fn launch(&mut self, command: &str) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
+        println!("[windows_platform] launch thread id: {:?}", std::thread::current().id());
         trace!(command, "WindowsPlatform::launch called");
         let cmd_line_wide = Self::to_wide(command);
         let mut startup_info: STARTUPINFOW = unsafe { std::mem::zeroed() };
@@ -276,7 +283,7 @@ impl PlatformAPI for WindowsPlatform {
         Ok(Some(crate::protocol::DebugEvent::ProcessCreated { pid: process_info.dwProcessId, tid: process_info.dwThreadId, image_file_name: None, base_of_image: 0, size_of_image: None }))
     }
 
-    async fn read_memory(&mut self, pid: u32, address: u64, size: usize) -> Result<Vec<u8>, PlatformError> {
+    fn read_memory(&mut self, pid: u32, address: u64, size: usize) -> Result<Vec<u8>, PlatformError> {
         trace!(pid = %format!("0x{:X}", pid), address = %format!("0x{:X}", address), size, "WindowsPlatform::read_memory called");
         unsafe {
             let handle = if let Some(ref info) = self.process_info {
@@ -311,7 +318,7 @@ impl PlatformAPI for WindowsPlatform {
         }
     }
 
-    async fn write_memory(&mut self, pid: u32, address: u64, data: &[u8]) -> Result<(), PlatformError> {
+    fn write_memory(&mut self, pid: u32, address: u64, data: &[u8]) -> Result<(), PlatformError> {
         trace!(pid = %format!("0x{:X}", pid), address = %format!("0x{:X}", address), data_len = data.len(), "WindowsPlatform::write_memory called");
         unsafe {
             let handle = if let Some(ref info) = self.process_info {
@@ -344,9 +351,9 @@ impl PlatformAPI for WindowsPlatform {
         }
     }
 
-    async fn get_thread_context(&mut self, _pid: u32, tid: u32) -> Result<crate::protocol::ThreadContext, PlatformError> {
+    fn get_thread_context(&mut self, _pid: u32, tid: u32) -> Result<crate::protocol::ThreadContext, PlatformError> {
         trace!(tid, "WindowsPlatform::get_thread_context called");
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(windows)]
         {
             let thread_handle = unsafe { OpenThread(THREAD_ALL_ACCESS, 0, tid as u32) };
             if thread_handle == std::ptr::null_mut() {
@@ -358,80 +365,48 @@ impl PlatformAPI for WindowsPlatform {
             let mut aligned_context = AlignedContext {
                 context: unsafe { std::mem::zeroed() },
             };
-            aligned_context.context.ContextFlags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_ALL_AMD64;
+            aligned_context.context.ContextFlags = CONTEXT_FULL_AMD64;
             let ok = unsafe { GetThreadContext(thread_handle, &mut aligned_context.context) };
+            unsafe { CloseHandle(thread_handle) };
             if ok == 0 {
                 let error = unsafe { GetLastError() };
                 let error_str = Self::error_message(error);
-                unsafe { CloseHandle(thread_handle) };
                 error!(error, error_str, "GetThreadContext failed");
                 return Err(PlatformError::OsError(format!("GetThreadContext failed: {} ({})", error, error_str)));
             }
-            let regs = crate::protocol::X64Context {
-                rax: aligned_context.context.Rax,
-                rbx: aligned_context.context.Rbx,
-                rcx: aligned_context.context.Rcx,
-                rdx: aligned_context.context.Rdx,
-                rsi: aligned_context.context.Rsi,
-                rdi: aligned_context.context.Rdi,
-                rsp: aligned_context.context.Rsp,
-                rbp: aligned_context.context.Rbp,
-                r8: aligned_context.context.R8,
-                r9: aligned_context.context.R9,
-                r10: aligned_context.context.R10,
-                r11: aligned_context.context.R11,
-                r12: aligned_context.context.R12,
-                r13: aligned_context.context.R13,
-                r14: aligned_context.context.R14,
-                r15: aligned_context.context.R15,
-                rip: aligned_context.context.Rip,
-            };
-            unsafe { CloseHandle(thread_handle) };
             trace!("GetThreadContext succeeded");
-            Ok(crate::protocol::ThreadContext::X64 { regs })
+            Ok(crate::protocol::ThreadContext::Win32RawContext(aligned_context.context))
         }
-
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(not(windows))]
         {
-            error!("get_thread_context not implemented for aarch64");
             Err(PlatformError::NotImplemented)
         }
     }
 
-    async fn set_thread_context(&mut self, _pid: u32, tid: u32, context: crate::protocol::ThreadContext) -> Result<(), PlatformError> {
+    fn set_thread_context(&mut self, _pid: u32, tid: u32, context: crate::protocol::ThreadContext) -> Result<(), PlatformError> {
         trace!(tid, "WindowsPlatform::set_thread_context called");
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(windows)]
         unsafe {
-            let thread_handle = OpenThread(THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION, 0, tid as u32) as isize;
-            if thread_handle == 0 {
+            let thread_handle = OpenThread(THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION, 0, tid as u32);
+            if thread_handle == std::ptr::null_mut() {
                 let error = GetLastError();
                 let error_str = Self::error_message(error);
                 error!(error, error_str, "OpenThread failed");
                 return Err(PlatformError::OsError(format!("OpenThread failed: {} ({})", error, error_str)));
             }
             match context {
-                crate::protocol::ThreadContext::X64 { regs } => {
-                    let mut ctx: CONTEXT = std::mem::zeroed();
-                    ctx.ContextFlags = 0x1003F;
-                    ctx.Rax = regs.rax;
-                    ctx.Rbx = regs.rbx;
-                    ctx.Rcx = regs.rcx;
-                    ctx.Rdx = regs.rdx;
-                    ctx.Rsi = regs.rsi;
-                    ctx.Rdi = regs.rdi;
-                    ctx.Rsp = regs.rsp;
-                    ctx.Rbp = regs.rbp;
-                    ctx.R8 = regs.r8;
-                    ctx.R9 = regs.r9;
-                    ctx.R10 = regs.r10;
-                    ctx.R11 = regs.r11;
-                    ctx.R12 = regs.r12;
-                    ctx.R13 = regs.r13;
-                    ctx.R14 = regs.r14;
-                    ctx.R15 = regs.r15;
-                    ctx.Rip = regs.rip;
-                    let ok = SetThreadContext(thread_handle as *mut std::ffi::c_void, &ctx);
-                    CloseHandle(thread_handle as *mut std::ffi::c_void);
+                crate::protocol::ThreadContext::Win32RawContext(ctx) => {
+                    // Use aligned memory for CONTEXT
+                    let mut aligned_context = AlignedContext {
+                        context: std::mem::zeroed(),
+                    };
+                    std::ptr::copy_nonoverlapping(
+                        &ctx as *const _ as *const u8,
+                        &mut aligned_context.context as *mut _ as *mut u8,
+                        std::mem::size_of::<CONTEXT>(),
+                    );
+                    let ok = SetThreadContext(thread_handle, &aligned_context.context);
+                    CloseHandle(thread_handle);
                     if ok == 0 {
                         let error = GetLastError();
                         let error_str = Self::error_message(error);
@@ -441,16 +416,10 @@ impl PlatformAPI for WindowsPlatform {
                     trace!("SetThreadContext succeeded");
                     Ok(())
                 }
-                _ => {
-                    CloseHandle(thread_handle as *mut std::ffi::c_void);
-                    error!("set_thread_context not implemented for this arch");
-                    Err(PlatformError::NotImplemented)
-                }
             }
         }
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(not(windows))]
         {
-            error!("set_thread_context not implemented for aarch64");
             Err(PlatformError::NotImplemented)
         }
     }

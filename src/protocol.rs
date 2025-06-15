@@ -4,7 +4,6 @@ pub use self::request_response::*;
 
 mod request_response {
     use super::*;
-    use std::fmt;
 
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(tag = "type", content = "data")]
@@ -20,7 +19,7 @@ mod request_response {
         // ... add more as needed
     }
 
-    #[derive(Debug, Serialize, Deserialize)]
+    #[derive(Debug, Serialize, Deserialize, Clone)]
     #[serde(tag = "type", content = "data")]
     pub enum DebuggerResponse {
         Ack,
@@ -33,7 +32,7 @@ mod request_response {
         // ... add more as needed
     }
 
-    #[derive(Debug, Serialize, Deserialize)]
+    #[derive(Debug, Serialize, Deserialize, Clone)]
     #[serde(tag = "event_type", content = "data")]
     pub enum DebugEvent {
         //ProcessStarted { pid: u32 },
@@ -45,6 +44,7 @@ mod request_response {
             code: u32,
             address: u64,
             first_chance: bool,
+            parameters: Vec<u64>,
         },
         Breakpoint {
             pid: u32,
@@ -89,52 +89,77 @@ mod request_response {
         Unknown,
     }
 
-    #[derive(Debug, Serialize, Deserialize)]
-    #[serde(tag = "arch", content = "context")]
+    #[derive(Clone)]
     pub enum ThreadContext {
-        X64 { regs: X64Context },
-        Arm64 { regs: Arm64Context },
+        #[cfg(windows)]
+        Win32RawContext(crate::protocol::CONTEXT),
     }
 
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct X64Context {
-        pub rax: u64,
-        pub rbx: u64,
-        pub rcx: u64,
-        pub rdx: u64,
-        pub rsi: u64,
-        pub rdi: u64,
-        pub rsp: u64,
-        pub rbp: u64,
-        pub r8: u64,
-        pub r9: u64,
-        pub r10: u64,
-        pub r11: u64,
-        pub r12: u64,
-        pub r13: u64,
-        pub r14: u64,
-        pub r15: u64,
-        pub rip: u64,
-    }
-
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct Arm64Context {
-        pub x: [u64; 31], // x0-x30
-        pub sp: u64,
-        pub pc: u64,
-        pub pstate: u64,
-    }
-
-    impl fmt::Display for DebugEvent {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    #[cfg(windows)]
+    impl serde::Serialize for ThreadContext {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
             match self {
-                DebugEvent::ProcessExited { pid, exit_code } => write!(f, "ProcessExited {{ pid: {}, exit_code: {} }}", pid, exit_code),
+                ThreadContext::Win32RawContext(ctx) => {
+                    use serde::ser::SerializeStruct;
+                    let mut s = serializer.serialize_struct("ThreadContext", 2)?;
+                    s.serialize_field("arch", "Win32RawContext")?;
+                    let bytes = crate::protocol::windows_context_serde::serialize(ctx);
+                    s.serialize_field("context", &bytes)?;
+                    s.end()
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    impl<'de> serde::Deserialize<'de> for ThreadContext {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            #[derive(serde::Deserialize)]
+            struct Helper {
+                arch: String,
+                context: Vec<u8>,
+            }
+            let helper = Helper::deserialize(deserializer)?;
+            if helper.arch == "Win32RawContext" {
+                let ctx = crate::protocol::windows_context_serde::deserialize(&helper.context)?;
+                Ok(ThreadContext::Win32RawContext(ctx))
+            } else {
+                Err(serde::de::Error::custom("Unknown arch variant for ThreadContext"))
+            }
+        }
+    }
+
+    impl std::fmt::Debug for ThreadContext {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            {
+                let ThreadContext::Win32RawContext(ctx) = self;
+                return write!(f,
+                    "rax=0x{:016X} rbx=0x{:016X} rcx=0x{:016X} rdx=0x{:016X} rsi=0x{:016X} rdi=0x{:016X} rsp=0x{:016X} rbp=0x{:016X} r8=0x{:016X} r9=0x{:016X} r10=0x{:016X} r11=0x{:016X} r12=0x{:016X} r13=0x{:016X} r14=0x{:016X} r15=0x{:016X} rip=0x{:016X}",
+                    ctx.Rax, ctx.Rbx, ctx.Rcx, ctx.Rdx, ctx.Rsi, ctx.Rdi,
+                    ctx.Rsp, ctx.Rbp, ctx.R8, ctx.R9, ctx.R10, ctx.R11,
+                    ctx.R12, ctx.R13, ctx.R14, ctx.R15, ctx.Rip
+                );
+            }
+        }
+    }
+
+    impl std::fmt::Display for DebugEvent {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                DebugEvent::ProcessExited { pid, exit_code } => write!(f, "ProcessExited {{ pid: {}, exit_code: 0x{:X} }}", pid, exit_code),
                 DebugEvent::Output { pid, tid, output } => write!(f, "Output {{ pid: {}, tid: {}, output: {} }}", pid, tid, output),
-                DebugEvent::Exception { pid, tid, code, address, first_chance } => write!(f, "Exception {{ pid: {}, tid: {}, code: 0x{:X}, address: 0x{:X}, first_chance: {} }}", pid, tid, code, address, first_chance),
+                DebugEvent::Exception { pid, tid, code, address, first_chance, parameters } => write!(f, "Exception {{ pid: {}, tid: {}, code: 0x{:X}, address: 0x{:X}, first_chance: {}, parameters: {:?} }}", pid, tid, code, address, first_chance, parameters),
                 DebugEvent::Breakpoint { pid, tid, address } => write!(f, "Breakpoint {{ pid: {}, tid: {}, address: 0x{:X} }}", pid, tid, address),
                 DebugEvent::ProcessCreated { pid, tid, image_file_name, base_of_image, size_of_image } => write!(f, "ProcessCreated {{ pid: {}, tid: {}, image_file_name: {:?}, base_of_image: 0x{:X}, size_of_image: {:?} }}", pid, tid, image_file_name, base_of_image, size_of_image.as_ref().map(|v| format!("0x{:X}", v))),
                 DebugEvent::ThreadCreated { pid, tid, start_address } => write!(f, "ThreadCreated {{ pid: {}, tid: {}, start_address: 0x{:X} }}", pid, tid, start_address),
-                DebugEvent::ThreadExited { pid, tid, exit_code } => write!(f, "ThreadExited {{ pid: {}, tid: {}, exit_code: {} }}", pid, tid, exit_code),
+                DebugEvent::ThreadExited { pid, tid, exit_code } => write!(f, "ThreadExited {{ pid: {}, tid: {}, exit_code: 0x{:X} }}", pid, tid, exit_code),
                 DebugEvent::DllLoaded { pid, tid, dll_name, base_of_dll, size_of_dll } => write!(f, "DllLoaded {{ pid: {}, tid: {}, dll_name: {:?}, base_of_dll: 0x{:X}, size_of_dll: {:?} }}", pid, tid, dll_name, base_of_dll, size_of_dll.as_ref().map(|v| format!("0x{:X}", v))),
                 DebugEvent::DllUnloaded { pid, tid, base_of_dll } => write!(f, "DllUnloaded {{ pid: {}, tid: {}, base_of_dll: 0x{:X} }}", pid, tid, base_of_dll),
                 DebugEvent::RipEvent { pid, tid, error, event_type } => write!(f, "RipEvent {{ pid: {}, tid: {}, error: 0x{:X}, event_type: 0x{:X} }}", pid, tid, error, event_type),
@@ -143,36 +168,48 @@ mod request_response {
         }
     }
 
-    impl fmt::Display for ThreadContext {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match self {
-                ThreadContext::X64 { regs } => write!(f, "X64 {{ {} }}", regs),
-                ThreadContext::Arm64 { regs } => write!(f, "Arm64 {{ {} }}", regs),
+    impl std::fmt::Display for ThreadContext {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            {
+                let ThreadContext::Win32RawContext(ctx) = self;
+                return write!(f,
+                    "rax=0x{:016X} rbx=0x{:016X} rcx=0x{:016X} rdx=0x{:016X} rsi=0x{:016X} rdi=0x{:016X} rsp=0x{:016X} rbp=0x{:016X} r8=0x{:016X} r9=0x{:016X} r10=0x{:016X} r11=0x{:016X} r12=0x{:016X} r13=0x{:016X} r14=0x{:016X} r15=0x{:016X} rip=0x{:016X}",
+                    ctx.Rax, ctx.Rbx, ctx.Rcx, ctx.Rdx, ctx.Rsi, ctx.Rdi,
+                    ctx.Rsp, ctx.Rbp, ctx.R8, ctx.R9, ctx.R10, ctx.R11,
+                    ctx.R12, ctx.R13, ctx.R14, ctx.R15, ctx.Rip
+                );
             }
         }
     }
+}
 
-    impl fmt::Display for X64Context {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f,
-                "rax=0x{:016X} rbx=0x{:016X} rcx=0x{:016X} rdx=0x{:016X} rsi=0x{:016X} rdi=0x{:016X} \
-                rsp=0x{:016X} rbp=0x{:016X} r8=0x{:016X} r9=0x{:016X} r10=0x{:016X} r11=0x{:016X} \
-                r12=0x{:016X} r13=0x{:016X} r14=0x{:016X} r15=0x{:016X} rip=0x{:016X}",
-                self.rax, self.rbx, self.rcx, self.rdx, self.rsi, self.rdi,
-                self.rsp, self.rbp, self.r8, self.r9, self.r10, self.r11,
-                self.r12, self.r13, self.r14, self.r15, self.rip
-            )
+#[cfg(windows)]
+pub use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
+
+#[cfg(windows)]
+pub mod windows_context_serde {
+    use super::CONTEXT;
+    pub fn serialize(ctx: &CONTEXT) -> Vec<u8> {
+        unsafe {
+            std::slice::from_raw_parts(
+                ctx as *const CONTEXT as *const u8,
+                std::mem::size_of::<CONTEXT>(),
+            ).to_vec()
         }
     }
-
-    impl fmt::Display for Arm64Context {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "x=[")?;
-            for (i, reg) in self.x.iter().enumerate() {
-                if i > 0 { write!(f, ", ")?; }
-                write!(f, "x{}=0x{:016X}", i, reg)?;
-            }
-            write!(f, "] sp=0x{:016X} pc=0x{:016X} pstate=0x{:016X}", self.sp, self.pc, self.pstate)
+    pub fn deserialize<'de, D: serde::de::Error>(bytes: &[u8]) -> Result<CONTEXT, D> {
+        if bytes.len() != std::mem::size_of::<CONTEXT>() {
+            return Err(D::custom("Invalid CONTEXT size"));
         }
+        let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                &mut ctx as *mut CONTEXT as *mut u8,
+                std::mem::size_of::<CONTEXT>(),
+            );
+        }
+        Ok(ctx)
     }
 }
