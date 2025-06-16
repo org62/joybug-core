@@ -4,11 +4,12 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, MAX_PATH,
 };
 use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleA;
-use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, IMAGE_NT_HEADERS64};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE,
     TH32CS_SNAPMODULE32,
 };
+use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_SIGNATURE};
 
 /// Gets the file path from a Windows file handle.
 ///
@@ -93,26 +94,29 @@ pub fn get_path_from_handle(file_handle: HANDLE) -> Option<String> {
 /// * `Some(usize)` - The module size in bytes if successful
 /// * `None` - If the operation fails
 pub fn get_module_size_from_address(process_handle: HANDLE, module_base: usize) -> Option<usize> {
+    trace!(process_handle = ?process_handle, module_base = %format!("0x{:X}", module_base), "get_module_size_from_address");
     if process_handle.is_null() || std::ptr::eq(process_handle, INVALID_HANDLE_VALUE) {
         warn!("Invalid process handle provided to get_module_size_from_address");
         return None;
     }
 
+    trace!(process_handle = ?process_handle, module_base = %format!("0x{:X}", module_base), "get_module_size_from_address");
+
     // Read DOS header to get PE header offset
-    let mut dos_header = vec![0u8; 64]; // sizeof(IMAGE_DOS_HEADER)
+    let mut dos_header: IMAGE_DOS_HEADER = unsafe { std::mem::zeroed() };
     let mut bytes_read = 0;
 
     let success = unsafe {
         ReadProcessMemory(
             process_handle,
             module_base as *const _,
-            dos_header.as_mut_ptr() as *mut _,
-            dos_header.len(),
+            &mut dos_header as *mut _ as *mut _,
+            std::mem::size_of::<IMAGE_DOS_HEADER>(),
             &mut bytes_read,
         )
     };
 
-    if success == 0 || bytes_read != dos_header.len() {
+    if success == 0 || bytes_read != std::mem::size_of::<IMAGE_DOS_HEADER>() {
         let error_code = unsafe { GetLastError() };
         error!(
             error_code = %error_code,
@@ -123,7 +127,7 @@ pub fn get_module_size_from_address(process_handle: HANDLE, module_base: usize) 
     }
 
     // Check DOS signature "MZ"
-    if dos_header[0] != b'M' || dos_header[1] != b'Z' {
+    if dos_header.e_magic != IMAGE_DOS_SIGNATURE {
         warn!(
             module_base = format_args!("0x{:X}", module_base),
             "Invalid DOS signature"
@@ -131,41 +135,34 @@ pub fn get_module_size_from_address(process_handle: HANDLE, module_base: usize) 
         return None;
     }
 
-    // Get PE header offset (at offset 0x3C in DOS header)
-    let pe_offset = u32::from_le_bytes([
-        dos_header[0x3C],
-        dos_header[0x3D],
-        dos_header[0x3E],
-        dos_header[0x3F],
-    ]) as usize;
+    // Get PE header offset
+    let nt_header_address = module_base + dos_header.e_lfanew as usize;
+    let mut nt_headers: IMAGE_NT_HEADERS64 = unsafe { std::mem::zeroed() };
 
-    // Read PE signature and optional header
-    let mut pe_header = vec![0u8; 256]; // Enough for PE signature + file header + optional header start
-    let pe_address = module_base + pe_offset;
-
+    // Read PE header
     let success = unsafe {
         ReadProcessMemory(
             process_handle,
-            pe_address as *const _,
-            pe_header.as_mut_ptr() as *mut _,
-            pe_header.len(),
+            nt_header_address as *const _,
+            &mut nt_headers as *mut _ as *mut _,
+            std::mem::size_of::<IMAGE_NT_HEADERS64>(),
             &mut bytes_read,
         )
     };
 
-    if success == 0 || bytes_read < 24 { // Need at least PE sig + file header
+    if success == 0 || bytes_read < std::mem::size_of::<IMAGE_NT_HEADERS64>() {
         let error_code = unsafe { GetLastError() };
         error!(
             error_code = %error_code,
             module_base = format_args!("0x{:X}", module_base),
-            pe_address = format_args!("0x{:X}", pe_address),
+            nt_header_address = format_args!("0x{:X}", nt_header_address),
             "Failed to read PE header"
         );
         return None;
     }
 
     // Check PE signature "PE\0\0"
-    if pe_header[0] != b'P' || pe_header[1] != b'E' || pe_header[2] != 0 || pe_header[3] != 0 {
+    if nt_headers.Signature != IMAGE_NT_SIGNATURE {
         warn!(
             module_base = format_args!("0x{:X}", module_base),
             "Invalid PE signature"
@@ -173,25 +170,7 @@ pub fn get_module_size_from_address(process_handle: HANDLE, module_base: usize) 
         return None;
     }
 
-    // Skip PE signature (4 bytes) + file header (20 bytes) to get to optional header
-    // SizeOfImage is at offset 56 in the optional header (for both PE32 and PE32+)
-    let optional_header_start = 4 + 20; // PE sig + file header size
-    let size_of_image_offset = optional_header_start + 56;
-
-    if bytes_read < size_of_image_offset + 4 {
-        error!(
-            module_base = format_args!("0x{:X}", module_base),
-            "PE header too small to contain SizeOfImage"
-        );
-        return None;
-    }
-
-    let size_of_image = u32::from_le_bytes([
-        pe_header[size_of_image_offset],
-        pe_header[size_of_image_offset + 1],
-        pe_header[size_of_image_offset + 2],
-        pe_header[size_of_image_offset + 3],
-    ]) as usize;
+    let size_of_image = nt_headers.OptionalHeader.SizeOfImage as usize;
 
     trace!(
         module_base = format_args!("0x{:X}", module_base),
@@ -202,7 +181,7 @@ pub fn get_module_size_from_address(process_handle: HANDLE, module_base: usize) 
     Some(size_of_image)
 }
 
-pub fn get_modules(pid: u32) -> Result<Vec<ModuleInfo>, String> {
+pub fn _get_modules(pid: u32) -> Result<Vec<ModuleInfo>, String> {
     let mut modules = Vec::new();
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
 

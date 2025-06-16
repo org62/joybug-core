@@ -17,6 +17,7 @@ mod request_response {
         GetThreadContext { pid: u32, tid: u32 },
         SetThreadContext { pid: u32, tid: u32, context: ThreadContext },
         ListModules { pid: u32 },
+        ListProcesses,
         // ... add more as needed
     }
 
@@ -31,6 +32,7 @@ mod request_response {
         ThreadContext { context: ThreadContext },
         SetContextAck,
         ModuleList { modules: Vec<ModuleInfo> },
+        ProcessList { processes: Vec<ProcessInfo> },
         // ... add more as needed
     }
 
@@ -89,6 +91,12 @@ mod request_response {
             event_type: u32,
         },
         Unknown,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct ProcessInfo {
+        pub pid: u32,
+        pub name: String,
     }
 
     #[derive(Serialize, Deserialize, Clone)]

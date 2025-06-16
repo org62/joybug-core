@@ -2,7 +2,7 @@ mod utils;
 mod module_manager;
 
 use crate::interfaces::{PlatformAPI, PlatformError};
-use crate::protocol::ModuleInfo;
+use crate::protocol::{ModuleInfo, ProcessInfo};
 use module_manager::ModuleManager;
 use windows_sys::Win32::System::Diagnostics::Debug::{
     FORMAT_MESSAGE_FROM_SYSTEM,
@@ -26,6 +26,10 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     SetThreadContext,
     ReadProcessMemory,
     WriteProcessMemory,
+    DebugActiveProcess,
+};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Threading::{
     DEBUG_PROCESS, 
@@ -44,6 +48,7 @@ use windows_sys::Win32::Foundation::{
     INVALID_HANDLE_VALUE,
     GetLastError,
     CloseHandle,
+    HANDLE,
 };
 use windows_sys::core::PWSTR;
 use std::ffi::OsStr;
@@ -51,10 +56,10 @@ use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 use tracing::{trace, error};
 
-// Safe wrapper for PROCESS_INFORMATION
-pub struct ProcessInfoSafe(pub PROCESS_INFORMATION);
-unsafe impl Send for ProcessInfoSafe {}
-unsafe impl Sync for ProcessInfoSafe {}
+// Safe wrapper for HANDLE
+struct ProcessHandleSafe(HANDLE);
+unsafe impl Send for ProcessHandleSafe {}
+unsafe impl Sync for ProcessHandleSafe {}
 
 // Aligned wrapper for CONTEXT structure
 #[repr(align(16))]
@@ -64,13 +69,13 @@ struct AlignedContext {
 
 pub struct WindowsPlatform {
     pid: Option<u32>,
-    process_info: Option<ProcessInfoSafe>,
+    process_handle: Option<ProcessHandleSafe>,
     module_manager: ModuleManager,
 }
 
 impl WindowsPlatform {
     pub fn new() -> Self {
-        Self { pid: None, process_info: None, module_manager: ModuleManager::new() }
+        Self { pid: None, process_handle: None, module_manager: ModuleManager::new() }
     }
 
     fn to_wide(s: &str) -> Vec<u16> {
@@ -101,19 +106,57 @@ impl WindowsPlatform {
 }
 
 impl PlatformAPI for WindowsPlatform {
-    fn attach(&mut self, pid: u32) -> Result<(), PlatformError> {
+    fn attach(&mut self, pid: u32) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
         trace!(pid, "WindowsPlatform::attach called");
-        self.pid = Some(pid);
-        self.module_manager.clear();
-        let modules = utils::get_modules(pid).map_err(PlatformError::Other)?;
-        for module in modules {
-            self.module_manager.add_module(module);
+
+        if unsafe { DebugActiveProcess(pid) } == 0 {
+            let error = unsafe { GetLastError() };
+            let error_str = Self::error_message(error);
+            error!(error, error_str, "DebugActiveProcess failed");
+            return Err(PlatformError::OsError(format!("DebugActiveProcess failed: {} ({})", error, error_str)));
         }
-        Ok(())
+
+        self.pid = Some(pid);
+        
+        // After attaching, we must wait for the initial CREATE_PROCESS_DEBUG_EVENT
+        let mut debug_event: DEBUG_EVENT = unsafe { std::mem::zeroed() };
+        let wait_res = unsafe { WaitForDebugEvent(&mut debug_event, INFINITE) };
+        if wait_res == FALSE {
+            let error = unsafe { GetLastError() };
+            let error_str = Self::error_message(error);
+            error!(error, error_str, "WaitForDebugEvent after attach failed");
+            return Err(PlatformError::OsError(format!("WaitForDebugEvent after attach failed: {} ({})", error, error_str)));
+        }
+
+        if debug_event.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT {
+            let info = unsafe { debug_event.u.CreateProcessInfo };
+            self.process_handle = Some(ProcessHandleSafe(info.hProcess));
+            let image_file_name = utils::get_path_from_handle(info.hFile).unwrap_or_else(|| "<unknown>".to_string());
+            let size_of_image = utils::get_module_size_from_address(info.hProcess, info.lpBaseOfImage as usize).map(|sz| sz as u64);
+            
+            self.module_manager.clear();
+            self.module_manager.add_module(ModuleInfo {
+                name: image_file_name.clone(),
+                base: info.lpBaseOfImage as u64,
+                size: size_of_image,
+            });
+
+            Ok(Some(crate::protocol::DebugEvent::ProcessCreated {
+                pid: debug_event.dwProcessId,
+                tid: debug_event.dwThreadId,
+                image_file_name: Some(image_file_name),
+                base_of_image: info.lpBaseOfImage as u64,
+                size_of_image,
+            }))
+        } else {
+            error!(event_code = debug_event.dwDebugEventCode, "Unexpected debug event after attach");
+            // We should probably continue the event we received...
+            unsafe { ContinueDebugEvent(debug_event.dwProcessId, debug_event.dwThreadId, DBG_CONTINUE); }
+            Err(PlatformError::Other("Unexpected debug event after attach".to_string()))
+        }
     }
 
     fn continue_exec(&mut self, pid: u32, tid: u32) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
-        println!("[windows_platform] continue_exec thread id: {:?}", std::thread::current().id());
         trace!(pid, tid, "WindowsPlatform::continue_exec called");
         let cont_res = unsafe {
             ContinueDebugEvent(pid, tid, DBG_CONTINUE)
@@ -209,11 +252,12 @@ impl PlatformAPI for WindowsPlatform {
             LOAD_DLL_DEBUG_EVENT => {
                 let info = unsafe { debug_event.u.LoadDll };
                 let dll_name = utils::get_path_from_handle(info.hFile).unwrap_or_else(|| "<unknown>".to_string());
-                let size_of_dll = if let Some(ref process_info) = self.process_info {
-                    utils::get_module_size_from_address(process_info.0.hProcess, info.lpBaseOfDll as usize).map(|sz| sz as u64)
-                } else {
-                    None
-                };
+                let h_process = self.process_handle.as_ref().ok_or_else(|| PlatformError::OsError("No process handle for LOAD_DLL_DEBUG_EVENT".to_string()))?.0;
+                let size_of_dll = utils::get_module_size_from_address(h_process, info.lpBaseOfDll as usize).map(|sz| sz as u64);
+                if size_of_dll.is_none() {
+                    error!("Failed to get size of DLL");
+                    return Err(PlatformError::OsError("Failed to get size of DLL".to_string()));
+                }
 
                 self.module_manager.add_module(ModuleInfo {
                     name: dll_name.clone(),
@@ -299,7 +343,7 @@ impl PlatformAPI for WindowsPlatform {
             error!(error, error_str, "CreateProcessW failed");
             return Err(PlatformError::OsError(format!("CreateProcessW failed: {} ({})", error, error_str)));
         }
-        self.process_info = Some(ProcessInfoSafe(process_info));
+        self.process_handle = Some(ProcessHandleSafe(process_info.hProcess));
         self.pid = Some(process_info.dwProcessId);
         // Immediately run the debug loop for the new process
         let mut debug_event: DEBUG_EVENT = unsafe { std::mem::zeroed() };
@@ -318,6 +362,10 @@ impl PlatformAPI for WindowsPlatform {
         let info = unsafe { debug_event.u.CreateProcessInfo };
         let image_file_name = utils::get_path_from_handle(info.hFile).unwrap_or_else(|| command.split_whitespace().next().unwrap_or("<unknown>").to_string());
         let size_of_image = utils::get_module_size_from_address(info.hProcess, info.lpBaseOfImage as usize).map(|sz| sz as u64);
+        if size_of_image.is_none() {
+            error!("Failed to get size of image");
+            return Err(PlatformError::OsError("Failed to get size of image".to_string()));
+        }
         self.module_manager.add_module(ModuleInfo {
             name: image_file_name.clone(),
             base: info.lpBaseOfImage as u64,
@@ -330,9 +378,9 @@ impl PlatformAPI for WindowsPlatform {
     fn read_memory(&mut self, pid: u32, address: u64, size: usize) -> Result<Vec<u8>, PlatformError> {
         trace!(pid = %format!("0x{:X}", pid), address = %format!("0x{:X}", address), size, "WindowsPlatform::read_memory called");
         unsafe {
-            let handle = if let Some(ref info) = self.process_info {
-                if info.0.dwProcessId == pid && info.0.hProcess != std::ptr::null_mut() && info.0.hProcess != INVALID_HANDLE_VALUE {
-                    info.0.hProcess
+            let handle = if let Some(handle) = self.process_handle.as_ref() {
+                if self.pid == Some(pid) && handle.0 != std::ptr::null_mut() && handle.0 != INVALID_HANDLE_VALUE {
+                    handle.0
                 } else {
                     error!("No valid process handle for memory read");
                     return Err(PlatformError::OsError("No valid process handle for memory read".to_string()));
@@ -365,9 +413,9 @@ impl PlatformAPI for WindowsPlatform {
     fn write_memory(&mut self, pid: u32, address: u64, data: &[u8]) -> Result<(), PlatformError> {
         trace!(pid = %format!("0x{:X}", pid), address = %format!("0x{:X}", address), data_len = data.len(), "WindowsPlatform::write_memory called");
         unsafe {
-            let handle = if let Some(ref info) = self.process_info {
-                if info.0.dwProcessId == pid && info.0.hProcess != std::ptr::null_mut() && info.0.hProcess != INVALID_HANDLE_VALUE {
-                    info.0.hProcess
+            let handle = if let Some(handle) = self.process_handle.as_ref() {
+                if self.pid == Some(pid) && handle.0 != std::ptr::null_mut() && handle.0 != INVALID_HANDLE_VALUE {
+                    handle.0
                 } else {
                     error!("No valid process handle for memory write");
                     return Err(PlatformError::OsError("No valid process handle for memory write".to_string()));
@@ -470,5 +518,48 @@ impl PlatformAPI for WindowsPlatform {
 
     fn list_modules(&self, _pid: u32) -> Result<Vec<ModuleInfo>, PlatformError> {
         Ok(self.module_manager.list_modules())
+    }
+
+    fn list_processes(&self) -> Result<Vec<ProcessInfo>, PlatformError> {
+        trace!("WindowsPlatform::list_processes called");
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot == INVALID_HANDLE_VALUE {
+                let error = GetLastError();
+                let error_str = Self::error_message(error);
+                error!(error, error_str, "CreateToolhelp32Snapshot failed");
+                return Err(PlatformError::OsError(format!("CreateToolhelp32Snapshot failed: {} ({})", error, error_str)));
+            }
+
+            let mut pe32: PROCESSENTRY32W = std::mem::zeroed();
+            pe32.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+            if Process32FirstW(snapshot, &mut pe32) == 0 {
+                let error = GetLastError();
+                let error_str = Self::error_message(error);
+                CloseHandle(snapshot);
+                error!(error, error_str, "Process32FirstW failed");
+                return Err(PlatformError::OsError(format!("Process32FirstW failed: {} ({})", error, error_str)));
+            }
+            
+            let mut processes = Vec::new();
+
+            loop {
+                let name = String::from_utf16_lossy(&pe32.szExeFile);
+                let name = name.trim_end_matches('\0').to_string();
+
+                processes.push(ProcessInfo {
+                    pid: pe32.th32ProcessID,
+                    name,
+                });
+
+                if Process32NextW(snapshot, &mut pe32) == 0 {
+                    break;
+                }
+            }
+
+            CloseHandle(snapshot);
+            Ok(processes)
+        }
     }
 } 
