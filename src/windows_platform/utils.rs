@@ -1,19 +1,24 @@
-use tracing::{error, warn, trace};
+use crate::protocol::ModuleInfo;
+use tracing::{error, trace, warn};
 use windows_sys::Win32::Foundation::{
-    GetLastError, HANDLE, INVALID_HANDLE_VALUE, MAX_PATH,
+    CloseHandle, GetLastError, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, MAX_PATH,
 };
 use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleA;
 use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE,
+    TH32CS_SNAPMODULE32,
+};
 
 /// Gets the file path from a Windows file handle.
-/// 
+///
 /// This function uses the Windows API GetFinalPathNameByHandleA to retrieve
 /// the full path of a file given its handle. It handles buffer resizing
 /// automatically if the initial buffer is too small.
-/// 
+///
 /// # Arguments
 /// * `file_handle` - A valid Windows file handle
-/// 
+///
 /// # Returns
 /// * `Some(String)` - The file path if successful
 /// * `None` - If the handle is invalid or the operation fails
@@ -28,7 +33,7 @@ pub fn get_path_from_handle(file_handle: HANDLE) -> Option<String> {
 
     // FILE_NAME_NORMALIZED 0x0
     // VOLUME_NAME_DOS 0x0
-    let flags = 0x0; 
+    let flags = 0x0;
 
     loop {
         path_len = unsafe {
@@ -53,9 +58,9 @@ pub fn get_path_from_handle(file_handle: HANDLE) -> Option<String> {
             break;
         }
     }
-    
+
     let actual_len = path_buffer.iter().position(|&c| c == 0).unwrap_or(path_len as usize);
-    
+
     if actual_len == 0 {
          warn!("get_path_from_handle: Resulting path length is zero");
         return None;
@@ -76,14 +81,14 @@ pub fn get_path_from_handle(file_handle: HANDLE) -> Option<String> {
 }
 
 /// Gets the size of a module (DLL/EXE) loaded at the specified base address by reading PE headers.
-/// 
+///
 /// This function reads the PE (Portable Executable) header from the target process
 /// to determine the size of the module loaded at the given base address.
-/// 
+///
 /// # Arguments
 /// * `process_handle` - A valid handle to the target process
 /// * `module_base` - The base address where the module is loaded
-/// 
+///
 /// # Returns
 /// * `Some(usize)` - The module size in bytes if successful
 /// * `None` - If the operation fails
@@ -129,7 +134,7 @@ pub fn get_module_size_from_address(process_handle: HANDLE, module_base: usize) 
     // Get PE header offset (at offset 0x3C in DOS header)
     let pe_offset = u32::from_le_bytes([
         dos_header[0x3C],
-        dos_header[0x3D], 
+        dos_header[0x3D],
         dos_header[0x3E],
         dos_header[0x3F],
     ]) as usize;
@@ -195,4 +200,67 @@ pub fn get_module_size_from_address(process_handle: HANDLE, module_base: usize) 
     );
 
     Some(size_of_image)
+}
+
+pub fn get_modules(pid: u32) -> Result<Vec<ModuleInfo>, String> {
+    let mut modules = Vec::new();
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
+
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(format!(
+            "CreateToolhelp32Snapshot failed: {}",
+            unsafe { GetLastError() }
+        ));
+    }
+
+    let mut me32: MODULEENTRY32W = unsafe { std::mem::zeroed() };
+    me32.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
+
+    if unsafe { Module32FirstW(snapshot, &mut me32) } == 0 {
+        let err = unsafe { GetLastError() };
+        unsafe { CloseHandle(snapshot) };
+        // It can fail with ERROR_NO_MORE_FILES if there are no modules, which is not an error.
+        if err == ERROR_NO_MORE_FILES {
+            return Ok(modules);
+        }
+        return Err(format!("Module32FirstW failed: {}", err));
+    }
+
+    loop {
+        let name = {
+            let len = me32
+                .szModule
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(me32.szModule.len());
+            String::from_utf16_lossy(&me32.szModule[..len])
+        };
+
+        let path = {
+            let len = me32
+                .szExePath
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(me32.szExePath.len());
+            String::from_utf16_lossy(&me32.szExePath[..len])
+        };
+
+        modules.push(ModuleInfo {
+            name: if !path.is_empty() { path } else { name },
+            base: me32.modBaseAddr as u64,
+            size: Some(me32.modBaseSize as u64),
+        });
+
+        if unsafe { Module32NextW(snapshot, &mut me32) } == 0 {
+            let err = unsafe { GetLastError() };
+            if err == ERROR_NO_MORE_FILES {
+                break; // No more modules
+            }
+            unsafe { CloseHandle(snapshot) };
+            return Err(format!("Module32NextW failed: {}", err));
+        }
+    }
+
+    unsafe { CloseHandle(snapshot) };
+    Ok(modules)
 } 

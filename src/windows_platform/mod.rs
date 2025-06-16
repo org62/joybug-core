@@ -1,6 +1,9 @@
 mod utils;
+mod module_manager;
 
 use crate::interfaces::{PlatformAPI, PlatformError};
+use crate::protocol::ModuleInfo;
+use module_manager::ModuleManager;
 use windows_sys::Win32::System::Diagnostics::Debug::{
     FORMAT_MESSAGE_FROM_SYSTEM,
     FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -62,11 +65,12 @@ struct AlignedContext {
 pub struct WindowsPlatform {
     pid: Option<u32>,
     process_info: Option<ProcessInfoSafe>,
+    module_manager: ModuleManager,
 }
 
 impl WindowsPlatform {
     pub fn new() -> Self {
-        Self { pid: None, process_info: None }
+        Self { pid: None, process_info: None, module_manager: ModuleManager::new() }
     }
 
     fn to_wide(s: &str) -> Vec<u16> {
@@ -100,6 +104,11 @@ impl PlatformAPI for WindowsPlatform {
     fn attach(&mut self, pid: u32) -> Result<(), PlatformError> {
         trace!(pid, "WindowsPlatform::attach called");
         self.pid = Some(pid);
+        self.module_manager.clear();
+        let modules = utils::get_modules(pid).map_err(PlatformError::Other)?;
+        for module in modules {
+            self.module_manager.add_module(module);
+        }
         Ok(())
     }
 
@@ -153,13 +162,20 @@ impl PlatformAPI for WindowsPlatform {
             }
             CREATE_PROCESS_DEBUG_EVENT => {
                 let info = unsafe { debug_event.u.CreateProcessInfo };
-                let image_file_name = utils::get_path_from_handle(info.hFile).or(Some(String::from("<unknown>")));
+                let image_file_name = utils::get_path_from_handle(info.hFile).unwrap_or_else(|| "<unknown>".to_string());
                 let size_of_image = utils::get_module_size_from_address(info.hProcess, info.lpBaseOfImage as usize).map(|sz| sz as u64);
+
+                self.module_manager.add_module(ModuleInfo {
+                    name: image_file_name.clone(),
+                    base: info.lpBaseOfImage as u64,
+                    size: size_of_image,
+                });
+
                 trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), base_of_image = %format!("0x{:X}", info.lpBaseOfImage as u64), image_file_name = ?image_file_name, size_of_image = ?size_of_image, "ProcessCreated event");
                 Some(crate::protocol::DebugEvent::ProcessCreated {
                     pid: debug_event.dwProcessId,
                     tid: debug_event.dwThreadId,
-                    image_file_name,
+                    image_file_name: Some(image_file_name),
                     base_of_image: info.lpBaseOfImage as u64,
                     size_of_image,
                 })
@@ -192,17 +208,24 @@ impl PlatformAPI for WindowsPlatform {
             }
             LOAD_DLL_DEBUG_EVENT => {
                 let info = unsafe { debug_event.u.LoadDll };
-                let dll_name = utils::get_path_from_handle(info.hFile).or(Some(String::from("<unknown>")));
+                let dll_name = utils::get_path_from_handle(info.hFile).unwrap_or_else(|| "<unknown>".to_string());
                 let size_of_dll = if let Some(ref process_info) = self.process_info {
                     utils::get_module_size_from_address(process_info.0.hProcess, info.lpBaseOfDll as usize).map(|sz| sz as u64)
                 } else {
                     None
                 };
+
+                self.module_manager.add_module(ModuleInfo {
+                    name: dll_name.clone(),
+                    base: info.lpBaseOfDll as u64,
+                    size: size_of_dll,
+                });
+
                 trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), base_of_dll = %format!("0x{:X}", info.lpBaseOfDll as u64), dll_name = ?dll_name, size_of_dll = ?size_of_dll, "DllLoaded event");
                 Some(crate::protocol::DebugEvent::DllLoaded {
                     pid: debug_event.dwProcessId,
                     tid: debug_event.dwThreadId,
-                    dll_name,
+                    dll_name: Some(dll_name),
                     base_of_dll: info.lpBaseOfDll as u64,
                     size_of_dll,
                 })
@@ -210,6 +233,7 @@ impl PlatformAPI for WindowsPlatform {
             UNLOAD_DLL_DEBUG_EVENT => {
                 let info = unsafe { debug_event.u.UnloadDll };
                 trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), base_of_dll = %format!("0x{:X}", info.lpBaseOfDll as u64), "DllUnloaded event");
+                self.module_manager.remove_module(info.lpBaseOfDll as u64);
                 Some(crate::protocol::DebugEvent::DllUnloaded {
                     pid: debug_event.dwProcessId,
                     tid: debug_event.dwThreadId,
@@ -248,6 +272,7 @@ impl PlatformAPI for WindowsPlatform {
     }
 
     fn launch(&mut self, command: &str) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
+        self.module_manager.clear();
         println!("[windows_platform] launch thread id: {:?}", std::thread::current().id());
         trace!(command, "WindowsPlatform::launch called");
         let cmd_line_wide = Self::to_wide(command);
@@ -289,7 +314,17 @@ impl PlatformAPI for WindowsPlatform {
             error!("Unexpected debug event after launch");
             return Err(PlatformError::OsError("Unexpected debug event after launch".to_string()));
         }
-        Ok(Some(crate::protocol::DebugEvent::ProcessCreated { pid: process_info.dwProcessId, tid: process_info.dwThreadId, image_file_name: None, base_of_image: 0, size_of_image: None }))
+
+        let info = unsafe { debug_event.u.CreateProcessInfo };
+        let image_file_name = utils::get_path_from_handle(info.hFile).unwrap_or_else(|| command.split_whitespace().next().unwrap_or("<unknown>").to_string());
+        let size_of_image = utils::get_module_size_from_address(info.hProcess, info.lpBaseOfImage as usize).map(|sz| sz as u64);
+        self.module_manager.add_module(ModuleInfo {
+            name: image_file_name.clone(),
+            base: info.lpBaseOfImage as u64,
+            size: size_of_image,
+        });
+
+        Ok(Some(crate::protocol::DebugEvent::ProcessCreated { pid: process_info.dwProcessId, tid: process_info.dwThreadId, image_file_name: Some(image_file_name), base_of_image: info.lpBaseOfImage as u64, size_of_image }))
     }
 
     fn read_memory(&mut self, pid: u32, address: u64, size: usize) -> Result<Vec<u8>, PlatformError> {
@@ -431,5 +466,9 @@ impl PlatformAPI for WindowsPlatform {
         {
             Err(PlatformError::NotImplemented)
         }
+    }
+
+    fn list_modules(&self, _pid: u32) -> Result<Vec<ModuleInfo>, PlatformError> {
+        Ok(self.module_manager.list_modules())
     }
 } 

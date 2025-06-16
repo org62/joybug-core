@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use thiserror::Error;
+use crate::protocol::ModuleInfo;
 
 #[derive(Debug, Error)]
 pub enum PlatformError {
@@ -20,5 +21,6 @@ pub trait PlatformAPI: Send + Sync {
     fn write_memory(&mut self, pid: u32, address: u64, data: &[u8]) -> Result<(), PlatformError>;
     fn get_thread_context(&mut self, pid: u32, tid: u32) -> Result<crate::protocol::ThreadContext, PlatformError>;
     fn set_thread_context(&mut self, pid: u32, tid: u32, context: crate::protocol::ThreadContext) -> Result<(), PlatformError>;
+    fn list_modules(&self, pid: u32) -> Result<Vec<ModuleInfo>, PlatformError>;
     // ... add more as needed
 } 

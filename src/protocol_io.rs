@@ -1,4 +1,4 @@
-pub use crate::protocol::{DebuggerRequest, DebuggerResponse, DebugEvent};
+pub use crate::protocol::{DebuggerRequest, DebuggerResponse, DebugEvent, ModuleInfo};
 use std::io::{Read, Write};
 pub use std::net::TcpStream;
 
@@ -24,6 +24,16 @@ impl DebugClient {
         let addr = addr.unwrap_or("127.0.0.1:9000");
         let stream = TcpStream::connect(addr)?;
         Ok(Self { stream })
+    }
+
+    pub fn list_modules(&mut self, pid: u32) -> anyhow::Result<Vec<ModuleInfo>> {
+        let req = DebuggerRequest::ListModules { pid };
+        let resp = self.send_and_receive(&req)?;
+        if let DebuggerResponse::ModuleList { modules } = resp {
+            Ok(modules)
+        } else {
+            Err(anyhow::anyhow!("Unexpected response: {:?}", resp))
+        }
     }
 
     pub fn launch<S, F>(

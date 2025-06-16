@@ -49,6 +49,7 @@ pub async fn run_server() -> anyhow::Result<()> {
                 debug!(req = %match &req {
                     Ok(DebuggerRequest::ReadMemory { pid, address, size }) => format!("ReadMemory {{ pid: {}, address: 0x{:X}, size: {} }}", pid, address, size),
                     Ok(DebuggerRequest::WriteMemory { pid, address, data }) => format!("WriteMemory {{ pid: {}, address: 0x{:X}, data: [..{} bytes] }}", pid, address, data.len()),
+                    Ok(DebuggerRequest::ListModules { pid }) => format!("ListModules {{ pid: {} }}", pid),
                     _ => format!("{:?}", req),
                 }, "Received request");
                 let resp = match req {
@@ -102,11 +103,18 @@ pub async fn run_server() -> anyhow::Result<()> {
                             Err(e) => DebuggerResponse::Error { message: e.to_string() },
                         }
                     }
+                    Ok(DebuggerRequest::ListModules { pid }) => {
+                        match platform.list_modules(pid) {
+                            Ok(modules) => DebuggerResponse::ModuleList { modules },
+                            Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                        }
+                    }
                     Err(e) => DebuggerResponse::Error { message: format!("Invalid request: {}", e) },
                 };
                 debug!(resp = %match &resp {
                     DebuggerResponse::Event { event } => event.to_string(),
                     DebuggerResponse::ThreadContext { context } => context.to_string(),
+                    DebuggerResponse::ModuleList { modules } => format!("ModuleList {{ modules: [..{} modules] }}", modules.len()),
                     _ => format!("{:?}", resp),
                 }, "Sending response");
                 let resp_json = serde_json::to_vec(&resp).unwrap();

@@ -1,6 +1,6 @@
 #![cfg(windows)]
 
-use joybug_basics_tests1::protocol::{DebuggerResponse, DebugEvent};
+use joybug_basics_tests1::protocol::{DebuggerResponse, DebugEvent, ModuleInfo};
 use joybug_basics_tests1::protocol_io::DebugClient;
 use std::thread;
 use tokio;
@@ -13,13 +13,20 @@ fn test_debug_client_event_collection() {
         rt.block_on(joybug_basics_tests1::server::run_server()).unwrap();
     });
     let mut client = DebugClient::connect(None).expect("connect");
-    let mut events = Vec::new();
+    struct TestState {
+        modules: Vec<ModuleInfo>,
+        events: Vec<DebugEvent>,
+    }
+    let mut state = TestState { modules: Vec::new(), events: Vec::new() };
 
-    client.launch("cmd.exe /c echo test".to_string(), &mut events, |_client, events, resp| {
+    client.launch("cmd.exe /c echo test".to_string(), &mut state, |client, state, resp| {
         match resp {
             DebuggerResponse::Event { event } => {
-                events.push(event.clone());
-                if matches!(event, DebugEvent::ProcessExited { .. }) {
+                state.events.push(event.clone());
+                if let DebugEvent::ProcessExited { pid, .. } = &event {
+                    let modules = client.list_modules(*pid).expect("Should get module list");
+                    state.modules.extend(modules);
+                    println!("modules: {:?}", state.modules);
                     return false;
                 }
             }
@@ -28,13 +35,14 @@ fn test_debug_client_event_collection() {
         true
     }).expect("debug loop");
 
-    let process_created = events.iter().filter(|e| matches!(e, DebugEvent::ProcessCreated { .. })).count();
-    let process_exited = events.iter().filter(|e| matches!(e, DebugEvent::ProcessExited { .. })).count();
-    let breakpoints = events.iter().filter(|e| matches!(e, DebugEvent::Breakpoint { .. })).count();
-    let dll_loaded = events.iter().filter(|e| matches!(e, DebugEvent::DllLoaded { .. })).count();
+    let process_created = state.events.iter().filter(|e| matches!(e, DebugEvent::ProcessCreated { .. })).count();
+    let process_exited = state.events.iter().filter(|e| matches!(e, DebugEvent::ProcessExited { .. })).count();
+    let breakpoints = state.events.iter().filter(|e| matches!(e, DebugEvent::Breakpoint { .. })).count();
+    let dll_loaded = state.events.iter().filter(|e| matches!(e, DebugEvent::DllLoaded { .. })).count();
 
     assert_eq!(process_created, 1, "Should be exactly one process created event");
     assert_eq!(process_exited, 1, "Should be exactly one process exited event");
     assert_eq!(breakpoints, 1, "Should be exactly one breakpoint event");
     assert!(dll_loaded >= 1, "Should be at least one DLL loaded event");
+    assert!(state.modules.len() >= dll_loaded as usize, "Should be at least as many modules as DLLs loaded");
 } 

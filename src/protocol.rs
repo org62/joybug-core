@@ -16,6 +16,7 @@ mod request_response {
         WriteMemory { pid: u32, address: u64, data: Vec<u8> },
         GetThreadContext { pid: u32, tid: u32 },
         SetThreadContext { pid: u32, tid: u32, context: ThreadContext },
+        ListModules { pid: u32 },
         // ... add more as needed
     }
 
@@ -29,6 +30,7 @@ mod request_response {
         WriteAck,
         ThreadContext { context: ThreadContext },
         SetContextAck,
+        ModuleList { modules: Vec<ModuleInfo> },
         // ... add more as needed
     }
 
@@ -87,6 +89,42 @@ mod request_response {
             event_type: u32,
         },
         Unknown,
+    }
+
+    #[derive(Serialize, Deserialize, Clone)]
+    pub struct ModuleInfo {
+        pub name: String,
+        pub base: u64,
+        pub size: Option<u64>,
+    }
+
+    impl std::fmt::Debug for ModuleInfo {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let mut ds = f.debug_struct("ModuleInfo");
+            ds.field("name", &self.name);
+            ds.field("base", &format_args!("0x{:X}", self.base));
+            if let Some(size) = self.size {
+                ds.field("size", &format_args!("0x{:X}", size));
+            } else {
+                ds.field("size", &self.size);
+            }
+            ds.finish()
+        }
+    }
+
+    impl std::fmt::Display for ModuleInfo {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "{} [{}] @ 0x{:X}",
+                self.name,
+                self.size
+                    .map(|s| format!("0x{:X}", s))
+                    .as_deref()
+                    .unwrap_or("N/A"),
+                self.base
+            )
+        }
     }
 
     #[derive(Clone)]
