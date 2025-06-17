@@ -103,6 +103,12 @@ fn handle_connection(mut stream: std::net::TcpStream) {
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            Ok(DebuggerRequest::ListThreads { pid }) => {
+                match platform.list_threads(pid) {
+                    Ok(threads) => DebuggerResponse::ThreadList { threads },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             Ok(DebuggerRequest::ListProcesses) => {
                 match platform.list_processes() {
                     Ok(processes) => DebuggerResponse::ProcessList { processes },
@@ -115,6 +121,7 @@ fn handle_connection(mut stream: std::net::TcpStream) {
             DebuggerResponse::Event { event } => event.to_string(),
             DebuggerResponse::ThreadContext { context } => context.to_string(),
             DebuggerResponse::ModuleList { modules } => format!("ModuleList {{ modules: [..{} modules] }}", modules.len()),
+            DebuggerResponse::ThreadList { threads } => format!("ThreadList {{ threads: [..{} threads] }}", threads.len()),
             DebuggerResponse::ProcessList { processes } => format!("ProcessList {{ processes: [..{} processes] }}", processes.len()),
             _ => format!("{:?}", resp),
         }, "Sending response");

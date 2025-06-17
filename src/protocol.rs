@@ -17,6 +17,7 @@ mod request_response {
         GetThreadContext { pid: u32, tid: u32 },
         SetThreadContext { pid: u32, tid: u32, context: ThreadContext },
         ListModules { pid: u32 },
+        ListThreads { pid: u32 },
         ListProcesses,
         // ... add more as needed
     }
@@ -32,6 +33,7 @@ mod request_response {
         ThreadContext { context: ThreadContext },
         SetContextAck,
         ModuleList { modules: Vec<ModuleInfo> },
+        ThreadList { threads: Vec<ThreadInfo> },
         ProcessList { processes: Vec<ProcessInfo> },
         // ... add more as needed
     }
@@ -227,6 +229,12 @@ mod request_response {
                 );
             }
         }
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct ThreadInfo {
+        pub tid: u32,
+        pub start_address: u64,
     }
 }
 

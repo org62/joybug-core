@@ -1,4 +1,4 @@
-pub use crate::protocol::{DebuggerRequest, DebuggerResponse, DebugEvent, ModuleInfo, ProcessInfo};
+pub use crate::protocol::{DebuggerRequest, DebuggerResponse, DebugEvent, ModuleInfo, ProcessInfo, ThreadInfo};
 use std::io::{Read, Write};
 pub use std::net::TcpStream;
 
@@ -41,6 +41,16 @@ impl DebugClient {
         let resp = self.send_and_receive(&req)?;
         if let DebuggerResponse::ModuleList { modules } = resp {
             Ok(modules)
+        } else {
+            Err(anyhow::anyhow!("Unexpected response: {:?}", resp))
+        }
+    }
+
+    pub fn list_threads(&mut self, pid: u32) -> anyhow::Result<Vec<ThreadInfo>> {
+        let req = DebuggerRequest::ListThreads { pid };
+        let resp = self.send_and_receive(&req)?;
+        if let DebuggerResponse::ThreadList { threads } = resp {
+            Ok(threads)
         } else {
             Err(anyhow::anyhow!("Unexpected response: {:?}", resp))
         }

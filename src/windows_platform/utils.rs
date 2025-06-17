@@ -94,13 +94,10 @@ pub fn get_path_from_handle(file_handle: HANDLE) -> Option<String> {
 /// * `Some(usize)` - The module size in bytes if successful
 /// * `None` - If the operation fails
 pub fn get_module_size_from_address(process_handle: HANDLE, module_base: usize) -> Option<usize> {
-    trace!(process_handle = ?process_handle, module_base = %format!("0x{:X}", module_base), "get_module_size_from_address");
     if process_handle.is_null() || std::ptr::eq(process_handle, INVALID_HANDLE_VALUE) {
         warn!("Invalid process handle provided to get_module_size_from_address");
         return None;
     }
-
-    trace!(process_handle = ?process_handle, module_base = %format!("0x{:X}", module_base), "get_module_size_from_address");
 
     // Read DOS header to get PE header offset
     let mut dos_header: IMAGE_DOS_HEADER = unsafe { std::mem::zeroed() };

@@ -1,9 +1,11 @@
 mod utils;
 mod module_manager;
+mod thread_manager;
 
 use crate::interfaces::{PlatformAPI, PlatformError};
-use crate::protocol::{ModuleInfo, ProcessInfo};
+use crate::protocol::{ModuleInfo, ProcessInfo, ThreadInfo};
 use module_manager::ModuleManager;
+use thread_manager::ThreadManager;
 use windows_sys::Win32::System::Diagnostics::Debug::{
     FORMAT_MESSAGE_FROM_SYSTEM,
     FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -34,13 +36,10 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 use windows_sys::Win32::System::Threading::{
     DEBUG_PROCESS, 
     INFINITE, 
-    THREAD_SET_CONTEXT, 
-    THREAD_QUERY_INFORMATION, 
-    THREAD_ALL_ACCESS,
     STARTUPINFOW, 
     PROCESS_INFORMATION, 
     CreateProcessW, 
-    OpenThread, 
+    GetCurrentProcess,
 };
 use windows_sys::Win32::Foundation::{
     FALSE,
@@ -49,6 +48,8 @@ use windows_sys::Win32::Foundation::{
     GetLastError,
     CloseHandle,
     HANDLE,
+    DuplicateHandle,
+    DUPLICATE_SAME_ACCESS,
 };
 use windows_sys::core::PWSTR;
 use std::ffi::OsStr;
@@ -71,11 +72,12 @@ pub struct WindowsPlatform {
     pid: Option<u32>,
     process_handle: Option<ProcessHandleSafe>,
     module_manager: ModuleManager,
+    thread_manager: ThreadManager,
 }
 
 impl WindowsPlatform {
     pub fn new() -> Self {
-        Self { pid: None, process_handle: None, module_manager: ModuleManager::new() }
+        Self { pid: None, process_handle: None, module_manager: ModuleManager::new(), thread_manager: ThreadManager::new() }
     }
 
     fn to_wide(s: &str) -> Vec<u16> {
@@ -132,21 +134,34 @@ impl PlatformAPI for WindowsPlatform {
             let info = unsafe { debug_event.u.CreateProcessInfo };
             self.process_handle = Some(ProcessHandleSafe(info.hProcess));
             let image_file_name = utils::get_path_from_handle(info.hFile).unwrap_or_else(|| "<unknown>".to_string());
+            unsafe { CloseHandle(info.hFile); } 
             let size_of_image = utils::get_module_size_from_address(info.hProcess, info.lpBaseOfImage as usize).map(|sz| sz as u64);
             
             self.module_manager.clear();
+            self.thread_manager.clear();
             self.module_manager.add_module(ModuleInfo {
                 name: image_file_name.clone(),
                 base: info.lpBaseOfImage as u64,
                 size: size_of_image,
             });
 
+            let mut thread_handle = 0 as HANDLE;
+            let current_process = unsafe { GetCurrentProcess() };
+            if unsafe { DuplicateHandle(current_process, info.hThread, current_process, &mut thread_handle, 0, FALSE, DUPLICATE_SAME_ACCESS) } == 0 {
+                let error = unsafe { GetLastError() };
+                let error_str = Self::error_message(error);
+                error!(error, error_str, "DuplicateHandle for thread failed in attach");
+                return Err(PlatformError::OsError(format!("DuplicateHandle for thread failed in attach: {} ({})", error, error_str)));
+            }
+            let start_address = info.lpStartAddress.map_or(0, |addr| addr as usize as u64);
+            self.thread_manager.add_thread(debug_event.dwThreadId, start_address, thread_handle);
+
             Ok(Some(crate::protocol::DebugEvent::ProcessCreated {
                 pid: debug_event.dwProcessId,
                 tid: debug_event.dwThreadId,
                 image_file_name: Some(image_file_name),
                 base_of_image: info.lpBaseOfImage as u64,
-                size_of_image,
+                size_of_image: size_of_image,
             }))
         } else {
             error!(event_code = debug_event.dwDebugEventCode, "Unexpected debug event after attach");
@@ -180,7 +195,7 @@ impl PlatformAPI for WindowsPlatform {
                 let ex_info = unsafe { debug_event.u.Exception };
                 let ex_record = ex_info.ExceptionRecord;
                 if ex_record.ExceptionCode == windows_sys::Win32::Foundation::EXCEPTION_BREAKPOINT {
-                    trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), address = %format!("0x{:X}", ex_record.ExceptionAddress as u64), "Breakpoint event");
+                    trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, address = %format!("0x{:X}", ex_record.ExceptionAddress as u64), "Breakpoint event");
                     Some(crate::protocol::DebugEvent::Breakpoint {
                         pid: debug_event.dwProcessId,
                         tid: debug_event.dwThreadId,
@@ -192,7 +207,7 @@ impl PlatformAPI for WindowsPlatform {
                     for i in 0..num_params {
                         params.push(ex_record.ExceptionInformation[i] as u64);
                     }
-                    trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), code = %format!("0x{:X}", ex_record.ExceptionCode as u32), address = %format!("0x{:X}", ex_record.ExceptionAddress as u64), first_chance = ex_info.dwFirstChance == 1, parameters = ?params, "Exception event");
+                    trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, code = %format!("0x{:X}", ex_record.ExceptionCode as u32), address = %format!("0x{:X}", ex_record.ExceptionAddress as u64), first_chance = ex_info.dwFirstChance == 1, parameters = ?params, "Exception event");
                     Some(crate::protocol::DebugEvent::Exception {
                         pid: debug_event.dwProcessId,
                         tid: debug_event.dwThreadId,
@@ -206,6 +221,7 @@ impl PlatformAPI for WindowsPlatform {
             CREATE_PROCESS_DEBUG_EVENT => {
                 let info = unsafe { debug_event.u.CreateProcessInfo };
                 let image_file_name = utils::get_path_from_handle(info.hFile).unwrap_or_else(|| "<unknown>".to_string());
+                unsafe { CloseHandle(info.hFile); }
                 let size_of_image = utils::get_module_size_from_address(info.hProcess, info.lpBaseOfImage as usize).map(|sz| sz as u64);
 
                 self.module_manager.add_module(ModuleInfo {
@@ -214,18 +230,30 @@ impl PlatformAPI for WindowsPlatform {
                     size: size_of_image,
                 });
 
-                trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), base_of_image = %format!("0x{:X}", info.lpBaseOfImage as u64), image_file_name = ?image_file_name, size_of_image = ?size_of_image, "ProcessCreated event");
+                self.thread_manager.clear();
+                let mut thread_handle = 0 as HANDLE;
+                let current_process = unsafe { GetCurrentProcess() };
+                if unsafe { DuplicateHandle(current_process, info.hThread, current_process, &mut thread_handle, 0, FALSE, DUPLICATE_SAME_ACCESS) } == 0 {
+                    let error = unsafe { GetLastError() };
+                    let error_str = Self::error_message(error);
+                    error!(error, error_str, "DuplicateHandle for thread failed in CREATE_PROCESS_DEBUG_EVENT");
+                } else {
+                    let start_address = info.lpStartAddress.map_or(0, |addr| addr as usize as u64);
+                    self.thread_manager.add_thread(debug_event.dwThreadId, start_address, thread_handle);
+                }
+
+                trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, base_of_image = %format!("0x{:X}", info.lpBaseOfImage as u64), image_file_name = ?image_file_name, size_of_image = %format!("{:X?}", size_of_image), "ProcessCreated event");
                 Some(crate::protocol::DebugEvent::ProcessCreated {
                     pid: debug_event.dwProcessId,
                     tid: debug_event.dwThreadId,
                     image_file_name: Some(image_file_name),
                     base_of_image: info.lpBaseOfImage as u64,
-                    size_of_image,
+                    size_of_image: size_of_image,
                 })
             }
             EXIT_PROCESS_DEBUG_EVENT => {
                 let info = unsafe { debug_event.u.ExitProcess };
-                trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), exit_code = %format!("0x{:X}", info.dwExitCode), "ProcessExited event");
+                trace!(pid = debug_event.dwProcessId, exit_code = %format!("0x{:X}", info.dwExitCode), "ProcessExited event");
                 Some(crate::protocol::DebugEvent::ProcessExited {
                     pid: debug_event.dwProcessId,
                     exit_code: info.dwExitCode,
@@ -233,7 +261,19 @@ impl PlatformAPI for WindowsPlatform {
             }
             CREATE_THREAD_DEBUG_EVENT => {
                 let info = unsafe { debug_event.u.CreateThread };
-                trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), start_address = %format!("0x{:X}", info.lpStartAddress.map_or(0, |addr| addr as usize as u64)), "ThreadCreated event");
+                
+                let mut thread_handle = 0 as HANDLE;
+                let current_process = unsafe { GetCurrentProcess() };
+                if unsafe { DuplicateHandle(current_process, info.hThread, current_process, &mut thread_handle, 0, FALSE, DUPLICATE_SAME_ACCESS) } == 0 {
+                    let error = unsafe { GetLastError() };
+                    let error_str = Self::error_message(error);
+                    error!(error, error_str, "DuplicateHandle for thread failed in CREATE_THREAD_DEBUG_EVENT");
+                } else {
+                    let start_address = info.lpStartAddress.map_or(0, |addr| addr as usize as u64);
+                    self.thread_manager.add_thread(debug_event.dwThreadId, start_address, thread_handle);
+                }
+
+                trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, start_address = %format!("0x{:X}", info.lpStartAddress.map_or(0, |addr| addr as usize as u64)), "ThreadCreated event");
                 Some(crate::protocol::DebugEvent::ThreadCreated {
                     pid: debug_event.dwProcessId,
                     tid: debug_event.dwThreadId,
@@ -242,7 +282,8 @@ impl PlatformAPI for WindowsPlatform {
             }
             EXIT_THREAD_DEBUG_EVENT => {
                 let info = unsafe { debug_event.u.ExitThread };
-                trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), exit_code = %format!("0x{:X}", info.dwExitCode), "ThreadExited event");
+                trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, exit_code = %format!("0x{:X}", info.dwExitCode), "ThreadExited event");
+                self.thread_manager.remove_thread(debug_event.dwThreadId);
                 Some(crate::protocol::DebugEvent::ThreadExited {
                     pid: debug_event.dwProcessId,
                     tid: debug_event.dwThreadId,
@@ -252,6 +293,7 @@ impl PlatformAPI for WindowsPlatform {
             LOAD_DLL_DEBUG_EVENT => {
                 let info = unsafe { debug_event.u.LoadDll };
                 let dll_name = utils::get_path_from_handle(info.hFile).unwrap_or_else(|| "<unknown>".to_string());
+                unsafe { CloseHandle(info.hFile); }
                 let h_process = self.process_handle.as_ref().ok_or_else(|| PlatformError::OsError("No process handle for LOAD_DLL_DEBUG_EVENT".to_string()))?.0;
                 let size_of_dll = utils::get_module_size_from_address(h_process, info.lpBaseOfDll as usize).map(|sz| sz as u64);
                 if size_of_dll.is_none() {
@@ -265,7 +307,7 @@ impl PlatformAPI for WindowsPlatform {
                     size: size_of_dll,
                 });
 
-                trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), base_of_dll = %format!("0x{:X}", info.lpBaseOfDll as u64), dll_name = ?dll_name, size_of_dll = ?size_of_dll, "DllLoaded event");
+                trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, base_of_dll = %format!("0x{:X}", info.lpBaseOfDll as u64), dll_name = ?dll_name, size_of_dll = %format!("{:X?}", size_of_dll), "DllLoaded event");
                 Some(crate::protocol::DebugEvent::DllLoaded {
                     pid: debug_event.dwProcessId,
                     tid: debug_event.dwThreadId,
@@ -276,7 +318,7 @@ impl PlatformAPI for WindowsPlatform {
             }
             UNLOAD_DLL_DEBUG_EVENT => {
                 let info = unsafe { debug_event.u.UnloadDll };
-                trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), base_of_dll = %format!("0x{:X}", info.lpBaseOfDll as u64), "DllUnloaded event");
+                trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, base_of_dll = %format!("0x{:X}", info.lpBaseOfDll as u64), "DllUnloaded event");
                 self.module_manager.remove_module(info.lpBaseOfDll as u64);
                 Some(crate::protocol::DebugEvent::DllUnloaded {
                     pid: debug_event.dwProcessId,
@@ -285,7 +327,7 @@ impl PlatformAPI for WindowsPlatform {
                 })
             }
             OUTPUT_DEBUG_STRING_EVENT => {
-                trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), "OutputDebugString event");
+                trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, "OutputDebugString event");
                 Some(crate::protocol::DebugEvent::Output {
                     pid: debug_event.dwProcessId,
                     tid: debug_event.dwThreadId,
@@ -294,7 +336,7 @@ impl PlatformAPI for WindowsPlatform {
             }
             RIP_EVENT => {
                 let info = unsafe { debug_event.u.RipInfo };
-                trace!(pid = %format!("0x{:X}", debug_event.dwProcessId), tid = %format!("0x{:X}", debug_event.dwThreadId), error = %format!("0x{:X}", info.dwError), event_type = %format!("0x{:X}", info.dwType), "RipEvent");
+                trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, error = %format!("0x{:X}", info.dwError), event_type = %format!("0x{:X}", info.dwType), "RipEvent");
                 Some(crate::protocol::DebugEvent::RipEvent {
                     pid: debug_event.dwProcessId,
                     tid: debug_event.dwThreadId,
@@ -317,6 +359,7 @@ impl PlatformAPI for WindowsPlatform {
 
     fn launch(&mut self, command: &str) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
         self.module_manager.clear();
+        self.thread_manager.clear();
         println!("[windows_platform] launch thread id: {:?}", std::thread::current().id());
         trace!(command, "WindowsPlatform::launch called");
         let cmd_line_wide = Self::to_wide(command);
@@ -361,6 +404,7 @@ impl PlatformAPI for WindowsPlatform {
 
         let info = unsafe { debug_event.u.CreateProcessInfo };
         let image_file_name = utils::get_path_from_handle(info.hFile).unwrap_or_else(|| command.split_whitespace().next().unwrap_or("<unknown>").to_string());
+        unsafe { CloseHandle(info.hFile); }
         let size_of_image = utils::get_module_size_from_address(info.hProcess, info.lpBaseOfImage as usize).map(|sz| sz as u64);
         if size_of_image.is_none() {
             error!("Failed to get size of image");
@@ -372,11 +416,28 @@ impl PlatformAPI for WindowsPlatform {
             size: size_of_image,
         });
 
-        Ok(Some(crate::protocol::DebugEvent::ProcessCreated { pid: process_info.dwProcessId, tid: process_info.dwThreadId, image_file_name: Some(image_file_name), base_of_image: info.lpBaseOfImage as u64, size_of_image }))
+        let mut thread_handle = 0 as HANDLE;
+        let current_process = unsafe { GetCurrentProcess() };
+        if unsafe { DuplicateHandle(current_process, info.hThread, current_process, &mut thread_handle, 0, FALSE, DUPLICATE_SAME_ACCESS) } == 0 {
+            let error = unsafe { GetLastError() };
+            let error_str = Self::error_message(error);
+            error!(error, error_str, "DuplicateHandle for thread failed in launch");
+            return Err(PlatformError::OsError(format!("DuplicateHandle for thread failed in launch: {} ({})", error, error_str)));
+        }
+        let start_address = info.lpStartAddress.map_or(0, |addr| addr as usize as u64);
+        self.thread_manager.add_thread(process_info.dwThreadId, start_address, thread_handle);
+
+        Ok(Some(crate::protocol::DebugEvent::ProcessCreated {
+            pid: process_info.dwProcessId,
+            tid: process_info.dwThreadId,
+            image_file_name: Some(image_file_name),
+            base_of_image: info.lpBaseOfImage as u64,
+            size_of_image: size_of_image,
+        }))
     }
 
     fn read_memory(&mut self, pid: u32, address: u64, size: usize) -> Result<Vec<u8>, PlatformError> {
-        trace!(pid = %format!("0x{:X}", pid), address = %format!("0x{:X}", address), size, "WindowsPlatform::read_memory called");
+        trace!(pid, address = %format!("0x{:X}", address), size, "WindowsPlatform::read_memory called");
         unsafe {
             let handle = if let Some(handle) = self.process_handle.as_ref() {
                 if self.pid == Some(pid) && handle.0 != std::ptr::null_mut() && handle.0 != INVALID_HANDLE_VALUE {
@@ -411,7 +472,7 @@ impl PlatformAPI for WindowsPlatform {
     }
 
     fn write_memory(&mut self, pid: u32, address: u64, data: &[u8]) -> Result<(), PlatformError> {
-        trace!(pid = %format!("0x{:X}", pid), address = %format!("0x{:X}", address), data_len = data.len(), "WindowsPlatform::write_memory called");
+        trace!(pid, address = %format!("0x{:X}", address), data_len = data.len(), "WindowsPlatform::write_memory called");
         unsafe {
             let handle = if let Some(handle) = self.process_handle.as_ref() {
                 if self.pid == Some(pid) && handle.0 != std::ptr::null_mut() && handle.0 != INVALID_HANDLE_VALUE {
@@ -447,19 +508,13 @@ impl PlatformAPI for WindowsPlatform {
         trace!(tid, "WindowsPlatform::get_thread_context called");
         #[cfg(windows)]
         {
-            let thread_handle = unsafe { OpenThread(THREAD_ALL_ACCESS, 0, tid as u32) };
-            if thread_handle == std::ptr::null_mut() {
-                let error = unsafe { GetLastError() };
-                let error_str = Self::error_message(error);
-                error!(error, error_str, "OpenThread failed");
-                return Err(PlatformError::OsError(format!("OpenThread failed: {} ({})", error, error_str)));
-            }
+            let thread_handle = self.thread_manager.get_thread_handle(tid).ok_or_else(|| PlatformError::OsError(format!("No handle for thread {}", tid)))?;
+            
             let mut aligned_context = AlignedContext {
                 context: unsafe { std::mem::zeroed() },
             };
             aligned_context.context.ContextFlags = CONTEXT_FULL_AMD64;
             let ok = unsafe { GetThreadContext(thread_handle, &mut aligned_context.context) };
-            unsafe { CloseHandle(thread_handle) };
             if ok == 0 {
                 let error = unsafe { GetLastError() };
                 let error_str = Self::error_message(error);
@@ -479,13 +534,8 @@ impl PlatformAPI for WindowsPlatform {
         trace!(tid, "WindowsPlatform::set_thread_context called");
         #[cfg(windows)]
         unsafe {
-            let thread_handle = OpenThread(THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION, 0, tid as u32);
-            if thread_handle == std::ptr::null_mut() {
-                let error = GetLastError();
-                let error_str = Self::error_message(error);
-                error!(error, error_str, "OpenThread failed");
-                return Err(PlatformError::OsError(format!("OpenThread failed: {} ({})", error, error_str)));
-            }
+            let thread_handle = self.thread_manager.get_thread_handle(tid).ok_or_else(|| PlatformError::OsError(format!("No handle for thread {}", tid)))?;
+
             match context {
                 crate::protocol::ThreadContext::Win32RawContext(ctx) => {
                     // Use aligned memory for CONTEXT
@@ -498,7 +548,6 @@ impl PlatformAPI for WindowsPlatform {
                         std::mem::size_of::<CONTEXT>(),
                     );
                     let ok = SetThreadContext(thread_handle, &aligned_context.context);
-                    CloseHandle(thread_handle);
                     if ok == 0 {
                         let error = GetLastError();
                         let error_str = Self::error_message(error);
@@ -518,6 +567,10 @@ impl PlatformAPI for WindowsPlatform {
 
     fn list_modules(&self, _pid: u32) -> Result<Vec<ModuleInfo>, PlatformError> {
         Ok(self.module_manager.list_modules())
+    }
+
+    fn list_threads(&self, _pid: u32) -> Result<Vec<ThreadInfo>, PlatformError> {
+        Ok(self.thread_manager.list_threads())
     }
 
     fn list_processes(&self) -> Result<Vec<ProcessInfo>, PlatformError> {
