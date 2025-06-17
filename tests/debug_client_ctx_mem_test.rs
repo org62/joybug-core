@@ -1,16 +1,16 @@
 #![cfg(windows)]
 
-use joybug_basics_tests1::protocol::{DebuggerResponse, DebugEvent, DebuggerRequest, ThreadContext};
-use joybug_basics_tests1::protocol_io::DebugClient;
+use joybug2::protocol::{DebuggerResponse, DebugEvent, DebuggerRequest, ThreadContext};
+use joybug2::protocol_io::DebugClient;
 use std::thread;
 use tokio;
 
 #[test]
 fn test_debug_client_breakpoint_context() {
-    joybug_basics_tests1::init_tracing();
+    joybug2::init_tracing();
     thread::spawn(|| {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(joybug_basics_tests1::server::run_server()).unwrap();
+        rt.block_on(joybug2::server::run_server()).unwrap();
     });
     let mut client = DebugClient::connect(None).expect("connect");
     let mut handled_breakpoint = false;
@@ -25,7 +25,7 @@ fn test_debug_client_breakpoint_context() {
                     if let DebuggerResponse::ThreadContext { context } = resp {
                         match context {
                             #[cfg(windows)]
-                            joybug_basics_tests1::protocol::ThreadContext::Win32RawContext(ctx) => {
+                            joybug2::protocol::ThreadContext::Win32RawContext(ctx) => {
                                 // Try round-trip: set the same context back
                                 let set_ctx_req = DebuggerRequest::SetThreadContext { pid, tid, context: ThreadContext::Win32RawContext(ctx.clone()) };
                                 let resp = client.send_and_receive(&set_ctx_req).unwrap();

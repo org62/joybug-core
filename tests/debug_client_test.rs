@@ -1,16 +1,16 @@
 #![cfg(windows)]
 
-use joybug_basics_tests1::protocol::{DebuggerResponse, DebugEvent, ModuleInfo};
-use joybug_basics_tests1::protocol_io::DebugClient;
+use joybug2::protocol::{DebuggerResponse, DebugEvent, ModuleInfo};
+use joybug2::protocol_io::DebugClient;
 use std::thread;
 use tokio;
 
 #[test]
 fn test_debug_client_event_collection() {
-    joybug_basics_tests1::init_tracing();
+    joybug2::init_tracing();
     thread::spawn(|| {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(joybug_basics_tests1::server::run_server()).unwrap();
+        rt.block_on(joybug2::server::run_server()).unwrap();
     });
     let mut client = DebugClient::connect(None).expect("connect");
     struct TestState {

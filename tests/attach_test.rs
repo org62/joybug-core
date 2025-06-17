@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
-use joybug_basics_tests1::protocol::{DebuggerResponse, DebugEvent, ModuleInfo};
-use joybug_basics_tests1::protocol_io::DebugClient;
+use joybug2::protocol::{DebuggerResponse, DebugEvent, ModuleInfo};
+use joybug2::protocol_io::DebugClient;
 use std::thread;
 use tokio;
 use windows_sys::Win32::System::Threading::{
@@ -19,10 +19,10 @@ fn to_wide(s: &str) -> Vec<u16> {
 
 #[test]
 fn test_attach_and_list_modules() {
-    joybug_basics_tests1::init_tracing();
+    joybug2::init_tracing();
     thread::spawn(|| {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(joybug_basics_tests1::server::run_server()).unwrap();
+        rt.block_on(joybug2::server::run_server()).unwrap();
     });
 
     // Create a suspended process

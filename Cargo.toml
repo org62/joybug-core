@@ -1,10 +1,10 @@
 [package]
-name = "joybug-basics-tests1"
+name = "joybug2"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "joybug_basics_tests1"
+name = "joybug2"
 path = "src/lib.rs"
 
 [dependencies]
