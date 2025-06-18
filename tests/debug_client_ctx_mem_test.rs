@@ -19,6 +19,20 @@ fn test_debug_client_breakpoint_context() {
         match resp {
             DebuggerResponse::Event { event } => {
                 if let DebugEvent::Breakpoint { pid, tid, address } = event {
+                    // Try to resolve the breakpoint address to a symbol
+                    let symbol_req = DebuggerRequest::ResolveAddressToSymbol { pid, address };
+                    let symbol_resp = client.send_and_receive(&symbol_req).unwrap();
+                    match symbol_resp {
+                        DebuggerResponse::AddressSymbol { module_path, symbol, offset } => {
+                            if let (Some(module), Some(sym), Some(off)) = (module_path, symbol, offset) {
+                                println!("Breakpoint at 0x{:X} resolved to symbol '{}' in module '{}' + 0x{:X}", address, sym.name, module, off);
+                            } else {
+                                println!("Breakpoint at 0x{:X} - no symbol information available", address);
+                            }
+                        }
+                        _ => println!("Breakpoint at 0x{:X} - failed to resolve symbol", address),
+                    }
+
                     // Request thread context
                     let req = DebuggerRequest::GetThreadContext { pid, tid };
                     let resp = client.send_and_receive(&req).unwrap();

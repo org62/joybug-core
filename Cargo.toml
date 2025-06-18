@@ -30,3 +30,9 @@ windows-sys = { version = "0.60.2", features = [
 ] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Symbol processing dependencies
+pelite = "0.10"
+pdb = "0.8"
+symsrv = "0.5"
+msvc-demangler = "0.9"
+uuid = { version = "1.6", features = ["v4"] }

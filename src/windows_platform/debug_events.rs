@@ -32,11 +32,18 @@ pub(super) fn handle_create_process_event(
     platform.module_manager.clear();
     platform.thread_manager.clear();
     
-    platform.module_manager.add_module(ModuleInfo {
+    let main_module = ModuleInfo {
         name: image_file_name.clone(),
         base: info.lpBaseOfImage as u64,
         size: size_of_image,
-    });
+    };
+    
+    platform.module_manager.add_module(main_module.clone());
+
+    // Start loading symbols for the main executable in the background
+    if let Some(ref symbol_manager) = platform.symbol_manager {
+        symbol_manager.start_loading_symbols(&main_module);
+    }
 
     let mut thread_handle = 0 as HANDLE;
     let current_process = unsafe { GetCurrentProcess() };
@@ -232,11 +239,18 @@ pub(super) fn continue_exec(
                 return Err(PlatformError::OsError("Failed to get size of DLL".to_string()));
             }
 
-            platform.module_manager.add_module(ModuleInfo {
+            let module_info = ModuleInfo {
                 name: dll_name.clone(),
                 base: info.lpBaseOfDll as u64,
                 size: size_of_dll,
-            });
+            };
+            
+            platform.module_manager.add_module(module_info.clone());
+
+            // Start loading symbols for the newly loaded module in the background
+            if let Some(ref symbol_manager) = platform.symbol_manager {
+                symbol_manager.start_loading_symbols(&module_info);
+            }
 
             trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, base_of_dll = %format!("0x{:X}", info.lpBaseOfDll as u64), dll_name = ?dll_name, size_of_dll = %format!("{:X?}", size_of_dll), "DllLoaded event");
             Some(crate::protocol::DebugEvent::DllLoaded {

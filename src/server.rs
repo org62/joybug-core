@@ -115,6 +115,39 @@ fn handle_connection(mut stream: std::net::TcpStream) {
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            Ok(DebuggerRequest::FindSymbol { module_path, symbol_name }) => {
+                match platform.find_symbol(&module_path, &symbol_name) {
+                    Ok(symbol) => DebuggerResponse::Symbol { symbol },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            Ok(DebuggerRequest::ListSymbols { module_path }) => {
+                match platform.list_symbols(&module_path) {
+                    Ok(symbols) => DebuggerResponse::SymbolList { symbols },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            Ok(DebuggerRequest::ResolveRvaToSymbol { module_path, rva }) => {
+                match platform.resolve_rva_to_symbol(&module_path, rva) {
+                    Ok(symbol) => DebuggerResponse::Symbol { symbol },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            Ok(DebuggerRequest::ResolveAddressToSymbol { pid, address }) => {
+                match platform.resolve_address_to_symbol(pid, address) {
+                    Ok(Some((module_path, symbol, offset))) => DebuggerResponse::AddressSymbol { 
+                        module_path: Some(module_path), 
+                        symbol: Some(symbol), 
+                        offset: Some(offset) 
+                    },
+                    Ok(None) => DebuggerResponse::AddressSymbol { 
+                        module_path: None, 
+                        symbol: None, 
+                        offset: None 
+                    },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             Err(e) => DebuggerResponse::Error { message: format!("Invalid request: {}", e) },
         };
         debug!(resp = %match &resp {

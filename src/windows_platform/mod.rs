@@ -5,11 +5,14 @@ mod process;
 mod debug_events;
 mod memory;
 mod thread_context;
+mod symbol_manager;
+mod symbol_provider;
 
-use crate::interfaces::{PlatformAPI, PlatformError};
+use crate::interfaces::{PlatformAPI, PlatformError, Symbol, SymbolError};
 use crate::protocol::{ModuleInfo, ProcessInfo, ThreadInfo};
 use module_manager::ModuleManager;
 use thread_manager::ThreadManager;
+use symbol_manager::SymbolManager;
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use tracing::{trace};
@@ -39,11 +42,19 @@ pub struct WindowsPlatform {
     pub(crate) process_handle: Option<HandleSafe>,
     pub(crate) module_manager: ModuleManager,
     pub(crate) thread_manager: ThreadManager,
+    pub(crate) symbol_manager: Option<SymbolManager>,
 }
 
 impl WindowsPlatform {
     pub fn new() -> Self {
-        Self { pid: None, process_handle: None, module_manager: ModuleManager::new(), thread_manager: ThreadManager::new() }
+        let symbol_manager = SymbolManager::new().ok(); // Log error but don't fail initialization
+        Self { 
+            pid: None, 
+            process_handle: None, 
+            module_manager: ModuleManager::new(), 
+            thread_manager: ThreadManager::new(),
+            symbol_manager,
+        }
     }
 }
 
@@ -91,5 +102,39 @@ impl PlatformAPI for WindowsPlatform {
 
     fn list_processes(&self) -> Result<Vec<ProcessInfo>, PlatformError> {
         process::list_processes()
+    }
+
+    // Symbol-related methods
+    fn find_symbol(&self, module_path: &str, symbol_name: &str) -> Result<Option<Symbol>, SymbolError> {
+        if let Some(ref symbol_manager) = self.symbol_manager {
+            symbol_manager.find_symbol(module_path, symbol_name)
+        } else {
+            Err(SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()))
+        }
+    }
+
+    fn list_symbols(&self, module_path: &str) -> Result<Vec<Symbol>, SymbolError> {
+        if let Some(ref symbol_manager) = self.symbol_manager {
+            symbol_manager.list_symbols(module_path)
+        } else {
+            Err(SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()))
+        }
+    }
+
+    fn resolve_rva_to_symbol(&self, module_path: &str, rva: u32) -> Result<Option<Symbol>, SymbolError> {
+        if let Some(ref symbol_manager) = self.symbol_manager {
+            symbol_manager.resolve_rva_to_symbol(module_path, rva)
+        } else {
+            Err(SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()))
+        }
+    }
+
+    fn resolve_address_to_symbol(&self, _pid: u32, address: u64) -> Result<Option<(String, Symbol, u64)>, SymbolError> {
+        if let Some(ref symbol_manager) = self.symbol_manager {
+            let modules = self.module_manager.list_modules();
+            symbol_manager.resolve_address_to_symbol(&modules, address)
+        } else {
+            Err(SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()))
+        }
     }
 } 
