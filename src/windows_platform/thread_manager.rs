@@ -1,24 +1,11 @@
 use crate::protocol::ThreadInfo;
 use std::collections::HashMap;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-
-// Safe wrapper for HANDLE that automatically closes it
-#[derive(Debug)]
-pub struct ThreadHandleSafe(pub HANDLE);
-unsafe impl Send for ThreadHandleSafe {}
-unsafe impl Sync for ThreadHandleSafe {}
-
-impl Drop for ThreadHandleSafe {
-    fn drop(&mut self) {
-        if !self.0.is_null() && self.0 as isize != -1 {
-            unsafe { CloseHandle(self.0) };
-        }
-    }
-}
+use windows_sys::Win32::Foundation::HANDLE;
+use super::HandleSafe;
 
 #[derive(Debug, Default)]
 pub struct ThreadManager {
-    threads: HashMap<u32, (ThreadInfo, ThreadHandleSafe)>, // tid -> (ThreadInfo, Handle)
+    threads: HashMap<u32, (ThreadInfo, HandleSafe)>, // tid -> (ThreadInfo, Handle)
 }
 
 impl ThreadManager {
@@ -30,7 +17,7 @@ impl ThreadManager {
 
     pub fn add_thread(&mut self, tid: u32, start_address: u64, handle: HANDLE) {
         let info = ThreadInfo { tid, start_address };
-        self.threads.insert(tid, (info, ThreadHandleSafe(handle)));
+        self.threads.insert(tid, (info, HandleSafe(handle)));
     }
 
     pub fn remove_thread(&mut self, tid: u32) {

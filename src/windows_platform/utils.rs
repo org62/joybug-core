@@ -4,12 +4,40 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, MAX_PATH,
 };
 use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleA;
-use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, IMAGE_NT_HEADERS64};
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    FormatMessageW, ReadProcessMemory, IMAGE_NT_HEADERS64, FORMAT_MESSAGE_FROM_SYSTEM,
+    FORMAT_MESSAGE_IGNORE_INSERTS,
+};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE,
     TH32CS_SNAPMODULE32,
 };
-use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_SIGNATURE};
+use windows_sys::Win32::System::SystemServices::{
+    IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_SIGNATURE,
+};
+use windows_sys::core::PWSTR;
+
+pub fn error_message(error_code: u32) -> String {
+    use std::ptr::null_mut;
+    let mut buf = [0u16; 512];
+    let len = unsafe {
+        FormatMessageW(
+            FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            null_mut(),
+            error_code,
+            0,
+            buf.as_mut_ptr() as PWSTR,
+            buf.len() as u32,
+            null_mut(),
+        )
+    };
+    if len == 0 {
+        format!("Unknown error code {}", error_code)
+    } else {
+        let msg = String::from_utf16_lossy(&buf[..len as usize]);
+        msg.trim().to_string()
+    }
+}
 
 /// Gets the file path from a Windows file handle.
 ///
@@ -239,4 +267,4 @@ pub fn _get_modules(pid: u32) -> Result<Vec<ModuleInfo>, String> {
 
     unsafe { CloseHandle(snapshot) };
     Ok(modules)
-} 
+}
