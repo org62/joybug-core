@@ -26,11 +26,13 @@ fn test_debug_client_breakpoint_context() {
                         DebuggerResponse::AddressSymbol { module_path, symbol, offset } => {
                             if let (Some(module), Some(sym), Some(off)) = (module_path, symbol, offset) {
                                 println!("Breakpoint at 0x{:X} resolved to symbol '{}' in module '{}' + 0x{:X}", address, sym.name, module, off);
+                                // Assert that the symbol name is LdrpDoDebuggerBreak
+                                assert_eq!(sym.name, "LdrpDoDebuggerBreak", "Expected symbol name to be LdrpDoDebuggerBreak");
                             } else {
-                                println!("Breakpoint at 0x{:X} - no symbol information available", address);
+                                panic!("Expected symbol information to be available for breakpoint at 0x{:X}", address);
                             }
                         }
-                        _ => println!("Breakpoint at 0x{:X} - failed to resolve symbol", address),
+                        _ => panic!("Failed to resolve symbol for breakpoint at 0x{:X}", address),
                     }
 
                     // Request thread context
