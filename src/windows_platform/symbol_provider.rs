@@ -3,15 +3,15 @@ use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::convert::TryInto;
 
-use async_trait::async_trait;
 use msvc_demangler::DemangleFlags;
 use pelite::pe64::{Pe, PeFile};
 use pelite::image::IMAGE_DEBUG_TYPE_CODEVIEW;
 use pelite::Error as PeliteError;
 use pdb::{PDB, PublicSymbol, SymbolData, FallibleIterator};
-use symsrv::{self, SymsrvDownloader};
-use tracing::{error, trace, warn};
+use symsrv::{SymsrvDownloader, parse_nt_symbol_path, get_symbol_path_from_environment, get_home_sym_dir};
+use tracing::{trace, debug};
 use uuid::Uuid;
+use tokio::runtime::Runtime;
 
 use crate::interfaces::{Address, Symbol, SymbolError, SymbolProvider};
 
@@ -102,6 +102,7 @@ pub fn extract_pdb_identifier_from_file(module_path: &Path) -> Result<PdbIdentif
 /// It can download PDBs from symbol servers and parse them to provide symbol information.
 pub struct WindowsSymbolProvider {
     downloader: SymsrvDownloader,
+    runtime: Runtime,
     /// Stores loaded symbols for modules.
     /// Key: Module path (String)
     /// Value: Tuple of (Module Base Address, Module Size (Option<usize>), Vec<Symbol from debugger_interface>)
@@ -110,53 +111,39 @@ pub struct WindowsSymbolProvider {
 
 impl WindowsSymbolProvider {
     pub fn new() -> Result<Self, SymbolError> {
-        let symbol_path_env = symsrv::get_symbol_path_from_environment();
-        let symbol_path = symbol_path_env
-            .as_deref()
-            .unwrap_or("srv*https://msdl.microsoft.com/download/symbols");
-        
-        trace!(symbol_path, "Using symbol path for WindowsSymbolProvider");
-        
-        let parsed_symbol_path = symsrv::parse_nt_symbol_path(symbol_path);
-        if parsed_symbol_path.is_empty() {
-            warn!("Parsed symbol path is empty. Symbol server functionality might be limited.");
-        }
-        
+        // Create tokio runtime for async operations
+        let runtime = Runtime::new()
+            .map_err(|e| SymbolError::SymSrvError(format!("Failed to create async runtime: {}", e)))?;
+
+        // Parse the _NT_SYMBOL_PATH environment variable using symsrv
+        let symbol_path_env = get_symbol_path_from_environment();
+        let symbol_path = symbol_path_env.as_deref().unwrap_or("srv**https://msdl.microsoft.com/download/symbols");
+        let parsed_symbol_path = parse_nt_symbol_path(symbol_path);
+
+        // Create a downloader which follows the _NT_SYMBOL_PATH recipe
         let mut downloader = SymsrvDownloader::new(parsed_symbol_path);
-        
-        if let Some(default_cache) = symsrv::get_home_sym_dir() {
-            if !default_cache.exists() {
-                if let Err(e) = std::fs::create_dir_all(&default_cache) {
-                    warn!(path = %default_cache.display(), error = %e, "Failed to create default symbol cache directory. Caching may be affected.");
-                } else {
-                    trace!(path = %default_cache.display(), "Created default symbol cache directory.");
-                }
-            }
-            downloader.set_default_downstream_store(Some(default_cache));
-        } else {
-            warn!("Could not determine default symbol cache directory. Symbol caching might be affected.");
-        }
+        downloader.set_default_downstream_store(get_home_sym_dir());
+
+        trace!(symbol_path, "Using symsrv downloader with symbol path");
 
         Ok(Self {
             downloader,
+            runtime,
             loaded_modules: HashMap::new(),
         })
     }
 
-    /// Internal helper to fetch a PDB file.
-    async fn internal_fetch_pdb(&self, pdb_filename: &str, identifier: &str) -> Result<PathBuf, SymbolError> {
-        trace!(pdb_filename, identifier, "Attempting to fetch PDB");
-        match self.downloader.get_file(pdb_filename, identifier).await {
-            Ok(path_buf) => {
-                trace!(path = %path_buf.display(), "Successfully fetched PDB");
-                Ok(path_buf)
-            }
-            Err(e) => {
-                let err_msg = format!("SymSrv operation for PDB '{pdb_filename}' (ID: '{identifier}') failed: {e}");
-                error!(error = err_msg, "Failed to fetch PDB");
-                Err(SymbolError::SymSrvError(err_msg))
-            }
-        }
+    /// Internal helper to fetch a PDB file using symsrv.
+    fn internal_fetch_pdb(&self, pdb_filename: &str, identifier: &str) -> Result<PathBuf, SymbolError> {
+        trace!(pdb_filename, identifier, "Attempting to fetch PDB using symsrv");
+        
+        // Use symsrv to download and cache the PDB file
+        let local_path = self.runtime.block_on(async {
+            self.downloader.get_file(pdb_filename, identifier).await
+        }).map_err(|e| SymbolError::SymSrvError(format!("Failed to download PDB {}/{}: {}", pdb_filename, identifier, e)))?;
+        
+        debug!(path = %local_path.display(), "Successfully downloaded PDB using symsrv");
+        Ok(local_path)
     }
 
     /// Internal helper to parse a PDB file and return a vector of `Symbol` structs.
@@ -198,132 +185,110 @@ impl WindowsSymbolProvider {
                         }
                         Ok(_other_data) => { /* Optionally handle other symbol types or log them */ }
                         Err(pdb_parse_err) => { 
-                            warn!(path = %pdb_path.display(), error = %pdb_parse_err, "Failed to parse a symbol data in PDB, skipping.");
+                            trace!(error = %pdb_parse_err, "Failed to parse some PDB symbol, skipping");
                         }
                     }
                 }
-                Ok(None) => {
+                Ok(None) => break,
+                Err(pdb_iter_err) => {
+                    trace!(error = %pdb_iter_err, "Failed to iterate over some PDB symbols, skipping");
                     break;
-                }
-                Err(iter_err) => {
-                     warn!(path = %pdb_path.display(), error = ?iter_err, "Error iterating PDB global symbols, stopping iteration.");
-                     break; 
                 }
             }
         }
-        trace!(path = %pdb_path.display(), count = symbols_vec.len(), "PDB parsing complete");
+
+        trace!(count = symbols_vec.len(), "Successfully parsed symbols from PDB");
         Ok(symbols_vec)
     }
 }
 
-#[async_trait]
 impl SymbolProvider for WindowsSymbolProvider {
-    async fn load_symbols_for_module(
+    fn load_symbols_for_module(
         &mut self,
         module_path_str: &str,
         module_base: Address,
         module_size: Option<usize>,
     ) -> Result<(), SymbolError> {
-        trace!(module_path = module_path_str, base = format!("0x{:X}", module_base), "Loading symbols for module");
+        trace!(module_path = module_path_str, module_base = format!("0x{:X}", module_base), "Loading symbols for module");
         
         if self.loaded_modules.contains_key(module_path_str) {
-            trace!(module_path = module_path_str, "Symbols already loaded for this module path. Skipping reload.");
+            trace!(module_path = module_path_str, "Symbols already loaded for module");
             return Ok(());
         }
-
-        let module_path_obj = Path::new(module_path_str);
-        if !module_path_obj.exists() {
-            error!(module_path = module_path_str, "Module file not found.");
-            return Err(SymbolError::IoError(std::io::Error::new(std::io::ErrorKind::NotFound, format!("Module file not found: {module_path_str}"))));
-        }
-
-        // 1. Extract PDB identifier from the PE file
-        let pdb_identifier = extract_pdb_identifier_from_file(module_path_obj)?;
-        trace!(name = %pdb_identifier.name, guid = %pdb_identifier.guid, age = pdb_identifier.age, "Extracted PDB info for module {}", module_path_str);
-
-        // 2. Fetch the PDB file
-        let symsrv_id = pdb_identifier.to_symsrv_identifier();
-        let downloaded_pdb_path = self.internal_fetch_pdb(&pdb_identifier.name, &symsrv_id).await?;
         
-        if !downloaded_pdb_path.exists() {
-            error!(path = %downloaded_pdb_path.display(), "Fetched PDB file does not exist for module {}", module_path_str);
-            return Err(SymbolError::PdbNotFound(format!("Fetched PDB for {} not found at {}", pdb_identifier.name, downloaded_pdb_path.display())));
-        }
-
-        // 3. Parse the PDB file
+        let module_path = Path::new(module_path_str);
+        
+        // Extract PDB identifier from the PE file
+        let pdb_identifier = extract_pdb_identifier_from_file(module_path)?;
+        let symsrv_id = pdb_identifier.to_symsrv_identifier();
+        
+        trace!(pdb_name = %pdb_identifier.name, pdb_guid = %pdb_identifier.guid, pdb_age = pdb_identifier.age, symsrv_id = %symsrv_id, "Extracted PDB identifier");
+        
+        // Fetch the PDB file
+        let downloaded_pdb_path = self.internal_fetch_pdb(&pdb_identifier.name, &symsrv_id)?;
+        
+        // Parse the PDB file
         let symbols = self.internal_parse_pdb_to_symbols(&downloaded_pdb_path)?;
         
-        // 4. Store the symbols
+        // Store the symbols
         self.loaded_modules.insert(module_path_str.to_string(), (module_base, module_size, symbols));
-        let count = self.loaded_modules.get(module_path_str).map_or(0, |(_,_,s)| s.len());
-        trace!(module_path = module_path_str, count, "Successfully loaded and parsed symbols");
         
+        trace!(module_path = module_path_str, symbol_count = self.loaded_modules.get(module_path_str).unwrap().2.len(), "Successfully loaded symbols for module");
         Ok(())
     }
 
-    async fn find_symbol(
+    fn find_symbol(
         &self,
         module_path: &str,
         symbol_name: &str,
     ) -> Result<Option<Symbol>, SymbolError> {
-        trace!(module_path, symbol_name, "Finding symbol");
-        match self.loaded_modules.get(module_path) {
-            Some((_base, _size, symbols)) => {
-                let found_symbol = symbols.iter().find(|s| s.name == symbol_name).cloned();
-                if found_symbol.is_some() {
-                    trace!(module_path, symbol_name, "Symbol found.");
-                } else {
-                    trace!(module_path, symbol_name, "Symbol not found in loaded symbols for module.");
-                }
-                Ok(found_symbol)
-            }
-            None => {
-                warn!(module_path, symbol_name, "Symbols not loaded for module, cannot find symbol.");
-                Err(SymbolError::ModuleNotLoaded(module_path.to_string()))
-            }
+        if let Some((_base, _size, symbols)) = self.loaded_modules.get(module_path) {
+            let found_symbol = symbols.iter().find(|s| s.name == symbol_name).cloned();
+            trace!(module_path, symbol_name, found = found_symbol.is_some(), "Symbol lookup completed");
+            Ok(found_symbol)
+        } else {
+            trace!(module_path, symbol_name, "No symbols loaded for module");
+            Err(SymbolError::ModuleNotLoaded(format!("Module {} not loaded", module_path)))
         }
     }
 
-    async fn list_symbols(&self, module_path: &str) -> Result<Vec<Symbol>, SymbolError> {
-        trace!(module_path, "Listing symbols");
-        match self.loaded_modules.get(module_path) {
-            Some((_base, _size, symbols)) => {
-                trace!(module_path, count = symbols.len(), "Returning list of symbols.");
-                Ok(symbols.clone())
-            }
-            None => {
-                warn!(module_path, "Symbols not loaded for module, cannot list symbols.");
-                Err(SymbolError::ModuleNotLoaded(module_path.to_string()))
-            }
+    fn list_symbols(&self, module_path: &str) -> Result<Vec<Symbol>, SymbolError> {
+        if let Some((_base, _size, symbols)) = self.loaded_modules.get(module_path) {
+            trace!(module_path, count = symbols.len(), "Symbol listing completed");
+            Ok(symbols.clone())
+        } else {
+            trace!(module_path, "No symbols loaded for module");
+            Err(SymbolError::ModuleNotLoaded(format!("Module {} not loaded", module_path)))
         }
     }
-    
-    async fn resolve_rva_to_symbol(
+
+    fn resolve_rva_to_symbol(
         &self,
         module_path: &str,
         rva: u32,
     ) -> Result<Option<Symbol>, SymbolError> {
-        trace!(module_path, rva = format!("0x{:X}", rva), "Resolving RVA to symbol");
-        match self.loaded_modules.get(module_path) {
-            Some((_base, _size, symbols)) => {
-                let mut best_match: Option<Symbol> = None;
-                for symbol_entry in symbols {
-                    if symbol_entry.rva <= rva
-                        && (best_match.is_none() || symbol_entry.rva > best_match.as_ref().unwrap().rva) {
-                            best_match = Some(symbol_entry.clone());
-                        }
+        if let Some((_base, _size, symbols)) = self.loaded_modules.get(module_path) {
+            // Find the symbol with the highest RVA that is still <= the target RVA
+            let mut best_match: Option<&Symbol> = None;
+            for symbol in symbols {
+                if symbol.rva <= rva && (best_match.is_none() || symbol.rva > best_match.unwrap().rva) {
+                    best_match = Some(symbol);
                 }
-                if let Some(ref found_symbol) = best_match {
-                    trace!(module_path, rva = format!("0x{:X}", rva), symbol_name = %found_symbol.name, symbol_rva = format!("0x{:X}", found_symbol.rva), "RVA resolved.");
-                } else {
-                    trace!(module_path, rva = format!("0x{:X}", rva), "No symbol found at or before this RVA.");
+            }
+            
+            match best_match {
+                Some(symbol) => {
+                    trace!(module_path, rva = format!("0x{:X}", rva), symbol_name = %symbol.name, symbol_rva = format!("0x{:X}", symbol.rva), offset = rva - symbol.rva, "RVA resolved to symbol");
+                    Ok(Some(symbol.clone()))
                 }
-                Ok(best_match)
+                None => {
+                    trace!(module_path, rva = format!("0x{:X}", rva), "No symbol found for RVA");
+                    Ok(None)
+                }
             }
-            None => {
-                warn!(module_path, rva = format!("0x{:X}", rva), "Symbols not loaded for module, cannot resolve RVA.");
-                Err(SymbolError::ModuleNotLoaded(module_path.to_string()))
-            }
+        } else {
+            trace!(module_path, rva = format!("0x{:X}", rva), "No symbols loaded for module");
+            Err(SymbolError::ModuleNotLoaded(format!("Module {} not loaded", module_path)))
         }
     }
 } 

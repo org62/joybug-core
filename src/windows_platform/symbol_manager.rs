@@ -35,7 +35,7 @@ impl SymbolManager {
         let task = std::thread::spawn(move || {
             trace!(module_path = %module_path_for_task, "Starting background symbol loading");
             
-            // Create a temporary provider for this task to avoid Send issues
+            // Create a temporary provider for this task
             let mut temp_provider = match WindowsSymbolProvider::new() {
                 Ok(provider) => provider,
                 Err(e) => {
@@ -46,24 +46,14 @@ impl SymbolManager {
                 }
             };
             
-            // Use a simple runtime for the async operations
-            let rt = match tokio::runtime::Runtime::new() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    warn!(module_path = %module_path_for_task, error = %e, "Failed to create tokio runtime");
-                    let mut tasks_guard = tasks.lock().unwrap();
-                    tasks_guard.remove(&module_path_for_task);
-                    return Err(SymbolError::SymbolsNotFound(format!("Failed to create runtime: {}", e)));
-                }
-            };
-            
-            let result = rt.block_on(temp_provider.load_symbols_for_module(&module_path_for_task, module_base, module_size));
+            // Load symbols synchronously
+            let result = temp_provider.load_symbols_for_module(&module_path_for_task, module_base, module_size);
             
             match &result {
                 Ok(()) => {
                     trace!(module_path = %module_path_for_task, "Symbol loading completed successfully");
                     // Store the loaded symbols in the cache
-                    if let Ok(symbols) = rt.block_on(temp_provider.list_symbols(&module_path_for_task)) {
+                    if let Ok(symbols) = temp_provider.list_symbols(&module_path_for_task) {
                         let mut cache_guard = cache.lock().unwrap();
                         cache_guard.insert(module_path_for_task.clone(), symbols.clone());
                         trace!(count = symbols.len(), "Successfully stored symbols in cache");

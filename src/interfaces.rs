@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 use thiserror::Error;
 use crate::protocol::{ModuleInfo, ProcessInfo, ThreadInfo};
-use async_trait::async_trait;
 
 pub type Address = u64;
 
@@ -39,24 +38,23 @@ pub struct Symbol {
     pub rva: u32, // Relative Virtual Address
 }
 
-#[async_trait]
 pub trait SymbolProvider: Send + Sync {
-    async fn load_symbols_for_module(
+    fn load_symbols_for_module(
         &mut self,
         module_path: &str,
         module_base: Address,
         module_size: Option<usize>,
     ) -> Result<(), SymbolError>;
 
-    async fn find_symbol(
+    fn find_symbol(
         &self,
         module_path: &str,
         symbol_name: &str,
     ) -> Result<Option<Symbol>, SymbolError>;
 
-    async fn list_symbols(&self, module_path: &str) -> Result<Vec<Symbol>, SymbolError>;
+    fn list_symbols(&self, module_path: &str) -> Result<Vec<Symbol>, SymbolError>;
 
-    async fn resolve_rva_to_symbol(
+    fn resolve_rva_to_symbol(
         &self,
         module_path: &str,
         rva: u32,
