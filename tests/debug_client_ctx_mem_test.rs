@@ -2,6 +2,7 @@
 
 use joybug2::protocol::{DebuggerResponse, DebugEvent, DebuggerRequest, ThreadContext};
 use joybug2::protocol_io::DebugClient;
+use joybug2::interfaces::{Architecture, InstructionFormatter};
 use std::thread;
 use tokio;
 
@@ -35,6 +36,18 @@ fn test_debug_client_breakpoint_context() {
                         _ => panic!("Failed to resolve symbol for breakpoint at 0x{:X}", address),
                     }
 
+                    // Disassemble instructions around the breakpoint
+                    println!("Disassembling instructions around breakpoint at 0x{:X}", address);
+
+                    let disasm_req = DebuggerRequest::DisassembleMemory { pid, address, count: 10, arch: Architecture::X64 };
+                    let resp = client.send_and_receive(&disasm_req).unwrap();
+                    if let DebuggerResponse::Instructions { instructions } = resp {
+                        println!("Instructions from memory disassembly:");
+                        println!("{}", instructions.format_disassembly());
+                    } else {
+                        println!("Failed to disassemble memory: {:?}", resp);
+                    }
+
                     // Request thread context
                     let req = DebuggerRequest::GetThreadContext { pid, tid };
                     let resp = client.send_and_receive(&req).unwrap();
@@ -52,6 +65,7 @@ fn test_debug_client_breakpoint_context() {
                     } else {
                         panic!("Expected ThreadContext response");
                     }
+
                     // Read memory at breakpoint
                     let read_req = DebuggerRequest::ReadMemory { pid, address, size: 1 };
                     let resp = client.send_and_receive(&read_req).unwrap();

@@ -1,4 +1,5 @@
 pub mod protocol;
+pub mod formatting;
 pub mod protocol_io;
 pub mod interfaces;
 pub mod windows_platform;

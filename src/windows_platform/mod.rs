@@ -7,12 +7,14 @@ mod memory;
 mod thread_context;
 mod symbol_manager;
 mod symbol_provider;
+pub mod disassembler;
 
-use crate::interfaces::{PlatformAPI, PlatformError, Symbol, SymbolError};
+use crate::interfaces::{PlatformAPI, PlatformError, Symbol, SymbolError, Architecture, DisassemblerError, Instruction, DisassemblerProvider};
 use crate::protocol::{ModuleInfo, ProcessInfo, ThreadInfo};
 use module_manager::ModuleManager;
 use thread_manager::ThreadManager;
 use symbol_manager::SymbolManager;
+use disassembler::CapstoneDisassembler;
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use tracing::{trace};
@@ -43,17 +45,20 @@ pub struct WindowsPlatform {
     pub(crate) module_manager: ModuleManager,
     pub(crate) thread_manager: ThreadManager,
     pub(crate) symbol_manager: Option<SymbolManager>,
+    pub(crate) disassembler: Option<CapstoneDisassembler>,
 }
 
 impl WindowsPlatform {
     pub fn new() -> Self {
         let symbol_manager = SymbolManager::new().ok(); // Log error but don't fail initialization
+        let disassembler = CapstoneDisassembler::new().ok(); // Log error but don't fail initialization
         Self { 
             pid: None, 
             process_handle: None, 
             module_manager: ModuleManager::new(), 
             thread_manager: ThreadManager::new(),
             symbol_manager,
+            disassembler,
         }
     }
 }
@@ -136,5 +141,39 @@ impl PlatformAPI for WindowsPlatform {
         } else {
             Err(SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()))
         }
+    }
+    
+    // Symbolized disassembly methods
+    fn disassemble_memory(&mut self, pid: u32, address: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
+        if self.disassembler.is_none() {
+            return Err(DisassemblerError::CapstoneError("Disassembler not initialized".to_string()));
+        }
+        
+        // First read memory from the process
+        let data = self.read_memory(pid, address, count * 16) // Read up to 16 bytes per instruction estimate
+            .map_err(|e| DisassemblerError::InvalidData(format!("Failed to read memory: {}", e)))?;
+        
+        // Create a symbol resolver closure
+        let symbol_resolver = |addr: u64| -> Option<crate::interfaces::SymbolInfo> {
+            if let Ok(Some((module_path, symbol, offset))) = self.resolve_address_to_symbol(pid, addr) {
+                // Extract module name from path
+                let module_name = std::path::Path::new(&module_path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&module_path)
+                    .to_string();
+                
+                Some(crate::interfaces::SymbolInfo {
+                    module_name,
+                    symbol_name: symbol.name,
+                    offset,
+                })
+            } else {
+                None
+            }
+        };
+        
+        // Now safely access the disassembler with symbol resolution
+        self.disassembler.as_ref().unwrap().disassemble_with_symbols(arch, &data, address, count, symbol_resolver)
     }
 } 

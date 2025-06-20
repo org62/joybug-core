@@ -1,26 +1,11 @@
-#![allow(unused_imports, dead_code)]
 use crate::protocol::{DebuggerRequest, DebuggerResponse};
-use crate::interfaces::{PlatformAPI, PlatformError};
+use crate::interfaces::PlatformAPI;
 use tokio::net::TcpListener;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use std::sync::Arc;
 use tracing::{info, error, debug};
 use std::io::{Read, Write};
-use std::sync::Mutex;
 
 #[cfg(windows)]
 type PlatformImpl = crate::windows_platform::WindowsPlatform;
-#[cfg(not(windows))]
-struct DummyPlatform;
-#[cfg(not(windows))]
-#[async_trait::async_trait]
-impl PlatformAPI for DummyPlatform {
-    async fn attach(&mut self, _pid: u32) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> { Ok(None) }
-    async fn continue_exec(&mut self) -> Result<(), PlatformError> { Ok(()) }
-    async fn set_breakpoint(&mut self, _addr: u64) -> Result<(), PlatformError> { Ok(()) }
-    async fn launch(&mut self, _command: &str) -> Result<(), PlatformError> { Ok(()) }
-    async fn list_processes(&self) -> Result<Vec<crate::protocol::ProcessInfo>, PlatformError> { Ok(vec![]) }
-}
 
 fn handle_connection(mut stream: std::net::TcpStream) {
     let mut buf = [0u8; 4096];
@@ -148,6 +133,12 @@ fn handle_connection(mut stream: std::net::TcpStream) {
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            Ok(DebuggerRequest::DisassembleMemory { pid, address, count, arch }) => {
+                match platform.disassemble_memory(pid, address, count, arch) {
+                    Ok(instructions) => DebuggerResponse::Instructions { instructions },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             Err(e) => DebuggerResponse::Error { message: format!("Invalid request: {}", e) },
         };
         debug!(resp = %match &resp {
@@ -156,6 +147,10 @@ fn handle_connection(mut stream: std::net::TcpStream) {
             DebuggerResponse::ModuleList { modules } => format!("ModuleList {{ modules: [..{} modules] }}", modules.len()),
             DebuggerResponse::ThreadList { threads } => format!("ThreadList {{ threads: [..{} threads] }}", threads.len()),
             DebuggerResponse::ProcessList { processes } => format!("ProcessList {{ processes: [..{} processes] }}", processes.len()),
+            DebuggerResponse::Instructions { instructions } => {
+                use crate::interfaces::InstructionFormatter;
+                format!("Instructions {{\n{}}}", instructions.format_disassembly())
+            },
             _ => format!("{:?}", resp),
         }, "Sending response");
         let resp_json = serde_json::to_vec(&resp).unwrap();

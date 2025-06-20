@@ -36,3 +36,5 @@ symsrv = "0.5"
 msvc-demangler = "0.9"
 uuid = { version = "1.6", features = ["v4"] }
 dirs = "5.0"
+capstone = "0.12"
+regex = "1.10"
