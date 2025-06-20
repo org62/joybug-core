@@ -7,6 +7,10 @@ edition = "2024"
 name = "joybug2"
 path = "src/lib.rs"
 
+[[bin]]
+name = "joybug2"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { version = "1.37", features = ["full", "rt"] }
 serde = { version = "1.0", features = ["derive"] }
