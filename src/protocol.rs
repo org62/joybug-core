@@ -123,6 +123,22 @@ mod request_response {
                 DebugEvent::Unknown => 0, // Or handle as an error
             }
         }
+
+        pub fn tid(&self) -> u32 {
+            match self {
+                DebugEvent::Output { tid, .. } => *tid,
+                DebugEvent::Exception { tid, .. } => *tid,
+                DebugEvent::Breakpoint { tid, .. } => *tid,
+                DebugEvent::ProcessCreated { tid, .. } => *tid,
+                DebugEvent::ThreadCreated { tid, .. } => *tid,
+                DebugEvent::ThreadExited { tid, .. } => *tid,
+                DebugEvent::DllLoaded { tid, .. } => *tid,
+                DebugEvent::DllUnloaded { tid, .. } => *tid,
+                DebugEvent::RipEvent { tid, .. } => *tid,
+                DebugEvent::ProcessExited { .. } => 0,
+                DebugEvent::Unknown => 0,
+            }
+        }
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
