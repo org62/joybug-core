@@ -107,6 +107,24 @@ mod request_response {
         Unknown,
     }
 
+    impl DebugEvent {
+        pub fn pid(&self) -> u32 {
+            match self {
+                DebugEvent::ProcessExited { pid, .. } => *pid,
+                DebugEvent::Output { pid, .. } => *pid,
+                DebugEvent::Exception { pid, .. } => *pid,
+                DebugEvent::Breakpoint { pid, .. } => *pid,
+                DebugEvent::ProcessCreated { pid, .. } => *pid,
+                DebugEvent::ThreadCreated { pid, .. } => *pid,
+                DebugEvent::ThreadExited { pid, .. } => *pid,
+                DebugEvent::DllLoaded { pid, .. } => *pid,
+                DebugEvent::DllUnloaded { pid, .. } => *pid,
+                DebugEvent::RipEvent { pid, .. } => *pid,
+                DebugEvent::Unknown => 0, // Or handle as an error
+            }
+        }
+    }
+
     #[derive(Debug, Serialize, Deserialize, Clone)]
     pub struct ProcessInfo {
         pub pid: u32,

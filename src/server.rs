@@ -3,13 +3,13 @@ use crate::interfaces::PlatformAPI;
 use tokio::net::TcpListener;
 use tracing::{info, error, debug};
 use std::io::{Read, Write};
+use std::sync::{Arc, Mutex};
 
 #[cfg(windows)]
 type PlatformImpl = crate::windows_platform::WindowsPlatform;
 
-fn handle_connection(mut stream: std::net::TcpStream) {
+fn handle_connection(mut stream: std::net::TcpStream, platform: Arc<Mutex<PlatformImpl>>) {
     let mut buf = [0u8; 4096];
-    let mut platform = PlatformImpl::new();
     loop {
         let n = match stream.read(&mut buf) {
             Ok(0) => {
@@ -30,116 +30,119 @@ fn handle_connection(mut stream: std::net::TcpStream) {
             Ok(DebuggerRequest::ListProcesses) => "ListProcesses".to_string(),
             _ => format!("{:?}", req),
         }, "Received request");
-        let resp = match req {
-            Ok(DebuggerRequest::Attach { pid }) => {
-                match platform.attach(pid) {
-                    Ok(Some(event)) => DebuggerResponse::Event { event },
-                    Ok(None) => DebuggerResponse::Ack,
-                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+        let resp = {
+            let mut platform = platform.lock().unwrap();
+            match req {
+                Ok(DebuggerRequest::Attach { pid }) => {
+                    match platform.attach(pid) {
+                        Ok(Some(event)) => DebuggerResponse::Event { event },
+                        Ok(None) => DebuggerResponse::Ack,
+                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                    }
                 }
-            }
-            Ok(DebuggerRequest::Continue { pid, tid }) => {
-                match platform.continue_exec(pid, tid) {
-                    Ok(Some(event)) => DebuggerResponse::Event { event },
-                    Ok(None) => DebuggerResponse::Ack,
-                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                Ok(DebuggerRequest::Continue { pid, tid }) => {
+                    match platform.continue_exec(pid, tid) {
+                        Ok(Some(event)) => DebuggerResponse::Event { event },
+                        Ok(None) => DebuggerResponse::Ack,
+                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                    }
                 }
-            }
-            Ok(DebuggerRequest::SetBreakpoint { addr }) => {
-                match platform.set_breakpoint(addr) {
-                    Ok(_) => DebuggerResponse::Ack,
-                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                Ok(DebuggerRequest::SetBreakpoint { addr }) => {
+                    match platform.set_breakpoint(addr) {
+                        Ok(_) => DebuggerResponse::Ack,
+                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                    }
                 }
-            }
-            Ok(DebuggerRequest::Launch { command }) => {
-                match platform.launch(&command) {
-                    Ok(Some(event)) => DebuggerResponse::Event { event },
-                    Ok(None) => DebuggerResponse::Ack,
-                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                Ok(DebuggerRequest::Launch { command }) => {
+                    match platform.launch(&command) {
+                        Ok(Some(event)) => DebuggerResponse::Event { event },
+                        Ok(None) => DebuggerResponse::Ack,
+                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                    }
                 }
-            }
-            Ok(DebuggerRequest::ReadMemory { pid, address, size }) => {
-                match platform.read_memory(pid, address, size) {
-                    Ok(data) => DebuggerResponse::MemoryData { data },
-                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                Ok(DebuggerRequest::ReadMemory { pid, address, size }) => {
+                    match platform.read_memory(pid, address, size) {
+                        Ok(data) => DebuggerResponse::MemoryData { data },
+                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                    }
                 }
-            }
-            Ok(DebuggerRequest::WriteMemory { pid, address, data }) => {
-                match platform.write_memory(pid, address, &data) {
-                    Ok(_) => DebuggerResponse::WriteAck,
-                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                Ok(DebuggerRequest::WriteMemory { pid, address, data }) => {
+                    match platform.write_memory(pid, address, &data) {
+                        Ok(_) => DebuggerResponse::WriteAck,
+                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                    }
                 }
-            }
-            Ok(DebuggerRequest::GetThreadContext { pid, tid }) => {
-                match platform.get_thread_context(pid, tid) {
-                    Ok(context) => DebuggerResponse::ThreadContext { context },
-                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                Ok(DebuggerRequest::GetThreadContext { pid, tid }) => {
+                    match platform.get_thread_context(pid, tid) {
+                        Ok(context) => DebuggerResponse::ThreadContext { context },
+                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                    }
                 }
-            }
-            Ok(DebuggerRequest::SetThreadContext { pid, tid, context }) => {
-                match platform.set_thread_context(pid, tid, context) {
-                    Ok(_) => DebuggerResponse::SetContextAck,
-                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                Ok(DebuggerRequest::SetThreadContext { pid, tid, context }) => {
+                    match platform.set_thread_context(pid, tid, context) {
+                        Ok(_) => DebuggerResponse::SetContextAck,
+                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                    }
                 }
-            }
-            Ok(DebuggerRequest::ListModules { pid }) => {
-                match platform.list_modules(pid) {
-                    Ok(modules) => DebuggerResponse::ModuleList { modules },
-                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                Ok(DebuggerRequest::ListModules { pid }) => {
+                    match platform.list_modules(pid) {
+                        Ok(modules) => DebuggerResponse::ModuleList { modules },
+                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                    }
                 }
-            }
-            Ok(DebuggerRequest::ListThreads { pid }) => {
-                match platform.list_threads(pid) {
-                    Ok(threads) => DebuggerResponse::ThreadList { threads },
-                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                Ok(DebuggerRequest::ListThreads { pid }) => {
+                    match platform.list_threads(pid) {
+                        Ok(threads) => DebuggerResponse::ThreadList { threads },
+                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                    }
                 }
-            }
-            Ok(DebuggerRequest::ListProcesses) => {
-                match platform.list_processes() {
-                    Ok(processes) => DebuggerResponse::ProcessList { processes },
-                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                Ok(DebuggerRequest::ListProcesses) => {
+                    match platform.list_processes() {
+                        Ok(processes) => DebuggerResponse::ProcessList { processes },
+                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                    }
                 }
-            }
-            Ok(DebuggerRequest::FindSymbol { module_path, symbol_name }) => {
-                match platform.find_symbol(&module_path, &symbol_name) {
-                    Ok(symbol) => DebuggerResponse::Symbol { symbol },
-                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                Ok(DebuggerRequest::FindSymbol { module_path, symbol_name }) => {
+                    match platform.find_symbol(&module_path, &symbol_name) {
+                        Ok(symbol) => DebuggerResponse::Symbol { symbol },
+                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                    }
                 }
-            }
-            Ok(DebuggerRequest::ListSymbols { module_path }) => {
-                match platform.list_symbols(&module_path) {
-                    Ok(symbols) => DebuggerResponse::SymbolList { symbols },
-                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                Ok(DebuggerRequest::ListSymbols { module_path }) => {
+                    match platform.list_symbols(&module_path) {
+                        Ok(symbols) => DebuggerResponse::SymbolList { symbols },
+                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                    }
                 }
-            }
-            Ok(DebuggerRequest::ResolveRvaToSymbol { module_path, rva }) => {
-                match platform.resolve_rva_to_symbol(&module_path, rva) {
-                    Ok(symbol) => DebuggerResponse::Symbol { symbol },
-                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                Ok(DebuggerRequest::ResolveRvaToSymbol { module_path, rva }) => {
+                    match platform.resolve_rva_to_symbol(&module_path, rva) {
+                        Ok(symbol) => DebuggerResponse::Symbol { symbol },
+                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                    }
                 }
-            }
-            Ok(DebuggerRequest::ResolveAddressToSymbol { pid, address }) => {
-                match platform.resolve_address_to_symbol(pid, address) {
-                    Ok(Some((module_path, symbol, offset))) => DebuggerResponse::AddressSymbol { 
-                        module_path: Some(module_path), 
-                        symbol: Some(symbol), 
-                        offset: Some(offset) 
-                    },
-                    Ok(None) => DebuggerResponse::AddressSymbol { 
-                        module_path: None, 
-                        symbol: None, 
-                        offset: None 
-                    },
-                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                Ok(DebuggerRequest::ResolveAddressToSymbol { pid, address }) => {
+                    match platform.resolve_address_to_symbol(pid, address) {
+                        Ok(Some((module_path, symbol, offset))) => DebuggerResponse::AddressSymbol { 
+                            module_path: Some(module_path), 
+                            symbol: Some(symbol), 
+                            offset: Some(offset) 
+                        },
+                        Ok(None) => DebuggerResponse::AddressSymbol { 
+                            module_path: None, 
+                            symbol: None, 
+                            offset: None 
+                        },
+                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                    }
                 }
-            }
-            Ok(DebuggerRequest::DisassembleMemory { pid, address, count, arch }) => {
-                match platform.disassemble_memory(pid, address, count, arch) {
-                    Ok(instructions) => DebuggerResponse::Instructions { instructions },
-                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                Ok(DebuggerRequest::DisassembleMemory { pid, address, count, arch }) => {
+                    match platform.disassemble_memory(pid, address, count, arch) {
+                        Ok(instructions) => DebuggerResponse::Instructions { instructions },
+                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                    }
                 }
+                Err(e) => DebuggerResponse::Error { message: format!("Invalid request: {}", e) },
             }
-            Err(e) => DebuggerResponse::Error { message: format!("Invalid request: {}", e) },
         };
         debug!(resp = %match &resp {
             DebuggerResponse::Event { event } => event.to_string(),
@@ -164,13 +167,15 @@ fn handle_connection(mut stream: std::net::TcpStream) {
 pub async fn run_server() -> anyhow::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:9000").await?;
     info!("Server listening on 127.0.0.1:9000");
+    let platform = Arc::new(Mutex::new(PlatformImpl::new()));
     loop {
         let (socket, addr) = listener.accept().await?;
         info!(%addr, "Accepted connection");
         let std_stream = socket.into_std()?;
         std_stream.set_nonblocking(false)?;
+        let platform_clone = Arc::clone(&platform);
         std::thread::spawn(move || {
-            handle_connection(std_stream);
+            handle_connection(std_stream, platform_clone);
         });
     }
 }
