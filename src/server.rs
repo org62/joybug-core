@@ -167,15 +167,14 @@ fn handle_connection(mut stream: std::net::TcpStream, platform: Arc<Mutex<Platfo
 pub async fn run_server() -> anyhow::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:9000").await?;
     info!("Server listening on 127.0.0.1:9000");
-    let platform = Arc::new(Mutex::new(PlatformImpl::new()));
     loop {
         let (socket, addr) = listener.accept().await?;
         info!(%addr, "Accepted connection");
         let std_stream = socket.into_std()?;
         std_stream.set_nonblocking(false)?;
-        let platform_clone = Arc::clone(&platform);
+        let platform = Arc::new(Mutex::new(PlatformImpl::new()));
         std::thread::spawn(move || {
-            handle_connection(std_stream, platform_clone);
+            handle_connection(std_stream, platform);
         });
     }
 }
