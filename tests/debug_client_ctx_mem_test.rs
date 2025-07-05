@@ -66,8 +66,10 @@ fn test_debug_client_breakpoint_context() {
                         panic!("Expected ThreadContext response");
                     }
 
-                    // Read memory at breakpoint
-                    let read_req = DebuggerRequest::ReadMemory { pid, address, size: 1 };
+                    // Read memory at breakpoint, on x64 read 1 byte, on arm64 read 4 bytes
+                    let read_size = if cfg!(target_arch = "x86_64") { 1 } else { 4 };
+
+                    let read_req = DebuggerRequest::ReadMemory { pid, address, size: read_size };
                     let resp = client.send_and_receive(&read_req).unwrap();
                     if let DebuggerResponse::MemoryData { data } = resp {
                         #[cfg(target_arch = "x86_64")]
@@ -88,7 +90,24 @@ fn test_debug_client_breakpoint_context() {
                         }
                         #[cfg(target_arch = "aarch64")]
                         {
-                            panic!("AArch64 breakpoint not implemented");
+                            // d43e0000 brk #0xF000
+                            // d503201f nop
+                            let nop_bytes = vec![0x1f, 0x20, 0x03, 0xd5];
+                            let brk_bytes = vec![0x00, 0x00, 0x3e, 0xd4];
+                            assert_eq!(data, brk_bytes);
+                            // Overwrite with NOP
+                            let write_req = DebuggerRequest::WriteMemory { pid, address, data: nop_bytes.clone() };
+                            let resp = client.send_and_receive(&write_req).unwrap();
+                            assert!(matches!(resp, DebuggerResponse::WriteAck));
+                            // Confirm overwrite
+                            let read_req = DebuggerRequest::ReadMemory { pid, address, size: read_size };
+                            let resp = client.send_and_receive(&read_req).unwrap();
+                            if let DebuggerResponse::MemoryData { data } = resp {
+                                assert_eq!(data, nop_bytes, "Expected NOP at breakpoint after write");
+                                println!("data: {:?}", data);
+                            } else {
+                                panic!("Expected MemoryData response, got: {:?}", resp);
+                            }
                         }
                     }
                     *handled_breakpoint = true;
