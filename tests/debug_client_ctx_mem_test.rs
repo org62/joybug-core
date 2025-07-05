@@ -7,7 +7,7 @@ use std::thread;
 use tokio;
 
 #[test]
-fn test_debug_client_breakpoint_context() {
+fn test_debug_client_ctx_mem_test() {
     joybug2::init_tracing();
     thread::spawn(|| {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -39,7 +39,8 @@ fn test_debug_client_breakpoint_context() {
                     // Disassemble instructions around the breakpoint
                     println!("Disassembling instructions around breakpoint at 0x{:X}", address);
 
-                    let disasm_req = DebuggerRequest::DisassembleMemory { pid, address, count: 10, arch: Architecture::X64 };
+                    let arch = if cfg!(target_arch = "x86_64") { Architecture::X64 } else { Architecture::Arm64 };
+                    let disasm_req = DebuggerRequest::DisassembleMemory { pid, address, count: 10, arch };
                     let resp = client.send_and_receive(&disasm_req).unwrap();
                     if let DebuggerResponse::Instructions { instructions } = resp {
                         println!("Instructions from memory disassembly:");
