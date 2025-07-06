@@ -12,24 +12,15 @@ pub(super) fn read_memory(
 ) -> Result<Vec<u8>, PlatformError> {
     trace!(pid, address = %format!("0x{:X}", address), size, "WindowsPlatform::read_memory called");
     unsafe {
-        let handle = if let Some(handle) = platform.process_handle.as_ref() {
-            if platform.pid == Some(pid)
-                && handle.0 != std::ptr::null_mut()
-                && handle.0 != INVALID_HANDLE_VALUE
-            {
-                handle.0
-            } else {
-                error!("No valid process handle for memory read");
-                return Err(PlatformError::OsError(
-                    "No valid process handle for memory read".to_string(),
-                ));
-            }
-        } else {
-            error!("No process handle for memory read");
+        let process = platform.get_process(pid)?;
+        let handle = process.process_handle.0;
+        
+        if handle == std::ptr::null_mut() || handle == INVALID_HANDLE_VALUE {
+            error!("No valid process handle for memory read");
             return Err(PlatformError::OsError(
-                "No process handle for memory read".to_string(),
+                "No valid process handle for memory read".to_string(),
             ));
-        };
+        }
         let mut buffer = vec![0u8; size];
         let mut bytes_read = 0;
         let ok = ReadProcessMemory(
@@ -62,24 +53,15 @@ pub(super) fn write_memory(
 ) -> Result<(), PlatformError> {
     trace!(pid, address = %format!("0x{:X}", address), data_len = data.len(), "WindowsPlatform::write_memory called");
     unsafe {
-        let handle = if let Some(handle) = platform.process_handle.as_ref() {
-            if platform.pid == Some(pid)
-                && handle.0 != std::ptr::null_mut()
-                && handle.0 != INVALID_HANDLE_VALUE
-            {
-                handle.0
-            } else {
-                error!("No valid process handle for memory write");
-                return Err(PlatformError::OsError(
-                    "No valid process handle for memory write".to_string(),
-                ));
-            }
-        } else {
-            trace!("No process handle for memory write");
+        let process = platform.get_process(pid)?;
+        let handle = process.process_handle.0;
+        
+        if handle == std::ptr::null_mut() || handle == INVALID_HANDLE_VALUE {
+            error!("No valid process handle for memory write");
             return Err(PlatformError::OsError(
-                "No process handle for memory write".to_string(),
+                "No valid process handle for memory write".to_string(),
             ));
-        };
+        }
         let mut bytes_written = 0;
         let ok = WriteProcessMemory(
             handle,

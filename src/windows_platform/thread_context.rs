@@ -9,13 +9,14 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 
 pub(super) fn get_thread_context(
     platform: &mut WindowsPlatform,
-    _pid: u32,
+    pid: u32,
     tid: u32,
 ) -> Result<ThreadContext, PlatformError> {
-    trace!(tid, "WindowsPlatform::get_thread_context called");
+    trace!(pid, tid, "WindowsPlatform::get_thread_context called");
     #[cfg(windows)]
     {
-        let thread_handle = platform
+        let process = platform.get_process(pid)?;
+        let thread_handle = process
             .thread_manager
             .get_thread_handle(tid)
             .ok_or_else(|| PlatformError::OsError(format!("No handle for thread {}", tid)))?;
@@ -47,14 +48,15 @@ pub(super) fn get_thread_context(
 
 pub(super) fn set_thread_context(
     platform: &mut WindowsPlatform,
-    _pid: u32,
+    pid: u32,
     tid: u32,
     context: ThreadContext,
 ) -> Result<(), PlatformError> {
-    trace!(tid, "WindowsPlatform::set_thread_context called");
+    trace!(pid, tid, "WindowsPlatform::set_thread_context called");
     #[cfg(windows)]
     unsafe {
-        let thread_handle = platform
+        let process = platform.get_process(pid)?;
+        let thread_handle = process
             .thread_manager
             .get_thread_handle(tid)
             .ok_or_else(|| PlatformError::OsError(format!("No handle for thread {}", tid)))?;

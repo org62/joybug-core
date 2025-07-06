@@ -6,12 +6,21 @@ use std::thread::JoinHandle;
 use tracing::{trace, warn};
 use super::symbol_provider::WindowsSymbolProvider;
 
+/// Cached symbols for a single module with RVA-based storage
+#[derive(Debug, Clone)]
+pub struct ModuleSymbols {
+    pub module_path: String,
+    pub symbols: Vec<Symbol>, // All symbols stored as RVAs
+}
+
 /// Manages symbol loading for modules in the Windows platform
+/// Uses RVA-based storage for efficient sharing across processes
 pub struct SymbolManager {
     /// Track loading tasks for modules
     loading_tasks: Arc<Mutex<HashMap<String, JoinHandle<Result<(), SymbolError>>>>>,
-    /// Store loaded symbols for fast access (module_path -> symbols)
-    symbol_cache: Arc<Mutex<HashMap<String, Vec<Symbol>>>>,
+    /// Store loaded symbols for fast access (module_path -> ModuleSymbols)
+    /// All symbols are stored as RVAs, independent of process loading addresses
+    symbol_cache: Arc<Mutex<HashMap<String, ModuleSymbols>>>,
 }
 
 impl SymbolManager {
@@ -55,7 +64,11 @@ impl SymbolManager {
                     // Store the loaded symbols in the cache
                     if let Ok(symbols) = temp_provider.list_symbols(&module_path_for_task) {
                         let mut cache_guard = cache.lock().unwrap();
-                        cache_guard.insert(module_path_for_task.clone(), symbols.clone());
+                        let module_symbols = ModuleSymbols {
+                            module_path: module_path_for_task.clone(),
+                            symbols: symbols.clone(),
+                        };
+                        cache_guard.insert(module_path_for_task.clone(), module_symbols);
                         trace!(count = symbols.len(), "Successfully stored symbols in cache");
                     }
                 },
@@ -119,8 +132,8 @@ impl SymbolManager {
         self.wait_for_loading(module_path)?;
         
         let cache = self.symbol_cache.lock().unwrap();
-        if let Some(symbols) = cache.get(module_path) {
-            let found_symbol = symbols.iter().find(|s| s.name == symbol_name).cloned();
+        if let Some(module_symbols) = cache.get(module_path) {
+            let found_symbol = module_symbols.symbols.iter().find(|s| s.name == symbol_name).cloned();
             trace!(module_path, symbol_name, found = found_symbol.is_some(), "Symbol lookup completed");
             Ok(found_symbol)
         } else {
@@ -134,9 +147,9 @@ impl SymbolManager {
         self.wait_for_loading(module_path)?;
         
         let cache = self.symbol_cache.lock().unwrap();
-        if let Some(symbols) = cache.get(module_path) {
-            trace!(module_path, count = symbols.len(), "Symbol listing completed");
-            Ok(symbols.clone())
+        if let Some(module_symbols) = cache.get(module_path) {
+            trace!(module_path, count = module_symbols.symbols.len(), "Symbol listing completed");
+            Ok(module_symbols.symbols.clone())
         } else {
             trace!(module_path, "No symbols loaded for module");
             Ok(Vec::new())
@@ -144,14 +157,15 @@ impl SymbolManager {
     }
 
     /// Resolve an RVA to a symbol, waiting for loading to complete if necessary
+    /// This method works directly with RVAs since symbols are stored as RVAs
     pub fn resolve_rva_to_symbol(&self, module_path: &str, rva: u32) -> Result<Option<Symbol>, SymbolError> {
         self.wait_for_loading(module_path)?;
         
         let cache = self.symbol_cache.lock().unwrap();
-        if let Some(symbols) = cache.get(module_path) {
+        if let Some(module_symbols) = cache.get(module_path) {
             // Find the symbol with the highest RVA that is still <= the target RVA
             let mut best_match: Option<&Symbol> = None;
-            for symbol in symbols {
+            for symbol in &module_symbols.symbols {
                 if symbol.rva <= rva && (best_match.is_none() || symbol.rva > best_match.unwrap().rva) {
                     best_match = Some(symbol);
                 }
@@ -174,6 +188,7 @@ impl SymbolManager {
     }
 
     /// Resolve an absolute address to a symbol by finding the appropriate module
+    /// This is the new implementation that properly uses RVA-based symbol storage
     pub fn resolve_address_to_symbol(&self, modules: &[ModuleInfo], address: u64) -> Result<Option<(String, Symbol, u64)>, SymbolError> {
         // Find the module that contains this address
         let containing_module = modules.iter().find(|module| {
@@ -182,10 +197,13 @@ impl SymbolManager {
         });
 
         if let Some(module) = containing_module {
+            // Calculate the RVA (Relative Virtual Address) from the module base
             let rva = (address - module.base) as u32;
             
+            // Use the RVA-based symbol resolution
             match self.resolve_rva_to_symbol(&module.name, rva)? {
                 Some(symbol) => {
+                    // Calculate offset from the symbol's RVA
                     let offset_from_symbol = address - (module.base + symbol.rva as u64);
                     Ok(Some((module.name.clone(), symbol, offset_from_symbol)))
                 }
@@ -194,5 +212,11 @@ impl SymbolManager {
         } else {
             Ok(None)
         }
+    }
+    
+    /// Find a symbol by RVA within a specific module
+    /// This is a convenient method for direct RVA-based lookups
+    pub fn find_symbol_by_rva(&self, module_path: &str, rva: u32) -> Result<Option<Symbol>, SymbolError> {
+        self.resolve_rva_to_symbol(module_path, rva)
     }
 } 

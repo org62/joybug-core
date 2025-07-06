@@ -18,6 +18,7 @@ use disassembler::CapstoneDisassembler;
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use tracing::{trace};
+use std::collections::HashMap;
 
 // Safe wrapper for HANDLE that automatically closes it
 #[derive(Debug)]
@@ -39,12 +40,32 @@ struct AlignedContext {
     context: CONTEXT,
 }
 
-pub struct WindowsPlatform {
-    pub(crate) pid: Option<u32>,
-    pub(crate) process_handle: Option<HandleSafe>,
+/// Represents a single debugged process with its associated state
+#[derive(Debug)]
+pub(crate) struct DebuggedProcess {
+    pub(crate) pid: u32,
+    pub(crate) process_handle: HandleSafe,
     pub(crate) module_manager: ModuleManager,
     pub(crate) thread_manager: ThreadManager,
+}
+
+impl DebuggedProcess {
+    pub fn new(pid: u32, process_handle: HANDLE) -> Self {
+        Self {
+            pid,
+            process_handle: HandleSafe(process_handle),
+            module_manager: ModuleManager::new(),
+            thread_manager: ThreadManager::new(),
+        }
+    }
+}
+
+pub struct WindowsPlatform {
+    /// Map of PID to DebuggedProcess for managing multiple processes
+    pub(crate) processes: HashMap<u32, DebuggedProcess>,
+    /// Shared symbol manager for all processes
     pub(crate) symbol_manager: Option<SymbolManager>,
+    /// Shared disassembler for all processes
     pub(crate) disassembler: Option<CapstoneDisassembler>,
 }
 
@@ -53,13 +74,33 @@ impl WindowsPlatform {
         let symbol_manager = SymbolManager::new().ok(); // Log error but don't fail initialization
         let disassembler = CapstoneDisassembler::new().ok(); // Log error but don't fail initialization
         Self { 
-            pid: None, 
-            process_handle: None, 
-            module_manager: ModuleManager::new(), 
-            thread_manager: ThreadManager::new(),
+            processes: HashMap::new(),
             symbol_manager,
             disassembler,
         }
+    }
+    
+    /// Get a reference to a debugged process by PID
+    pub(crate) fn get_process(&self, pid: u32) -> Result<&DebuggedProcess, PlatformError> {
+        self.processes.get(&pid)
+            .ok_or_else(|| PlatformError::Other(format!("Process {} not found", pid)))
+    }
+    
+    /// Get a mutable reference to a debugged process by PID
+    pub(crate) fn get_process_mut(&mut self, pid: u32) -> Result<&mut DebuggedProcess, PlatformError> {
+        self.processes.get_mut(&pid)
+            .ok_or_else(|| PlatformError::Other(format!("Process {} not found", pid)))
+    }
+    
+    /// Add a new debugged process
+    pub(crate) fn add_process(&mut self, pid: u32, process_handle: HANDLE) {
+        let process = DebuggedProcess::new(pid, process_handle);
+        self.processes.insert(pid, process);
+    }
+    
+    /// Remove a debugged process
+    pub(crate) fn remove_process(&mut self, pid: u32) {
+        self.processes.remove(&pid);
     }
 }
 
@@ -97,12 +138,14 @@ impl PlatformAPI for WindowsPlatform {
         thread_context::set_thread_context(self, pid, tid, context)
     }
 
-    fn list_modules(&self, _pid: u32) -> Result<Vec<ModuleInfo>, PlatformError> {
-        Ok(self.module_manager.list_modules())
+    fn list_modules(&self, pid: u32) -> Result<Vec<ModuleInfo>, PlatformError> {
+        let process = self.get_process(pid)?;
+        Ok(process.module_manager.list_modules())
     }
 
-    fn list_threads(&self, _pid: u32) -> Result<Vec<ThreadInfo>, PlatformError> {
-        Ok(self.thread_manager.list_threads())
+    fn list_threads(&self, pid: u32) -> Result<Vec<ThreadInfo>, PlatformError> {
+        let process = self.get_process(pid)?;
+        Ok(process.thread_manager.list_threads())
     }
 
     fn list_processes(&self) -> Result<Vec<ProcessInfo>, PlatformError> {
@@ -134,9 +177,10 @@ impl PlatformAPI for WindowsPlatform {
         }
     }
 
-    fn resolve_address_to_symbol(&self, _pid: u32, address: u64) -> Result<Option<(String, Symbol, u64)>, SymbolError> {
+    fn resolve_address_to_symbol(&self, pid: u32, address: u64) -> Result<Option<(String, Symbol, u64)>, SymbolError> {
         if let Some(ref symbol_manager) = self.symbol_manager {
-            let modules = self.module_manager.list_modules();
+            let process = self.get_process(pid).map_err(|e| SymbolError::SymbolsNotFound(e.to_string()))?;
+            let modules = process.module_manager.list_modules();
             symbol_manager.resolve_address_to_symbol(&modules, address)
         } else {
             Err(SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()))
@@ -153,21 +197,31 @@ impl PlatformAPI for WindowsPlatform {
         let data = self.read_memory(pid, address, count * 16) // Read up to 16 bytes per instruction estimate
             .map_err(|e| DisassemblerError::InvalidData(format!("Failed to read memory: {}", e)))?;
         
+        // Get the process modules for symbol resolution
+        let process = self.get_process(pid)
+            .map_err(|e| DisassemblerError::InvalidData(format!("Process not found: {}", e)))?;
+        let modules = process.module_manager.list_modules();
+        
         // Create a symbol resolver closure
-        let symbol_resolver = |addr: u64| -> Option<crate::interfaces::SymbolInfo> {
-            if let Ok(Some((module_path, symbol, offset))) = self.resolve_address_to_symbol(pid, addr) {
-                // Extract module name from path
-                let module_name = std::path::Path::new(&module_path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(&module_path)
-                    .to_string();
-                
-                Some(crate::interfaces::SymbolInfo {
-                    module_name,
-                    symbol_name: symbol.name,
-                    offset,
-                })
+        let symbol_manager = self.symbol_manager.as_ref();
+        let symbol_resolver = move |addr: u64| -> Option<crate::interfaces::SymbolInfo> {
+            if let Some(symbol_manager) = symbol_manager {
+                if let Ok(Some((module_path, symbol, offset))) = symbol_manager.resolve_address_to_symbol(&modules, addr) {
+                    // Extract module name from path
+                    let module_name = std::path::Path::new(&module_path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&module_path)
+                        .to_string();
+                    
+                    Some(crate::interfaces::SymbolInfo {
+                        module_name,
+                        symbol_name: symbol.name,
+                        offset,
+                    })
+                } else {
+                    None
+                }
             } else {
                 None
             }

@@ -17,8 +17,7 @@ pub(super) fn handle_create_process_event(
     image_path_fallback: Option<&str>,
 ) -> Result<crate::protocol::DebugEvent, PlatformError> {
     let info = unsafe { debug_event.u.CreateProcessInfo };
-    platform.process_handle = Some(super::HandleSafe(info.hProcess));
-    platform.pid = Some(debug_event.dwProcessId);
+    let pid = debug_event.dwProcessId;
 
     let image_file_name =
         utils::get_path_from_handle(info.hFile).unwrap_or_else(|| image_path_fallback.unwrap_or("<unknown>").to_string());
@@ -29,8 +28,10 @@ pub(super) fn handle_create_process_event(
         utils::get_module_size_from_address(info.hProcess, info.lpBaseOfImage as usize)
             .map(|sz| sz as u64);
 
-    platform.module_manager.clear();
-    platform.thread_manager.clear();
+    // Get the process for this PID and clear its managers
+    let process = platform.get_process_mut(pid)?;
+    process.module_manager.clear();
+    process.thread_manager.clear();
     
     let main_module = ModuleInfo {
         name: image_file_name.clone(),
@@ -38,7 +39,7 @@ pub(super) fn handle_create_process_event(
         size: size_of_image,
     };
     
-    platform.module_manager.add_module(main_module.clone());
+    process.module_manager.add_module(main_module.clone());
 
     // Start loading symbols for the main executable in the background
     if let Some(ref symbol_manager) = platform.symbol_manager {
@@ -72,7 +73,8 @@ pub(super) fn handle_create_process_event(
         )));
     } else {
         let start_address = info.lpStartAddress.map_or(0, |addr| addr as usize as u64);
-        platform.thread_manager.add_thread(
+        let process = platform.get_process_mut(pid)?;
+        process.thread_manager.add_thread(
             debug_event.dwThreadId,
             start_address,
             thread_handle,
@@ -189,7 +191,8 @@ pub(super) fn continue_exec(
                 );
             } else {
                 let start_address = info.lpStartAddress.map_or(0, |addr| addr as usize as u64);
-                platform.thread_manager.add_thread(
+                let process = platform.get_process_mut(debug_event.dwProcessId)?;
+                process.thread_manager.add_thread(
                     debug_event.dwThreadId,
                     start_address,
                     thread_handle,
@@ -206,9 +209,9 @@ pub(super) fn continue_exec(
         EXIT_THREAD_DEBUG_EVENT => {
             let info = unsafe { debug_event.u.ExitThread };
             trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, exit_code = %format!("0x{:X}", info.dwExitCode), "ThreadExited event");
-            platform
-                .thread_manager
-                .remove_thread(debug_event.dwThreadId);
+            if let Ok(process) = platform.get_process_mut(debug_event.dwProcessId) {
+                process.thread_manager.remove_thread(debug_event.dwThreadId);
+            }
             Some(crate::protocol::DebugEvent::ThreadExited {
                 pid: debug_event.dwProcessId,
                 tid: debug_event.dwThreadId,
@@ -222,15 +225,8 @@ pub(super) fn continue_exec(
             unsafe {
                 CloseHandle(info.hFile);
             }
-            let h_process = platform
-                .process_handle
-                .as_ref()
-                .ok_or_else(|| {
-                    PlatformError::OsError(
-                        "No process handle for LOAD_DLL_DEBUG_EVENT".to_string(),
-                    )
-                })?
-                .0;
+            let process = platform.get_process(debug_event.dwProcessId)?;
+            let h_process = process.process_handle.0;
             let size_of_dll =
                 utils::get_module_size_from_address(h_process, info.lpBaseOfDll as usize)
                     .map(|sz| sz as u64);
@@ -245,7 +241,8 @@ pub(super) fn continue_exec(
                 size: size_of_dll,
             };
             
-            platform.module_manager.add_module(module_info.clone());
+            let process = platform.get_process_mut(debug_event.dwProcessId)?;
+            process.module_manager.add_module(module_info.clone());
 
             // Start loading symbols for the newly loaded module in the background
             if let Some(ref symbol_manager) = platform.symbol_manager {
@@ -264,9 +261,9 @@ pub(super) fn continue_exec(
         UNLOAD_DLL_DEBUG_EVENT => {
             let info = unsafe { debug_event.u.UnloadDll };
             trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, base_of_dll = %format!("0x{:X}", info.lpBaseOfDll as u64), "DllUnloaded event");
-            platform
-                .module_manager
-                .remove_module(info.lpBaseOfDll as u64);
+            if let Ok(process) = platform.get_process_mut(debug_event.dwProcessId) {
+                process.module_manager.remove_module(info.lpBaseOfDll as u64);
+            }
             Some(crate::protocol::DebugEvent::DllUnloaded {
                 pid: debug_event.dwProcessId,
                 tid: debug_event.dwThreadId,

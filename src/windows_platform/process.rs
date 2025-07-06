@@ -28,8 +28,6 @@ fn to_wide(s: &str) -> Vec<u16> {
 }
 
 pub(super) fn launch(platform: &mut WindowsPlatform, command: &str) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
-    platform.module_manager.clear();
-    platform.thread_manager.clear();
     println!("[windows_platform] launch thread id: {:?}", std::thread::current().id());
     trace!(command, "WindowsPlatform::launch called");
     let cmd_line_wide = to_wide(command);
@@ -56,8 +54,13 @@ pub(super) fn launch(platform: &mut WindowsPlatform, command: &str) -> Result<Op
         error!(error, error_str, "CreateProcessW failed");
         return Err(PlatformError::OsError(format!("CreateProcessW failed: {} ({})", error, error_str)));
     }
-    platform.process_handle = Some(HandleSafe(process_info.hProcess));
-    platform.pid = Some(process_info.dwProcessId);
+    
+    let pid = process_info.dwProcessId;
+    let process_handle = process_info.hProcess;
+    
+    // Add the new process to the platform
+    platform.add_process(pid, process_handle);
+    
     // Immediately run the debug loop for the new process
     let mut debug_event: DEBUG_EVENT = unsafe { std::mem::zeroed() };
     let wait_res = unsafe { WaitForDebugEvent(&mut debug_event, INFINITE) };
@@ -86,8 +89,6 @@ pub(super) fn attach(platform: &mut WindowsPlatform, pid: u32) -> Result<Option<
         return Err(PlatformError::OsError(format!("DebugActiveProcess failed: {} ({})", error, error_str)));
     }
 
-    platform.pid = Some(pid);
-    
     // After attaching, we must wait for the initial CREATE_PROCESS_DEBUG_EVENT
     let mut debug_event: DEBUG_EVENT = unsafe { std::mem::zeroed() };
     let wait_res = unsafe { WaitForDebugEvent(&mut debug_event, INFINITE) };
@@ -99,6 +100,10 @@ pub(super) fn attach(platform: &mut WindowsPlatform, pid: u32) -> Result<Option<
     }
 
     if debug_event.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT {
+        // Extract the process handle from the debug event to add to our platform
+        let process_handle = unsafe { debug_event.u.CreateProcessInfo.hProcess };
+        platform.add_process(pid, process_handle);
+        
         debug_events::handle_create_process_event(platform, &debug_event, None).map(Some)
     } else {
         error!(event_code = debug_event.dwDebugEventCode, "Unexpected debug event after attach");
