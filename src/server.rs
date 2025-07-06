@@ -40,6 +40,12 @@ fn handle_connection(mut stream: std::net::TcpStream, platform: Arc<Mutex<Platfo
                         Err(e) => DebuggerResponse::Error { message: e.to_string() },
                     }
                 }
+                Ok(DebuggerRequest::Detach { pid }) => {
+                    match platform.detach(pid) {
+                        Ok(_) => DebuggerResponse::Ack,
+                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                    }
+                }
                 Ok(DebuggerRequest::Continue { pid, tid }) => {
                     match platform.continue_exec(pid, tid) {
                         Ok(Some(event)) => DebuggerResponse::Event { event },

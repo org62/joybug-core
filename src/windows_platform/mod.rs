@@ -17,7 +17,7 @@ use symbol_manager::SymbolManager;
 use disassembler::CapstoneDisassembler;
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-use tracing::{trace};
+use tracing::trace;
 use std::collections::HashMap;
 
 // Safe wrapper for HANDLE that automatically closes it
@@ -43,16 +43,14 @@ struct AlignedContext {
 /// Represents a single debugged process with its associated state
 #[derive(Debug)]
 pub(crate) struct DebuggedProcess {
-    pub(crate) pid: u32,
     pub(crate) process_handle: HandleSafe,
     pub(crate) module_manager: ModuleManager,
     pub(crate) thread_manager: ThreadManager,
 }
 
 impl DebuggedProcess {
-    pub fn new(pid: u32, process_handle: HANDLE) -> Self {
+    pub fn new(_pid: u32, process_handle: HANDLE) -> Self {
         Self {
-            pid,
             process_handle: HandleSafe(process_handle),
             module_manager: ModuleManager::new(),
             thread_manager: ThreadManager::new(),
@@ -107,6 +105,16 @@ impl WindowsPlatform {
 impl PlatformAPI for WindowsPlatform {
     fn attach(&mut self, pid: u32) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
         process::attach(self, pid)
+    }
+
+    fn detach(&mut self, pid: u32) -> Result<(), PlatformError> {
+        trace!(pid, "WindowsPlatform::detach called");
+        if self.processes.contains_key(&pid) {
+            self.remove_process(pid);
+            Ok(())
+        } else {
+            Err(PlatformError::Other(format!("Process {} not found", pid)))
+        }
     }
 
     fn continue_exec(&mut self, pid: u32, tid: u32) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {

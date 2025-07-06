@@ -9,6 +9,7 @@ mod request_response {
     #[serde(tag = "type", content = "data")]
     pub enum DebuggerRequest {
         Attach { pid: u32 },
+        Detach { pid: u32 },
         Continue { pid: u32, tid: u32 },
         SetBreakpoint { addr: u64 },
         Launch { command: String },

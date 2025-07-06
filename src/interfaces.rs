@@ -170,6 +170,7 @@ pub trait DisassemblerProvider: Send + Sync {
 
 pub trait PlatformAPI: Send + Sync {
     fn attach(&mut self, pid: u32) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>;
+    fn detach(&mut self, pid: u32) -> Result<(), PlatformError>;
     fn continue_exec(&mut self, pid: u32, tid: u32) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>;
     fn set_breakpoint(&mut self, addr: u64) -> Result<(), PlatformError>;
     fn launch(&mut self, command: &str) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>;

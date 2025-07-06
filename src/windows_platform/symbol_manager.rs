@@ -9,7 +9,6 @@ use super::symbol_provider::WindowsSymbolProvider;
 /// Cached symbols for a single module with RVA-based storage
 #[derive(Debug, Clone)]
 pub struct ModuleSymbols {
-    pub module_path: String,
     pub symbols: Vec<Symbol>, // All symbols stored as RVAs
 }
 
@@ -65,7 +64,6 @@ impl SymbolManager {
                     if let Ok(symbols) = temp_provider.list_symbols(&module_path_for_task) {
                         let mut cache_guard = cache.lock().unwrap();
                         let module_symbols = ModuleSymbols {
-                            module_path: module_path_for_task.clone(),
                             symbols: symbols.clone(),
                         };
                         cache_guard.insert(module_path_for_task.clone(), module_symbols);
@@ -214,9 +212,5 @@ impl SymbolManager {
         }
     }
     
-    /// Find a symbol by RVA within a specific module
-    /// This is a convenient method for direct RVA-based lookups
-    pub fn find_symbol_by_rva(&self, module_path: &str, rva: u32) -> Result<Option<Symbol>, SymbolError> {
-        self.resolve_rva_to_symbol(module_path, rva)
-    }
+
 } 

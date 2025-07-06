@@ -160,6 +160,10 @@ pub(super) fn continue_exec(
         EXIT_PROCESS_DEBUG_EVENT => {
             let info = unsafe { debug_event.u.ExitProcess };
             trace!(pid = debug_event.dwProcessId, exit_code = %format!("0x{:X}", info.dwExitCode), "ProcessExited event");
+            
+            // Note: We don't remove the process from tracking here to allow post-mortem analysis
+            // The process will be removed when the client explicitly detaches or the connection closes
+            
             Some(crate::protocol::DebugEvent::ProcessExited {
                 pid: debug_event.dwProcessId,
                 exit_code: info.dwExitCode,

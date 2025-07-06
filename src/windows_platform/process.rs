@@ -1,4 +1,4 @@
-use super::{WindowsPlatform, HandleSafe};
+use super::WindowsPlatform;
 use super::utils;
 use super::debug_events;
 use crate::interfaces::PlatformError;
