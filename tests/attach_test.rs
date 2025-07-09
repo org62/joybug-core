@@ -26,7 +26,7 @@ fn test_attach_and_list_modules() {
     });
 
     // Create a suspended process
-    let cmd = to_wide("cmd /c \"(for /l %i in (1,1,2) do @echo Tick %i & timeout /t 1 >nul)\"");
+    let cmd = to_wide("cmd /c \"echo Tick 1 & echo Tick 2 & ping localhost -n 2 >nul\"");
     let mut startup_info: STARTUPINFOW = unsafe { std::mem::zeroed() };
     startup_info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut process_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
