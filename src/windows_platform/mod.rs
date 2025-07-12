@@ -16,10 +16,11 @@ use module_manager::ModuleManager;
 use thread_manager::ThreadManager;
 use symbol_manager::SymbolManager;
 use disassembler::CapstoneDisassembler;
-use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-use tracing::trace;
+use windows_sys::Win32::System::Diagnostics::Debug::{SymCleanup, SymInitialize, CONTEXT};
+use windows_sys::Win32::Foundation::{CloseHandle, FALSE, GetLastError, HANDLE};
+use tracing::{error, trace, warn};
 use std::collections::HashMap;
+use std::ptr;
 
 // Safe wrapper for HANDLE that automatically closes it
 #[derive(Debug)]
@@ -51,12 +52,26 @@ pub(crate) struct DebuggedProcess {
 }
 
 impl DebuggedProcess {
-    pub fn new(_pid: u32, process_handle: HANDLE, architecture: Architecture) -> Self {
-        Self {
+    pub fn new(pid: u32, process_handle: HANDLE, architecture: Architecture) -> Result<Self, PlatformError> {
+        if unsafe { SymInitialize(process_handle, ptr::null(), FALSE) } == FALSE {
+            let error = unsafe { GetLastError() };
+            error!(pid, "Failed to initialize symbol handler, error code: 0x{:x}", error);
+            return Err(PlatformError::OsError(format!("SymInitialize failed for pid {}: {}", pid, utils::error_message(error))));
+        }
+        Ok(Self {
             process_handle: HandleSafe(process_handle),
             architecture,
             module_manager: ModuleManager::new(),
             thread_manager: ThreadManager::new(),
+        })
+    }
+}
+
+impl Drop for DebuggedProcess {
+    fn drop(&mut self) {
+        if unsafe { SymCleanup(self.process_handle.0) } == FALSE {
+            let error = unsafe { GetLastError() };
+            warn!("Failed to cleanup symbol handler for process, error code: {}", error);
         }
     }
 }
@@ -94,9 +109,10 @@ impl WindowsPlatform {
     }
     
     /// Add a new debugged process
-    pub(crate) fn add_process(&mut self, pid: u32, process_handle: HANDLE, architecture: Architecture) {
-        let process = DebuggedProcess::new(pid, process_handle, architecture);
+    pub(crate) fn add_process(&mut self, pid: u32, process_handle: HANDLE, architecture: Architecture) -> Result<(), PlatformError> {
+        let process = DebuggedProcess::new(pid, process_handle, architecture)?;
         self.processes.insert(pid, process);
+        Ok(())
     }
     
     /// Remove a debugged process

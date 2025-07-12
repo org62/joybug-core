@@ -30,7 +30,7 @@ mod request_response {
         // ... add more as needed
     }
 
-    #[derive(Debug, Serialize, Deserialize, Clone)]
+    #[derive(Serialize, Deserialize, Clone)]
     #[serde(tag = "type", content = "data")]
     pub enum DebuggerResponse {
         Ack,

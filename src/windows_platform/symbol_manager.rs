@@ -203,7 +203,13 @@ impl SymbolManager {
                 Some(symbol) => {
                     // Calculate offset from the symbol's RVA
                     let offset_from_symbol = address - (module.base + symbol.rva as u64);
-                    Ok(Some((module.name.clone(), symbol, offset_from_symbol)))
+                    // put only module name, not the full path
+                    let module_name = std::path::Path::new(&module.name)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&module.name)
+                        .to_string();
+                    Ok(Some((module_name, symbol, offset_from_symbol)))
                 }
                 None => Ok(None),
             }

@@ -5,7 +5,6 @@ use windows_sys::Win32::System::SystemInformation::{IMAGE_FILE_MACHINE_AMD64, IM
 use windows_sys::Win32::Foundation::*;
 use tracing::{debug, warn};
 use std::mem;
-use std::ptr;
 
 const MAX_STACK_FRAMES: usize = 100;
 
@@ -35,16 +34,6 @@ pub fn get_call_stack(
     
     // Initialize the stack frame and extract the raw context
     let (mut stack_frame, mut raw_context) = initialize_stack_frame_with_context(&context, architecture)?;
-    
-    // Initialize the symbol handler for this process if not already done
-    let symbol_initialized = unsafe {
-        SymInitialize(process_handle, ptr::null(), TRUE)
-    };
-    
-    if symbol_initialized == FALSE {
-        let error = unsafe { GetLastError() };
-        warn!(pid, "Failed to initialize symbol handler, error code: {}", error);
-    }
     
     // Walk the stack
     let mut frames = Vec::new();
@@ -86,7 +75,8 @@ pub fn get_call_stack(
         }
         
         // Validate that the instruction pointer is within a loaded module
-        if !is_valid_instruction_pointer(instruction_pointer, &modules) {
+        // Don't issue a warning if there is less than 2 modules (main executable is only loaded when process is started, but address is in ntdll)
+        if modules.len() > 1 && !is_valid_instruction_pointer(instruction_pointer, &modules) {
             warn!("Instruction pointer 0x{:016x} not in any loaded module. Including frame without symbols.", instruction_pointer);
         }
         
@@ -94,8 +84,8 @@ pub fn get_call_stack(
         let symbol_info = if is_valid_instruction_pointer(instruction_pointer, &modules) {
             match platform.resolve_address_to_symbol(pid, instruction_pointer) {
                 Ok(Some((module_path, symbol, offset_from_symbol))) => {
-                    debug!("Frame {}: resolved symbol {}+0x{:x} in module {}", 
-                           i, symbol.name, offset_from_symbol, module_path);
+                    //debug!("Frame {}: resolved symbol {}+0x{:x} in module {}", 
+                    //       i, symbol.name, offset_from_symbol, module_path);
                     
                     Some(SymbolInfo {
                         module_name: module_path,
@@ -104,11 +94,11 @@ pub fn get_call_stack(
                     })
                 }
                 Ok(None) => {
-                    debug!("Frame {}: no symbol found for address 0x{:016x}", i, instruction_pointer);
+                    //debug!("Frame {}: no symbol found for address 0x{:016x}", i, instruction_pointer);
                     None
                 }
                 Err(e) => {
-                    debug!("Frame {}: symbol resolution failed: {}", i, e);
+                    warn!("Frame {}: symbol resolution failed: {}", i, e);
                     None
                 }
             }
@@ -125,13 +115,6 @@ pub fn get_call_stack(
             frame_pointer,
             symbol: symbol_info,
         });
-    }
-    
-    if symbol_initialized == TRUE {
-        if unsafe { SymCleanup(process_handle) } == FALSE {
-            let error = unsafe { GetLastError() };
-            warn!(pid, "Failed to cleanup symbol handler, error code: {}", error);
-        }
     }
     
     debug!(pid, tid, frame_count = frames.len(), "Retrieved call stack");

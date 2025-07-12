@@ -1,15 +1,17 @@
 use super::{utils, WindowsPlatform};
 use crate::interfaces::PlatformError;
 use crate::protocol::{ModuleInfo};
-use tracing::{error, trace};
+use tracing::{error, trace, warn};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, FALSE, DBG_CONTINUE, DUPLICATE_SAME_ACCESS, HANDLE, DuplicateHandle};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, INFINITE};
 use windows_sys::Win32::System::Diagnostics::Debug::{
     ContinueDebugEvent, WaitForDebugEvent, DEBUG_EVENT, EXCEPTION_DEBUG_EVENT,
     CREATE_PROCESS_DEBUG_EVENT, EXIT_PROCESS_DEBUG_EVENT, CREATE_THREAD_DEBUG_EVENT,
     EXIT_THREAD_DEBUG_EVENT, LOAD_DLL_DEBUG_EVENT, UNLOAD_DLL_DEBUG_EVENT,
-    OUTPUT_DEBUG_STRING_EVENT, RIP_EVENT,
+    OUTPUT_DEBUG_STRING_EVENT, RIP_EVENT, SymLoadModule64, SymUnloadModule64,
 };
+use std::ffi::CString;
+use std::ptr;
 
 pub(super) fn handle_create_process_event(
     platform: &mut WindowsPlatform,
@@ -24,12 +26,29 @@ pub(super) fn handle_create_process_event(
     unsafe {
         CloseHandle(info.hFile);
     }
-    let size_of_image =
-        utils::get_module_size_from_address(info.hProcess, info.lpBaseOfImage as usize)
-            .map(|sz| sz as u64);
 
-    // Get the process for this PID and clear its managers
+    // Get the process for this PID to use its handle and clear its managers
     let process = platform.get_process_mut(pid)?;
+    let h_process = process.process_handle.0;
+
+    // Refresh the module list now that the process is created
+    let size_of_image =
+        utils::get_module_size_from_address(h_process, info.lpBaseOfImage as usize)
+            .map(|sz| sz as u64);
+            
+    // Load the module into the symbol handler
+    let c_name = CString::new(image_file_name.as_str()).unwrap();
+    if unsafe { SymLoadModule64(h_process, info.hFile, c_name.as_ptr() as *const u8, ptr::null(), info.lpBaseOfImage as u64, size_of_image.unwrap_or(0) as u32) } == 0 {
+        let error = unsafe { GetLastError() };
+        warn!(pid, "SymLoadModule64 failed in create_process for {}: 0x{:x}", image_file_name, error);
+    }
+    
+    // Now that we're done with hFile, close it.
+    unsafe {
+        CloseHandle(info.hFile);
+    }
+
+    // Clear its managers
     process.module_manager.clear();
     process.thread_manager.clear();
     
@@ -239,6 +258,18 @@ pub(super) fn continue_exec(
                 return Err(PlatformError::OsError("Failed to get size of DLL".to_string()));
             }
 
+            // Load module into symbol handler
+            let c_name = CString::new(dll_name.as_str()).unwrap();
+            if unsafe { SymLoadModule64(h_process, info.hFile, c_name.as_ptr() as *const u8, ptr::null(), info.lpBaseOfDll as u64, size_of_dll.unwrap_or(0) as u32) } == 0 {
+                 let error = unsafe { GetLastError() };
+                 warn!(pid = debug_event.dwProcessId, "SymLoadModule64 failed on DLL load for {}: 0x{:x}", dll_name, error);
+            }
+
+            // now close handle
+            unsafe {
+                CloseHandle(info.hFile);
+            }
+
             let module_info = ModuleInfo {
                 name: dll_name.clone(),
                 base: info.lpBaseOfDll as u64,
@@ -247,6 +278,13 @@ pub(super) fn continue_exec(
             
             let process = platform.get_process_mut(debug_event.dwProcessId)?;
             process.module_manager.add_module(module_info.clone());
+
+            // Refresh the module list for the symbol handler
+            // This is no longer needed as SymLoadModule64 handles incremental updates
+            // if unsafe { SymRefreshModuleList(h_process) } == FALSE {
+            //     let error = unsafe { GetLastError() };
+            //     warn!(pid = debug_event.dwProcessId, "SymRefreshModuleList failed on DLL load: 0x{:x}", error);
+            // }
 
             // Start loading symbols for the newly loaded module in the background
             if let Some(ref symbol_manager) = platform.symbol_manager {
@@ -265,9 +303,17 @@ pub(super) fn continue_exec(
         UNLOAD_DLL_DEBUG_EVENT => {
             let info = unsafe { debug_event.u.UnloadDll };
             trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, base_of_dll = %format!("0x{:X}", info.lpBaseOfDll as u64), "DllUnloaded event");
+            
             if let Ok(process) = platform.get_process_mut(debug_event.dwProcessId) {
+                // Unload from our manager
                 process.module_manager.remove_module(info.lpBaseOfDll as u64);
+                // Unload from symbol handler
+                if unsafe { SymUnloadModule64(process.process_handle.0, info.lpBaseOfDll as u64) } == FALSE {
+                    let error = unsafe { GetLastError() };
+                    warn!(pid = debug_event.dwProcessId, "SymUnloadModule64 failed: 0x{:x}", error);
+                }
             }
+            
             Some(crate::protocol::DebugEvent::DllUnloaded {
                 pid: debug_event.dwProcessId,
                 tid: debug_event.dwThreadId,
