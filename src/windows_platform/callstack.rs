@@ -1,15 +1,13 @@
 use crate::interfaces::{PlatformError, CallFrame, SymbolInfo, Architecture, PlatformAPI};
 use crate::windows_platform::WindowsPlatform;
 use windows_sys::Win32::System::Diagnostics::Debug::*;
+use windows_sys::Win32::System::SystemInformation::{IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64};
 use windows_sys::Win32::Foundation::*;
-use windows_sys::Win32::System::Threading::*;
-use std::ptr;
-use std::mem;
 use tracing::{debug, warn};
+use std::mem;
+use std::ptr;
 
 const MAX_STACK_FRAMES: usize = 100;
-const IMAGE_FILE_MACHINE_AMD64: u32 = 0x8664;
-const IMAGE_FILE_MACHINE_ARM64: u32 = 0xAA64;
 
 /// Get the call stack for a specific thread within a debugged process
 pub fn get_call_stack(
@@ -27,18 +25,11 @@ pub fn get_call_stack(
     // Get the list of modules for address validation
     let modules = process.module_manager.list_modules();
     
-    // Get the thread handle
-    let thread_handle = unsafe {
-        OpenThread(THREAD_ALL_ACCESS, FALSE, tid)
-    };
-    
-    if thread_handle.is_null() {
-        return Err(PlatformError::OsError(format!("Failed to open thread {}", tid)));
-    }
-    
-    // Ensure thread handle is closed when we're done
-    let _thread_guard = ThreadHandleGuard(thread_handle);
-    
+    // Get the thread handle from the thread manager
+    let thread_handle = process.thread_manager.get_thread_handle(tid)
+        .filter(|h| !h.is_null())
+        .ok_or_else(|| PlatformError::OsError(format!("Failed to get thread handle for {}", tid)))?;
+
     // Get the thread context
     let context = platform.get_thread_context(pid, tid)?;
     
@@ -58,8 +49,8 @@ pub fn get_call_stack(
     // Walk the stack
     let mut frames = Vec::new();
     let machine_type = match architecture {
-        Architecture::X64 => IMAGE_FILE_MACHINE_AMD64,
-        Architecture::Arm64 => IMAGE_FILE_MACHINE_ARM64,
+        Architecture::X64 => IMAGE_FILE_MACHINE_AMD64 as u32,
+        Architecture::Arm64 => IMAGE_FILE_MACHINE_ARM64 as u32,
     };
     
     for i in 0..MAX_STACK_FRAMES {
@@ -245,15 +236,4 @@ unsafe extern "system" fn read_process_memory_proc(
     }
     
     result
-}
-
-/// RAII guard for thread handle
-struct ThreadHandleGuard(HANDLE);
-
-impl Drop for ThreadHandleGuard {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { CloseHandle(self.0) };
-        }
-    }
 } 

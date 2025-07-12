@@ -6,24 +6,24 @@ use crate::protocol::{ProcessInfo};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
-use tracing::{trace, error, debug};
+use tracing::{trace, error, warn};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, FALSE, DBG_CONTINUE, INVALID_HANDLE_VALUE
+    CloseHandle, GetLastError, FALSE, DBG_CONTINUE, INVALID_HANDLE_VALUE, TRUE, HANDLE
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{
     ContinueDebugEvent, WaitForDebugEvent,
     CREATE_PROCESS_DEBUG_EVENT, DEBUG_EVENT,
-    DebugActiveProcess,
+    DebugActiveProcess, SymInitialize, SymCleanup,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW,
+    CreateProcessW, IsWow64Process2,
     DEBUG_PROCESS, INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
 };
 use windows_sys::Win32::System::SystemInformation::{
-    GetNativeSystemInfo, SYSTEM_INFO,
+    IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_UNKNOWN
 };
 
 fn to_wide(s: &str) -> Vec<u16> {
@@ -31,45 +31,41 @@ fn to_wide(s: &str) -> Vec<u16> {
 }
 
 /// Determine the architecture of a process by checking if it's running under WoW64
-fn determine_process_architecture(process_handle: windows_sys::Win32::Foundation::HANDLE) -> Architecture {
-    use windows_sys::Win32::System::Threading::IsWow64Process;
-    
-    let mut is_wow64 = FALSE;
-    let result = unsafe { IsWow64Process(process_handle, &mut is_wow64) };
-    
+fn determine_process_architecture(process_handle: windows_sys::Win32::Foundation::HANDLE) -> Result<Architecture, PlatformError> {
+    let mut process_machine: u16 = IMAGE_FILE_MACHINE_UNKNOWN;
+    let mut native_machine: u16 = IMAGE_FILE_MACHINE_UNKNOWN;
+
+    let result = unsafe { IsWow64Process2(process_handle, &mut process_machine, &mut native_machine) };
+
     if result == FALSE {
-        debug!("Failed to determine if process is WoW64, defaulting to X64");
-        return Architecture::X64;
+        let error = unsafe { GetLastError() };
+        error!("IsWow64Process2 failed with error code: {}, falling back to GetNativeSystemInfo", error);
+        return Err(PlatformError::OsError(format!("IsWow64Process2 failed: {} ({})", error, utils::error_message(error))));
     }
-    
-    // Get the system architecture
-    let mut system_info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
-    unsafe { GetNativeSystemInfo(&mut system_info) };
-    
-    let processor_architecture = unsafe { system_info.Anonymous.Anonymous.wProcessorArchitecture };
-    
-    match processor_architecture {
-        9 => { // PROCESSOR_ARCHITECTURE_AMD64
-            if is_wow64 != FALSE {
-                // 32-bit process on 64-bit system - we'll consider this as X64 for debugging purposes
-                Architecture::X64
+
+    match native_machine {
+        IMAGE_FILE_MACHINE_AMD64 => {
+            if process_machine == IMAGE_FILE_MACHINE_UNKNOWN {
+                // Not a WOW64 process, so it's a native 64-bit process
+                Ok(Architecture::X64)
             } else {
-                // 64-bit process on 64-bit system
-                Architecture::X64
+                // This is a 32-bit process on a 64-bit system. For our purposes, we'll treat it as X64
+                // as the debugging APIs will behave as if it's a 64-bit process.
+                Ok(Architecture::X64)
             }
         }
-        12 => { // PROCESSOR_ARCHITECTURE_ARM64
-            if is_wow64 != FALSE {
-                // 32-bit process on ARM64 system
-                Architecture::Arm64
+        IMAGE_FILE_MACHINE_ARM64 => {
+             if process_machine == IMAGE_FILE_MACHINE_UNKNOWN {
+                // Not a WOW64 process, so it's a native 64-bit process
+                Ok(Architecture::Arm64)
             } else {
-                // 64-bit process on ARM64 system
-                Architecture::Arm64
+                // This is a 32-bit process on a 64-bit system.
+                Ok(Architecture::Arm64)
             }
         }
         _ => {
-            debug!("Unknown processor architecture: {}, defaulting to X64", processor_architecture);
-            Architecture::X64
+            error!("Unknown native machine type: {}, defaulting to X64", native_machine);
+            Err(PlatformError::OsError(format!("Unknown native machine type: {}", native_machine)))
         }
     }
 }
@@ -105,8 +101,14 @@ pub(super) fn launch(platform: &mut WindowsPlatform, command: &str) -> Result<Op
     let pid = process_info.dwProcessId;
     let process_handle = process_info.hProcess;
     
+    // Initialize the symbol handler for this process
+    if unsafe { SymInitialize(process_handle, ptr::null(), TRUE) } == FALSE {
+        let error = unsafe { GetLastError() };
+        warn!(pid, "Failed to initialize symbol handler, error code: {}", error);
+    }
+    
     // Determine the architecture of the process
-    let architecture = determine_process_architecture(process_handle);
+    let architecture = determine_process_architecture(process_handle)?;
     
     // Add the new process to the platform
     platform.add_process(pid, process_handle, architecture);
@@ -153,8 +155,14 @@ pub(super) fn attach(platform: &mut WindowsPlatform, pid: u32) -> Result<Option<
         // Extract the process handle from the debug event to add to our platform
         let process_handle = unsafe { debug_event.u.CreateProcessInfo.hProcess };
         
+        // Initialize the symbol handler for this process
+        if unsafe { SymInitialize(process_handle, ptr::null(), TRUE) } == FALSE {
+            let error = unsafe { GetLastError() };
+            warn!(pid, "Failed to initialize symbol handler, error code: {}", error);
+        }
+        
         // Determine the architecture of the process
-        let architecture = determine_process_architecture(process_handle);
+        let architecture = determine_process_architecture(process_handle)?;
         
         platform.add_process(pid, process_handle, architecture);
         
@@ -164,6 +172,16 @@ pub(super) fn attach(platform: &mut WindowsPlatform, pid: u32) -> Result<Option<
         // We should probably continue the event we received...
         unsafe { ContinueDebugEvent(debug_event.dwProcessId, debug_event.dwThreadId, DBG_CONTINUE); }
         Err(PlatformError::Other("Unexpected debug event after attach".to_string()))
+    }
+}
+
+pub(super) fn cleanup_process(platform: &mut WindowsPlatform, pid: u32) {
+    let process = platform.get_process(pid).unwrap();
+    let process_handle = process.process_handle.0;
+
+    if unsafe { SymCleanup(process_handle) } == FALSE {
+        let error = unsafe { GetLastError() };
+        warn!("Failed to cleanup symbol handler, error code: {}", error);
     }
 }
 
