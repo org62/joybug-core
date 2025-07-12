@@ -165,34 +165,54 @@ fn initialize_stack_frame_with_context(
     match context {
         #[cfg(windows)]
         crate::protocol::ThreadContext::Win32RawContext(ctx) => {
-            match architecture {
-                Architecture::X64 => {
-                    // Initialize PC (Program Counter / Instruction Pointer)
-                    stack_frame.AddrPC.Offset = ctx.Rip;
-                    stack_frame.AddrPC.Mode = AddrModeFlat;
-                    
-                    // Initialize Stack Pointer
-                    stack_frame.AddrStack.Offset = ctx.Rsp;
-                    stack_frame.AddrStack.Mode = AddrModeFlat;
-                    
-                    // Initialize Frame Pointer
-                    stack_frame.AddrFrame.Offset = ctx.Rbp;
-                    stack_frame.AddrFrame.Mode = AddrModeFlat;
-                    
-                    // Initialize Return Address (crucial for stack walking)
-                    stack_frame.AddrReturn.Offset = 0;
-                    stack_frame.AddrReturn.Mode = AddrModeFlat;
-                    
-                    debug!("Initialized stack frame: IP=0x{:016x}, SP=0x{:016x}, FP=0x{:016x}", 
-                           ctx.Rip, ctx.Rsp, ctx.Rbp);
-                           
-                    Ok((stack_frame, *ctx))
+            #[cfg(target_arch = "x86_64")]
+            {
+                if architecture != Architecture::X64 {
+                    return Err(PlatformError::NotImplemented);
                 }
-                Architecture::Arm64 => {
-                    // ARM64 support is more complex due to different context structure
-                    // For now, return an error for ARM64
-                    Err(PlatformError::NotImplemented)
+
+                stack_frame.AddrPC.Offset = ctx.Rip;
+                stack_frame.AddrPC.Mode = AddrModeFlat;
+                stack_frame.AddrStack.Offset = ctx.Rsp;
+                stack_frame.AddrStack.Mode = AddrModeFlat;
+                stack_frame.AddrFrame.Offset = ctx.Rbp;
+                stack_frame.AddrFrame.Mode = AddrModeFlat;
+                stack_frame.AddrReturn.Offset = 0;
+                stack_frame.AddrReturn.Mode = AddrModeFlat;
+
+                debug!("Initialized stack frame: IP=0x{:016x}, SP=0x{:016x}, FP=0x{:016x}", 
+                       ctx.Rip, ctx.Rsp, ctx.Rbp);
+                       
+                Ok((stack_frame, *ctx))
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                if architecture != Architecture::Arm64 {
+                    return Err(PlatformError::NotImplemented);
                 }
+
+                stack_frame.AddrPC.Offset = ctx.Pc;
+                stack_frame.AddrPC.Mode = AddrModeFlat;
+                stack_frame.AddrStack.Offset = ctx.Sp;
+                stack_frame.AddrStack.Mode = AddrModeFlat;
+                // The CONTEXT struct for ARM64 has an anonymous union.
+                // We need to access Fp (Frame Pointer) and Lr (Link Register) through it.
+                // Fp is X29, Lr is X30.
+                unsafe {
+                    stack_frame.AddrFrame.Offset = ctx.Anonymous.Anonymous.Fp;
+                    stack_frame.AddrReturn.Offset = ctx.Anonymous.Anonymous.Lr;
+                }
+                stack_frame.AddrFrame.Mode = AddrModeFlat;
+                stack_frame.AddrReturn.Mode = AddrModeFlat;
+
+                debug!("Initialized stack frame: IP=0x{:016x}, SP=0x{:016x}, FP=0x{:016x}", 
+                       ctx.Pc, ctx.Sp, unsafe { ctx.Anonymous.Anonymous.Fp });
+                       
+                Ok((stack_frame, *ctx))
+            }
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            {
+                Err(PlatformError::NotImplemented)
             }
         }
     }
