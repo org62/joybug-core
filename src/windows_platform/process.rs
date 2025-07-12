@@ -1,12 +1,12 @@
 use super::WindowsPlatform;
 use super::utils;
 use super::debug_events;
-use crate::interfaces::PlatformError;
+use crate::interfaces::{PlatformError, Architecture};
 use crate::protocol::{ProcessInfo};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
-use tracing::{trace, error};
+use tracing::{trace, error, debug};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, FALSE, DBG_CONTINUE, INVALID_HANDLE_VALUE
 };
@@ -22,9 +22,56 @@ use windows_sys::Win32::System::Threading::{
     CreateProcessW,
     DEBUG_PROCESS, INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
 };
+use windows_sys::Win32::System::SystemInformation::{
+    GetNativeSystemInfo, SYSTEM_INFO,
+};
 
 fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(Some(0)).collect()
+}
+
+/// Determine the architecture of a process by checking if it's running under WoW64
+fn determine_process_architecture(process_handle: windows_sys::Win32::Foundation::HANDLE) -> Architecture {
+    use windows_sys::Win32::System::Threading::IsWow64Process;
+    
+    let mut is_wow64 = FALSE;
+    let result = unsafe { IsWow64Process(process_handle, &mut is_wow64) };
+    
+    if result == FALSE {
+        debug!("Failed to determine if process is WoW64, defaulting to X64");
+        return Architecture::X64;
+    }
+    
+    // Get the system architecture
+    let mut system_info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+    unsafe { GetNativeSystemInfo(&mut system_info) };
+    
+    let processor_architecture = unsafe { system_info.Anonymous.Anonymous.wProcessorArchitecture };
+    
+    match processor_architecture {
+        9 => { // PROCESSOR_ARCHITECTURE_AMD64
+            if is_wow64 != FALSE {
+                // 32-bit process on 64-bit system - we'll consider this as X64 for debugging purposes
+                Architecture::X64
+            } else {
+                // 64-bit process on 64-bit system
+                Architecture::X64
+            }
+        }
+        12 => { // PROCESSOR_ARCHITECTURE_ARM64
+            if is_wow64 != FALSE {
+                // 32-bit process on ARM64 system
+                Architecture::Arm64
+            } else {
+                // 64-bit process on ARM64 system
+                Architecture::Arm64
+            }
+        }
+        _ => {
+            debug!("Unknown processor architecture: {}, defaulting to X64", processor_architecture);
+            Architecture::X64
+        }
+    }
 }
 
 pub(super) fn launch(platform: &mut WindowsPlatform, command: &str) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
@@ -58,8 +105,11 @@ pub(super) fn launch(platform: &mut WindowsPlatform, command: &str) -> Result<Op
     let pid = process_info.dwProcessId;
     let process_handle = process_info.hProcess;
     
+    // Determine the architecture of the process
+    let architecture = determine_process_architecture(process_handle);
+    
     // Add the new process to the platform
-    platform.add_process(pid, process_handle);
+    platform.add_process(pid, process_handle, architecture);
     
     // Immediately run the debug loop for the new process
     let mut debug_event: DEBUG_EVENT = unsafe { std::mem::zeroed() };
@@ -102,7 +152,11 @@ pub(super) fn attach(platform: &mut WindowsPlatform, pid: u32) -> Result<Option<
     if debug_event.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT {
         // Extract the process handle from the debug event to add to our platform
         let process_handle = unsafe { debug_event.u.CreateProcessInfo.hProcess };
-        platform.add_process(pid, process_handle);
+        
+        // Determine the architecture of the process
+        let architecture = determine_process_architecture(process_handle);
+        
+        platform.add_process(pid, process_handle, architecture);
         
         debug_events::handle_create_process_event(platform, &debug_event, None).map(Some)
     } else {

@@ -1,9 +1,40 @@
 #![cfg(windows)]
 
-use joybug2::protocol::{DebuggerResponse, DebugEvent};
+use joybug2::protocol::{DebuggerResponse, DebugEvent, DebuggerRequest};
 use joybug2::protocol_io::DebugClient;
 use std::thread;
 use tokio;
+
+fn print_call_stack(client: &mut DebugClient, event: &DebugEvent) {
+    let pid = event.pid();
+    let tid = event.tid();
+    if pid != 0 && tid != 0 {
+        println!("Requesting call stack for PID: {}, TID: {}", pid, tid);
+        match client.send_and_receive(&DebuggerRequest::GetCallStack { pid, tid }) {
+            Ok(DebuggerResponse::CallStack { frames }) => {
+                println!("Call Stack ({} frames):", frames.len());
+                for (i, frame) in frames.iter().enumerate() {
+                    if let Some(symbol) = &frame.symbol {
+                        println!("  #{}: 0x{:016x} - {}", i, frame.instruction_pointer, symbol.format_symbol());
+                    } else {
+                        println!("  #{}: 0x{:016x}", i, frame.instruction_pointer);
+                    }
+                }
+            }
+            Ok(DebuggerResponse::Error { message }) => {
+                println!("Call stack error: {}", message);
+            }
+            Ok(other) => {
+                println!("Unexpected response to GetCallStack: {:?}", other);
+            }
+            Err(e) => {
+                println!("Failed to get call stack: {}", e);
+            }
+        }
+    } else {
+        println!("Skipping call stack request for event without valid PID/TID");
+    }
+}
 
 #[test]
 fn test_debug_client_event_collection() {
@@ -18,10 +49,15 @@ fn test_debug_client_event_collection() {
     }
     let mut state = TestState { events: Vec::new() };
 
-    client.launch("cmd.exe /c echo test".to_string(), &mut state, |_client, state, resp| {
+    client.launch("cmd.exe /c echo test".to_string(), &mut state, |client, state, resp| {
         match resp {
             DebuggerResponse::Event { event } => {
+                println!("=== Debug Event: {} ===", event);
                 state.events.push(event.clone());
+                
+                // Get and print call stack for this event
+                print_call_stack(client, &event);
+                println!();
             }
             _ => {}
         }

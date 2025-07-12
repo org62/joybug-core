@@ -4,8 +4,12 @@ use crate::protocol::ThreadContext;
 use tracing::{error, trace};
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    GetThreadContext, SetThreadContext, CONTEXT, CONTEXT_FULL_AMD64,
+    GetThreadContext, SetThreadContext, CONTEXT,
 };
+
+// Context flags for x64 architecture
+const CONTEXT_CONTROL: u32 = 0x00100001;
+const CONTEXT_INTEGER: u32 = 0x00100002;
 
 pub(super) fn get_thread_context(
     platform: &mut WindowsPlatform,
@@ -24,7 +28,10 @@ pub(super) fn get_thread_context(
         let mut aligned_context = AlignedContext {
             context: unsafe { std::mem::zeroed() },
         };
-        aligned_context.context.ContextFlags = CONTEXT_FULL_AMD64;
+        // Use CONTEXT_CONTROL | CONTEXT_INTEGER for proper stack walking
+        // CONTEXT_CONTROL gives us IP, SP, BP and segment registers
+        // CONTEXT_INTEGER gives us general purpose registers
+        aligned_context.context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
         let ok = unsafe { GetThreadContext(thread_handle, &mut aligned_context.context) };
         if ok == 0 {
             let error = unsafe { GetLastError() };

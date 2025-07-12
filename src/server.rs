@@ -147,6 +147,12 @@ fn handle_connection(mut stream: std::net::TcpStream, platform: Arc<Mutex<Platfo
                         Err(e) => DebuggerResponse::Error { message: e.to_string() },
                     }
                 }
+                Ok(DebuggerRequest::GetCallStack { pid, tid }) => {
+                    match platform.get_call_stack(pid, tid) {
+                        Ok(frames) => DebuggerResponse::CallStack { frames },
+                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                    }
+                }
                 Err(e) => DebuggerResponse::Error { message: format!("Invalid request: {}", e) },
             }
         };

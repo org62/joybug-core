@@ -26,6 +26,7 @@ mod request_response {
         ResolveRvaToSymbol { module_path: String, rva: u32 },
         ResolveAddressToSymbol { pid: u32, address: u64 },
         DisassembleMemory { pid: u32, address: u64, count: usize, arch: crate::interfaces::Architecture },
+        GetCallStack { pid: u32, tid: u32 },
         // ... add more as needed
     }
 
@@ -48,6 +49,8 @@ mod request_response {
         AddressSymbol { module_path: Option<String>, symbol: Option<crate::interfaces::Symbol>, offset: Option<u64> },
         // Disassembly responses
         Instructions { instructions: Vec<crate::interfaces::Instruction> },
+        // Call stack responses
+        CallStack { frames: Vec<crate::interfaces::CallFrame> },
         // ... add more as needed
     }
 

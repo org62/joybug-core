@@ -8,6 +8,7 @@ mod thread_context;
 mod symbol_manager;
 mod symbol_provider;
 pub mod disassembler;
+mod callstack;
 
 use crate::interfaces::{PlatformAPI, PlatformError, Symbol, SymbolError, Architecture, DisassemblerError, Instruction, DisassemblerProvider};
 use crate::protocol::{ModuleInfo, ProcessInfo, ThreadInfo};
@@ -44,14 +45,16 @@ struct AlignedContext {
 #[derive(Debug)]
 pub(crate) struct DebuggedProcess {
     pub(crate) process_handle: HandleSafe,
+    pub(crate) architecture: Architecture,
     pub(crate) module_manager: ModuleManager,
     pub(crate) thread_manager: ThreadManager,
 }
 
 impl DebuggedProcess {
-    pub fn new(_pid: u32, process_handle: HANDLE) -> Self {
+    pub fn new(_pid: u32, process_handle: HANDLE, architecture: Architecture) -> Self {
         Self {
             process_handle: HandleSafe(process_handle),
+            architecture,
             module_manager: ModuleManager::new(),
             thread_manager: ThreadManager::new(),
         }
@@ -91,8 +94,8 @@ impl WindowsPlatform {
     }
     
     /// Add a new debugged process
-    pub(crate) fn add_process(&mut self, pid: u32, process_handle: HANDLE) {
-        let process = DebuggedProcess::new(pid, process_handle);
+    pub(crate) fn add_process(&mut self, pid: u32, process_handle: HANDLE, architecture: Architecture) {
+        let process = DebuggedProcess::new(pid, process_handle, architecture);
         self.processes.insert(pid, process);
     }
     
@@ -237,5 +240,9 @@ impl PlatformAPI for WindowsPlatform {
         
         // Now safely access the disassembler with symbol resolution
         self.disassembler.as_ref().unwrap().disassemble_with_symbols(arch, &data, address, count, symbol_resolver)
+    }
+    
+    fn get_call_stack(&mut self, pid: u32, tid: u32) -> Result<Vec<crate::interfaces::CallFrame>, PlatformError> {
+        callstack::get_call_stack(self, pid, tid)
     }
 } 
