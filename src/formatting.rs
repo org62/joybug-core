@@ -2,6 +2,33 @@ use crate::protocol::*;
 use crate::interfaces::*;
 
 // Protocol Display and Debug implementations
+impl std::fmt::Debug for DebuggerResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DebuggerResponse::CallStack { frames } => {
+                let mut ds = f.debug_struct("CallStack");
+                ds.field("frames", &frames.iter().map(|frame| format!("{}", frame)).collect::<Vec<_>>());
+                ds.finish()
+            }
+            // Add other variants here, using a default debug format
+            DebuggerResponse::Ack => write!(f, "Ack"),
+            DebuggerResponse::Error { message } => f.debug_struct("Error").field("message", message).finish(),
+            DebuggerResponse::Event { event } => f.debug_struct("Event").field("event", event).finish(),
+            DebuggerResponse::MemoryData { data } => f.debug_struct("MemoryData").field("data", data).finish(),
+            DebuggerResponse::WriteAck => write!(f, "WriteAck"),
+            DebuggerResponse::ThreadContext { context } => f.debug_struct("ThreadContext").field("context", context).finish(),
+            DebuggerResponse::SetContextAck => write!(f, "SetContextAck"),
+            DebuggerResponse::ModuleList { modules } => f.debug_struct("ModuleList").field("modules", modules).finish(),
+            DebuggerResponse::ThreadList { threads } => f.debug_struct("ThreadList").field("threads", threads).finish(),
+            DebuggerResponse::ProcessList { processes } => f.debug_struct("ProcessList").field("processes", processes).finish(),
+            DebuggerResponse::Symbol { symbol } => f.debug_struct("Symbol").field("symbol", symbol).finish(),
+            DebuggerResponse::SymbolList { symbols } => f.debug_struct("SymbolList").field("symbols", symbols).finish(),
+            DebuggerResponse::AddressSymbol { module_path, symbol, offset } => f.debug_struct("AddressSymbol").field("module_path", module_path).field("symbol", symbol).field("offset", offset).finish(),
+            DebuggerResponse::Instructions { instructions } => f.debug_struct("Instructions").field("instructions", instructions).finish(),
+        }
+    }
+}
+
 impl std::fmt::Debug for ModuleInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut ds = f.debug_struct("ModuleInfo");
@@ -230,5 +257,19 @@ impl std::fmt::Display for Instruction {
         };
         
         write!(f, "{}: {} {}", address_str, bytes_padded, instruction_str)
+    }
+} 
+
+impl std::fmt::Display for CallFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(ref sym) = self.symbol {
+            write!(
+                f,
+                "0x{:016x} {}!{}+0x{:x}",
+                self.instruction_pointer, sym.module_name, sym.symbol_name, sym.offset
+            )
+        } else {
+            write!(f, "0x{:016x}", self.instruction_pointer)
+        }
     }
 } 

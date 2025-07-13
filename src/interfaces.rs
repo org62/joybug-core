@@ -62,6 +62,14 @@ pub struct SymbolInfo {
     pub offset: u64,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CallFrame {
+    pub instruction_pointer: u64,
+    pub stack_pointer: u64,
+    pub frame_pointer: u64,
+    pub symbol: Option<SymbolInfo>,
+}
+
 pub trait InstructionFormatter {
     fn format_disassembly(&self) -> String;
 }
@@ -190,6 +198,9 @@ pub trait PlatformAPI: Send + Sync {
     
     // Symbolized disassembly methods
     fn disassemble_memory(&mut self, pid: u32, address: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError>;
+    
+    // Call stack methods
+    fn get_call_stack(&mut self, pid: u32, tid: u32) -> Result<Vec<CallFrame>, PlatformError>;
     
     // ... add more as needed
 }

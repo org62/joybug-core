@@ -1,7 +1,7 @@
 use super::WindowsPlatform;
 use super::utils;
 use super::debug_events;
-use crate::interfaces::PlatformError;
+use crate::interfaces::{PlatformError, Architecture};
 use crate::protocol::{ProcessInfo};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
@@ -19,12 +19,55 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW,
+    CreateProcessW, IsWow64Process2,
     DEBUG_PROCESS, INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
+};
+use windows_sys::Win32::System::SystemInformation::{
+    IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_UNKNOWN
 };
 
 fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(Some(0)).collect()
+}
+
+/// Determine the architecture of a process by checking if it's running under WoW64
+fn determine_process_architecture(process_handle: windows_sys::Win32::Foundation::HANDLE) -> Result<Architecture, PlatformError> {
+    let mut process_machine: u16 = IMAGE_FILE_MACHINE_UNKNOWN;
+    let mut native_machine: u16 = IMAGE_FILE_MACHINE_UNKNOWN;
+
+    let result = unsafe { IsWow64Process2(process_handle, &mut process_machine, &mut native_machine) };
+
+    if result == FALSE {
+        let error = unsafe { GetLastError() };
+        error!("IsWow64Process2 failed with error code: {}, falling back to GetNativeSystemInfo", error);
+        return Err(PlatformError::OsError(format!("IsWow64Process2 failed: {} ({})", error, utils::error_message(error))));
+    }
+
+    match native_machine {
+        IMAGE_FILE_MACHINE_AMD64 => {
+            if process_machine == IMAGE_FILE_MACHINE_UNKNOWN {
+                // Not a WOW64 process, so it's a native 64-bit process
+                Ok(Architecture::X64)
+            } else {
+                // This is a 32-bit process on a 64-bit system. For our purposes, we'll treat it as X64
+                // as the debugging APIs will behave as if it's a 64-bit process.
+                Ok(Architecture::X64)
+            }
+        }
+        IMAGE_FILE_MACHINE_ARM64 => {
+             if process_machine == IMAGE_FILE_MACHINE_UNKNOWN {
+                // Not a WOW64 process, so it's a native 64-bit process
+                Ok(Architecture::Arm64)
+            } else {
+                // This is a 32-bit process on a 64-bit system.
+                Ok(Architecture::Arm64)
+            }
+        }
+        _ => {
+            error!("Unknown native machine type: {}, defaulting to X64", native_machine);
+            Err(PlatformError::OsError(format!("Unknown native machine type: {}", native_machine)))
+        }
+    }
 }
 
 pub(super) fn launch(platform: &mut WindowsPlatform, command: &str) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
@@ -58,8 +101,11 @@ pub(super) fn launch(platform: &mut WindowsPlatform, command: &str) -> Result<Op
     let pid = process_info.dwProcessId;
     let process_handle = process_info.hProcess;
     
+    // Determine the architecture of the process
+    let architecture = determine_process_architecture(process_handle)?;
+    
     // Add the new process to the platform
-    platform.add_process(pid, process_handle);
+    platform.add_process(pid, process_handle, architecture)?;
     
     // Immediately run the debug loop for the new process
     let mut debug_event: DEBUG_EVENT = unsafe { std::mem::zeroed() };
@@ -102,7 +148,11 @@ pub(super) fn attach(platform: &mut WindowsPlatform, pid: u32) -> Result<Option<
     if debug_event.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT {
         // Extract the process handle from the debug event to add to our platform
         let process_handle = unsafe { debug_event.u.CreateProcessInfo.hProcess };
-        platform.add_process(pid, process_handle);
+        
+        // Determine the architecture of the process
+        let architecture = determine_process_architecture(process_handle)?;
+        
+        platform.add_process(pid, process_handle, architecture)?;
         
         debug_events::handle_create_process_event(platform, &debug_event, None).map(Some)
     } else {
