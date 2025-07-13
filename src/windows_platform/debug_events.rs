@@ -245,9 +245,7 @@ pub(super) fn continue_exec(
             let info = unsafe { debug_event.u.LoadDll };
             let dll_name =
                 utils::get_path_from_handle(info.hFile).unwrap_or_else(|| "<unknown>".to_string());
-            unsafe {
-                CloseHandle(info.hFile);
-            }
+
             let process = platform.get_process(debug_event.dwProcessId)?;
             let h_process = process.process_handle.0;
             let size_of_dll =
