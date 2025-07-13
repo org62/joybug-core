@@ -44,7 +44,7 @@ pub fn get_call_stack(
     
     for i in 0..MAX_STACK_FRAMES {
         let result = unsafe {
-            StackWalk2(
+            StackWalk64(
                 machine_type,
                 process_handle,
                 thread_handle,
@@ -53,14 +53,12 @@ pub fn get_call_stack(
                 Some(read_process_memory_proc),
                 Some(SymFunctionTableAccess64),
                 Some(SymGetModuleBase64),
-                None, // No translation function
-                None, // No symbol search callback
-                SYM_STKWALK_DEFAULT,
+                None,
             )
         };
         
         if result == FALSE {
-            debug!("StackWalk2 returned FALSE, end of stack after {} frames", i);
+            debug!("StackWalk64 returned FALSE, end of stack after {} frames", i);
             break;
         }
         
@@ -133,8 +131,8 @@ fn is_valid_instruction_pointer(ip: u64, modules: &[crate::protocol::ModuleInfo]
 fn initialize_stack_frame_with_context(
     context: &crate::protocol::ThreadContext,
     architecture: Architecture,
-) -> Result<(STACKFRAME_EX, windows_sys::Win32::System::Diagnostics::Debug::CONTEXT), PlatformError> {
-    let mut stack_frame: STACKFRAME_EX = unsafe { mem::zeroed() };
+) -> Result<(STACKFRAME64, windows_sys::Win32::System::Diagnostics::Debug::CONTEXT), PlatformError> {
+    let mut stack_frame: STACKFRAME64 = unsafe { mem::zeroed() };
     
     match context {
         #[cfg(windows)]
