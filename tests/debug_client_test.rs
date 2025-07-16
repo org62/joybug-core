@@ -34,6 +34,49 @@ fn get_call_stack(client: &mut DebugClient, event: &DebugEvent) -> Option<Vec<Ca
     }
 }
 
+fn test_symbol_search(client: &mut DebugClient, event: &DebugEvent) {
+    // Search symbols by name, *Query*
+    if let DebugEvent::ProcessExited { .. } = &event {
+        println!("=== Searching for symbols in ntdll.dll ===");
+        
+        // Test symbol search with actual ntdll functions
+        let test_symbols = vec![
+            "ntdll!NtCreateFile",
+            "NtReadFile", 
+            "ntdll!Nt",
+            "LdrInitializeThunk"
+        ];
+        
+        for symbol_name in test_symbols {
+            match client.send_and_receive(&DebuggerRequest::FindSymbol { 
+                symbol_name: symbol_name.to_string(), 
+                max_results: 5 
+            }) {
+                Ok(DebuggerResponse::ResolvedSymbolList { symbols }) => {
+                    assert!(symbols.len() > 0, "Expected to find at least one symbol matching '{}'", symbol_name);
+                    println!("Found {} symbols matching '{}':", symbols.len(), symbol_name);
+                    for (i, symbol) in symbols.iter().enumerate() {
+                        println!("  {}: {} (Module: {}, RVA: 0x{:x}, VA: 0x{:x})", 
+                            i + 1, symbol.name, symbol.module_name, symbol.rva, symbol.va);
+                    }
+                    if symbols.is_empty() {
+                        panic!("  No symbols found for '{}'", symbol_name);
+                    }
+                }
+                Ok(DebuggerResponse::Error { message }) => {
+                    panic!("Symbol search error for '{}': {}", symbol_name, message);
+                }
+                Ok(other) => {
+                    panic!("Unexpected response to FindSymbol for '{}': {:?}", symbol_name, other);
+                }
+                Err(e) => {
+                    panic!("Failed to search symbols for '{}': {}", symbol_name, e);
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn test_debug_client_event_collection() {
     joybug2::init_tracing();
@@ -60,6 +103,8 @@ fn test_debug_client_event_collection() {
                 }
                 state.events.push(event.clone());
                 println!();
+
+                test_symbol_search(client, &event);
             }
             _ => {}
         }
