@@ -21,7 +21,7 @@ mod request_response {
         ListThreads { pid: u32 },
         ListProcesses,
         // Symbol-related requests
-        FindSymbol { module_path: String, symbol_name: String },
+        FindSymbol { symbol_name: String, max_results: usize },
         ListSymbols { module_path: String },
         ResolveRvaToSymbol { module_path: String, rva: u32 },
         ResolveAddressToSymbol { pid: u32, address: u64 },
@@ -44,9 +44,10 @@ mod request_response {
         ThreadList { threads: Vec<ThreadInfo> },
         ProcessList { processes: Vec<ProcessInfo> },
         // Symbol-related responses
-        Symbol { symbol: Option<crate::interfaces::Symbol> },
-        SymbolList { symbols: Vec<crate::interfaces::Symbol> },
-        AddressSymbol { module_path: Option<String>, symbol: Option<crate::interfaces::Symbol>, offset: Option<u64> },
+        Symbol { symbol: Option<crate::interfaces::ModuleSymbol> },
+        SymbolList { symbols: Vec<crate::interfaces::ModuleSymbol> },
+        ResolvedSymbolList { symbols: Vec<crate::interfaces::ResolvedSymbol> },
+        AddressSymbol { module_path: Option<String>, symbol: Option<crate::interfaces::ModuleSymbol>, offset: Option<u64> },
         // Disassembly responses
         Instructions { instructions: Vec<crate::interfaces::Instruction> },
         // Call stack responses

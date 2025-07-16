@@ -1,15 +1,16 @@
-use crate::interfaces::{Symbol, SymbolError, SymbolProvider};
+use crate::interfaces::{ModuleSymbol, ResolvedSymbol, SymbolError, SymbolProvider};
 use crate::protocol::ModuleInfo;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use tracing::{trace, warn};
-use super::symbol_provider::WindowsSymbolProvider;
+use crate::windows_platform::symbol_provider::WindowsSymbolProvider;
 
 /// Cached symbols for a single module with RVA-based storage
 #[derive(Debug, Clone)]
 pub struct ModuleSymbols {
-    pub symbols: Vec<Symbol>, // All symbols stored as RVAs
+    pub module_base: u64, // Base address where the module is loaded
+    pub symbols: Vec<ModuleSymbol>, // All symbols stored as RVAs
 }
 
 /// Manages symbol loading for modules in the Windows platform
@@ -64,6 +65,7 @@ impl SymbolManager {
                     if let Ok(symbols) = temp_provider.list_symbols(&module_path_for_task) {
                         let mut cache_guard = cache.lock().unwrap();
                         let module_symbols = ModuleSymbols {
+                            module_base: module_base,
                             symbols: symbols.clone(),
                         };
                         cache_guard.insert(module_path_for_task.clone(), module_symbols);
@@ -125,44 +127,92 @@ impl SymbolManager {
         Ok(())
     }
 
-    /// Find a symbol in the specified module, waiting for loading to complete if necessary
-    pub fn find_symbol(&self, module_path: &str, symbol_name: &str) -> Result<Option<Symbol>, SymbolError> {
-        self.wait_for_loading(module_path)?;
-        
+    /// Find symbols across all loaded modules, returning up to max_results matches
+    /// Supports Windows-style "module!symbol" format (e.g., "ntdll!NtCreateFile")
+    pub fn find_symbol_across_all_modules(&self, symbol_name: &str, max_results: usize) -> Result<Vec<ResolvedSymbol>, SymbolError> {
         let cache = self.symbol_cache.lock().unwrap();
-        if let Some(module_symbols) = cache.get(module_path) {
-            let found_symbol = module_symbols.symbols.iter().find(|s| s.name == symbol_name).cloned();
-            trace!(module_path, symbol_name, found = found_symbol.is_some(), "Symbol lookup completed");
-            Ok(found_symbol)
-        } else {
-            trace!(module_path, symbol_name, "No symbols loaded for module");
-            Ok(None)
-        }
-    }
-
-    /// List all symbols in the specified module, waiting for loading to complete if necessary
-    pub fn list_symbols(&self, module_path: &str) -> Result<Vec<Symbol>, SymbolError> {
-        self.wait_for_loading(module_path)?;
+        let mut found_symbols = Vec::new();
         
-        let cache = self.symbol_cache.lock().unwrap();
-        if let Some(module_symbols) = cache.get(module_path) {
-            trace!(module_path, count = module_symbols.symbols.len(), "Symbol listing completed");
-            Ok(module_symbols.symbols.clone())
+        // Check if the symbol name contains module specification (module!symbol format)
+        if let Some(exclamation_pos) = symbol_name.find('!') {
+            let (target_module_name, target_symbol_name) = symbol_name.split_at(exclamation_pos);
+            let target_symbol_name = &target_symbol_name[1..]; // Skip the '!' character
+            
+            // Search only in the specified module
+            for (module_path, module_symbols) in cache.iter() {
+                // Extract module name from path
+                let module_name = std::path::Path::new(module_path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(module_path);
+                
+                // Check if this is the target module (case-insensitive)
+                if module_name.to_lowercase() == target_module_name.to_lowercase() {
+                    // Find all matching symbols in this specific module
+                    for symbol in &module_symbols.symbols {
+                        if symbol.name.to_lowercase().contains(&target_symbol_name.to_lowercase()) {
+                            let symbol_name_with_module = format!("{}!{}", module_name, symbol.name);
+                            found_symbols.push(ResolvedSymbol { 
+                                name: symbol_name_with_module, 
+                                module_name: module_name.to_string(),
+                                rva: symbol.rva,
+                                va: module_symbols.module_base + symbol.rva as u64,
+                            });
+                            
+                            // Stop if we've reached the maximum number of results
+                            if found_symbols.len() >= max_results {
+                                trace!(symbol_name, found_count = found_symbols.len(), max_results, "Module-specific symbol search completed (max results reached)");
+                                return Ok(found_symbols);
+                            }
+                        }
+                    }
+                    break; // We found the target module, no need to continue
+                }
+            }
         } else {
-            trace!(module_path, "No symbols loaded for module");
-            Ok(Vec::new())
+            // Search through all loaded modules (original behavior with contains matching)
+            for (_module_path, module_symbols) in cache.iter() {
+                // Extract module name from path
+                let module_name = std::path::Path::new(_module_path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(_module_path)
+                    .to_string();
+                    
+                // Find all matching symbols in this module (contains-based search)
+                for symbol in &module_symbols.symbols {
+                    if symbol.name.to_lowercase().contains(&symbol_name.to_lowercase()) {
+                        let symbol_name_with_module = format!("{}!{}", module_name, symbol.name);
+                        found_symbols.push(ResolvedSymbol { 
+                            name: symbol_name_with_module, 
+                            module_name: module_name.clone(),
+                            rva: symbol.rva,
+                            va: module_symbols.module_base + symbol.rva as u64,
+                        });
+                        
+                        // Stop if we've reached the maximum number of results
+                        if found_symbols.len() >= max_results {
+                            trace!(symbol_name, found_count = found_symbols.len(), max_results, "Symbol search completed (max results reached)");
+                            return Ok(found_symbols);
+                        }
+                    }
+                }
+            }
         }
+        
+        trace!(symbol_name, found_count = found_symbols.len(), max_results, "Symbol search completed");
+        Ok(found_symbols)
     }
 
     /// Resolve an RVA to a symbol, waiting for loading to complete if necessary
     /// This method works directly with RVAs since symbols are stored as RVAs
-    pub fn resolve_rva_to_symbol(&self, module_path: &str, rva: u32) -> Result<Option<Symbol>, SymbolError> {
+    pub fn resolve_rva_to_symbol(&self, module_path: &str, rva: u32) -> Result<Option<ResolvedSymbol>, SymbolError> {
         self.wait_for_loading(module_path)?;
         
         let cache = self.symbol_cache.lock().unwrap();
         if let Some(module_symbols) = cache.get(module_path) {
             // Find the symbol with the highest RVA that is still <= the target RVA
-            let mut best_match: Option<&Symbol> = None;
+            let mut best_match: Option<&ModuleSymbol> = None;
             for symbol in &module_symbols.symbols {
                 if symbol.rva <= rva && (best_match.is_none() || symbol.rva > best_match.unwrap().rva) {
                     best_match = Some(symbol);
@@ -171,8 +221,23 @@ impl SymbolManager {
             
             match best_match {
                 Some(symbol) => {
-                    trace!(module_path, rva = format!("0x{:X}", rva), symbol_name = %symbol.name, symbol_rva = format!("0x{:X}", symbol.rva), offset = rva - symbol.rva, "RVA resolved to symbol");
-                    Ok(Some(symbol.clone()))
+                    // Extract module name from path
+                    let module_name = std::path::Path::new(module_path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(module_path)
+                        .to_string();
+                        
+                    // Calculate VA for the returned symbol
+                    let symbol_with_va = ResolvedSymbol {
+                        name: symbol.name.clone(),
+                        module_name,
+                        rva: symbol.rva,
+                        va: module_symbols.module_base + symbol.rva as u64,
+                    };
+                    
+                    trace!(module_path, rva = format!("0x{:X}", rva), symbol_name = %symbol.name, symbol_rva = format!("0x{:X}", symbol.rva), symbol_va = format!("0x{:X}", symbol_with_va.va), offset = rva - symbol.rva, "RVA resolved to symbol");
+                    Ok(Some(symbol_with_va))
                 }
                 None => {
                     trace!(module_path, rva = format!("0x{:X}", rva), "No symbol found for RVA");
@@ -187,7 +252,7 @@ impl SymbolManager {
 
     /// Resolve an absolute address to a symbol by finding the appropriate module
     /// This is the new implementation that properly uses RVA-based symbol storage
-    pub fn resolve_address_to_symbol(&self, modules: &[ModuleInfo], address: u64) -> Result<Option<(String, Symbol, u64)>, SymbolError> {
+    pub fn resolve_address_to_symbol(&self, modules: &[ModuleInfo], address: u64) -> Result<Option<(String, ResolvedSymbol, u64)>, SymbolError> {
         // Find the module that contains this address
         let containing_module = modules.iter().find(|module| {
             let module_end = module.base + module.size.unwrap_or(0);
@@ -218,5 +283,80 @@ impl SymbolManager {
         }
     }
     
+    /// List all symbols in the specified module as raw ModuleSymbols (without VA calculation)
+    pub fn list_symbols_raw(&self, module_path: &str) -> Result<Vec<ModuleSymbol>, SymbolError> {
+        self.wait_for_loading(module_path)?;
+        
+        let cache = self.symbol_cache.lock().unwrap();
+        if let Some(module_symbols) = cache.get(module_path) {
+            trace!(module_path, count = module_symbols.symbols.len(), "Raw symbol listing completed");
+            Ok(module_symbols.symbols.clone())
+        } else {
+            trace!(module_path, "No symbols loaded for module");
+            Ok(Vec::new())
+        }
+    }
+
+    /// Resolve an RVA to a symbol as raw ModuleSymbol (without VA calculation)
+    pub fn resolve_rva_to_symbol_raw(&self, module_path: &str, rva: u32) -> Result<Option<ModuleSymbol>, SymbolError> {
+        self.wait_for_loading(module_path)?;
+        
+        let cache = self.symbol_cache.lock().unwrap();
+        if let Some(module_symbols) = cache.get(module_path) {
+            // Find the symbol with the highest RVA that is still <= the target RVA
+            let mut best_match: Option<&ModuleSymbol> = None;
+            for symbol in &module_symbols.symbols {
+                if symbol.rva <= rva && (best_match.is_none() || symbol.rva > best_match.unwrap().rva) {
+                    best_match = Some(symbol);
+                }
+            }
+            
+            match best_match {
+                Some(symbol) => {
+                    trace!(module_path, rva = format!("0x{:X}", rva), symbol_name = %symbol.name, symbol_rva = format!("0x{:X}", symbol.rva), offset = rva - symbol.rva, "RVA resolved to raw symbol");
+                    Ok(Some(symbol.clone()))
+                }
+                None => {
+                    trace!(module_path, rva = format!("0x{:X}", rva), "No symbol found for RVA");
+                    Ok(None)
+                }
+            }
+        } else {
+            trace!(module_path, rva = format!("0x{:X}", rva), "No symbols loaded for module");
+            Err(SymbolError::ModuleNotLoaded(format!("Module {} not loaded", module_path)))
+        }
+    }
+
+    /// Resolve an absolute address to a raw ModuleSymbol (without VA calculation)
+    pub fn resolve_address_to_symbol_raw(&self, modules: &[ModuleInfo], address: u64) -> Result<Option<(String, ModuleSymbol, u64)>, SymbolError> {
+        // Find the module that contains this address
+        let containing_module = modules.iter().find(|module| {
+            let module_end = module.base + module.size.unwrap_or(0);
+            address >= module.base && address < module_end
+        });
+
+        if let Some(module) = containing_module {
+            // Calculate the RVA (Relative Virtual Address) from the module base
+            let rva = (address - module.base) as u32;
+            
+            // Use the RVA-based symbol resolution to get raw ModuleSymbol
+            match self.resolve_rva_to_symbol_raw(&module.name, rva)? {
+                Some(symbol) => {
+                    // Calculate offset from the symbol's RVA
+                    let offset_from_symbol = address - (module.base + symbol.rva as u64);
+                    // Extract only module name, not the full path
+                    let module_name = std::path::Path::new(&module.name)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&module.name)
+                        .to_string();
+                    Ok(Some((module_name, symbol, offset_from_symbol)))
+                }
+                None => Ok(None),
+            }
+        } else {
+            Ok(None)
+        }
+    }
 
 } 

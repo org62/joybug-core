@@ -33,9 +33,17 @@ pub enum SymbolError {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Symbol {
+pub struct ModuleSymbol {
     pub name: String,
     pub rva: u32, // Relative Virtual Address
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ResolvedSymbol {
+    pub name: String,
+    pub module_name: String,
+    pub rva: u32, // Relative Virtual Address  
+    pub va: u64,  // Virtual Address (module_base + rva)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -117,17 +125,17 @@ pub trait SymbolProvider: Send + Sync {
 
     fn find_symbol(
         &self,
-        module_path: &str,
         symbol_name: &str,
-    ) -> Result<Option<Symbol>, SymbolError>;
+        max_results: usize,
+    ) -> Result<Vec<ResolvedSymbol>, SymbolError>;
 
-    fn list_symbols(&self, module_path: &str) -> Result<Vec<Symbol>, SymbolError>;
+    fn list_symbols(&self, module_path: &str) -> Result<Vec<ModuleSymbol>, SymbolError>;
 
     fn resolve_rva_to_symbol(
         &self,
         module_path: &str,
         rva: u32,
-    ) -> Result<Option<Symbol>, SymbolError>;
+    ) -> Result<Option<ModuleSymbol>, SymbolError>;
 }
 
 pub trait DisassemblerProvider: Send + Sync {
@@ -191,10 +199,10 @@ pub trait PlatformAPI: Send + Sync {
     fn list_processes(&self) -> Result<Vec<ProcessInfo>, PlatformError>;
     
     // Symbol-related methods
-    fn find_symbol(&self, module_path: &str, symbol_name: &str) -> Result<Option<Symbol>, SymbolError>;
-    fn list_symbols(&self, module_path: &str) -> Result<Vec<Symbol>, SymbolError>;
-    fn resolve_rva_to_symbol(&self, module_path: &str, rva: u32) -> Result<Option<Symbol>, SymbolError>;
-    fn resolve_address_to_symbol(&self, pid: u32, address: u64) -> Result<Option<(String, Symbol, u64)>, SymbolError>; // Returns (module_path, symbol, offset_from_symbol)
+    fn find_symbol(&self, symbol_name: &str, max_results: usize) -> Result<Vec<ResolvedSymbol>, SymbolError>;
+    fn list_symbols(&self, module_path: &str) -> Result<Vec<ModuleSymbol>, SymbolError>;
+    fn resolve_rva_to_symbol(&self, module_path: &str, rva: u32) -> Result<Option<ModuleSymbol>, SymbolError>;
+    fn resolve_address_to_symbol(&self, pid: u32, address: u64) -> Result<Option<(String, ModuleSymbol, u64)>, SymbolError>; // Returns (module_path, symbol, offset_from_symbol)
     
     // Symbolized disassembly methods
     fn disassemble_memory(&mut self, pid: u32, address: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError>;

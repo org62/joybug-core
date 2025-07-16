@@ -10,7 +10,7 @@ mod symbol_provider;
 pub mod disassembler;
 mod callstack;
 
-use crate::interfaces::{PlatformAPI, PlatformError, Symbol, SymbolError, Architecture, DisassemblerError, Instruction, DisassemblerProvider};
+use crate::interfaces::{PlatformAPI, PlatformError, ModuleSymbol, ResolvedSymbol, SymbolError, Architecture, DisassemblerError, Instruction, DisassemblerProvider};
 use crate::protocol::{ModuleInfo, ProcessInfo, ThreadInfo};
 use module_manager::ModuleManager;
 use thread_manager::ThreadManager;
@@ -180,35 +180,37 @@ impl PlatformAPI for WindowsPlatform {
     }
 
     // Symbol-related methods
-    fn find_symbol(&self, module_path: &str, symbol_name: &str) -> Result<Option<Symbol>, SymbolError> {
+    fn find_symbol(&self, symbol_name: &str, max_results: usize) -> Result<Vec<ResolvedSymbol>, SymbolError> {
         if let Some(ref symbol_manager) = self.symbol_manager {
-            symbol_manager.find_symbol(module_path, symbol_name)
+            symbol_manager.find_symbol_across_all_modules(symbol_name, max_results)
         } else {
             Err(SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()))
         }
     }
 
-    fn list_symbols(&self, module_path: &str) -> Result<Vec<Symbol>, SymbolError> {
+    fn list_symbols(&self, module_path: &str) -> Result<Vec<ModuleSymbol>, SymbolError> {
         if let Some(ref symbol_manager) = self.symbol_manager {
-            symbol_manager.list_symbols(module_path)
+            // Get the raw ModuleSymbol objects without VA calculation
+            symbol_manager.list_symbols_raw(module_path)
         } else {
             Err(SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()))
         }
     }
 
-    fn resolve_rva_to_symbol(&self, module_path: &str, rva: u32) -> Result<Option<Symbol>, SymbolError> {
+    fn resolve_rva_to_symbol(&self, module_path: &str, rva: u32) -> Result<Option<ModuleSymbol>, SymbolError> {
         if let Some(ref symbol_manager) = self.symbol_manager {
-            symbol_manager.resolve_rva_to_symbol(module_path, rva)
+            // Get the raw ModuleSymbol without VA calculation
+            symbol_manager.resolve_rva_to_symbol_raw(module_path, rva)
         } else {
             Err(SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()))
         }
     }
 
-    fn resolve_address_to_symbol(&self, pid: u32, address: u64) -> Result<Option<(String, Symbol, u64)>, SymbolError> {
+    fn resolve_address_to_symbol(&self, pid: u32, address: u64) -> Result<Option<(String, ModuleSymbol, u64)>, SymbolError> {
         if let Some(ref symbol_manager) = self.symbol_manager {
             let process = self.get_process(pid).map_err(|e| SymbolError::SymbolsNotFound(e.to_string()))?;
             let modules = process.module_manager.list_modules();
-            symbol_manager.resolve_address_to_symbol(&modules, address)
+            symbol_manager.resolve_address_to_symbol_raw(&modules, address)
         } else {
             Err(SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()))
         }

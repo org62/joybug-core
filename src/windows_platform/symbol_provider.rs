@@ -13,7 +13,7 @@ use tracing::{trace, debug};
 use uuid::Uuid;
 use tokio::runtime::Runtime;
 
-use crate::interfaces::{Address, Symbol, SymbolError, SymbolProvider};
+use crate::interfaces::{Address, ModuleSymbol, ResolvedSymbol, SymbolError, SymbolProvider};
 
 // --- PDB Identifier Logic (adapted from src/windows/symbols/pe_reader.rs) ---
 
@@ -105,8 +105,8 @@ pub struct WindowsSymbolProvider {
     runtime: Runtime,
     /// Stores loaded symbols for modules.
     /// Key: Module path (String)
-    /// Value: Tuple of (Module Base Address, Module Size (Option<usize>), Vec<Symbol from debugger_interface>)
-    loaded_modules: HashMap<String, (Address, Option<usize>, Vec<Symbol>)>,
+    /// Value: Tuple of (Module Base Address, Module Size (Option<usize>), Vec<ModuleSymbol from debugger_interface>)
+    loaded_modules: HashMap<String, (Address, Option<usize>, Vec<ModuleSymbol>)>,
 }
 
 impl WindowsSymbolProvider {
@@ -146,9 +146,8 @@ impl WindowsSymbolProvider {
         Ok(local_path)
     }
 
-    /// Internal helper to parse a PDB file and return a vector of `Symbol` structs.
-    /// RVAs are stored as found in the PDB.
-    fn internal_parse_pdb_to_symbols(&self, pdb_path: &Path) -> Result<Vec<Symbol>, SymbolError> {
+    /// Internal helper to parse a PDB file and extract symbols as ModuleSymbols.
+    fn internal_parse_pdb_to_symbols(&self, pdb_path: &Path) -> Result<Vec<ModuleSymbol>, SymbolError> {
         trace!(path = %pdb_path.display(), "Parsing PDB file");
         let file = File::open(pdb_path).map_err(SymbolError::IoError)?;
         let mut pdb_parser = PDB::open(file)
@@ -178,9 +177,9 @@ impl WindowsSymbolProvider {
                             
                             let rva = offset.to_rva(&address_map).unwrap_or_default().0;
                             
-                            symbols_vec.push(Symbol {
+                            symbols_vec.push(ModuleSymbol {
                                 name: demangled_name,
-                                rva, 
+                                rva,
                             });
                         }
                         Ok(_other_data) => { /* Optionally handle other symbol types or log them */ }
@@ -239,20 +238,87 @@ impl SymbolProvider for WindowsSymbolProvider {
 
     fn find_symbol(
         &self,
-        module_path: &str,
         symbol_name: &str,
-    ) -> Result<Option<Symbol>, SymbolError> {
-        if let Some((_base, _size, symbols)) = self.loaded_modules.get(module_path) {
-            let found_symbol = symbols.iter().find(|s| s.name == symbol_name).cloned();
-            trace!(module_path, symbol_name, found = found_symbol.is_some(), "Symbol lookup completed");
-            Ok(found_symbol)
+        max_results: usize,
+    ) -> Result<Vec<ResolvedSymbol>, SymbolError> {
+        let mut found_symbols = Vec::new();
+        
+        // Check if the symbol name contains module specification (module!symbol format)
+        if let Some(exclamation_pos) = symbol_name.find('!') {
+            let (target_module_name, target_symbol_name) = symbol_name.split_at(exclamation_pos);
+            let target_symbol_name = &target_symbol_name[1..]; // Skip the '!' character
+            
+            // Search only in the specified module
+            for (module_path, (module_base, _size, symbols)) in &self.loaded_modules {
+                // Extract module name from path
+                let module_name = std::path::Path::new(module_path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(module_path);
+                
+                // Check if this is the target module (case-insensitive)
+                if module_name.to_lowercase() == target_module_name.to_lowercase() {
+                    // Find all matching symbols in this specific module
+                    for symbol in symbols {
+                        if symbol.name == target_symbol_name {
+                            // Create ResolvedSymbol with VA calculated
+                            let resolved_symbol = ResolvedSymbol {
+                                name: format!("{}!{}", module_name, symbol.name),
+                                module_name: module_name.to_string(),
+                                rva: symbol.rva,
+                                va: module_base + symbol.rva as u64,
+                            };
+                            
+                            found_symbols.push(resolved_symbol);
+                            
+                            // Stop if we've reached the maximum number of results
+                            if found_symbols.len() >= max_results {
+                                trace!(symbol_name, found_count = found_symbols.len(), max_results, "Module-specific symbol search completed (max results reached)");
+                                return Ok(found_symbols);
+                            }
+                        }
+                    }
+                    break; // We found the target module, no need to continue
+                }
+            }
         } else {
-            trace!(module_path, symbol_name, "No symbols loaded for module");
-            Err(SymbolError::ModuleNotLoaded(format!("Module {} not loaded", module_path)))
+            // Search through all loaded modules (original behavior with contains matching)
+            for (module_path, (module_base, _size, symbols)) in &self.loaded_modules {
+                // Extract module name from path  
+                let module_name = std::path::Path::new(module_path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(module_path)
+                    .to_string();
+                    
+                // Find all matching symbols in this module (contains-based search)
+                for symbol in symbols {
+                    if symbol.name.to_lowercase().contains(&symbol_name.to_lowercase()) {
+                        // Create ResolvedSymbol with VA calculated
+                        let resolved_symbol = ResolvedSymbol {
+                            name: format!("{}!{}", module_name, symbol.name),
+                            module_name: module_name.clone(),
+                            rva: symbol.rva,
+                            va: module_base + symbol.rva as u64,
+                        };
+                        
+                        found_symbols.push(resolved_symbol);
+                        
+                        // Stop if we've reached the maximum number of results
+                        if found_symbols.len() >= max_results {
+                            trace!(symbol_name, found_count = found_symbols.len(), max_results, "Symbol search completed (max results reached)");
+                            return Ok(found_symbols);
+                        }
+                    }
+                }
+            }
         }
+        
+        trace!(symbol_name, found_count = found_symbols.len(), max_results, "Symbol search completed");
+        Ok(found_symbols)
     }
 
-    fn list_symbols(&self, module_path: &str) -> Result<Vec<Symbol>, SymbolError> {
+    fn list_symbols(&self, module_path: &str) -> Result<Vec<ModuleSymbol>, SymbolError> {
         if let Some((_base, _size, symbols)) = self.loaded_modules.get(module_path) {
             trace!(module_path, count = symbols.len(), "Symbol listing completed");
             Ok(symbols.clone())
@@ -266,10 +332,10 @@ impl SymbolProvider for WindowsSymbolProvider {
         &self,
         module_path: &str,
         rva: u32,
-    ) -> Result<Option<Symbol>, SymbolError> {
+    ) -> Result<Option<ModuleSymbol>, SymbolError> {
         if let Some((_base, _size, symbols)) = self.loaded_modules.get(module_path) {
             // Find the symbol with the highest RVA that is still <= the target RVA
-            let mut best_match: Option<&Symbol> = None;
+            let mut best_match: Option<&ModuleSymbol> = None;
             for symbol in symbols {
                 if symbol.rva <= rva && (best_match.is_none() || symbol.rva > best_match.unwrap().rva) {
                     best_match = Some(symbol);

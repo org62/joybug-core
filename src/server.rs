@@ -28,6 +28,7 @@ fn handle_connection(mut stream: std::net::TcpStream, platform: Arc<Mutex<Platfo
             Ok(DebuggerRequest::WriteMemory { pid, address, data }) => format!("WriteMemory {{ pid: {}, address: 0x{:X}, data: [..{} bytes] }}", pid, address, data.len()),
             Ok(DebuggerRequest::ListModules { pid }) => format!("ListModules {{ pid: {} }}", pid),
             Ok(DebuggerRequest::ListProcesses) => "ListProcesses".to_string(),
+            Ok(DebuggerRequest::FindSymbol { symbol_name, max_results }) => format!("FindSymbol {{ symbol_name: {}, max_results: {} }}", symbol_name, max_results),
             _ => format!("{:?}", req),
         }, "Received request");
         let resp = {
@@ -108,9 +109,9 @@ fn handle_connection(mut stream: std::net::TcpStream, platform: Arc<Mutex<Platfo
                         Err(e) => DebuggerResponse::Error { message: e.to_string() },
                     }
                 }
-                Ok(DebuggerRequest::FindSymbol { module_path, symbol_name }) => {
-                    match platform.find_symbol(&module_path, &symbol_name) {
-                        Ok(symbol) => DebuggerResponse::Symbol { symbol },
+                Ok(DebuggerRequest::FindSymbol { symbol_name, max_results }) => {
+                    match platform.find_symbol(&symbol_name, max_results) {
+                        Ok(symbols) => DebuggerResponse::ResolvedSymbolList { symbols },
                         Err(e) => DebuggerResponse::Error { message: e.to_string() },
                     }
                 }
@@ -166,6 +167,8 @@ fn handle_connection(mut stream: std::net::TcpStream, platform: Arc<Mutex<Platfo
                 use crate::interfaces::InstructionFormatter;
                 format!("Instructions {{\n{}}}", instructions.format_disassembly())
             },
+            DebuggerResponse::SymbolList { symbols } => format!("SymbolList {{ symbols: [..{} symbols] }}", symbols.len()),
+            DebuggerResponse::ResolvedSymbolList { symbols } => format!("ResolvedSymbolList {{ symbols: [..{} symbols] }}", symbols.len()),
             _ => format!("{:?}", resp),
         }, "Sending response");
         let resp_json = serde_json::to_vec(&resp).unwrap();
