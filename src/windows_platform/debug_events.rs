@@ -1,14 +1,15 @@
-use super::{utils, WindowsPlatform};
-use crate::interfaces::PlatformError;
-use crate::protocol::{ModuleInfo};
+use super::{utils, WindowsPlatform, stepper};
+use crate::interfaces::{PlatformError, Architecture};
+use crate::protocol::ModuleInfo;
 use tracing::{error, trace, warn};
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, FALSE, DBG_CONTINUE, DUPLICATE_SAME_ACCESS, HANDLE, DuplicateHandle};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, FALSE, DBG_CONTINUE, DUPLICATE_SAME_ACCESS, HANDLE, DuplicateHandle, STATUS_SINGLE_STEP};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, INFINITE};
 use windows_sys::Win32::System::Diagnostics::Debug::{
     ContinueDebugEvent, WaitForDebugEvent, DEBUG_EVENT, EXCEPTION_DEBUG_EVENT,
     CREATE_PROCESS_DEBUG_EVENT, EXIT_PROCESS_DEBUG_EVENT, CREATE_THREAD_DEBUG_EVENT,
     EXIT_THREAD_DEBUG_EVENT, LOAD_DLL_DEBUG_EVENT, UNLOAD_DLL_DEBUG_EVENT,
     OUTPUT_DEBUG_STRING_EVENT, RIP_EVENT, SymLoadModule64, SymUnloadModule64,
+    GetThreadContext, SetThreadContext, CONTEXT_CONTROL_X86, CONTEXT_INTEGER_X86,
 };
 use std::ffi::CString;
 use std::ptr;
@@ -148,6 +149,41 @@ pub(super) fn continue_exec(
                     tid: debug_event.dwThreadId,
                     address: ex_record.ExceptionAddress as u64,
                 })
+            } else if ex_record.ExceptionCode == STATUS_SINGLE_STEP {
+                trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, address = %format!("0x{:X}", ex_record.ExceptionAddress as u64), "Single-step event");
+                
+                // Check if this is from an active stepper
+                let step_key = (debug_event.dwProcessId, debug_event.dwThreadId);
+                if let Some(step_state) = platform.active_steppers.remove(&step_key) {
+                    // This is from an active stepping operation
+                    trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, kind = ?step_state.kind, "Single-step from active stepper");
+                    
+                    // TODO: I think there is no need to clear the single-step flag, as it is cleared by the OS when the thread is resumed.
+                    if let Err(e) = clear_single_step_flag(platform, debug_event.dwProcessId, debug_event.dwThreadId) {
+                        error!("Failed to clear single-step flag: {}", e);
+                    }
+                    
+                    // Return a proper StepComplete event
+                    Some(crate::protocol::DebugEvent::StepComplete {
+                        pid: debug_event.dwProcessId,
+                        tid: debug_event.dwThreadId,
+                        kind: step_state.kind,
+                        address: ex_record.ExceptionAddress as u64,
+                    })
+                } else {
+                    // This is an unexpected single-step (not from our stepper)
+                    trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, "Unexpected single-step event");
+                    
+                    // Return as normal exception
+                    Some(crate::protocol::DebugEvent::Exception {
+                        pid: debug_event.dwProcessId,
+                        tid: debug_event.dwThreadId,
+                        code: ex_record.ExceptionCode as u32,
+                        address: ex_record.ExceptionAddress as u64,
+                        first_chance: ex_info.dwFirstChance == 1,
+                        parameters: vec![],
+                    })
+                }
             } else {
                 let mut params = Vec::new();
                 let num_params = ex_record.NumberParameters as usize;
@@ -342,4 +378,79 @@ pub(super) fn continue_exec(
         }
     };
     Ok(event)
+}
+
+fn clear_single_step_flag(platform: &mut WindowsPlatform, pid: u32, tid: u32) -> Result<(), PlatformError> {
+    let process = platform.get_process(pid)?;
+    let thread_handle = process
+        .thread_manager
+        .get_thread_handle(tid)
+        .ok_or_else(|| PlatformError::OsError(format!("No handle for thread {}", tid)))?;
+
+    // Get current thread context
+    let mut aligned_context = super::AlignedContext {
+        context: unsafe { std::mem::zeroed() },
+    };
+    
+    // Set context flags based on architecture
+    match process.architecture {
+        Architecture::X64 => {
+            aligned_context.context.ContextFlags = CONTEXT_CONTROL_X86 | CONTEXT_INTEGER_X86;
+        }
+        Architecture::Arm64 => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                // Use ARM64-specific context flags
+                aligned_context.context.ContextFlags = 0x00400001 | 0x00400002; // CONTEXT_CONTROL_ARM64 | CONTEXT_INTEGER_ARM64
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                // Use fallback flags
+                aligned_context.context.ContextFlags = CONTEXT_CONTROL_X86 | CONTEXT_INTEGER_X86;
+            }
+        }
+    }
+    
+    let ok = unsafe { GetThreadContext(thread_handle, &mut aligned_context.context) };
+    if ok == 0 {
+        let error = unsafe { GetLastError() };
+        let error_str = utils::error_message(error);
+        error!(error, error_str, "GetThreadContext failed while clearing single-step flag");
+        return Err(PlatformError::OsError(format!(
+            "GetThreadContext failed: {} ({})",
+            error, error_str
+        )));
+    }
+
+    // Clear single-step flag based on architecture
+    match process.architecture {
+        Architecture::X64 => {
+            stepper::clear_x64_single_step_flag(&mut aligned_context.context)?;
+        }
+        Architecture::Arm64 => {
+            #[cfg(target_arch = "aarch64")]
+            {
+                stepper::clear_arm64_single_step_flag(&mut aligned_context.context)?;
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                return Err(PlatformError::OsError("ARM64 stepping not supported on this architecture".to_string()));
+            }
+        }
+    }
+
+    // Set the modified context back
+    let ok = unsafe { SetThreadContext(thread_handle, &aligned_context.context) };
+    if ok == 0 {
+        let error = unsafe { GetLastError() };
+        let error_str = utils::error_message(error);
+        error!(error, error_str, "SetThreadContext failed while clearing single-step flag");
+        return Err(PlatformError::OsError(format!(
+            "SetThreadContext failed: {} ({})",
+            error, error_str
+        )));
+    }
+
+    trace!(pid, tid, "Single-step flag cleared successfully");
+    Ok(())
 } 

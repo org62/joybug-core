@@ -130,7 +130,8 @@ impl DebugClient {
                 | DebugEvent::Breakpoint { pid, tid, .. }
                 | DebugEvent::Output { pid, tid, .. }
                 | DebugEvent::Exception { pid, tid, .. }
-                | DebugEvent::RipEvent { pid, tid, .. } => {
+                | DebugEvent::RipEvent { pid, tid, .. } 
+                | DebugEvent::StepComplete { pid, tid, .. } => {
                     let cont = DebuggerRequest::Continue { pid, tid };
                     send_request(&mut self.stream, &cont).unwrap();
                 }

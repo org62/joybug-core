@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
 use joybug2::interfaces::CallFrame;
-use joybug2::protocol::{DebuggerResponse, DebugEvent, DebuggerRequest};
+use joybug2::protocol::{DebuggerResponse, DebugEvent, DebuggerRequest, StepKind};
 use joybug2::protocol_io::DebugClient;
 use std::thread;
 use tokio;
@@ -77,6 +77,48 @@ fn test_symbol_search(client: &mut DebugClient, event: &DebugEvent) {
     }
 }
 
+fn test_stepping(client: &mut DebugClient, event: &DebugEvent) {
+    // Only test stepping when we have a process created event
+    if let DebugEvent::Breakpoint { pid, tid, .. } = event {
+        println!("=== Testing Step In functionality ===");
+        
+        let step_count = 3; // Step 3 times to test basic functionality
+        
+        for i in 1..=step_count {
+            println!("Performing step {} of {}", i, step_count);
+            
+            match client.send_and_receive(&DebuggerRequest::Step { 
+                pid: *pid, 
+                tid: *tid, 
+                kind: StepKind::Into 
+            }) {
+                Ok(DebuggerResponse::Event { event }) => {
+                    match event {
+                        DebugEvent::StepComplete { address, kind, .. } => {
+                            println!("  Step {}: Step complete ({:?}) at address 0x{:016x}", i, kind, address);
+                        }
+                        _ => {
+                            // Note: In a bigger test this is not necessary true, but good for now.
+                            panic!("Step {}: Unexpected event: {:?}", i, event);
+                        }
+                    }
+                }
+                Ok(DebuggerResponse::Error { message }) => {
+                    panic!("Step {}: Error - {}", i, message);
+                }
+                Ok(other) => {
+                    panic!("Step {}: Unexpected response: {:?}", i, other);
+                }
+                Err(e) => {
+                    panic!("Step {}: Communication error: {}", i, e);
+                }
+            }
+        }
+        
+        println!("Step testing completed successfully");
+    }
+}
+
 #[test]
 fn test_debug_client_event_collection() {
     joybug2::init_tracing();
@@ -105,6 +147,7 @@ fn test_debug_client_event_collection() {
                 println!();
 
                 test_symbol_search(client, &event);
+                test_stepping(client, &event);
             }
             _ => {}
         }

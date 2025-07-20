@@ -184,6 +184,10 @@ pub trait DisassemblerProvider: Send + Sync {
     }
 }
 
+pub trait Stepper: Send + Sync {
+    fn step(&mut self, pid: u32, tid: u32, kind: crate::protocol::StepKind) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>;
+}
+
 pub trait PlatformAPI: Send + Sync {
     fn attach(&mut self, pid: u32) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>;
     fn detach(&mut self, pid: u32) -> Result<(), PlatformError>;

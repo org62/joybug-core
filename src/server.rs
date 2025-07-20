@@ -1,5 +1,5 @@
 use crate::protocol::{DebuggerRequest, DebuggerResponse};
-use crate::interfaces::PlatformAPI;
+use crate::interfaces::{PlatformAPI, Stepper};
 use tokio::net::TcpListener;
 use tracing::{info, error, debug};
 use std::io::{Read, Write};
@@ -151,6 +151,20 @@ fn handle_connection(mut stream: std::net::TcpStream, platform: Arc<Mutex<Platfo
                 Ok(DebuggerRequest::GetCallStack { pid, tid }) => {
                     match platform.get_call_stack(pid, tid) {
                         Ok(frames) => DebuggerResponse::CallStack { frames },
+                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                    }
+                }
+                Ok(DebuggerRequest::Step { pid, tid, kind }) => {
+                    // First, set up the stepping state
+                    match platform.step(pid, tid, kind) {
+                        Ok(_) => {
+                            // Stepping state is set up, now continue execution and wait for any event
+                            match platform.continue_exec(pid, tid) {
+                                Ok(Some(event)) => DebuggerResponse::Event { event },
+                                Ok(None) => DebuggerResponse::Ack,
+                                Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                            }
+                        }
                         Err(e) => DebuggerResponse::Error { message: e.to_string() },
                     }
                 }

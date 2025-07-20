@@ -9,9 +9,10 @@ mod symbol_manager;
 mod symbol_provider;
 pub mod disassembler;
 mod callstack;
+mod stepper;
 
-use crate::interfaces::{PlatformAPI, PlatformError, ModuleSymbol, ResolvedSymbol, SymbolError, Architecture, DisassemblerError, Instruction, DisassemblerProvider};
-use crate::protocol::{ModuleInfo, ProcessInfo, ThreadInfo};
+use crate::interfaces::{PlatformAPI, PlatformError, ModuleSymbol, ResolvedSymbol, SymbolError, Architecture, DisassemblerError, Instruction, DisassemblerProvider, Stepper};
+use crate::protocol::{ModuleInfo, ProcessInfo, ThreadInfo, StepKind};
 use module_manager::ModuleManager;
 use thread_manager::ThreadManager;
 use symbol_manager::SymbolManager;
@@ -40,6 +41,12 @@ impl Drop for HandleSafe {
 #[repr(align(16))]
 struct AlignedContext {
     context: CONTEXT,
+}
+
+// Stepping state tracking
+#[derive(Debug, Clone)]
+pub(crate) struct StepState {
+    pub(crate) kind: StepKind,
 }
 
 /// Represents a single debugged process with its associated state
@@ -83,6 +90,8 @@ pub struct WindowsPlatform {
     pub(crate) symbol_manager: Option<SymbolManager>,
     /// Shared disassembler for all processes
     pub(crate) disassembler: Option<CapstoneDisassembler>,
+    /// Track active stepping operations by (pid, tid)
+    pub(crate) active_steppers: HashMap<(u32, u32), StepState>,
 }
 
 impl WindowsPlatform {
@@ -93,6 +102,7 @@ impl WindowsPlatform {
             processes: HashMap::new(),
             symbol_manager,
             disassembler,
+            active_steppers: HashMap::new(),
         }
     }
     
@@ -262,5 +272,11 @@ impl PlatformAPI for WindowsPlatform {
     
     fn get_call_stack(&mut self, pid: u32, tid: u32) -> Result<Vec<crate::interfaces::CallFrame>, PlatformError> {
         callstack::get_call_stack(self, pid, tid)
+    }
+}
+
+impl Stepper for WindowsPlatform {
+    fn step(&mut self, pid: u32, tid: u32, kind: StepKind) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
+        stepper::step(self, pid, tid, kind)
     }
 } 

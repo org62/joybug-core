@@ -5,6 +5,13 @@ pub use self::request_response::*;
 mod request_response {
     use super::*;
 
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+    pub enum StepKind {
+        Into,
+        Over,
+        Out,
+    }
+
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(tag = "type", content = "data")]
     pub enum DebuggerRequest {
@@ -27,6 +34,8 @@ mod request_response {
         ResolveAddressToSymbol { pid: u32, address: u64 },
         DisassembleMemory { pid: u32, address: u64, count: usize, arch: crate::interfaces::Architecture },
         GetCallStack { pid: u32, tid: u32 },
+        // Step request
+        Step { pid: u32, tid: u32, kind: StepKind },
         // ... add more as needed
     }
 
@@ -109,6 +118,12 @@ mod request_response {
             error: u32,
             event_type: u32,
         },
+        StepComplete {
+            pid: u32,
+            tid: u32,
+            kind: StepKind,
+            address: u64,
+        },
         Unknown,
     }
 
@@ -125,6 +140,7 @@ mod request_response {
                 DebugEvent::DllLoaded { pid, .. } => *pid,
                 DebugEvent::DllUnloaded { pid, .. } => *pid,
                 DebugEvent::RipEvent { pid, .. } => *pid,
+                DebugEvent::StepComplete { pid, .. } => *pid,
                 DebugEvent::Unknown => 0, // Or handle as an error
             }
         }
@@ -140,6 +156,7 @@ mod request_response {
                 DebugEvent::DllLoaded { tid, .. } => *tid,
                 DebugEvent::DllUnloaded { tid, .. } => *tid,
                 DebugEvent::RipEvent { tid, .. } => *tid,
+                DebugEvent::StepComplete { tid, .. } => *tid,
                 DebugEvent::ProcessExited { .. } => 0,
                 DebugEvent::Unknown => 0,
             }
