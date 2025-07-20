@@ -4,12 +4,15 @@ use crate::protocol::ThreadContext;
 use tracing::{error, trace};
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    GetThreadContext, SetThreadContext, CONTEXT,
+    GetThreadContext, SetThreadContext, CONTEXT
 };
 
-// Context flags for x64 architecture
-const CONTEXT_CONTROL: u32 = 0x00100001;
-const CONTEXT_INTEGER: u32 = 0x00100002;
+#[cfg(target_arch = "x86_64")]
+use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_ALL_AMD64;
+
+#[cfg(target_arch = "aarch64")]
+use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_ALL_ARM64;
+
 
 pub(super) fn get_thread_context(
     platform: &mut WindowsPlatform,
@@ -28,10 +31,16 @@ pub(super) fn get_thread_context(
         let mut aligned_context = AlignedContext {
             context: unsafe { std::mem::zeroed() },
         };
-        // Use CONTEXT_CONTROL | CONTEXT_INTEGER for proper stack walking
-        // CONTEXT_CONTROL gives us IP, SP, BP and segment registers
-        // CONTEXT_INTEGER gives us general purpose registers
-        aligned_context.context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            aligned_context.context.ContextFlags = CONTEXT_ALL_ARM64;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            aligned_context.context.ContextFlags = CONTEXT_ALL_AMD64;
+        }
+
         let ok = unsafe { GetThreadContext(thread_handle, &mut aligned_context.context) };
         if ok == 0 {
             let error = unsafe { GetLastError() };

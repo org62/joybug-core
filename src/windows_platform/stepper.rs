@@ -1,11 +1,9 @@
-use super::{utils, WindowsPlatform, AlignedContext};
-use crate::interfaces::{PlatformError, Architecture};
-use crate::protocol::{StepKind, DebugEvent};
-use tracing::{error, trace, debug};
-use windows_sys::Win32::Foundation::GetLastError;
+use super::{WindowsPlatform};
+use crate::interfaces::PlatformError;
+use crate::protocol::{StepKind, DebugEvent, ThreadContext};
+use tracing::{trace, debug};
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    GetThreadContext, SetThreadContext, CONTEXT, CONTEXT_CONTROL_X86, CONTEXT_INTEGER_X86,
-    CONTEXT_CONTROL_ARM64, CONTEXT_INTEGER_ARM64
+    CONTEXT
 };
 
 // x64 EFlags register Trap Flag bit
@@ -29,52 +27,19 @@ pub(super) fn step(
         return Err(PlatformError::NotImplemented);
     }
 
-    let process = platform.get_process(pid)?;
-    let thread_handle = process
-        .thread_manager
-        .get_thread_handle(tid)
-        .ok_or_else(|| PlatformError::OsError(format!("No handle for thread {}", tid)))?;
-
-    // Get current thread context
-    let mut aligned_context = AlignedContext {
-        context: unsafe { std::mem::zeroed() },
+    // Get current thread context using platform function
+    let thread_context = super::thread_context::get_thread_context(platform, pid, tid)?;
+    
+    let mut context = match thread_context {
+        ThreadContext::Win32RawContext(ctx) => ctx,
     };
-    
-    // Set context flags based on architecture
-    match process.architecture {
-        Architecture::X64 => {
-            aligned_context.context.ContextFlags = CONTEXT_CONTROL_X86 | CONTEXT_INTEGER_X86;
-        }
-        Architecture::Arm64 => {
-            aligned_context.context.ContextFlags = CONTEXT_CONTROL_ARM64 | CONTEXT_INTEGER_ARM64;
-        }
-    }
-    
-    let ok = unsafe { GetThreadContext(thread_handle, &mut aligned_context.context) };
-    if ok == 0 {
-        let error = unsafe { GetLastError() };
-        let error_str = utils::error_message(error);
-        error!(error, error_str, "GetThreadContext failed in step");
-        return Err(PlatformError::OsError(format!(
-            "GetThreadContext failed: {} ({})",
-            error, error_str
-        )));
-    }
 
     // Set single-step flag based on architecture
-    set_single_step_flag_native(&mut aligned_context.context)?;
+    set_single_step_flag_native(&mut context)?;
 
-    // Set the modified context back
-    let ok = unsafe { SetThreadContext(thread_handle, &aligned_context.context) };
-    if ok == 0 {
-        let error = unsafe { GetLastError() };
-        let error_str = utils::error_message(error);
-        error!(error, error_str, "SetThreadContext failed in step");
-        return Err(PlatformError::OsError(format!(
-            "SetThreadContext failed: {} ({})",
-            error, error_str
-        )));
-    }
+    // Set the modified context back using platform function
+    let updated_context = ThreadContext::Win32RawContext(context);
+    super::thread_context::set_thread_context(platform, pid, tid, updated_context)?;
 
     debug!(pid, tid, "Single-step flag set, continuing execution");
     
@@ -85,7 +50,28 @@ pub(super) fn step(
     Ok(None)
 }
 
-fn set_single_step_flag_native(context: &mut CONTEXT) -> Result<(), PlatformError> {
+pub fn clear_single_step_flag_native2(platform: &mut WindowsPlatform, pid: u32, tid: u32) -> Result<(), PlatformError> {
+    trace!(pid, tid, "Clearing single-step flag");
+    
+    // Get current thread context using platform function
+    let thread_context = super::thread_context::get_thread_context(platform, pid, tid)?;
+    
+    let mut context = match thread_context {
+        ThreadContext::Win32RawContext(ctx) => ctx,
+    };
+
+    // Clear single-step flag based on architecture
+    clear_single_step_flag_native(&mut context)?;
+
+    // Set the modified context back using platform function
+    let updated_context = ThreadContext::Win32RawContext(context);
+    super::thread_context::set_thread_context(platform, pid, tid, updated_context)?;
+
+    debug!(pid, tid, "Single-step flag cleared");
+    Ok(())
+}
+
+pub fn set_single_step_flag_native(context: &mut CONTEXT) -> Result<(), PlatformError> {
     #[cfg(target_arch = "x86_64")]
     {
         set_x64_single_step_flag(context)?;
@@ -93,6 +79,18 @@ fn set_single_step_flag_native(context: &mut CONTEXT) -> Result<(), PlatformErro
     #[cfg(target_arch = "aarch64")]
     {
         set_arm64_single_step_flag(context)?;
+    }
+    Ok(())
+}
+
+pub fn clear_single_step_flag_native(context: &mut CONTEXT) -> Result<(), PlatformError> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        clear_x64_single_step_flag(context)?;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        clear_arm64_single_step_flag(context)?;
     }
     Ok(())
 }
