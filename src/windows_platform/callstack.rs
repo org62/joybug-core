@@ -8,6 +8,27 @@ use std::mem;
 
 const MAX_STACK_FRAMES: usize = 100;
 
+/// Masks the upper bits of addresses on aarch64 platforms to handle garbage bits
+#[cfg(target_arch = "aarch64")]
+fn mask_aarch64_addresses(
+    stack_frame: &mut STACKFRAME64,
+    raw_context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+) {
+    // Note: 0x000007FFFFFFFFFF is a super stupid fix, however on my machine it adds garbage
+    // to the upper bits on aarch64. Github's CI runners are ok.
+    // https://learn.microsoft.com/en-us/windows-hardware/drivers/gettingstarted/virtual-address-spaces
+
+    // For debugging, just print the context and see the values
+    // trace!("context: {:#?}", crate::protocol::ThreadContext::Win32RawContext(raw_context));
+
+    const MAX_ADDRESS: u64 = 0x00007FFFFFFFFFFFu64;
+    stack_frame.AddrPC.Offset &= MAX_ADDRESS;
+    unsafe {
+        raw_context.Pc &= MAX_ADDRESS;
+        raw_context.Anonymous.Anonymous.Lr &= MAX_ADDRESS;
+    }
+}
+
 /// Get the call stack for a specific thread within a debugged process
 pub fn get_call_stack(
     platform: &mut WindowsPlatform,
@@ -62,9 +83,14 @@ pub fn get_call_stack(
             break;
         }
         
-        let instruction_pointer = stack_frame.AddrPC.Offset;
-        let stack_pointer = stack_frame.AddrStack.Offset;
-        let frame_pointer = stack_frame.AddrFrame.Offset;
+        #[cfg(target_arch = "aarch64")]
+        mask_aarch64_addresses(&mut stack_frame, &mut raw_context);
+        
+        let (instruction_pointer, stack_pointer, frame_pointer) = (
+            stack_frame.AddrPC.Offset,
+            stack_frame.AddrStack.Offset,
+            stack_frame.AddrFrame.Offset
+        );
         
         // Skip invalid frames
         if instruction_pointer == 0 {
