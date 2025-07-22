@@ -75,7 +75,7 @@ pub fn get_call_stack(
         // Validate that the instruction pointer is within a loaded module
         // Don't issue a warning if there is less than 2 modules (main executable is only loaded when process is started, but address is in ntdll)
         if modules.len() > 1 && !is_valid_instruction_pointer(instruction_pointer, &modules) {
-            warn!("Instruction pointer 0x{:016x} not in any loaded module. Including frame without symbols.", instruction_pointer);
+            panic!("Instruction pointer 0x{:016x} not in any loaded module. Including frame without symbols.", instruction_pointer);
         }
         
         // Resolve symbol information

@@ -23,9 +23,6 @@ pub(super) fn handle_create_process_event(
 
     let image_file_name =
         utils::get_path_from_handle(info.hFile).unwrap_or_else(|| image_path_fallback.unwrap_or("<unknown>").to_string());
-    unsafe {
-        CloseHandle(info.hFile);
-    }
 
     // Get the process for this PID to use its handle and clear its managers
     let process = platform.get_process_mut(pid)?;
