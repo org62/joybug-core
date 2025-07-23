@@ -2,7 +2,7 @@ pub use serde::{Serialize, Deserialize};
 
 pub use self::request_response::*;
 
-mod request_response {
+pub mod request_response {
     use super::*;
 
     #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]

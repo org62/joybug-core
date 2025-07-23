@@ -164,4 +164,12 @@ impl DebugClient {
         send_request(&mut self.stream, req)?;
         receive_response(&mut self.stream)
     }
+
+    pub fn send(&mut self, req: &crate::protocol::DebuggerRequest) -> anyhow::Result<()> {
+        send_request(&mut self.stream, req)
+    }
+
+    pub fn receive(&mut self) -> anyhow::Result<crate::protocol::DebuggerResponse> {
+        receive_response(&mut self.stream)
+    }
 } 
