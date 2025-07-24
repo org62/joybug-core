@@ -151,8 +151,8 @@ fn test_debug_client_event_collection() {
                     if state.single_shot_breakpoint_addr == 0 {
                         println!("=== Hit initial breakpoint, setting up Single-Shot Breakpoint ===");
                         
-                        // Find a symbol to break on, e.g., WriteConsoleW
-                        let symbol_name = "kernelbase!WriteConsoleW".to_string();
+                        // Find a symbol to break on, e.g., cmd!CmdPutChars
+                        let symbol_name = "cmd!CmdPutChars".to_string();
                         let symbols = match client.send_and_receive(&DebuggerRequest::FindSymbol {
                             symbol_name: symbol_name.clone(),
                             max_results: 1
@@ -177,15 +177,15 @@ fn test_debug_client_event_collection() {
                         println!("*** Hit single-shot breakpoint at 0x{:x} ***", address);
                         state.single_shot_breakpoint_hit = true;
 
-                        // Get the first 3 arguments for WriteConsoleW
-                        match client.send_and_receive(&DebuggerRequest::GetFunctionArguments { pid: *pid, tid: *tid, count: 3 }) {
+                        // Get the first 2 arguments for CmdPutChars
+                        match client.send_and_receive(&DebuggerRequest::GetFunctionArguments { pid: *pid, tid: *tid, count: 2 }) {
                             Ok(DebuggerResponse::FunctionArguments { arguments }) => {
-                                if arguments.len() >= 3 {
-                                    let buffer_addr = arguments[1]; // lpBuffer
-                                    let chars_to_write = arguments[2] as u32; // nNumberOfCharsToWrite
+                                if arguments.len() >= 2 {
+                                    let buffer_addr = arguments[0]; // lpBuffer
+                                    let chars_to_write = arguments[1] as u32; // nNumberOfCharsToWrite
 
                                     if buffer_addr != 0 && chars_to_write > 0 {
-                                        println!("WriteConsoleW args: buffer=0x{:x}, len={}", buffer_addr, chars_to_write);
+                                        println!("CmdPutChars args: buffer=0x{:x}, len={}", buffer_addr, chars_to_write);
                                         match client.send_and_receive(&DebuggerRequest::ReadWideString { pid: *pid, address: buffer_addr, max_len: Some(chars_to_write as usize) }) {
                                             Ok(DebuggerResponse::WideStringData { data }) => {
                                                 println!("Read from console buffer: '{}'", data);
