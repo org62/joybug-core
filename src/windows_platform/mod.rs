@@ -161,7 +161,7 @@ impl PlatformAPI for WindowsPlatform {
             Architecture::Arm64 => {
                 // ARM64 BRK instruction (BRK #0)
                 let original_bytes = memory::read_memory_internal(process_handle, addr, 4)?;
-                (vec![0x00, 0x00, 0x20, 0xD4], original_bytes)
+                (vec![0x00, 0x00, 0x3e, 0xD4], original_bytes)
             }
         };
         
@@ -238,7 +238,7 @@ impl PlatformAPI for WindowsPlatform {
             (Architecture::Arm64, crate::protocol::ThreadContext::Win32RawContext(ctx)) => {
                 // First 8 arguments are in registers X0-X7
                 for i in 0..std::cmp::min(count, 8) {
-                    arguments.push(ctx.Anonymous.X[i]);
+                    arguments.push(unsafe { ctx.Anonymous.X[i] });
                 }
 
                 // Subsequent arguments are on the stack

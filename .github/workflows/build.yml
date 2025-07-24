@@ -26,5 +26,5 @@ jobs:
       run: cargo build
     - name: Run tests
       env:
-        RUST_LOG: debug
+        RUST_LOG: trace
       run: cargo test --verbose -- --nocapture
