@@ -56,6 +56,7 @@ pub(crate) struct DebuggedProcess {
     pub(crate) architecture: Architecture,
     pub(crate) module_manager: ModuleManager,
     pub(crate) thread_manager: ThreadManager,
+    pub(crate) single_shot_breakpoints: HashMap<u64, Vec<u8>>,
 }
 
 impl DebuggedProcess {
@@ -70,6 +71,7 @@ impl DebuggedProcess {
             architecture,
             module_manager: ModuleManager::new(),
             thread_manager: ThreadManager::new(),
+            single_shot_breakpoints: HashMap::new(),
         })
     }
 }
@@ -146,6 +148,30 @@ impl PlatformAPI for WindowsPlatform {
         }
     }
 
+    fn set_single_shot_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError> {
+        let process = self.get_process_mut(pid)?;
+        let process_handle = process.process_handle.0;
+        let arch = process.architecture;
+
+        let (breakpoint_bytes, original_bytes) = match arch {
+            Architecture::X64 => {
+                let original_byte = memory::read_memory_internal(process_handle, addr, 1)?;
+                (vec![0xCC], original_byte)
+            }
+            Architecture::Arm64 => {
+                // ARM64 BRK instruction (BRK #0)
+                let original_bytes = memory::read_memory_internal(process_handle, addr, 4)?;
+                (vec![0x00, 0x00, 0x20, 0xD4], original_bytes)
+            }
+        };
+        
+        // Store the original bytes
+        process.single_shot_breakpoints.insert(addr, original_bytes);
+        
+        // Write the breakpoint instruction
+        memory::write_memory_internal(process_handle, addr, &breakpoint_bytes)
+    }
+
     fn continue_exec(&mut self, pid: u32, tid: u32) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
         debug_events::continue_exec(self, pid, tid)
     }
@@ -167,12 +193,69 @@ impl PlatformAPI for WindowsPlatform {
         memory::write_memory(self, pid, address, data)
     }
 
+    fn read_wide_string(&mut self, pid: u32, address: u64, max_len: Option<usize>) -> Result<String, PlatformError> {
+        memory::read_wide_string(self, pid, address, max_len)
+    }
+
     fn get_thread_context(&mut self, pid: u32, tid: u32) -> Result<crate::protocol::ThreadContext, PlatformError> {
         thread_context::get_thread_context(self, pid, tid)
     }
 
     fn set_thread_context(&mut self, pid: u32, tid: u32, context: crate::protocol::ThreadContext) -> Result<(), PlatformError> {
         thread_context::set_thread_context(self, pid, tid, context)
+    }
+
+    fn get_function_arguments(&mut self, pid: u32, tid: u32, count: usize) -> Result<Vec<u64>, PlatformError> {
+        let process = self.get_process(pid)?;
+        let arch = process.architecture;
+        let context = self.get_thread_context(pid, tid)?;
+
+        let mut arguments = Vec::with_capacity(count);
+
+        match (arch, context) {
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            (Architecture::X64, crate::protocol::ThreadContext::Win32RawContext(ctx)) => {
+                // First 4 arguments are in registers: RCX, RDX, R8, R9
+                if count > 0 { arguments.push(ctx.Rcx); }
+                if count > 1 { arguments.push(ctx.Rdx); }
+                if count > 2 { arguments.push(ctx.R8); }
+                if count > 3 { arguments.push(ctx.R9); }
+
+                // Subsequent arguments are on the stack
+                if count > 4 {
+                    let stack_ptr = ctx.Rsp;
+                    // The first stack argument is at RSP+0x28 (after return address and space for register args)
+                    let stack_args_ptr = stack_ptr + 0x28;
+                    let num_stack_args = count - 4;
+                    let stack_data = self.read_memory(pid, stack_args_ptr, num_stack_args * 8)?;
+                    
+                    for chunk in stack_data.chunks_exact(8) {
+                        arguments.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+                    }
+                }
+            }
+            #[cfg(all(windows, target_arch = "aarch64"))]
+            (Architecture::Arm64, crate::protocol::ThreadContext::Win32RawContext(ctx)) => {
+                // First 8 arguments are in registers X0-X7
+                for i in 0..std::cmp::min(count, 8) {
+                    arguments.push(ctx.X[i]);
+                }
+
+                // Subsequent arguments are on the stack
+                if count > 8 {
+                    let stack_ptr = ctx.Sp;
+                    let num_stack_args = count - 8;
+                    let stack_data = self.read_memory(pid, stack_ptr, num_stack_args * 8)?;
+
+                    for chunk in stack_data.chunks_exact(8) {
+                        arguments.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+                    }
+                }
+            }
+            _ => return Err(PlatformError::NotImplemented),
+        }
+
+        Ok(arguments)
     }
 
     fn list_modules(&self, pid: u32) -> Result<Vec<ModuleInfo>, PlatformError> {

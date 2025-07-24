@@ -130,8 +130,10 @@ fn test_debug_client_event_collection() {
     struct TestState {
         events: Vec<DebugEvent>,
         dll_load_call_stacks: Vec<Option<Vec<CallFrame>>>,
+        single_shot_breakpoint_hit: bool,
+        single_shot_breakpoint_addr: u64,
     }
-    let mut state = TestState { events: Vec::new(), dll_load_call_stacks: Vec::new() };
+    let mut state = TestState { events: Vec::new(), dll_load_call_stacks: Vec::new(), single_shot_breakpoint_hit: false, single_shot_breakpoint_addr: 0 };
 
     client.launch("cmd.exe /c echo test".to_string(), &mut state, |client, state, resp| {
         match resp {
@@ -143,6 +145,62 @@ fn test_debug_client_event_collection() {
                     let call_stack = get_call_stack(client, &event);
                     state.dll_load_call_stacks.push(call_stack);
                 }
+
+                if let DebugEvent::Breakpoint { pid, tid, address } = &event {
+                    // If single_shot_breakpoint_addr is 0, this is the initial process breakpoint.
+                    if state.single_shot_breakpoint_addr == 0 {
+                        println!("=== Hit initial breakpoint, setting up Single-Shot Breakpoint ===");
+                        
+                        // Find a symbol to break on, e.g., WriteConsoleW
+                        let symbol_name = "kernelbase!WriteConsoleW".to_string();
+                        let symbols = match client.send_and_receive(&DebuggerRequest::FindSymbol {
+                            symbol_name: symbol_name.clone(),
+                            max_results: 1
+                        }) {
+                            Ok(DebuggerResponse::ResolvedSymbolList { symbols }) => symbols,
+                            _ => panic!("Failed to find symbol for single-shot breakpoint test."),
+                        };
+                        
+                        if symbols.is_empty() {
+                            panic!("Could not find symbol '{}' for testing single-shot breakpoint.", symbol_name);
+                        }
+                        
+                        state.single_shot_breakpoint_addr = symbols[0].va;
+                        println!("Setting single-shot breakpoint at {} (0x{:x})", symbol_name, state.single_shot_breakpoint_addr);
+                        
+                        // Set the single-shot breakpoint
+                        match client.send_and_receive(&DebuggerRequest::SetSingleShotBreakpoint { pid: *pid, addr: state.single_shot_breakpoint_addr }) {
+                            Ok(DebuggerResponse::Ack) => (),
+                            _ => panic!("Failed to set single-shot breakpoint."),
+                        }
+                    } else if *address == state.single_shot_breakpoint_addr {
+                        println!("*** Hit single-shot breakpoint at 0x{:x} ***", address);
+                        state.single_shot_breakpoint_hit = true;
+
+                        // Get the first 3 arguments for WriteConsoleW
+                        match client.send_and_receive(&DebuggerRequest::GetFunctionArguments { pid: *pid, tid: *tid, count: 3 }) {
+                            Ok(DebuggerResponse::FunctionArguments { arguments }) => {
+                                if arguments.len() >= 3 {
+                                    let buffer_addr = arguments[1]; // lpBuffer
+                                    let chars_to_write = arguments[2] as u32; // nNumberOfCharsToWrite
+
+                                    if buffer_addr != 0 && chars_to_write > 0 {
+                                        println!("WriteConsoleW args: buffer=0x{:x}, len={}", buffer_addr, chars_to_write);
+                                        match client.send_and_receive(&DebuggerRequest::ReadWideString { pid: *pid, address: buffer_addr, max_len: Some(chars_to_write as usize) }) {
+                                            Ok(DebuggerResponse::WideStringData { data }) => {
+                                                println!("Read from console buffer: '{}'", data);
+                                                assert_eq!(data, "test", "The console output should be 'test'");
+                                            }
+                                            _ => panic!("Failed to read wide string from process memory"),
+                                        }
+                                    }
+                                }
+                            }
+                            _ => panic!("Failed to get function arguments for WriteConsoleW"),
+                        }
+                    }
+                }
+
                 state.events.push(event.clone());
                 println!();
 
@@ -163,7 +221,7 @@ fn test_debug_client_event_collection() {
 
     assert_eq!(process_created, 1, "Should be exactly one process created event");
     assert_eq!(process_exited, 1, "Should be exactly one process exited event");
-    assert_eq!(breakpoints, 1, "Should be exactly one breakpoint event");
+    assert_eq!(breakpoints, 2, "Should be exactly two breakpoint events");
     assert!(dll_loaded >= 1, "Should be at least one DLL loaded event");
     assert!(thread_created >= 1, "Should be at least one thread created event");
     assert!(thread_exited >= 1, "Should be at least one thread exited event");
@@ -178,6 +236,8 @@ fn test_debug_client_event_collection() {
         .any(|substring| symbol.format_symbol().contains(substring)));
 
     assert!(found_map_view_of_section, "Expected to find 'MapViewOfSection' in a DllLoaded event call stack");
+
+    assert!(state.single_shot_breakpoint_hit, "Did not hit the single-shot breakpoint");
 
     for event in state.events {
         println!("event: {}", event);

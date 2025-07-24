@@ -127,11 +127,33 @@ impl SymbolManager {
         Ok(())
     }
 
+    pub fn wait_for_all_loading(&self) {
+        let handles: Vec<(String, JoinHandle<_>)> = {
+            let mut tasks = self.loading_tasks.lock().unwrap();
+            tasks.drain().collect()
+        };
+
+        if !handles.is_empty() {
+            trace!(count = handles.len(), "Waiting for background symbol loading tasks to complete...");
+            for (module_path, handle) in handles {
+                match handle.join() {
+                    Ok(Ok(())) => trace!(module_path, "Symbol loading finished successfully."),
+                    Ok(Err(e)) => warn!(module_path, error = %e, "Symbol loading finished with an error."),
+                    Err(_) => warn!(module_path, "Symbol loading thread panicked."),
+                }
+            }
+            trace!("All pending symbol loading tasks are complete.");
+        }
+    }
+
     /// Find symbols across all loaded modules, returning up to max_results matches
     /// Supports Windows-style "module!symbol" format (e.g., "ntdll!NtCreateFile")
     pub fn find_symbol_across_all_modules(&self, symbol_name: &str, max_results: usize) -> Result<Vec<ResolvedSymbol>, SymbolError> {
+        self.wait_for_all_loading();
         let cache = self.symbol_cache.lock().unwrap();
         let mut found_symbols = Vec::new();
+
+        trace!(loaded_modules = ?cache.keys(), "Searching for symbol in loaded modules");
         
         // Check if the symbol name contains module specification (module!symbol format)
         if let Some(exclamation_pos) = symbol_name.find('!') {

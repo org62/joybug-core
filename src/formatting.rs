@@ -26,6 +26,8 @@ impl std::fmt::Debug for DebuggerResponse {
             DebuggerResponse::ResolvedSymbolList { symbols } => f.debug_struct("ResolvedSymbolList").field("symbols", symbols).finish(),
             DebuggerResponse::AddressSymbol { module_path, symbol, offset } => f.debug_struct("AddressSymbol").field("module_path", module_path).field("symbol", symbol).field("offset", offset).finish(),
             DebuggerResponse::Instructions { instructions } => f.debug_struct("Instructions").field("instructions", instructions).finish(),
+            DebuggerResponse::FunctionArguments { arguments } => f.debug_struct("FunctionArguments").field("arguments", arguments).finish(),
+            DebuggerResponse::WideStringData { data } => f.debug_struct("WideStringData").field("data", data).finish(),
         }
     }
 }

@@ -19,6 +19,7 @@ pub mod request_response {
         Detach { pid: u32 },
         Continue { pid: u32, tid: u32 },
         SetBreakpoint { addr: u64 },
+        SetSingleShotBreakpoint { pid: u32, addr: u64 },
         Launch { command: String },
         ReadMemory { pid: u32, address: u64, size: usize },
         WriteMemory { pid: u32, address: u64, data: Vec<u8> },
@@ -36,7 +37,10 @@ pub mod request_response {
         GetCallStack { pid: u32, tid: u32 },
         // Step request
         Step { pid: u32, tid: u32, kind: StepKind },
-        // ... add more as needed
+        // Get function arguments
+        GetFunctionArguments { pid: u32, tid: u32, count: usize },
+        // Read wide string
+        ReadWideString { pid: u32, address: u64, max_len: Option<usize> },
     }
 
     #[derive(Serialize, Deserialize, Clone)]
@@ -61,6 +65,10 @@ pub mod request_response {
         Instructions { instructions: Vec<crate::interfaces::Instruction> },
         // Call stack responses
         CallStack { frames: Vec<crate::interfaces::CallFrame> },
+        // Argument responses
+        FunctionArguments { arguments: Vec<u64> },
+        // String responses
+        WideStringData { data: String },
         // ... add more as needed
     }
 
@@ -178,10 +186,28 @@ pub mod request_response {
 
 
 
-    #[derive(Clone)]
     pub enum ThreadContext {
         #[cfg(windows)]
         Win32RawContext(crate::protocol::CONTEXT),
+    }
+
+    #[cfg(windows)]
+    impl Clone for ThreadContext {
+        fn clone(&self) -> Self {
+            match self {
+                ThreadContext::Win32RawContext(ctx) => {
+                    let mut new_ctx: CONTEXT = unsafe { std::mem::zeroed() };
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            ctx as *const CONTEXT as *const u8,
+                            &mut new_ctx as *mut CONTEXT as *mut u8,
+                            std::mem::size_of::<CONTEXT>(),
+                        );
+                    }
+                    ThreadContext::Win32RawContext(new_ctx)
+                }
+            }
+        }
     }
 
     #[cfg(windows)]

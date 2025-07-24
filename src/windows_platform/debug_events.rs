@@ -139,7 +139,35 @@ pub(super) fn continue_exec(
             let ex_info = unsafe { debug_event.u.Exception };
             let ex_record = ex_info.ExceptionRecord;
             if ex_record.ExceptionCode == windows_sys::Win32::Foundation::EXCEPTION_BREAKPOINT {
-                trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, address = %format!("0x{:X}", ex_record.ExceptionAddress as u64), "Breakpoint event");
+                let address = ex_record.ExceptionAddress as u64;
+                trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, address = %format!("0x{:X}", address), "Breakpoint event");
+
+                let process = platform.get_process_mut(debug_event.dwProcessId)?;
+
+                // Check if this is a single-shot breakpoint
+                if let Some(original_bytes) = process.single_shot_breakpoints.remove(&address) {
+                    trace!(address = %format!("0x{:X}", address), "Single-shot breakpoint hit. Restoring original bytes.");
+
+                    // Restore the original byte
+                    super::memory::write_memory_internal(process.process_handle.0, address, &original_bytes)?;
+
+                    // Set IP back to the original instruction's address
+                    let mut context = match super::thread_context::get_thread_context(platform, debug_event.dwProcessId, debug_event.dwThreadId)? {
+                        crate::protocol::ThreadContext::Win32RawContext(ctx) => ctx,
+                    };
+                    
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        context.Rip = address;
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        context.Pc = address;
+                    }
+
+                    super::thread_context::set_thread_context(platform, debug_event.dwProcessId, debug_event.dwThreadId, crate::protocol::ThreadContext::Win32RawContext(context.clone()))?;
+                }
+
                 Some(crate::protocol::DebugEvent::Breakpoint {
                     pid: debug_event.dwProcessId,
                     tid: debug_event.dwThreadId,
