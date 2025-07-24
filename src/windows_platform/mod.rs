@@ -238,7 +238,7 @@ impl PlatformAPI for WindowsPlatform {
             (Architecture::Arm64, crate::protocol::ThreadContext::Win32RawContext(ctx)) => {
                 // First 8 arguments are in registers X0-X7
                 for i in 0..std::cmp::min(count, 8) {
-                    arguments.push(ctx.X[i]);
+                    arguments.push(ctx.Anonymous.X[i]);
                 }
 
                 // Subsequent arguments are on the stack
