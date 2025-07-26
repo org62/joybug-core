@@ -57,6 +57,8 @@ pub(crate) struct DebuggedProcess {
     pub(crate) module_manager: ModuleManager,
     pub(crate) thread_manager: ThreadManager,
     pub(crate) single_shot_breakpoints: HashMap<u64, Vec<u8>>,
+    /// Track whether this process has hit its initial breakpoint
+    pub(crate) has_hit_initial_breakpoint: bool,
 }
 
 impl DebuggedProcess {
@@ -72,6 +74,7 @@ impl DebuggedProcess {
             module_manager: ModuleManager::new(),
             thread_manager: ThreadManager::new(),
             single_shot_breakpoints: HashMap::new(),
+            has_hit_initial_breakpoint: false,
         })
     }
 }

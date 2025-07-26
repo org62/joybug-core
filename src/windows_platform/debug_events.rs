@@ -166,13 +166,32 @@ pub(super) fn continue_exec(
                     }
 
                     super::thread_context::set_thread_context(platform, debug_event.dwProcessId, debug_event.dwThreadId, crate::protocol::ThreadContext::Win32RawContext(context.clone()))?;
-                }
 
-                Some(crate::protocol::DebugEvent::Breakpoint {
-                    pid: debug_event.dwProcessId,
-                    tid: debug_event.dwThreadId,
-                    address: ex_record.ExceptionAddress as u64,
-                })
+                    // Emit specific single-shot breakpoint event
+                    Some(crate::protocol::DebugEvent::SingleShotBreakpoint {
+                        pid: debug_event.dwProcessId,
+                        tid: debug_event.dwThreadId,
+                        address: ex_record.ExceptionAddress as u64,
+                    })
+                } else {
+                    // Check if this is the initial breakpoint for this process
+                    // We consider it initial if it's the first breakpoint we've seen for this process
+                    let is_initial_breakpoint = !process.has_hit_initial_breakpoint;
+                    if is_initial_breakpoint {
+                        process.has_hit_initial_breakpoint = true;
+                        Some(crate::protocol::DebugEvent::InitialBreakpoint {
+                            pid: debug_event.dwProcessId,
+                            tid: debug_event.dwThreadId,
+                            address: ex_record.ExceptionAddress as u64,
+                        })
+                    } else {
+                        Some(crate::protocol::DebugEvent::Breakpoint {
+                            pid: debug_event.dwProcessId,
+                            tid: debug_event.dwThreadId,
+                            address: ex_record.ExceptionAddress as u64,
+                        })
+                    }
+                }
             } else if ex_record.ExceptionCode == STATUS_SINGLE_STEP {
                 trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, address = %format!("0x{:X}", ex_record.ExceptionAddress as u64), "Single-step event");
                 

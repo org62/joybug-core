@@ -12,35 +12,105 @@ pub mod request_response {
         Out,
     }
 
-    #[derive(Debug, Serialize, Deserialize)]
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+    pub enum StepAction {
+        Continue(StepKind),
+        Stop,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone)]
     #[serde(tag = "type", content = "data")]
     pub enum DebuggerRequest {
-        Attach { pid: u32 },
-        Detach { pid: u32 },
-        Continue { pid: u32, tid: u32 },
-        SetBreakpoint { addr: u64 },
-        SetSingleShotBreakpoint { pid: u32, addr: u64 },
-        Launch { command: String },
-        ReadMemory { pid: u32, address: u64, size: usize },
-        WriteMemory { pid: u32, address: u64, data: Vec<u8> },
-        GetThreadContext { pid: u32, tid: u32 },
-        SetThreadContext { pid: u32, tid: u32, context: ThreadContext },
-        ListModules { pid: u32 },
-        ListThreads { pid: u32 },
         ListProcesses,
+        ListModules {
+            pid: u32,
+        },
+        ListThreads {
+            pid: u32,
+        },
+        Attach {
+            pid: u32,
+        },
+        Detach {
+            pid: u32,
+        },
+        Launch {
+            command: String,
+        },
+        Continue {
+            pid: u32,
+            tid: u32,
+        },
+        SetBreakpoint {
+            addr: u64,
+        },
+        SetSingleShotBreakpoint {
+            pid: u32,
+            addr: u64,
+        },
+        ReadMemory {
+            pid: u32,
+            address: u64,
+            size: usize,
+        },
+        WriteMemory {
+            pid: u32,
+            address: u64,
+            data: Vec<u8>,
+        },
+        GetThreadContext {
+            pid: u32,
+            tid: u32,
+        },
+        SetThreadContext {
+            pid: u32,
+            tid: u32,
+            context: ThreadContext,
+        },
         // Symbol-related requests
-        FindSymbol { symbol_name: String, max_results: usize },
-        ListSymbols { module_path: String },
-        ResolveRvaToSymbol { module_path: String, rva: u32 },
-        ResolveAddressToSymbol { pid: u32, address: u64 },
-        DisassembleMemory { pid: u32, address: u64, count: usize, arch: crate::interfaces::Architecture },
-        GetCallStack { pid: u32, tid: u32 },
+        FindSymbol {
+            symbol_name: String,
+            max_results: usize,
+        },
+        ListSymbols {
+            module_path: String,
+        },
+        ResolveRvaToSymbol {
+            module_path: String,
+            rva: u32,
+        },
+        ResolveAddressToSymbol {
+            pid: u32,
+            address: u64,
+        },
+        DisassembleMemory {
+            pid: u32,
+            address: u64,
+            count: usize,
+            arch: crate::interfaces::Architecture,
+        },
+        GetCallStack {
+            pid: u32,
+            tid: u32,
+        },
         // Step request
-        Step { pid: u32, tid: u32, kind: StepKind },
+        Step {
+            pid: u32,
+            tid: u32,
+            kind: StepKind,
+        },
         // Get function arguments
-        GetFunctionArguments { pid: u32, tid: u32, count: usize },
+        GetFunctionArguments {
+            pid: u32,
+            tid: u32,
+            count: usize,
+        },
         // Read wide string
-        ReadWideString { pid: u32, address: u64, max_len: Option<usize> },
+        ReadWideString {
+            pid: u32,
+            address: u64,
+            max_len: Option<usize>,
+        },
     }
 
     #[derive(Serialize, Deserialize, Clone)]
@@ -60,7 +130,11 @@ pub mod request_response {
         Symbol { symbol: Option<crate::interfaces::ModuleSymbol> },
         SymbolList { symbols: Vec<crate::interfaces::ModuleSymbol> },
         ResolvedSymbolList { symbols: Vec<crate::interfaces::ResolvedSymbol> },
-        AddressSymbol { module_path: Option<String>, symbol: Option<crate::interfaces::ModuleSymbol>, offset: Option<u64> },
+        AddressSymbol {
+            module_path: Option<String>,
+            symbol: Option<crate::interfaces::ModuleSymbol>,
+            offset: Option<u64>,
+        },
         // Disassembly responses
         Instructions { instructions: Vec<crate::interfaces::Instruction> },
         // Call stack responses
@@ -87,6 +161,16 @@ pub mod request_response {
             parameters: Vec<u64>,
         },
         Breakpoint {
+            pid: u32,
+            tid: u32,
+            address: u64,
+        },
+        InitialBreakpoint {
+            pid: u32,
+            tid: u32,
+            address: u64,
+        },
+        SingleShotBreakpoint {
             pid: u32,
             tid: u32,
             address: u64,
@@ -142,6 +226,8 @@ pub mod request_response {
                 DebugEvent::Output { pid, .. } => *pid,
                 DebugEvent::Exception { pid, .. } => *pid,
                 DebugEvent::Breakpoint { pid, .. } => *pid,
+                DebugEvent::InitialBreakpoint { pid, .. } => *pid,
+                DebugEvent::SingleShotBreakpoint { pid, .. } => *pid,
                 DebugEvent::ProcessCreated { pid, .. } => *pid,
                 DebugEvent::ThreadCreated { pid, .. } => *pid,
                 DebugEvent::ThreadExited { pid, .. } => *pid,
@@ -158,6 +244,8 @@ pub mod request_response {
                 DebugEvent::Output { tid, .. } => *tid,
                 DebugEvent::Exception { tid, .. } => *tid,
                 DebugEvent::Breakpoint { tid, .. } => *tid,
+                DebugEvent::InitialBreakpoint { tid, .. } => *tid,
+                DebugEvent::SingleShotBreakpoint { tid, .. } => *tid,
                 DebugEvent::ProcessCreated { tid, .. } => *tid,
                 DebugEvent::ThreadCreated { tid, .. } => *tid,
                 DebugEvent::ThreadExited { tid, .. } => *tid,

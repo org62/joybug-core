@@ -1,10 +1,23 @@
 #![cfg(windows)]
 
-use joybug2::protocol::{DebuggerResponse, DebugEvent, DebuggerRequest, ThreadContext};
-use joybug2::protocol_io::DebugClient;
+use joybug2::protocol::ThreadContext;
+use joybug2::protocol_io::DebugSession;
 use joybug2::interfaces::{Architecture, InstructionFormatter};
 use std::thread;
 use tokio;
+
+/// Clean, simple test state for tracking events
+struct TestState {
+    initial_breakpoint_hit: bool,
+}
+
+impl TestState {
+    fn new() -> Self {
+        Self {
+            initial_breakpoint_hit: false,
+        }
+    }
+}
 
 #[test]
 fn test_debug_client_ctx_mem_test() {
@@ -13,112 +26,74 @@ fn test_debug_client_ctx_mem_test() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(joybug2::server::run_server()).unwrap();
     });
-    let mut client = DebugClient::connect(None).expect("connect");
-    let mut handled_breakpoint = false;
 
-    client.launch("cmd.exe /c echo test".to_string(), &mut handled_breakpoint, |client, handled_breakpoint, resp| {
-        match resp {
-            DebuggerResponse::Event { event } => {
-                if let DebugEvent::Breakpoint { pid, tid, address } = event {
-                    // Try to resolve the breakpoint address to a symbol
-                    let symbol_req = DebuggerRequest::ResolveAddressToSymbol { pid, address };
-                    let symbol_resp = client.send_and_receive(&symbol_req).unwrap();
-                    match symbol_resp {
-                        DebuggerResponse::AddressSymbol { module_path, symbol, offset } => {
-                            if let (Some(module), Some(sym), Some(off)) = (module_path, symbol, offset) {
-                                println!("Breakpoint at 0x{:X} resolved to symbol '{}' in module '{}' + 0x{:X}", address, sym.name, module, off);
-                                // Assert that the symbol name is LdrpDoDebuggerBreak
-                                assert_eq!(sym.name, "LdrpDoDebuggerBreak", "Expected symbol name to be LdrpDoDebuggerBreak");
-                            } else {
-                                panic!("Expected symbol information to be available for breakpoint at 0x{:X}", address);
-                            }
-                        }
-                        _ => panic!("Failed to resolve symbol for breakpoint at 0x{:X}", address),
-                    }
+    let final_state = DebugSession::new(TestState::new(), None)
+        .expect("connect")
+        .on_initial_breakpoint(|session, pid, tid, address| {
+            session.state.initial_breakpoint_hit = true;
 
-                    // Disassemble instructions around the breakpoint
-                    println!("Disassembling instructions around breakpoint at 0x{:X}", address);
+            // Try to resolve the breakpoint address to a symbol
+            let (module_path, symbol, offset) = session.resolve_address_to_symbol(pid, address).unwrap();
+            if let (Some(module), Some(sym), Some(off)) = (module_path, symbol, offset) {
+                println!("Breakpoint at 0x{:X} resolved to symbol '{}' in module '{}' + 0x{:X}", address, sym.name, module, off);
+                // Assert that the symbol name is LdrpDoDebuggerBreak
+                assert_eq!(sym.name, "LdrpDoDebuggerBreak", "Expected symbol name to be LdrpDoDebuggerBreak");
+            } else {
+                panic!("Expected symbol information to be available for breakpoint at 0x{:X}", address);
+            }
 
-                    let arch = if cfg!(target_arch = "x86_64") { Architecture::X64 } else { Architecture::Arm64 };
-                    let disasm_req = DebuggerRequest::DisassembleMemory { pid, address, count: 10, arch };
-                    let resp = client.send_and_receive(&disasm_req).unwrap();
-                    if let DebuggerResponse::Instructions { instructions } = resp {
-                        println!("Instructions from memory disassembly:");
-                        println!("{}", instructions.format_disassembly());
-                    } else {
-                        println!("Failed to disassemble memory: {:?}", resp);
-                    }
+            // Disassemble instructions around the breakpoint
+            println!("Disassembling instructions around breakpoint at 0x{:X}", address);
 
-                    // Request thread context
-                    let req = DebuggerRequest::GetThreadContext { pid, tid };
-                    let resp = client.send_and_receive(&req).unwrap();
-                    if let DebuggerResponse::ThreadContext { context } = resp {
-                        match context {
-                            #[cfg(windows)]
-                            joybug2::protocol::ThreadContext::Win32RawContext(ctx) => {
-                                // Try round-trip: set the same context back
-                                let set_ctx_req = DebuggerRequest::SetThreadContext { pid, tid, context: ThreadContext::Win32RawContext(ctx.clone()) };
-                                let resp = client.send_and_receive(&set_ctx_req).unwrap();
-                                println!("resp: {:?}", resp);
-                                assert!(matches!(resp, DebuggerResponse::SetContextAck));
-                            }
-                        }
-                    } else {
-                        panic!("Expected ThreadContext response");
-                    }
+            let arch = if cfg!(target_arch = "x86_64") { Architecture::X64 } else { Architecture::Arm64 };
+            let instructions = session.disassemble_memory(pid, address, 10, arch).unwrap();
+            println!("Instructions from memory disassembly:");
+            println!("{}", instructions.format_disassembly());
 
-                    // Read memory at breakpoint, on x64 read 1 byte, on arm64 read 4 bytes
-                    let read_size = if cfg!(target_arch = "x86_64") { 1 } else { 4 };
-
-                    let read_req = DebuggerRequest::ReadMemory { pid, address, size: read_size };
-                    let resp = client.send_and_receive(&read_req).unwrap();
-                    if let DebuggerResponse::MemoryData { data } = resp {
-                        #[cfg(target_arch = "x86_64")]
-                        {
-                            assert_eq!(data[0], 0xCC, "Expected int3 at breakpoint");
-                            // Overwrite with NOP
-                            let write_req = DebuggerRequest::WriteMemory { pid, address, data: vec![0x90] };
-                            let resp = client.send_and_receive(&write_req).unwrap();
-                            assert!(matches!(resp, DebuggerResponse::WriteAck));
-                            // Confirm overwrite
-                            let read_req = DebuggerRequest::ReadMemory { pid, address, size: 1 };
-                            let resp = client.send_and_receive(&read_req).unwrap();
-                            if let DebuggerResponse::MemoryData { data } = resp {
-                                assert_eq!(data[0], 0x90, "Expected NOP at breakpoint after write");
-                            } else {
-                                panic!("Expected MemoryData response, got: {:?}", resp);
-                            }
-                        }
-                        #[cfg(target_arch = "aarch64")]
-                        {
-                            // d43e0000 brk #0xF000
-                            // d503201f nop
-                            let nop_bytes = vec![0x1f, 0x20, 0x03, 0xd5];
-                            let brk_bytes = vec![0x00, 0x00, 0x3e, 0xd4];
-                            assert_eq!(data, brk_bytes);
-                            // Overwrite with NOP
-                            let write_req = DebuggerRequest::WriteMemory { pid, address, data: nop_bytes.clone() };
-                            let resp = client.send_and_receive(&write_req).unwrap();
-                            assert!(matches!(resp, DebuggerResponse::WriteAck));
-                            // Confirm overwrite
-                            let read_req = DebuggerRequest::ReadMemory { pid, address, size: read_size };
-                            let resp = client.send_and_receive(&read_req).unwrap();
-                            if let DebuggerResponse::MemoryData { data } = resp {
-                                assert_eq!(data, nop_bytes, "Expected NOP at breakpoint after write");
-                                println!("data: {:?}", data);
-                            } else {
-                                panic!("Expected MemoryData response, got: {:?}", resp);
-                            }
-                        }
-                    }
-                    *handled_breakpoint = true;
-                    return false; // Stop after handling one breakpoint
+            // Request thread context
+            let context = session.get_thread_context(pid, tid).unwrap();
+            match context {
+                joybug2::protocol::ThreadContext::Win32RawContext(ctx) => {
+                    // Try round-trip: set the same context back
+                    session.set_thread_context(pid, tid, ThreadContext::Win32RawContext(ctx.clone())).unwrap();
+                }
+                #[cfg(not(windows))]
+                _ => {
+                    panic!("Unexpected thread context type");
                 }
             }
-            _ => {}
-        }
-        true
-    }).expect("debug loop");
 
-    assert!(handled_breakpoint, "Should have handled a breakpoint event");
+            // Read memory at breakpoint, on x64 read 1 byte, on arm64 read 4 bytes
+            let read_size = if cfg!(target_arch = "x86_64") { 1 } else { 4 };
+
+            let data = session.read_memory(pid, address, read_size).unwrap();
+            #[cfg(target_arch = "x86_64")]
+            {
+                assert_eq!(data[0], 0xCC, "Expected int3 at breakpoint");
+                // Overwrite with NOP
+                session.write_memory(pid, address, vec![0x90]).unwrap();
+                // Confirm overwrite
+                let data = session.read_memory(pid, address, 1).unwrap();
+                assert_eq!(data[0], 0x90, "Expected NOP at breakpoint after write");
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                // d43e0000 brk #0xF000
+                // d503201f nop
+                let nop_bytes = vec![0x1f, 0x20, 0x03, 0xd5];
+                let brk_bytes = vec![0x00, 0x00, 0x3e, 0xd4];
+                assert_eq!(data, brk_bytes);
+                // Overwrite with NOP
+                session.write_memory(pid, address, nop_bytes.clone()).unwrap();
+                // Confirm overwrite
+                let data = session.read_memory(pid, address, read_size).unwrap();
+                assert_eq!(data, nop_bytes, "Expected NOP at breakpoint after write");
+                println!("data: {:?}", data);
+            }
+            Ok(())
+        })
+        .launch("cmd.exe /c echo test".to_string())
+        .expect("debug loop");
+
+    assert!(final_state.initial_breakpoint_hit, "Should have handled a breakpoint event");
 } 
