@@ -1,5 +1,5 @@
 use crate::interfaces::{Architecture, Instruction, ModuleSymbol};
-use crate::protocol::{
+pub use crate::protocol::{
     DebuggerRequest, DebuggerResponse, DebugEvent, ModuleInfo, ProcessInfo, StepAction, StepKind,
     ThreadContext, ThreadInfo,
 };
@@ -7,6 +7,7 @@ use anyhow::Ok;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 pub use std::net::TcpStream;
+use std::sync::Mutex;
 
 pub fn send_request(stream: &mut TcpStream, req: &DebuggerRequest) -> anyhow::Result<()> {
     let data = serde_json::to_vec(req)?;
@@ -21,34 +22,35 @@ pub fn receive_response(stream: &mut TcpStream) -> anyhow::Result<DebuggerRespon
     Ok(resp)
 }
 
-struct SteppingInfo<'a, S> {
+struct SteppingInfo<S> {
     handler: Box<
-        dyn FnMut(&mut DebugSession<'a, S>, u32, u32, u64, crate::protocol::StepKind) -> Result<StepAction, anyhow::Error>
-            + 'a,
+        dyn FnMut(&mut DebugSession<S>, u32, u32, u64, crate::protocol::StepKind) -> Result<StepAction, anyhow::Error>
+            + Send
+            + 'static,
     >,
 }
 
 /// Debug session with state management
-pub struct DebugSession<'a, S> {
-    pub stream: TcpStream,
+pub struct DebugSession<S> {
+    pub stream: Mutex<TcpStream>,
     pub state: S,
-    on_initial_breakpoint: Option<Box<dyn FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<()> + 'a>>,
+    on_initial_breakpoint: Option<Box<dyn FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<()> + Send + 'static>>,
     single_shot_handlers:
-        HashMap<u64, Box<dyn FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<()> + 'a>>,
-    stepping_info: Option<SteppingInfo<'a, S>>,
+        HashMap<u64, Box<dyn FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<()> + Send + 'static>>,
+    stepping_info: Option<SteppingInfo<S>>,
     on_dll_loaded:
-        Option<Box<dyn FnMut(&mut Self, u32, u32, &str, u64) -> anyhow::Result<()> + 'a>>,
+        Option<Box<dyn FnMut(&mut Self, u32, u32, &str, u64) -> anyhow::Result<()> + Send + 'static>>,
     on_process_created:
-        Option<Box<dyn FnMut(&mut Self, u32, u32, &str, u64) -> anyhow::Result<()> + 'a>>,
-    on_event: Option<Box<dyn FnMut(&mut Self, &DebugEvent) -> anyhow::Result<()> + 'a>>,
+        Option<Box<dyn FnMut(&mut Self, u32, u32, &str, u64) -> anyhow::Result<()> + Send + 'static>>,
+    on_event: Option<Box<dyn FnMut(&mut Self, &DebugEvent) -> anyhow::Result<()> + Send + 'static>>,
 }
 
-impl<'a, S> DebugSession<'a, S> {
+impl<S> DebugSession<S> {
     pub fn new(state: S, addr: Option<&str>) -> anyhow::Result<Self> {
         let addr = addr.unwrap_or("127.0.0.1:9000");
         let stream = TcpStream::connect(addr)?;
         Ok(Self {
-            stream,
+            stream: Mutex::new(stream),
             state,
             on_initial_breakpoint: None,
             single_shot_handlers: HashMap::new(),
@@ -62,7 +64,7 @@ impl<'a, S> DebugSession<'a, S> {
     /// Callback receives: (session, pid, tid, address)
     pub fn on_initial_breakpoint<F>(mut self, handler: F) -> Self
     where
-        F: FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<()> + 'a,
+        F: FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<()> + Send + 'static,
     {
         self.on_initial_breakpoint = Some(Box::new(handler));
         self
@@ -77,7 +79,7 @@ impl<'a, S> DebugSession<'a, S> {
         handler: F,
     ) -> anyhow::Result<()>
     where
-        F: FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<()> + 'a,
+        F: FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<()> + Send + 'static,
     {
         let address = self.setup_single_shot_breakpoint(pid, symbol_name)?;
         self.single_shot_handlers.insert(address, Box::new(handler));
@@ -92,7 +94,7 @@ impl<'a, S> DebugSession<'a, S> {
         handler: F,
     ) -> anyhow::Result<()>
     where
-        F: FnMut(&mut Self, u32, u32, u64, StepKind) -> Result<StepAction, anyhow::Error> + 'a,
+        F: FnMut(&mut Self, u32, u32, u64, StepKind) -> Result<StepAction, anyhow::Error> + Send + 'static,
     {
         if self.stepping_info.is_some() {
             return Err(anyhow::anyhow!(
@@ -116,7 +118,7 @@ impl<'a, S> DebugSession<'a, S> {
     /// Callback receives: (session, pid, tid, dll_name, base_address)
     pub fn on_dll_loaded<F>(mut self, handler: F) -> Self
     where
-        F: FnMut(&mut Self, u32, u32, &str, u64) -> anyhow::Result<()> + 'a,
+        F: FnMut(&mut Self, u32, u32, &str, u64) -> anyhow::Result<()> + Send + 'static,
     {
         self.on_dll_loaded = Some(Box::new(handler));
         self
@@ -126,7 +128,7 @@ impl<'a, S> DebugSession<'a, S> {
     /// Callback receives: (session, pid, tid, image_name, base_address)
     pub fn on_process_created<F>(mut self, handler: F) -> Self
     where
-        F: FnMut(&mut Self, u32, u32, &str, u64) -> anyhow::Result<()> + 'a,
+        F: FnMut(&mut Self, u32, u32, &str, u64) -> anyhow::Result<()> + Send + 'static,
     {
         self.on_process_created = Some(Box::new(handler));
         self
@@ -135,7 +137,7 @@ impl<'a, S> DebugSession<'a, S> {
     /// Generic event handler
     pub fn on_event<F>(mut self, handler: F) -> Self
     where
-        F: FnMut(&mut Self, &DebugEvent) -> anyhow::Result<()> + 'a,
+        F: FnMut(&mut Self, &DebugEvent) -> anyhow::Result<()> + Send + 'static,
     {
         self.on_event = Some(Box::new(handler));
         self
@@ -145,8 +147,10 @@ impl<'a, S> DebugSession<'a, S> {
     /// Returns the final state after the session completes
     pub fn launch(mut self, command: String) -> anyhow::Result<S> {
         let launch = DebuggerRequest::Launch { command };
-        send_request(&mut self.stream, &launch)?;
-        let resp = receive_response(&mut self.stream)?;
+        let mut stream = self.stream.lock().unwrap();
+        send_request(&mut stream, &launch)?;
+        let resp = receive_response(&mut stream)?;
+        drop(stream);
 
         if let DebuggerResponse::Event { event } = resp {
             self.run_session_loop(Some(event))?;
@@ -175,7 +179,9 @@ impl<'a, S> DebugSession<'a, S> {
         }
 
         loop {
-            let resp = receive_response(&mut self.stream)?;
+            let mut stream = self.stream.lock().unwrap();
+            let resp = receive_response(&mut stream)?;
+            drop(stream);
             if let DebuggerResponse::Event { event } = resp {
                 if !self.handle_session_event(&event)? {
                     break;
@@ -295,7 +301,8 @@ impl<'a, S> DebugSession<'a, S> {
                         pid: *pid,
                         tid: *tid,
                     };
-                    send_request(&mut self.stream, &cont)?;
+                    let mut stream = self.stream.lock().unwrap();
+                    send_request(&mut stream, &cont)?;
                 }
             }
 
@@ -313,7 +320,8 @@ impl<'a, S> DebugSession<'a, S> {
                     pid: *pid,
                     tid: *tid,
                 };
-                send_request(&mut self.stream, &cont)?;
+                let mut stream = self.stream.lock().unwrap();
+                send_request(&mut stream, &cont)?;
             }
             DebugEvent::Unknown => {}
         }
@@ -355,16 +363,19 @@ impl<'a, S> DebugSession<'a, S> {
         &mut self,
         req: &crate::protocol::DebuggerRequest,
     ) -> anyhow::Result<crate::protocol::DebuggerResponse> {
-        send_request(&mut self.stream, req)?;
-        receive_response(&mut self.stream)
+        let mut stream = self.stream.lock().unwrap();
+        send_request(&mut stream, req)?;
+        receive_response(&mut stream)
     }
 
     pub fn send(&mut self, req: &crate::protocol::DebuggerRequest) -> anyhow::Result<()> {
-        send_request(&mut self.stream, req)
+        let mut stream = self.stream.lock().unwrap();
+        send_request(&mut stream, req)
     }
 
     pub fn receive(&mut self) -> anyhow::Result<crate::protocol::DebuggerResponse> {
-        receive_response(&mut self.stream)
+        let mut stream = self.stream.lock().unwrap();
+        receive_response(&mut stream)
     }
 
     /// Get call stack
