@@ -90,7 +90,7 @@ fn test_attach_and_list_modules() {
     .on_dll_loaded(|_sess, _pid, _tid, _name, _base| Ok(()))
     .on_event(|sess, event| {
         sess.state.events.push(event.clone());
-        Ok(())
+        Ok(true)
     })
     .attach(process_info.dwProcessId)
     .expect("debug loop");

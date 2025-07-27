@@ -42,7 +42,7 @@ pub struct DebugSession<S> {
         Option<Box<dyn FnMut(&mut Self, u32, u32, &str, u64) -> anyhow::Result<()> + Send + 'static>>,
     on_process_created:
         Option<Box<dyn FnMut(&mut Self, u32, u32, &str, u64) -> anyhow::Result<()> + Send + 'static>>,
-    on_event: Option<Box<dyn FnMut(&mut Self, &DebugEvent) -> anyhow::Result<()> + Send + 'static>>,
+    on_event: Option<Box<dyn FnMut(&mut Self, &DebugEvent) -> anyhow::Result<bool> + Send + 'static>>,
 }
 
 impl<S> DebugSession<S> {
@@ -137,7 +137,7 @@ impl<S> DebugSession<S> {
     /// Generic event handler
     pub fn on_event<F>(mut self, handler: F) -> Self
     where
-        F: FnMut(&mut Self, &DebugEvent) -> anyhow::Result<()> + Send + 'static,
+        F: FnMut(&mut Self, &DebugEvent) -> anyhow::Result<bool> + Send + 'static,
     {
         self.on_event = Some(Box::new(handler));
         self
@@ -199,8 +199,11 @@ impl<S> DebugSession<S> {
         let mut on_process_created = self.on_process_created.take();
         let mut on_event = self.on_event.take();
 
+        // Check if on_event handler wants to stop the session
+        let mut should_continue = true;
         if let Some(ref mut handler) = on_event {
-            handler(self, event)?;
+            // The handler returns Result<bool> where false means stop the session
+            should_continue = handler(self, event)?;
         }
 
         match event {
@@ -284,6 +287,11 @@ impl<S> DebugSession<S> {
         self.on_dll_loaded = on_dll_loaded;
         self.on_process_created = on_process_created;
         self.on_event = on_event;
+
+        // If the on_event handler wants to stop, respect that
+        if !should_continue {
+            return Ok(false);
+        }
 
         // Handle automatic continuation for most events
         match event {

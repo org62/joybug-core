@@ -27,7 +27,7 @@ fn test_multi_client_sessions() {
         .expect("connect client 1")
         .on_event(|sess, event| {
             sess.state.events.push(event.clone());
-            Ok(())
+            Ok(true)
         })
         .launch("cmd.exe /c echo client1".to_string())
         .expect("debug loop for client 1")
@@ -46,7 +46,7 @@ fn test_multi_client_sessions() {
         .expect("connect client 2")
         .on_event(|sess, event| {
             sess.state.events.push(event.clone());
-            Ok(())
+            Ok(true)
         })
         .launch("cmd.exe /c echo client2".to_string())
         .expect("debug loop for client 2")
