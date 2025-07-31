@@ -96,7 +96,9 @@ pub struct WindowsPlatform {
     /// Shared disassembler for all processes
     pub(crate) disassembler: Option<CapstoneDisassembler>,
     /// Track active stepping operations by (pid, tid)
-    pub(crate) active_steppers: HashMap<(u32, u32), StepState>,
+    pub(crate) active_single_steps: HashMap<(u32, u32), StepState>,
+    /// Track step-over breakpoints by address
+    pub(crate) step_over_breakpoints: HashMap<u64, (u32, u32, StepKind)>,
 }
 
 impl WindowsPlatform {
@@ -107,7 +109,8 @@ impl WindowsPlatform {
             processes: HashMap::new(),
             symbol_manager,
             disassembler,
-            active_steppers: HashMap::new(),
+            active_single_steps: HashMap::new(),
+            step_over_breakpoints: HashMap::new(),
         }
     }
     
@@ -359,6 +362,7 @@ impl PlatformAPI for WindowsPlatform {
     fn get_call_stack(&mut self, pid: u32, tid: u32) -> Result<Vec<crate::interfaces::CallFrame>, PlatformError> {
         callstack::get_call_stack(self, pid, tid)
     }
+
 }
 
 impl Stepper for WindowsPlatform {

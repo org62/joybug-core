@@ -4,6 +4,7 @@ pub mod protocol_io;
 pub mod interfaces;
 pub mod windows_platform;
 pub mod server;
+pub mod framed_json_stream;
 
 #[cfg(windows)]
 pub type PlatformImpl = windows_platform::WindowsPlatform;
@@ -20,4 +21,4 @@ pub fn init_tracing() {
         .without_time()
         .with_env_filter(filter)
         .init();
-} 
+}

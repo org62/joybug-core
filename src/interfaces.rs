@@ -52,6 +52,12 @@ pub enum Architecture {
     Arm64,
 }
 
+impl Architecture {
+    pub fn from_native() -> Self {
+        if cfg!(target_arch = "x86_64") { Architecture::X64 } else { Architecture::Arm64 }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Instruction {
     pub address: u64,

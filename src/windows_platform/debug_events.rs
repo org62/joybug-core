@@ -167,12 +167,23 @@ pub(super) fn continue_exec(
 
                     super::thread_context::set_thread_context(platform, debug_event.dwProcessId, debug_event.dwThreadId, crate::protocol::ThreadContext::Win32RawContext(context.clone()))?;
 
-                    // Emit specific single-shot breakpoint event
-                    Some(crate::protocol::DebugEvent::SingleShotBreakpoint {
-                        pid: debug_event.dwProcessId,
-                        tid: debug_event.dwThreadId,
-                        address: ex_record.ExceptionAddress as u64,
-                    })
+                    // Check if this was a step-over breakpoint
+                    if let Some((pid, tid, kind)) = platform.step_over_breakpoints.remove(&address) {
+                        // This was a step-over breakpoint
+                        Some(crate::protocol::DebugEvent::StepComplete {
+                            pid,
+                            tid,
+                            kind,
+                            address,
+                        })
+                    } else {
+                        // This was a regular single-shot breakpoint
+                        Some(crate::protocol::DebugEvent::SingleShotBreakpoint {
+                            pid: debug_event.dwProcessId,
+                            tid: debug_event.dwThreadId,
+                            address,
+                        })
+                    }
                 } else {
                     // Check if this is the initial breakpoint for this process
                     // We consider it initial if it's the first breakpoint we've seen for this process
@@ -197,7 +208,7 @@ pub(super) fn continue_exec(
                 
                 // Check if this is from an active stepper
                 let step_key = (debug_event.dwProcessId, debug_event.dwThreadId);
-                if let Some(step_state) = platform.active_steppers.remove(&step_key) {
+                if let Some(step_state) = platform.active_single_steps.remove(&step_key) {
                     // This is from an active stepping operation
                     trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, kind = ?step_state.kind, "Single-step from active stepper");
                     

@@ -279,6 +279,24 @@ pub mod request_response {
         Win32RawContext(crate::protocol::CONTEXT),
     }
 
+    // get PC from ThreadContext, on x64 it's RIP on arm64 it's PC
+    impl ThreadContext {
+        pub fn get_pc(&self) -> u64 {
+            #[cfg(target_arch = "x86_64")]
+            {
+                match self {
+                    ThreadContext::Win32RawContext(ctx) => ctx.Rip,
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                match self {
+                    ThreadContext::Win32RawContext(ctx) => ctx.Pc,
+                }
+            }
+        }
+    }
+
     #[cfg(windows)]
     impl Clone for ThreadContext {
         fn clone(&self) -> Self {
@@ -337,10 +355,6 @@ pub mod request_response {
             }
         }
     }
-
-
-
-
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
     pub struct ThreadInfo {

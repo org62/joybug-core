@@ -5,20 +5,22 @@ pub use crate::protocol::{
 };
 use anyhow::Ok;
 use std::collections::HashMap;
-use std::io::{Read, Write};
 pub use std::net::TcpStream;
 use std::sync::Mutex;
+use crate::framed_json_stream::FramedJsonStream;
+use tracing::{debug, error, info};
 
-pub fn send_request(stream: &mut TcpStream, req: &DebuggerRequest) -> anyhow::Result<()> {
-    let data = serde_json::to_vec(req)?;
-    stream.write_all(&data)?;
-    Ok(())
+pub fn send_request(stream: &mut FramedJsonStream, req: &DebuggerRequest) -> anyhow::Result<()> {
+    debug!("Sending request: {:?}", req);
+    stream.send(req)
 }
 
-pub fn receive_response(stream: &mut TcpStream) -> anyhow::Result<DebuggerResponse> {
-    let mut buf = vec![0u8; 4096 * 1024];
-    let n = stream.read(&mut buf)?;
-    let resp = serde_json::from_slice(&buf[..n])?;
+pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<DebuggerResponse> {
+    let resp: DebuggerResponse = stream.receive()?;
+    debug!("Received response: {:?}", resp);
+    if let DebuggerResponse::Error { message } = &resp {
+        panic!("Error: {}", message);
+    }
     Ok(resp)
 }
 
@@ -32,7 +34,7 @@ struct SteppingInfo<S> {
 
 /// Debug session with state management
 pub struct DebugSession<S> {
-    pub stream: Mutex<TcpStream>,
+    pub stream: Mutex<FramedJsonStream>,
     pub state: S,
     on_initial_breakpoint: Option<Box<dyn FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<()> + Send + 'static>>,
     single_shot_handlers:
@@ -49,8 +51,9 @@ impl<S> DebugSession<S> {
     pub fn new(state: S, addr: Option<&str>) -> anyhow::Result<Self> {
         let addr = addr.unwrap_or("127.0.0.1:9000");
         let stream = TcpStream::connect(addr)?;
+        let framed_stream = FramedJsonStream::new(stream);
         Ok(Self {
-            stream: Mutex::new(stream),
+            stream: Mutex::new(framed_stream),
             state,
             on_initial_breakpoint: None,
             single_shot_handlers: HashMap::new(),
@@ -147,17 +150,10 @@ impl<S> DebugSession<S> {
     /// Returns the final state after the session completes
     pub fn launch(mut self, command: String) -> anyhow::Result<S> {
         let launch = DebuggerRequest::Launch { command };
-        let mut stream = self.stream.lock().unwrap();
-        send_request(&mut stream, &launch)?;
-        let resp = receive_response(&mut stream)?;
-        drop(stream);
-
-        if let DebuggerResponse::Event { event } = resp {
-            self.run_session_loop(Some(event))?;
-            Ok(self.state)
-        } else {
-            Err(anyhow::anyhow!("Expected event after launch, got {:?}", resp))
-        }
+        self.send(&launch)?;
+        // Don't wait for a response here, run_session_loop will handle it
+        self.run_session_loop(None)?;
+        Ok(self.state)
     }
 
     pub fn attach(mut self, pid: u32) -> anyhow::Result<S> {
@@ -186,6 +182,8 @@ impl<S> DebugSession<S> {
                 if !self.handle_session_event(&event)? {
                     break;
                 }
+            } else {
+                info!("Received non-event response: {:?}, ignoring.", resp);
             }
         }
         Ok(())
@@ -250,12 +248,7 @@ impl<S> DebugSession<S> {
                 let mut handler = if let Some(info) = self.stepping_info.take() {
                     info.handler
                 } else {
-                    let req = DebuggerRequest::Continue {
-                        pid: *pid,
-                        tid: *tid,
-                    };
-                    self.send(&req)?;
-                    return Ok(true);
+                    panic!("No stepping info, sending continue request");
                 };
 
                 let action = handler(self, *pid, *tid, *address, *kind)?;
@@ -271,11 +264,7 @@ impl<S> DebugSession<S> {
                         self.stepping_info = Some(SteppingInfo { handler });
                     }
                     StepAction::Stop => {
-                        let req = DebuggerRequest::Continue {
-                            pid: *pid,
-                            tid: *tid,
-                        };
-                        self.send(&req)?;
+                        // debug loop continues on itself we just don't need to setup the next step
                     }
                 }
             }
@@ -296,23 +285,6 @@ impl<S> DebugSession<S> {
         // Handle automatic continuation for most events
         match event {
             DebugEvent::ProcessExited { .. } => return Ok(false),
-            // Stepping is now fully handled in the main match block above,
-            // including sending the next Step or Continue request.
-            // So we do nothing here for StepComplete.
-            DebugEvent::StepComplete { .. } => return Ok(true),
-
-            DebugEvent::SingleShotBreakpoint { pid, tid, .. } => {
-                // If the handler initiated a stepping sequence, the first step has already
-                // been sent. Do not send an additional Continue.
-                if self.stepping_info.is_none() {
-                    let cont = DebuggerRequest::Continue {
-                        pid: *pid,
-                        tid: *tid,
-                    };
-                    let mut stream = self.stream.lock().unwrap();
-                    send_request(&mut stream, &cont)?;
-                }
-            }
 
             DebugEvent::ProcessCreated { pid, tid, .. }
             | DebugEvent::DllLoaded { pid, tid, .. }
@@ -323,6 +295,8 @@ impl<S> DebugSession<S> {
             | DebugEvent::InitialBreakpoint { pid, tid, .. }
             | DebugEvent::Output { pid, tid, .. }
             | DebugEvent::Exception { pid, tid, .. }
+            | DebugEvent::StepComplete { pid, tid, .. }
+            | DebugEvent::SingleShotBreakpoint { pid, tid, .. }
             | DebugEvent::RipEvent { pid, tid, .. } => {
                 let cont = DebuggerRequest::Continue {
                     pid: *pid,
@@ -395,12 +369,15 @@ impl<S> DebugSession<S> {
         match self.send_and_receive(&DebuggerRequest::GetCallStack { pid, tid })? {
             DebuggerResponse::CallStack { frames } => Ok(frames),
             DebuggerResponse::Error { message } => {
+                error!("Call stack error: {}", message);
                 Err(anyhow::anyhow!("Call stack error: {}", message))
             }
-            other => Err(anyhow::anyhow!(
+            other => {
+                error!("Unexpected response to GetCallStack: {:?}", other);
+                Err(anyhow::anyhow!(
                 "Unexpected response to GetCallStack: {:?}",
-                other
-            )),
+                other))
+            }
         }
     }
 

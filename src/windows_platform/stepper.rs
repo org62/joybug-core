@@ -1,6 +1,7 @@
 use super::{WindowsPlatform};
-use crate::interfaces::PlatformError;
+use crate::interfaces::{PlatformAPI, PlatformError};
 use crate::protocol::{StepKind, DebugEvent, ThreadContext};
+use crate::interfaces::Architecture;
 use tracing::{trace, debug};
 use windows_sys::Win32::System::Diagnostics::Debug::{
     CONTEXT
@@ -21,11 +22,6 @@ pub(super) fn step(
     kind: StepKind
 ) -> Result<Option<DebugEvent>, PlatformError> {
     trace!(pid, tid, kind = ?kind, "WindowsPlatform::step called");
-    
-    // For now, only implement Step Into
-    if kind != StepKind::Into {
-        return Err(PlatformError::NotImplemented);
-    }
 
     // Get current thread context using platform function
     let thread_context = super::thread_context::get_thread_context(platform, pid, tid)?;
@@ -35,16 +31,60 @@ pub(super) fn step(
     };
 
     // Set single-step flag based on architecture
-    set_single_step_flag_native(&mut context)?;
+    match kind {
+        StepKind::Into => {
 
-    // Set the modified context back using platform function
-    let updated_context = ThreadContext::Win32RawContext(context);
-    super::thread_context::set_thread_context(platform, pid, tid, updated_context)?;
+            // TODO: Special cases:
+            // - If the current instruction is `PUSHF`, it delegates to `StepOver` because stepping into `PUSHF` can cause confusion with TF on the stack.
+            // - If the instruction is `POP SS` or `MOV SS`, it sets a one-shot breakpoint at the instruction after.
 
-    debug!(pid, tid, "Single-step flag set, continuing execution");
-    
-    // Track this stepping operation
-    platform.active_steppers.insert((pid, tid), super::StepState { kind });
+            set_single_step_flag_native(&mut context)?;
+            // Set the modified context back using platform function
+            let updated_context = ThreadContext::Win32RawContext(context);
+            super::thread_context::set_thread_context(platform, pid, tid, updated_context)?;
+            // Track this stepping operation
+            platform.active_single_steps.insert((pid, tid), super::StepState { kind });
+            debug!(pid, tid, "Single-step flag set");
+        }
+        StepKind::Over => {
+            // Read and disassemble the current instruction.
+            // If it's a `CALL`, `REP`, or `PUSHF`, set a one-shot (single-use) breakpoint at the instruction immediately following.
+            // Otherwise, perform a `StepInto`.
+            let arch = Architecture::from_native();
+            let instructions = platform.disassemble_memory(pid, thread_context.get_pc(), 1, arch)
+                .map_err(|e| PlatformError::Other(format!("Failed to disassemble instruction: {}", e)))?;
+            
+            let instruction = instructions.first().ok_or_else(|| PlatformError::Other("No instructions returned from disassembler".to_string()))?;
+            let next_instruction_addr = instruction.address + instruction.size as u64;
+
+            // Check if this is a CALL, REP, or PUSHF instruction
+            // TODO: arm64 analogues
+            let needs_breakpoint = instruction.mnemonic.starts_with("call") ||
+                                 instruction.mnemonic.starts_with("rep") ||
+                                 instruction.mnemonic == "pushf" ||
+                                 instruction.mnemonic == "pushfq";
+
+            if needs_breakpoint {
+                // Set a one-shot breakpoint at the next instruction
+                platform.set_single_shot_breakpoint(pid, next_instruction_addr)?;
+                // Track this as a step-over breakpoint
+                platform.step_over_breakpoints.insert(next_instruction_addr, (pid, tid, kind));
+                debug!(pid, tid, "Set one-shot breakpoint for step-over at 0x{:X}", next_instruction_addr);
+            } else {
+                // For other instructions, just do a step-into
+                set_single_step_flag_native(&mut context)?;
+                // Set the modified context back using platform function
+                let updated_context = ThreadContext::Win32RawContext(context);
+                super::thread_context::set_thread_context(platform, pid, tid, updated_context)?;
+                // Track this stepping operation
+                platform.active_single_steps.insert((pid, tid), super::StepState { kind });
+                debug!(pid, tid, "Step-into is used for step-over");
+            }
+        }
+        StepKind::Out => {
+            todo!();
+        }
+    }
     
     // Stepping is set up - execution will be continued by the caller
     Ok(None)

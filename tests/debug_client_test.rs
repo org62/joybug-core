@@ -97,12 +97,14 @@ fn test_debug_client_event_collection() {
                     println!("Step completed ({:?}) at 0x{:016x}", kind, step_addr);
                     session.state.steps_completed += 1;
                     if session.state.steps_completed < 3 {
+                        println!("Continuing to next step");
                         Ok(StepAction::Continue(StepKind::Into))
                     } else {
+                        println!("Stopping");
                         Ok(StepAction::Stop)
                     }
                 })?;
-                
+                println!("Continue after single-shot breakpoint");
                 Ok(())
             })?;
             
