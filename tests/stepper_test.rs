@@ -99,6 +99,13 @@ fn test_stepper_test() {
             println!("Finished initial breakpoint");
             Ok(())
         })
+        .on_process_exited(|session, pid, exit_code| {
+            println!("Process {} exited with code {}", pid, exit_code);
+            assert!(session.state.expected_out_prefixes.is_empty(), "Expected out prefixes not popped: {:?}", session.state.expected_out_prefixes);
+            assert!(session.state.step_sequence.is_empty(), "Step sequence not empty: {:?}", session.state.step_sequence);
+            Ok(())
+        })
         .launch("cmd.exe /c echo test".to_string())
         .expect("Debug session failed");
+    // make sure all expected_out_prefixes are popped
 }
