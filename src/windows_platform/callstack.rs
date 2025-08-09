@@ -174,8 +174,8 @@ fn initialize_stack_frame_with_context(
                 stack_frame.AddrPC.Mode = AddrModeFlat;
                 stack_frame.AddrStack.Offset = ctx.Rsp;
                 stack_frame.AddrStack.Mode = AddrModeFlat;
-                stack_frame.AddrFrame.Offset = ctx.Rbp;
-                stack_frame.AddrFrame.Mode = AddrModeFlat;
+                //stack_frame.AddrFrame.Offset = ctx.Rbp;
+                //stack_frame.AddrFrame.Mode = AddrModeFlat;
                 stack_frame.AddrReturn.Offset = 0;
                 stack_frame.AddrReturn.Mode = AddrModeFlat;
 
