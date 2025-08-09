@@ -221,27 +221,30 @@ fn initialize_stack_frame_with_context(
 unsafe extern "system" fn read_process_memory_proc(
     process: HANDLE,
     base_address: u64,
-    buffer: *mut ::core::ffi::c_void,
+    buffer: *mut core::ffi::c_void,
     size: u32,
     number_of_bytes_read: *mut u32,
 ) -> BOOL {
-    let result = unsafe {
-        ReadProcessMemory(
-            process,
-            base_address as *const ::core::ffi::c_void,
-            buffer,
-            size as usize,
-            number_of_bytes_read as *mut usize,
-        )
-    };
-    
-    // Add debug logging for memory read failures
-    if result == FALSE {
-        let error = unsafe { GetLastError() };
-        if error != 299 { // ERROR_PARTIAL_COPY - common and expected
-            debug!("ReadProcessMemory failed at 0x{:016x}: error {}", base_address, error);
+    let mut bytes_read_sz: usize = 0;
+    let ok = unsafe { ReadProcessMemory(
+        process,
+        base_address as *const core::ffi::c_void,
+        buffer,
+        size as usize,
+        &mut bytes_read_sz as *mut usize,
+    ) };
+
+    if !number_of_bytes_read.is_null() {
+        let clamped = bytes_read_sz.min(u32::MAX as usize) as u32;
+        unsafe { *number_of_bytes_read = clamped; }
+    }
+
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        // treat ERROR_PARTIAL_COPY (299) with some bytes read as success for StackWalk64
+        if err == 299 && bytes_read_sz > 0 {
+            return 1;
         }
     }
-    
-    result
-} 
+    ok
+}
