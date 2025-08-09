@@ -3,7 +3,7 @@ use crate::windows_platform::WindowsPlatform;
 use windows_sys::Win32::System::Diagnostics::Debug::*;
 use windows_sys::Win32::System::SystemInformation::{IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64};
 use windows_sys::Win32::Foundation::*;
-use tracing::{debug, warn, trace};
+use tracing::{debug, warn, trace, error};
 use std::mem;
 
 const MAX_STACK_FRAMES: usize = 100;
@@ -241,9 +241,10 @@ unsafe extern "system" fn read_process_memory_proc(
 
     if ok == 0 {
         let err = unsafe { GetLastError() };
-        // treat ERROR_PARTIAL_COPY (299) with some bytes read as success for StackWalk64
-        if err == 299 && bytes_read_sz > 0 {
-            return 1;
+        // treat ERROR_PARTIAL_COPY  with some bytes read as success for StackWalk64
+        if err == ERROR_PARTIAL_COPY && bytes_read_sz > 0 {
+            error!("ReadProcessMemory ERROR_PARTIAL_COPY at 0x{:016x}: size {}", base_address, bytes_read_sz);
+            return 0;
         }
     }
     ok
