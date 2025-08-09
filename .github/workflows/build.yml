@@ -16,7 +16,7 @@ jobs:
         arch: [ARM64, X64-native]
     runs-on:
       - self-hosted
-      - Window
+      - Windows
       - ${{ matrix.arch }}
     steps:
     - uses: actions/checkout@v3
