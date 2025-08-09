@@ -20,5 +20,6 @@ pub fn init_tracing() {
     tracing_subscriber::fmt()
         .without_time()
         .with_env_filter(filter)
+        .with_writer(std::io::stderr)
         .init();
 }
