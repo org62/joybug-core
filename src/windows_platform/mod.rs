@@ -97,8 +97,10 @@ pub struct WindowsPlatform {
     pub(crate) disassembler: Option<CapstoneDisassembler>,
     /// Track active stepping operations by (pid, tid)
     pub(crate) active_single_steps: HashMap<(u32, u32), StepState>,
-    /// Track step-over breakpoints by address
-    pub(crate) step_over_breakpoints: HashMap<u64, (u32, u32, StepKind)>,
+        /// Track step-over breakpoints by address
+   pub(crate) step_over_breakpoints: HashMap<u64, (u32, u32, StepKind)>,
+    /// Track step-out breakpoints by fake address
+   pub(crate) step_out_breakpoints: HashMap<u64, (u32, u32, u64)>, // (pid, tid, original_return_address)
 }
 
 impl WindowsPlatform {
@@ -109,8 +111,9 @@ impl WindowsPlatform {
             processes: HashMap::new(),
             symbol_manager,
             disassembler,
-            active_single_steps: HashMap::new(),
-            step_over_breakpoints: HashMap::new(),
+                        active_single_steps: HashMap::new(),
+           step_over_breakpoints: HashMap::new(),
+           step_out_breakpoints: HashMap::new(),
         }
     }
     
@@ -136,6 +139,40 @@ impl WindowsPlatform {
     /// Remove a debugged process
     pub(crate) fn remove_process(&mut self, pid: u32) {
         self.processes.remove(&pid);
+    }
+
+    /// Cleanup all step-related breakpoint state for a process
+    pub(crate) fn cleanup_step_state_for_process(&mut self, pid: u32) -> (usize, usize) {
+        let before_over = self.step_over_breakpoints.len();
+        self.step_over_breakpoints.retain(|_, (p, _t, _)| *p != pid);
+        let removed_over = before_over - self.step_over_breakpoints.len();
+
+        let before_out = self.step_out_breakpoints.len();
+        self.step_out_breakpoints.retain(|_, (p, _t, _orig)| *p != pid);
+        let removed_out = before_out - self.step_out_breakpoints.len();
+
+        if removed_over > 0 || removed_out > 0 {
+            trace!(pid, removed_over, removed_out, "Cleaned up step breakpoint state for process");
+        }
+        (removed_over, removed_out)
+    }
+
+    /// Cleanup all step-related breakpoint state for a specific thread
+    pub(crate) fn cleanup_step_state_for_thread(&mut self, pid: u32, tid: u32) -> (usize, usize) {
+        let before_over = self.step_over_breakpoints.len();
+        self.step_over_breakpoints
+            .retain(|_, (p, t, _)| !(*p == pid && *t == tid));
+        let removed_over = before_over - self.step_over_breakpoints.len();
+
+        let before_out = self.step_out_breakpoints.len();
+        self.step_out_breakpoints
+            .retain(|_, (p, t, _)| !(*p == pid && *t == tid));
+        let removed_out = before_out - self.step_out_breakpoints.len();
+
+        if removed_over > 0 || removed_out > 0 {
+            trace!(pid, tid, removed_over, removed_out, "Cleaned up step breakpoint state for thread");
+        }
+        (removed_over, removed_out)
     }
 }
 

@@ -5,6 +5,8 @@ use joybug2::protocol::{StepKind, StepAction};
 use joybug2::protocol_io::DebugSession;
 use std::thread;
 use tokio;
+use joybug2::interfaces::InstructionFormatter;
+use joybug2::interfaces::Architecture;
 
 /// Clean, simple test state for tracking events
 struct TestState {
@@ -14,6 +16,7 @@ struct TestState {
     initial_breakpoint_hit: bool,
     process_created: bool,
     dll_loads_count: usize,
+    thread_exits_count: usize,
 }
 
 impl TestState {
@@ -25,8 +28,25 @@ impl TestState {
             initial_breakpoint_hit: false,
             process_created: false,
             dll_loads_count: 0,
+            thread_exits_count: 0,
         }
     }
+}
+
+fn print_disassembly(session: &mut DebugSession<TestState>, pid: u32, tid: u32, address: u64) -> anyhow::Result<()> {
+    let arch = Architecture::from_native();
+    let disassembly = session.disassemble_memory(pid, address, 10, arch)?;
+    println!("{}", disassembly.format_disassembly());
+    let call_stack = session.get_call_stack(pid, tid)?;
+    println!("Call stack:");
+    for frame in call_stack {
+        if let Some(symbol) = &frame.symbol {
+            println!("  {}", symbol.format_symbol());
+        } else {
+            panic!("  Symbol: <unknown>");
+        }
+    }
+    Ok(())
 }
 
 /// Test symbol search functionality
@@ -144,6 +164,26 @@ fn test_debug_client_event_collection() {
             session.state.process_created = true;
             Ok(())
         })
+        .on_thread_created(|session, pid, tid, address| {
+            println!("=== Thread created at 0x{:016x} ===", address);
+            print_disassembly(session, pid, tid, address)?;
+            Ok(())
+        })
+        .on_thread_exited(|session, pid, tid, exit_code| {
+            println!(
+                "=== Thread Exited: pid={}, tid={}, exit_code=0x{:x} ===",
+                pid, tid, exit_code
+            );
+            session.state.thread_exits_count += 1;
+            Ok(())
+        })
+        .on_process_exited(|_session, pid, exit_code| {
+            println!(
+                "=== Process Exited: pid={}, exit_code=0x{:x} ===",
+                pid, exit_code
+            );
+            Ok(())
+        })
         .launch("cmd.exe /c echo test".to_string())
         .expect("Debug session failed");
     
@@ -181,4 +221,5 @@ fn validate_test_results(state: &TestState) {
     println!("DLL loads: {}", state.dll_loads_count);
     println!("DLL load call stacks captured: {}", state.dll_load_call_stacks.len());
     println!("Steps completed: {}", state.steps_completed);
+    println!("Thread exits observed: {}", state.thread_exits_count);
 } 

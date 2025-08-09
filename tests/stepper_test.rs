@@ -1,6 +1,7 @@
 #![cfg(windows)]
 
 use joybug2::interfaces::{Architecture};
+use std::collections::VecDeque;
 use joybug2::protocol::{StepKind, StepAction};
 use joybug2::protocol_io::DebugSession;
 use std::thread;
@@ -10,12 +11,17 @@ use joybug2::interfaces::InstructionFormatter;
 /// Clean, simple test state for tracking events
 struct TestState {
     step_sequence: Vec<StepKind>,
+    expected_out_prefixes: VecDeque<&'static str>,
 }
 
 impl TestState {
     fn new() -> Self {
         Self {
-            step_sequence: vec![StepKind::Into, StepKind::Into, StepKind::Into, StepKind::Over, StepKind::Over],
+            step_sequence: vec![StepKind::Into, StepKind::Into, StepKind::Into, StepKind::Over, StepKind::Over, StepKind::Out, StepKind::Out],
+            expected_out_prefixes: VecDeque::from([
+                "ntdll!_LdrpInitialize",
+                "ntdll!LdrpInitializeInternal",
+            ]),
         }
     }
 }
@@ -34,6 +40,25 @@ fn print_disassembly(session: &mut DebugSession<TestState>, pid: u32, tid: u32, 
         }
     }
     Ok(())
+}
+
+fn assert_disasm_symbol_prefix(session: &mut DebugSession<TestState>, pid: u32, address: u64, expected_prefix: &str) {
+    let arch = Architecture::from_native();
+    let insns = session
+        .disassemble_memory(pid, address, 1, arch)
+        .expect("Failed to disassemble at step-complete address");
+    let first = insns.first().expect("No instruction returned at step-complete address");
+    let symbol_text = if let Some(ref sym) = first.symbol_info {
+        sym.format_symbol()
+    } else {
+        format!("0x{:016x}", first.address)
+    };
+    assert!(
+        symbol_text.starts_with(expected_prefix),
+        "Expected disasm symbol starting with '{}', got: {}",
+        expected_prefix,
+        symbol_text
+    );
 }
 
 #[test]
@@ -57,6 +82,11 @@ fn test_stepper_test() {
             session.step(pid, tid, first_step, |session, pid, tid, address, kind| {
                 println!("Step completed ({:?}) at 0x{:016x}, pid: {}, tid: {}, steps left: {}", kind, address, pid, tid, session.state.step_sequence.len());
                 let _ = print_disassembly(session, pid, tid, address);
+                if kind == StepKind::Out {
+                    if let Some(prefix) = session.state.expected_out_prefixes.pop_front() {
+                        assert_disasm_symbol_prefix(session, pid, address, prefix);
+                    }
+                }
                 if session.state.step_sequence.is_empty() {
                     println!("No more steps to take, stopping");
                     Ok(StepAction::Stop)

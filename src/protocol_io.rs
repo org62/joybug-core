@@ -3,7 +3,6 @@ pub use crate::protocol::{
     DebuggerRequest, DebuggerResponse, DebugEvent, ModuleInfo, ProcessInfo, StepAction, StepKind,
     ThreadContext, ThreadInfo,
 };
-use anyhow::Ok;
 use std::collections::HashMap;
 pub use std::net::TcpStream;
 use std::sync::Mutex;
@@ -42,6 +41,12 @@ pub struct DebugSession<S> {
     stepping_info: Option<SteppingInfo<S>>,
     on_dll_loaded:
         Option<Box<dyn FnMut(&mut Self, u32, u32, &str, u64) -> anyhow::Result<()> + Send + 'static>>,
+        on_thread_created:
+        Option<Box<dyn FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<()> + Send + Sync + 'static>>,
+    on_process_exited:
+        Option<Box<dyn FnMut(&mut Self, u32, u32) -> anyhow::Result<()> + Send + 'static>>,
+    on_thread_exited:
+        Option<Box<dyn FnMut(&mut Self, u32, u32, u32) -> anyhow::Result<()> + Send + Sync + 'static>>,
     on_process_created:
         Option<Box<dyn FnMut(&mut Self, u32, u32, &str, u64) -> anyhow::Result<()> + Send + 'static>>,
     on_event: Option<Box<dyn FnMut(&mut Self, &DebugEvent) -> anyhow::Result<bool> + Send + 'static>>,
@@ -59,6 +64,9 @@ impl<S> DebugSession<S> {
             single_shot_handlers: HashMap::new(),
             stepping_info: None,
             on_dll_loaded: None,
+            on_thread_created: None,
+            on_process_exited: None,
+            on_thread_exited: None,
             on_process_created: None,
             on_event: None,
         })
@@ -124,6 +132,36 @@ impl<S> DebugSession<S> {
         F: FnMut(&mut Self, u32, u32, &str, u64) -> anyhow::Result<()> + Send + 'static,
     {
         self.on_dll_loaded = Some(Box::new(handler));
+        self
+    }
+
+    /// Handle thread creation events
+    /// Callback receives: (session, pid, tid, start_address)
+        pub fn on_thread_created<F>(mut self, handler: F) -> Self
+    where
+        F: FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<()> + Send + Sync + 'static,
+    {
+        self.on_thread_created = Some(Box::new(handler));
+        self
+    }
+
+    /// Handle process exit events
+    /// Callback receives: (session, pid, exit_code)
+    pub fn on_process_exited<F>(mut self, handler: F) -> Self
+    where
+        F: FnMut(&mut Self, u32, u32) -> anyhow::Result<()> + Send + 'static,
+    {
+        self.on_process_exited = Some(Box::new(handler));
+        self
+    }
+
+    /// Handle thread exit events
+    /// Callback receives: (session, pid, tid, exit_code)
+    pub fn on_thread_exited<F>(mut self, handler: F) -> Self
+    where
+        F: FnMut(&mut Self, u32, u32, u32) -> anyhow::Result<()> + Send + Sync + 'static,
+    {
+        self.on_thread_exited = Some(Box::new(handler));
         self
     }
 
@@ -194,7 +232,10 @@ impl<S> DebugSession<S> {
         // when handlers themselves need to modify the session (e.g., add new breakpoints)
         let mut on_initial_breakpoint = self.on_initial_breakpoint.take();
         let mut on_dll_loaded = self.on_dll_loaded.take();
+        let mut on_thread_created = self.on_thread_created.take();
         let mut on_process_created = self.on_process_created.take();
+        let mut on_process_exited = self.on_process_exited.take();
+        let mut on_thread_exited = self.on_thread_exited.take();
         let mut on_event = self.on_event.take();
 
         // Check if on_event handler wants to stop the session
@@ -227,6 +268,15 @@ impl<S> DebugSession<S> {
                     handler(self, *pid, *tid, name, *base_of_dll)?;
                 }
             }
+            DebugEvent::ThreadCreated {
+                pid,
+                tid,
+                start_address,
+            } => {
+                if let Some(ref mut handler) = on_thread_created {
+                    handler(self, *pid, *tid, *start_address)?;
+                }
+            }
             DebugEvent::ProcessCreated {
                 pid,
                 tid,
@@ -237,6 +287,16 @@ impl<S> DebugSession<S> {
                 if let Some(ref mut handler) = on_process_created {
                     let name = image_file_name.as_deref().unwrap_or("<unknown>");
                     handler(self, *pid, *tid, name, *base_of_image)?;
+                }
+            }
+            DebugEvent::ThreadExited { pid, tid, exit_code } => {
+                if let Some(ref mut handler) = on_thread_exited {
+                    handler(self, *pid, *tid, *exit_code)?;
+                }
+            }
+            DebugEvent::ProcessExited { pid, exit_code } => {
+                if let Some(ref mut handler) = on_process_exited {
+                    handler(self, *pid, *exit_code)?;
                 }
             }
             DebugEvent::StepComplete {
@@ -268,12 +328,17 @@ impl<S> DebugSession<S> {
                     }
                 }
             }
-            _ => {}
+            _ => {
+                panic!("Unhandled event in handle_session_event: {}", event);
+            }
         }
 
         // Restore handlers
         self.on_initial_breakpoint = on_initial_breakpoint;
         self.on_dll_loaded = on_dll_loaded;
+        self.on_thread_created = on_thread_created;
+        self.on_process_exited = on_process_exited;
+        self.on_thread_exited = on_thread_exited;
         self.on_process_created = on_process_created;
         self.on_event = on_event;
 

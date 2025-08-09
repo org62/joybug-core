@@ -2,7 +2,7 @@ use super::{WindowsPlatform};
 use crate::interfaces::{PlatformAPI, PlatformError};
 use crate::protocol::{StepKind, DebugEvent, ThreadContext};
 use crate::interfaces::Architecture;
-use tracing::{trace, debug};
+use tracing::{trace, debug, warn};
 use windows_sys::Win32::System::Diagnostics::Debug::{
     CONTEXT
 };
@@ -82,7 +82,39 @@ pub(super) fn step(
             }
         }
         StepKind::Out => {
-            todo!();
+            // Get the call stack to find the return address and where it's stored on the stack.
+            let call_stack = platform.get_call_stack(pid, tid)
+                .map_err(|e| PlatformError::Other(format!("Failed to get call stack for step-out: {}", e)))?;
+
+            if let (Some(_current_frame), Some(caller_frame)) = (call_stack.get(0), call_stack.get(1)) {
+                let stack_patch_addr = caller_frame.stack_pointer - 8;
+                let original_return_address = caller_frame.instruction_pointer;
+    
+                if stack_patch_addr == 0 {
+                    return Err(PlatformError::Other("Stack pointer is zero in call frame, cannot step out.".to_string()));
+                }
+
+                // Generate a unique fake address.
+                let fake_address = 0x13370000 + platform.step_out_breakpoints.len() as u64;
+
+                // Write the fake address to the location of the return address on the stack.
+                platform.write_memory(pid, stack_patch_addr, &fake_address.to_le_bytes())?;
+
+                // Store the mapping of fake address to the original for later restoration.
+                platform.step_out_breakpoints.insert(fake_address, (pid, tid, original_return_address));
+                debug!(
+                    pid,
+                    tid,
+                    "Patched return address 0x{:X} at stack address 0x{:X} with fake address 0x{:X} for step-out.",
+                    original_return_address,
+                    stack_patch_addr,
+                    fake_address
+                );
+            } else {
+                // We are in the top-most frame, so we can't "step out".
+                // We'll treat this as a "continue" and let the debugger run.
+                warn!(pid, tid, "Cannot step out, no caller frame on the stack.");
+            }
         }
     }
     

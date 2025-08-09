@@ -11,7 +11,6 @@ use windows_sys::Win32::Foundation::CloseHandle;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
-use std::time::Duration;
 
 fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(Some(0)).collect()
@@ -70,9 +69,6 @@ fn test_attach_and_list_modules() {
 
     assert!(target_process.is_some(), "Could not find target process");
     assert_eq!(target_process.unwrap().name, "cmd.exe");
-
-    // wait for 500 milliseconds before attaching
-    thread::sleep(Duration::from_millis(500));
 
     let final_state = DebugSession::new(
         TestState {

@@ -237,6 +237,42 @@ pub(super) fn continue_exec(
                         parameters: vec![],
                     })
                 }
+            } else if let Some((pid, tid, original_return_address)) = platform.step_out_breakpoints.remove(&(ex_record.ExceptionAddress as u64)) {
+                // This is a step-out breakpoint. Restore the context and notify the client.
+                let address = ex_record.ExceptionAddress as u64;
+                trace!(
+                    address = %format!("0x{:X}", address),
+                    "Step-out breakpoint hit. Restoring original return address 0x{:X}",
+                    original_return_address
+                );
+
+                // Get the current context to modify the instruction pointer
+                let mut context = match super::thread_context::get_thread_context(platform, debug_event.dwProcessId, debug_event.dwThreadId)? {
+                    crate::protocol::ThreadContext::Win32RawContext(ctx) => ctx,
+                };
+
+                // Restore the instruction pointer to the original return address
+                #[cfg(target_arch = "x86_64")]
+                {
+                    context.Rip = original_return_address;
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    context.Pc = original_return_address;
+                }
+
+                // Apply the updated context
+                super::thread_context::set_thread_context(platform, debug_event.dwProcessId, debug_event.dwThreadId, crate::protocol::ThreadContext::Win32RawContext(context.clone()))?;
+
+                // The stack pointer is automatically adjusted by the `ret` instruction, so we don't need to modify it.
+                // The stack now points to where it should be after a normal function return.
+
+                Some(crate::protocol::DebugEvent::StepComplete {
+                    pid,
+                    tid,
+                    kind: crate::protocol::StepKind::Out,
+                    address: original_return_address,
+                })
             } else {
                 let mut params = Vec::new();
                 let num_params = ex_record.NumberParameters as usize;
@@ -269,8 +305,9 @@ pub(super) fn continue_exec(
             let info = unsafe { debug_event.u.ExitProcess };
             trace!(pid = debug_event.dwProcessId, exit_code = %format!("0x{:X}", info.dwExitCode), "ProcessExited event");
             
-            // Note: We don't remove the process from tracking here to allow post-mortem analysis
-            // The process will be removed when the client explicitly detaches or the connection closes
+            // Cleanup any pending step breakpoint state for this process
+            let pid = debug_event.dwProcessId;
+            platform.cleanup_step_state_for_process(pid);
             
             Some(crate::protocol::DebugEvent::ProcessExited {
                 pid: debug_event.dwProcessId,
@@ -321,6 +358,10 @@ pub(super) fn continue_exec(
         EXIT_THREAD_DEBUG_EVENT => {
             let info = unsafe { debug_event.u.ExitThread };
             trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, exit_code = %format!("0x{:X}", info.dwExitCode), "ThreadExited event");
+            // Cleanup any pending step breakpoint state for this thread
+            let pid = debug_event.dwProcessId;
+            let tid = debug_event.dwThreadId;
+            platform.cleanup_step_state_for_thread(pid, tid);
             if let Ok(process) = platform.get_process_mut(debug_event.dwProcessId) {
                 process.thread_manager.remove_thread(debug_event.dwThreadId);
             }

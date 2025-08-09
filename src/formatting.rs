@@ -13,7 +13,7 @@ impl std::fmt::Debug for DebuggerResponse {
             // Add other variants here, using a default debug format
             DebuggerResponse::Ack => write!(f, "Ack"),
             DebuggerResponse::Error { message } => f.debug_struct("Error").field("message", message).finish(),
-            DebuggerResponse::Event { event } => f.debug_struct("Event").field("event", event).finish(),
+            DebuggerResponse::Event { event } => f.debug_struct("Event").field("event", &format_args!("{}", event)).finish(),
             DebuggerResponse::MemoryData { data } => f.debug_struct("MemoryData").field("data", data).finish(),
             DebuggerResponse::WriteAck => write!(f, "WriteAck"),
             DebuggerResponse::ThreadContext { context } => f.debug_struct("ThreadContext").field("context", context).finish(),
