@@ -3,7 +3,7 @@ use crate::windows_platform::WindowsPlatform;
 use windows_sys::Win32::System::Diagnostics::Debug::*;
 use windows_sys::Win32::System::SystemInformation::{IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64};
 use windows_sys::Win32::Foundation::*;
-use tracing::{debug, warn};
+use tracing::{debug, warn, trace};
 use std::mem;
 
 const MAX_STACK_FRAMES: usize = 100;
@@ -97,6 +97,7 @@ pub fn get_call_stack(
             debug!("Skipping frame with IP=0");
             continue;
         }
+        trace!("Frame {}: IP=0x{:016x}, SP=0x{:016x}, FP=0x{:016x}", i, instruction_pointer, stack_pointer, frame_pointer);
         
         // Validate that the instruction pointer is within a loaded module
         // Don't issue a warning if there is less than 2 modules (main executable is only loaded when process is started, but address is in ntdll)
