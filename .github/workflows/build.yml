@@ -10,11 +10,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  build_github_actions:
     strategy:
       matrix:
-        os: [windows-latest, windows-11-arm]
-    runs-on: ${{ matrix.os }}
+        arch: [ARM64, X64-native]
+    runs-on:
+      - self-hosted
+      - Window
+      - ${{ matrix.arch }}
     steps:
     - uses: actions/checkout@v3
     - name: Install Rust toolchain
