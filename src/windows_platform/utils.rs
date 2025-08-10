@@ -122,8 +122,11 @@ pub fn get_path_from_handle(file_handle: HANDLE) -> Option<String> {
 /// * `Some(usize)` - The module size in bytes if successful
 /// * `None` - If the operation fails
 pub fn get_module_size_from_address(process_handle: HANDLE, module_base: usize) -> Option<usize> {
-    if process_handle.is_null() || std::ptr::eq(process_handle, INVALID_HANDLE_VALUE) {
-        warn!("Invalid process handle provided to get_module_size_from_address");
+    // Note: GetCurrentProcess() returns a pseudo-handle (INVALID_HANDLE_VALUE/(-1)) which is
+    // valid for APIs like ReadProcessMemory when referring to the current process. We therefore
+    // only treat a null handle as invalid here.
+    if process_handle.is_null() {
+        warn!("Invalid (null) process handle provided to get_module_size_from_address");
         return None;
     }
 

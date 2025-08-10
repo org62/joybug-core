@@ -4,7 +4,7 @@ use crate::interfaces::Architecture;
 use crate::interfaces::PlatformError;
 use crate::protocol::ModuleInfo;
 use tracing::{error, trace, warn};
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, FALSE, DBG_CONTINUE, DUPLICATE_SAME_ACCESS, HANDLE, DuplicateHandle, STATUS_SINGLE_STEP};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, FALSE, DBG_CONTINUE, DUPLICATE_SAME_ACCESS, HANDLE, DuplicateHandle, STATUS_SINGLE_STEP, MAX_PATH};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, INFINITE};
 use windows_sys::Win32::System::Diagnostics::Debug::{
     ContinueDebugEvent, WaitForDebugEvent, DEBUG_EVENT, EXCEPTION_DEBUG_EVENT,
@@ -14,6 +14,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 };
 use std::ffi::CString;
 use std::ptr;
+use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 
 pub(super) fn handle_create_process_event(
     platform: &mut WindowsPlatform,
@@ -64,6 +65,41 @@ pub(super) fn handle_create_process_event(
         symbol_manager.start_loading_symbols(&main_module);
     }
 
+    // --- SPECIAL-CASE NTDLL SYMBOLS HACK ------------------------------------------------------
+    // Why:
+    // - Early debug events often occur before the system DLL load notifications are delivered.
+    // - On Windows, the very first instructions executed in a new process are typically inside
+    //   ntdll.dll, but the loader DLL (including ntdll) may not be visible yet via LOAD_DLL events.
+    // - Our disassembler attempts to symbolize instructions using the currently known module list.
+    //   If ntdll is not listed yet, symbol lookup for RIP will fail and the disassembly is shown
+    //   without symbols.
+    // Hack:
+    // - Opportunistically pre-register ntdll.dll in the target's module list at process-create
+    //   time using the server process' own ntdll base and size. This allows symbolization to work
+    //   immediately for addresses that fall inside ntdll, even before LOAD_DLL for ntdll arrives.
+    // Caveats:
+    // - ASLR may cause the target process' ntdll base to differ from the server's; if they differ,
+    //   our temporary module range may not match the target addresses, and symbolization will still
+    //   fail until the real LOAD_DLL arrives. In practice, system DLLs often share the same base
+    //   within a boot session, so this frequently helps in the common case.
+    // - We intentionally do NOT call SymLoadModule64 for this synthetic entry to avoid confusing
+    //   dbghelp's internal state with a possibly incorrect base. We only add it to our own
+    //   ModuleManager and kick off PDB loading via the SymbolManager.
+    // - Once the real LOAD_DLL for ntdll arrives, its proper base/size will be registered and this
+    //   synthetic entry will be harmlessly redundant (overlapping). Future clean-up could reconcile
+    //   or replace it, but for now we keep the logic minimal and non-invasive.
+    if let Some(ntdll_module) = try_build_ntdll_moduleinfo_from_self() {
+        // Add to the target process' module list so address-to-module checks can succeed early.
+        let ntdll_module_cloned = ntdll_module.clone();
+        let process = platform.get_process_mut(pid)?;
+        process.module_manager.add_module(ntdll_module_cloned);
+
+        // Start background symbol load for ntdll so RVA -> name mapping is available quickly.
+        if let Some(ref symbol_manager) = platform.symbol_manager {
+            symbol_manager.start_loading_symbols(&ntdll_module);
+        }
+    }
+
     let mut thread_handle = 0 as HANDLE;
     let current_process = unsafe { GetCurrentProcess() };
     if unsafe {
@@ -107,6 +143,58 @@ pub(super) fn handle_create_process_event(
         base_of_image: info.lpBaseOfImage as u64,
         size_of_image: size_of_image,
     })
+}
+
+/// Builds a `ModuleInfo` for ntdll.dll using the current (server) process' mapping.
+///
+/// Notes:
+/// - This is part of the temporary workaround to enable early symbolization of ntdll code
+///   before the target process' DLL load events are observed.
+/// - We fetch the base address via GetModuleHandleW(L"ntdll.dll"), and the size by reading
+///   the PE headers using our existing `utils::get_module_size_from_address` helper.
+/// - The module path is resolved with GetModuleFileNameW for transparency and to ensure the
+///   symbol loader can find the correct PDB by PE's embedded CodeView record.
+fn try_build_ntdll_moduleinfo_from_self() -> Option<crate::protocol::ModuleInfo> {
+    let ntdll_w: Vec<u16> = {
+        let mut v: Vec<u16> = "ntdll.dll".encode_utf16().collect();
+        v.push(0);
+        v
+    };
+
+    // SAFETY: Calling into Win32 to query module handle of a well-known module in this process.
+    let h_mod = unsafe { GetModuleHandleW(ntdll_w.as_ptr()) } as *mut core::ffi::c_void;
+    if h_mod.is_null() {
+        return None;
+    }
+    let base = h_mod as usize as u64;
+
+    // Resolve module path from the HMODULE.
+    let module_path = get_module_path_from_handle(h_mod)?;
+
+    // Determine size by reading PE headers in this process' address space.
+    let size = unsafe { GetCurrentProcess() };
+    // `get_module_size_from_address` expects a HANDLE and base address.
+    let size_opt = super::utils::get_module_size_from_address(size, base as usize)
+        .map(|s| s as u64);
+
+    Some(crate::protocol::ModuleInfo {
+        name: module_path,
+        base,
+        size: size_opt,
+    })
+}
+
+/// Retrieves a module's full path via GetModuleFileNameW given an HMODULE.
+fn get_module_path_from_handle(h_module: *mut core::ffi::c_void) -> Option<String> {
+    // Single-shot attempt with a MAX_PATH-sized buffer. If it doesn't fit, fail fast.
+    // This keeps the code simple and avoids repeated syscalls.
+    let mut buf: Vec<u16> = vec![0; MAX_PATH as usize];
+    let len = unsafe { GetModuleFileNameW(h_module, buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    if len == 0 || len >= MAX_PATH as usize {
+        panic!("GetModuleFileNameW failed to get module path");
+    }
+    buf.truncate(len);
+    String::from_utf16(&buf).ok()
 }
 
 pub(super) fn continue_exec(
