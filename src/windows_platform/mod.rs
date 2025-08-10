@@ -51,12 +51,14 @@ pub(crate) struct StepState {
 
 /// Represents a single debugged process with its associated state
 #[derive(Debug)]
-pub(crate) struct DebuggedProcess {
+    pub(crate) struct DebuggedProcess {
     pub(crate) process_handle: HandleSafe,
     pub(crate) architecture: Architecture,
     pub(crate) module_manager: ModuleManager,
     pub(crate) thread_manager: ThreadManager,
     pub(crate) single_shot_breakpoints: HashMap<u64, Vec<u8>>,
+    pub(crate) persistent_breakpoints: HashMap<u64, Vec<u8>>,
+    pub(crate) persistent_bp_tid_filters: HashMap<u64, Option<u32>>,
     /// Track whether this process has hit its initial breakpoint
     pub(crate) has_hit_initial_breakpoint: bool,
 }
@@ -74,6 +76,8 @@ impl DebuggedProcess {
             module_manager: ModuleManager::new(),
             thread_manager: ThreadManager::new(),
             single_shot_breakpoints: HashMap::new(),
+            persistent_breakpoints: HashMap::new(),
+            persistent_bp_tid_filters: HashMap::new(),
             has_hit_initial_breakpoint: false,
         })
     }
@@ -97,10 +101,13 @@ pub struct WindowsPlatform {
     pub(crate) disassembler: Option<CapstoneDisassembler>,
     /// Track active stepping operations by (pid, tid)
     pub(crate) active_single_steps: HashMap<(u32, u32), StepState>,
-        /// Track step-over breakpoints by address
-   pub(crate) step_over_breakpoints: HashMap<u64, (u32, u32, StepKind)>,
+    /// Track step-over breakpoints by address
+    pub(crate) step_over_breakpoints: HashMap<u64, (u32, u32, StepKind)>,
     /// Track step-out breakpoints by fake address
-   pub(crate) step_out_breakpoints: HashMap<u64, (u32, u32, u64)>, // (pid, tid, original_return_address)
+    pub(crate) step_out_breakpoints: HashMap<u64, (u32, u32, u64)>, // (pid, tid, original_return_address)
+    /// Track threads that need re-arming after a single-step:
+    /// (pid, tid) -> (address, is_single_shot)
+    pub(crate) pending_rearm_breakpoints: HashMap<(u32, u32), (u64, bool)>,
 }
 
 impl WindowsPlatform {
@@ -111,9 +118,10 @@ impl WindowsPlatform {
             processes: HashMap::new(),
             symbol_manager,
             disassembler,
-                        active_single_steps: HashMap::new(),
-           step_over_breakpoints: HashMap::new(),
-           step_out_breakpoints: HashMap::new(),
+            active_single_steps: HashMap::new(),
+            step_over_breakpoints: HashMap::new(),
+            step_out_breakpoints: HashMap::new(),
+            pending_rearm_breakpoints: HashMap::new(),
         }
     }
     
@@ -219,9 +227,43 @@ impl PlatformAPI for WindowsPlatform {
         debug_events::continue_exec(self, pid, tid)
     }
 
-    fn set_breakpoint(&mut self, addr: u64) -> Result<(), PlatformError> {
-        trace!(addr, "WindowsPlatform::set_breakpoint called");
-        Err(PlatformError::NotImplemented)
+    fn set_breakpoint(&mut self, pid: u32, addr: u64, tid: Option<u32>) -> Result<(), PlatformError> {
+        trace!(pid, addr, "WindowsPlatform::set_breakpoint called");
+        let process = self.get_process_mut(pid)?;
+        let process_handle = process.process_handle.0;
+        let arch = process.architecture;
+
+        if process.persistent_breakpoints.contains_key(&addr) {
+            return Ok(());
+        }
+
+        let (breakpoint_bytes, original_bytes) = match arch {
+            Architecture::X64 => {
+                let original_byte = memory::read_memory_internal(process_handle, addr, 1)?;
+                (vec![0xCC], original_byte)
+            }
+            Architecture::Arm64 => {
+                let original_bytes = memory::read_memory_internal(process_handle, addr, 4)?;
+                (vec![0x00, 0x00, 0x3e, 0xD4], original_bytes)
+            }
+        };
+
+        process.persistent_breakpoints.insert(addr, original_bytes);
+        process.persistent_bp_tid_filters.insert(addr, tid);
+        memory::write_memory_internal(process_handle, addr, &breakpoint_bytes)
+    }
+
+    fn remove_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError> {
+        trace!(pid, addr, "WindowsPlatform::remove_breakpoint called");
+        let process = self.get_process_mut(pid)?;
+        let process_handle = process.process_handle.0;
+        if let Some(original) = process.persistent_breakpoints.remove(&addr) {
+            // Restore original bytes
+            memory::write_memory_internal(process_handle, addr, &original)
+        } else {
+            // If it's not a persistent breakpoint, noop
+            Ok(())
+        }
     }
 
     fn launch(&mut self, command: &str) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {

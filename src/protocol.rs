@@ -42,9 +42,15 @@ pub mod request_response {
             tid: u32,
         },
         SetBreakpoint {
+            pid: u32,
             addr: u64,
+            tid: Option<u32>,
         },
         SetSingleShotBreakpoint {
+            pid: u32,
+            addr: u64,
+        },
+        RemoveBreakpoint {
             pid: u32,
             addr: u64,
         },

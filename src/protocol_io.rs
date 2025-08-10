@@ -31,6 +31,12 @@ struct SteppingInfo<S> {
     >,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakpointDecision {
+    Keep,
+    Remove,
+}
+
 /// Debug session with state management
 pub struct DebugSession<S> {
     pub stream: Mutex<FramedJsonStream>,
@@ -38,6 +44,7 @@ pub struct DebugSession<S> {
     on_initial_breakpoint: Option<Box<dyn FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<()> + Send + 'static>>,
     single_shot_handlers:
         HashMap<u64, Box<dyn FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<()> + Send + 'static>>,
+    breakpoint_handlers: HashMap<u64, Vec<Box<dyn FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<BreakpointDecision> + Send + 'static>>>,
     stepping_info: Option<SteppingInfo<S>>,
     on_dll_loaded:
         Option<Box<dyn FnMut(&mut Self, u32, u32, &str, u64) -> anyhow::Result<()> + Send + 'static>>,
@@ -62,6 +69,7 @@ impl<S> DebugSession<S> {
             state,
             on_initial_breakpoint: None,
             single_shot_handlers: HashMap::new(),
+            breakpoint_handlers: HashMap::new(),
             stepping_info: None,
             on_dll_loaded: None,
             on_thread_created: None,
@@ -256,6 +264,23 @@ impl<S> DebugSession<S> {
                     handler(self, *pid, *tid, *address)?;
                 }
             }
+            DebugEvent::Breakpoint { pid, tid, address } => {
+                // Move handlers out to avoid holding a mutable borrow while invoking callbacks
+                if let Some(handlers_vec) = self.breakpoint_handlers.remove(address) {
+                    let mut kept: Vec<Box<dyn FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<BreakpointDecision> + Send + 'static>> = Vec::with_capacity(handlers_vec.len());
+                    for mut handler in handlers_vec.into_iter() {
+                        let decision = handler(self, *pid, *tid, *address)?;
+                        if decision == BreakpointDecision::Keep {
+                            kept.push(handler);
+                        } else {
+                            // Remove on server
+                            let _ = self.send_and_receive(&DebuggerRequest::RemoveBreakpoint { pid: *pid, addr: *address });
+                        }
+                    }
+                    // Put handlers back
+                    self.breakpoint_handlers.insert(*address, kept);
+                }
+            }
             DebugEvent::DllLoaded {
                 pid,
                 tid,
@@ -327,6 +352,9 @@ impl<S> DebugSession<S> {
                         // debug loop continues on itself we just don't need to setup the next step
                     }
                 }
+            }
+            DebugEvent::Exception { .. } => {
+                // No-op. Auto-continue will handle it below.
             }
             _ => {
                 panic!("Unhandled event in handle_session_event: {}", event);
@@ -469,6 +497,8 @@ impl<S> DebugSession<S> {
         }
     }
 
+    // removed older helper to avoid duplicate names; use set_breakpoint_by_symbol with handler below
+
     /// Set up a single-shot breakpoint at a symbol
     pub fn setup_single_shot_breakpoint(
         &mut self,
@@ -495,6 +525,64 @@ impl<S> DebugSession<S> {
             DebuggerResponse::Ack => Ok(address),
             _ => Err(anyhow::anyhow!("Failed to set single-shot breakpoint")),
         }
+    }
+
+    /// Internal: set persistent breakpoint at address
+    fn setup_persistent_breakpoint(&mut self, pid: u32, address: u64, tid: Option<u32>) -> anyhow::Result<()> {
+        let req = DebuggerRequest::SetBreakpoint { pid, addr: address, tid };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::Ack => Ok(()),
+            other => Err(anyhow::anyhow!(
+                "Unexpected response to SetBreakpoint: {:?}",
+                other
+            )),
+        }
+    }
+
+    /// Set a persistent breakpoint at a symbol with optional thread filter
+    pub fn set_breakpoint_by_symbol<F>(
+        &mut self,
+        pid: u32,
+        symbol_name: &str,
+        tid: Option<u32>,
+        handler: F,
+    ) -> anyhow::Result<u64>
+    where
+        F: FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<BreakpointDecision> + Send + 'static,
+    {
+        let symbols = self.find_symbols(symbol_name, 1)?;
+        if symbols.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Could not find symbol '{}' for persistent breakpoint",
+                symbol_name
+            ));
+        }
+        let address = symbols[0].va;
+        self.setup_persistent_breakpoint(pid, address, tid)?;
+        self.breakpoint_handlers
+            .entry(address)
+            .or_default()
+            .push(Box::new(handler));
+        Ok(address)
+    }
+
+    /// Set a persistent breakpoint at an address with optional thread filter
+    pub fn set_breakpoint_at<F>(
+        &mut self,
+        pid: u32,
+        address: u64,
+        tid: Option<u32>,
+        handler: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<BreakpointDecision> + Send + 'static,
+    {
+        self.setup_persistent_breakpoint(pid, address, tid)?;
+        self.breakpoint_handlers
+            .entry(address)
+            .or_default()
+            .push(Box::new(handler));
+        Ok(())
     }
 
     /// Get arguments for the current function context

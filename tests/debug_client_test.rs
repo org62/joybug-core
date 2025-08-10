@@ -17,6 +17,7 @@ struct TestState {
     process_created: bool,
     dll_loads_count: usize,
     thread_exits_count: usize,
+    ntclose_bp_hits: usize,
 }
 
 impl TestState {
@@ -29,6 +30,7 @@ impl TestState {
             process_created: false,
             dll_loads_count: 0,
             thread_exits_count: 0,
+            ntclose_bp_hits: 0,
         }
     }
 }
@@ -96,6 +98,16 @@ fn test_debug_client_event_collection() {
             println!("=== Hit Initial Breakpoint at 0x{:x} ===", address);
             session.state.initial_breakpoint_hit = true;
             
+            // Set a persistent breakpoint on NtClose and track hits (all threads)
+            session.set_breakpoint_by_symbol(pid, "ntdll!NtClose", None, |session, _pid, _tid, _addr| {
+                session.state.ntclose_bp_hits += 1;
+                if session.state.ntclose_bp_hits >= 3 {
+                    Ok(joybug2::protocol_io::BreakpointDecision::Remove)
+                } else {
+                    Ok(joybug2::protocol_io::BreakpointDecision::Keep)
+                }
+            })?;
+
             // Set the breakpoint first, let the process run, and *then* test stepping
             // from within the breakpoint handler. This is a more robust sequence.
             session.set_single_shot_breakpoint(pid, "cmd!CmdPutChars", |session, pid, tid, bp_addr| {
@@ -169,10 +181,10 @@ fn test_debug_client_event_collection() {
             print_disassembly(session, pid, tid, address)?;
             Ok(())
         })
-        .on_thread_exited(|session, pid, tid, exit_code| {
+        .on_thread_exited(|session, pid, _tid, exit_code| {
             println!(
-                "=== Thread Exited: pid={}, tid={}, exit_code=0x{:x} ===",
-                pid, tid, exit_code
+                "=== Thread Exited: pid={}, exit_code=0x{:x} ===",
+                pid, exit_code
             );
             session.state.thread_exits_count += 1;
             Ok(())
@@ -202,6 +214,7 @@ fn validate_test_results(state: &TestState) {
     
     // Validate stepping functionality
     assert_eq!(state.steps_completed, 3, "Should have completed exactly 3 steps");
+    assert_eq!(state.ntclose_bp_hits, 3, "NtClose should be hit exactly 3 times, got {}", state.ntclose_bp_hits);
     
     // Validate call stack functionality
     let mandatory_symbols = vec!["MapViewOfSection", "RtlUserThreadStart", "LdrpDoDebuggerBreak"];

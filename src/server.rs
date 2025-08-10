@@ -52,14 +52,20 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<Mutex<PlatformIm
                         Err(e) => DebuggerResponse::Error { message: e.to_string() },
                     }
                 }
-                DebuggerRequest::SetBreakpoint { addr } => {
-                    match platform.set_breakpoint(addr) {
+                DebuggerRequest::SetBreakpoint { pid, addr, tid } => {
+                    match platform.set_breakpoint(pid, addr, tid) {
                         Ok(_) => DebuggerResponse::Ack,
                         Err(e) => DebuggerResponse::Error { message: e.to_string() },
                     }
                 }
                 DebuggerRequest::SetSingleShotBreakpoint { pid, addr } => {
                     match platform.set_single_shot_breakpoint(pid, addr) {
+                        Ok(_) => DebuggerResponse::Ack,
+                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                    }
+                }
+                DebuggerRequest::RemoveBreakpoint { pid, addr } => {
+                    match platform.remove_breakpoint(pid, addr) {
                         Ok(_) => DebuggerResponse::Ack,
                         Err(e) => DebuggerResponse::Error { message: e.to_string() },
                     }

@@ -1,4 +1,5 @@
 use super::{utils, WindowsPlatform, stepper};
+use crate::interfaces::Architecture;
 use crate::interfaces::PlatformError;
 use crate::protocol::ModuleInfo;
 use tracing::{error, trace, warn};
@@ -184,6 +185,55 @@ pub(super) fn continue_exec(
                             address,
                         })
                     }
+                } else if process.persistent_breakpoints.contains_key(&address) {
+                    // Persistent breakpoint: restore original bytes, single-step, and re-arm after single-step
+                    trace!(address = %format!("0x{:X}", address), "Persistent breakpoint hit. Restoring original bytes and scheduling re-arm after single-step.");
+
+                    // Check thread filter
+                    if let Some(filter) = process.persistent_bp_tid_filters.get(&address).and_then(|&f| f) {
+                        if filter != debug_event.dwThreadId {
+                            // Ignore this breakpoint for other threads: just continue execution
+                            return Ok(Some(crate::protocol::DebugEvent::Exception {
+                                pid: debug_event.dwProcessId,
+                                tid: debug_event.dwThreadId,
+                                code: ex_record.ExceptionCode as u32,
+                                address: ex_record.ExceptionAddress as u64,
+                                first_chance: ex_info.dwFirstChance == 1,
+                                parameters: vec![],
+                            }));
+                        }
+                    }
+
+                    // Restore original
+                    if let Some(original_bytes) = process.persistent_breakpoints.get(&address).cloned() {
+                        super::memory::write_memory_internal(process.process_handle.0, address, &original_bytes)?;
+                    }
+
+                    // Reset IP to the original instruction
+                    let mut context = match super::thread_context::get_thread_context(platform, debug_event.dwProcessId, debug_event.dwThreadId)? {
+                        crate::protocol::ThreadContext::Win32RawContext(ctx) => ctx,
+                    };
+                    #[cfg(target_arch = "x86_64")]
+                    { context.Rip = address; }
+                    #[cfg(target_arch = "aarch64")]
+                    { context.Pc = address; }
+                    super::thread_context::set_thread_context(platform, debug_event.dwProcessId, debug_event.dwThreadId, crate::protocol::ThreadContext::Win32RawContext(context.clone()))?;
+
+                    // Arm single-step for this thread and remember to re-arm the breakpoint on SS
+                    platform.pending_rearm_breakpoints.insert((debug_event.dwProcessId, debug_event.dwThreadId), (address, false));
+                    // Piggyback on single-step handling: use Trap Flag
+                    let mut ctx2 = match super::thread_context::get_thread_context(platform, debug_event.dwProcessId, debug_event.dwThreadId)? {
+                        crate::protocol::ThreadContext::Win32RawContext(ctx) => ctx,
+                    };
+                    super::stepper::set_single_step_flag_native(&mut ctx2)?;
+                    super::thread_context::set_thread_context(platform, debug_event.dwProcessId, debug_event.dwThreadId, crate::protocol::ThreadContext::Win32RawContext(ctx2))?;
+
+                    // We'll emit a generic Breakpoint event to the client; re-arming will be handled on SS below
+                    Some(crate::protocol::DebugEvent::Breakpoint {
+                        pid: debug_event.dwProcessId,
+                        tid: debug_event.dwThreadId,
+                        address,
+                    })
                 } else {
                     // Check if this is the initial breakpoint for this process
                     // We consider it initial if it's the first breakpoint we've seen for this process
@@ -208,6 +258,37 @@ pub(super) fn continue_exec(
                 
                 // Check if this is from an active stepper
                 let step_key = (debug_event.dwProcessId, debug_event.dwThreadId);
+                // Handle re-arming of persistent breakpoints first
+                if let Some((rearm_addr, _is_single_shot)) = platform.pending_rearm_breakpoints.remove(&step_key) {
+                    // Clear TF
+                    if let Err(e) = stepper::clear_single_step_flag_native2(platform, debug_event.dwProcessId, debug_event.dwThreadId) {
+                        error!("Failed to clear single-step flag: {}", e);
+                    }
+
+                    // Re-arm INT3/BRK at the stored address if original bytes still present
+                    if let Ok(process) = platform.get_process_mut(debug_event.dwProcessId) {
+                        if let Some(original) = process.persistent_breakpoints.get(&rearm_addr).cloned() {
+                            let arch = process.architecture;
+                            let bp_bytes = match arch {
+                                Architecture::X64 => vec![0xCC],
+                                Architecture::Arm64 => vec![0x00, 0x00, 0x3e, 0xD4],
+                            };
+                            let current = super::memory::read_memory_internal(process.process_handle.0, rearm_addr, original.len()).unwrap_or_default();
+                            if current == original {
+                                let _ = super::memory::write_memory_internal(process.process_handle.0, rearm_addr, &bp_bytes);
+                            }
+                        }
+                    }
+                    // Return as normal exception to let client auto-continue
+                    return Ok(Some(crate::protocol::DebugEvent::Exception {
+                        pid: debug_event.dwProcessId,
+                        tid: debug_event.dwThreadId,
+                        code: ex_record.ExceptionCode as u32,
+                        address: ex_record.ExceptionAddress as u64,
+                        first_chance: ex_info.dwFirstChance == 1,
+                        parameters: vec![],
+                    }));
+                }
                 if let Some(step_state) = platform.active_single_steps.remove(&step_key) {
                     // This is from an active stepping operation
                     trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, kind = ?step_state.kind, "Single-step from active stepper");
@@ -216,6 +297,26 @@ pub(super) fn continue_exec(
                         error!("Failed to clear single-step flag: {}", e);
                     }
                     
+                    // If we stepped due to a persistent breakpoint re-arm, re-insert the INT3 now
+                    // Re-arm at the address we just single-stepped over (previous IP)
+                    let rearm_addr = ex_record.ExceptionAddress as u64;
+                    if let Ok(process) = platform.get_process_mut(debug_event.dwProcessId) {
+                        if let Some(original) = process.persistent_breakpoints.get(&rearm_addr).cloned() {
+                            // Write breakpoint instruction back
+                            let arch = process.architecture;
+                            let bp_bytes = match arch {
+                                Architecture::X64 => vec![0xCC],
+                                Architecture::Arm64 => vec![0x00, 0x00, 0x3e, 0xD4],
+                            };
+                            // Only re-arm if original currently present at address matches original bytes
+                            // (avoid re-arming if someone else modified code)
+                            let current = super::memory::read_memory_internal(process.process_handle.0, rearm_addr, original.len()).unwrap_or_default();
+                            if current == original {
+                                let _ = super::memory::write_memory_internal(process.process_handle.0, rearm_addr, &bp_bytes);
+                            }
+                        }
+                    }
+
                     // Return a proper StepComplete event
                     Some(crate::protocol::DebugEvent::StepComplete {
                         pid: debug_event.dwProcessId,
