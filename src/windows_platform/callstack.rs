@@ -22,7 +22,7 @@ fn mask_aarch64_addresses(
     // For debugging, just print the context and see the values
     // trace!("context: {:#?}", crate::protocol::ThreadContext::Win32RawContext(raw_context));
 
-    const MAX_ADDRESS: u64 = 0x00007FFF_FFFF_FFFF_FFFF_u64;
+    const MAX_ADDRESS: u64 = 0x0000_7FFF_FFFF_FFFF_u64;
     stack_frame.AddrPC.Offset &= MAX_ADDRESS;
     unsafe {
         raw_context.Pc &= MAX_ADDRESS;
