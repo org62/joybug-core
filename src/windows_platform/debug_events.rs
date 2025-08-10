@@ -453,42 +453,6 @@ pub(super) fn continue_exec(
                         parameters: vec![],
                     })
                 }
-            } else if let Some((pid, tid, original_return_address)) = platform.step_out_breakpoints.remove(&(ex_record.ExceptionAddress as u64)) {
-                // This is a step-out breakpoint. Restore the context and notify the client.
-                let address = ex_record.ExceptionAddress as u64;
-                trace!(
-                    address = %format!("0x{:X}", address),
-                    "Step-out breakpoint hit. Restoring original return address 0x{:X}",
-                    original_return_address
-                );
-
-                // Get the current context to modify the instruction pointer
-                let mut context = match super::thread_context::get_thread_context(platform, debug_event.dwProcessId, debug_event.dwThreadId)? {
-                    crate::protocol::ThreadContext::Win32RawContext(ctx) => ctx,
-                };
-
-                // Restore the instruction pointer to the original return address
-                #[cfg(target_arch = "x86_64")]
-                {
-                    context.Rip = original_return_address;
-                }
-                #[cfg(target_arch = "aarch64")]
-                {
-                    context.Pc = original_return_address;
-                }
-
-                // Apply the updated context
-                super::thread_context::set_thread_context(platform, debug_event.dwProcessId, debug_event.dwThreadId, crate::protocol::ThreadContext::Win32RawContext(context.clone()))?;
-
-                // The stack pointer is automatically adjusted by the `ret` instruction, so we don't need to modify it.
-                // The stack now points to where it should be after a normal function return.
-
-                Some(crate::protocol::DebugEvent::StepComplete {
-                    pid,
-                    tid,
-                    kind: crate::protocol::StepKind::Out,
-                    address: original_return_address,
-                })
             } else {
                 let mut params = Vec::new();
                 let num_params = ex_record.NumberParameters as usize;
