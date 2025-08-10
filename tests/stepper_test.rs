@@ -17,7 +17,7 @@ struct TestState {
 impl TestState {
     fn new() -> Self {
         Self {
-            step_sequence: vec![StepKind::Into, StepKind::Into, StepKind::Over, StepKind::Over, StepKind::Out, StepKind::Out],
+            step_sequence: vec![StepKind::Into, StepKind::Into, StepKind::Into, StepKind::Over, StepKind::Over, StepKind::Out, StepKind::Out],
             expected_out_prefixes: VecDeque::from([
                 "ntdll!_LdrpInitialize",
                 "ntdll!LdrpInitializeInternal",

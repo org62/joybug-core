@@ -57,12 +57,17 @@ pub(super) fn step(
             let instruction = instructions.first().ok_or_else(|| PlatformError::Other("No instructions returned from disassembler".to_string()))?;
             let next_instruction_addr = instruction.address + instruction.size as u64;
 
-            // Check if this is a CALL, REP, or PUSHF instruction
-            // TODO: arm64 analogues
-            let needs_breakpoint = instruction.mnemonic.starts_with("call") ||
-                                 instruction.mnemonic.starts_with("rep") ||
-                                 instruction.mnemonic == "pushf" ||
-                                 instruction.mnemonic == "pushfq";
+            // Check if this is a CALL-like instruction
+            let needs_breakpoint = if matches!(arch, Architecture::Arm64) {
+                // On ARM64, treat BL-family instructions as calls
+                instruction.mnemonic.starts_with("bl")
+            } else {
+                // On x64, match call/rep/pushf variants
+                instruction.mnemonic.starts_with("call") ||
+                instruction.mnemonic.starts_with("rep") ||
+                instruction.mnemonic == "pushf" ||
+                instruction.mnemonic == "pushfq"
+            };
 
             if needs_breakpoint {
                 // Set a one-shot breakpoint at the next instruction
