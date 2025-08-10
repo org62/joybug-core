@@ -82,38 +82,67 @@ pub(super) fn step(
             }
         }
         StepKind::Out => {
-            // Get the call stack to find the return address and where it's stored on the stack.
-            let call_stack = platform.get_call_stack(pid, tid)
-                .map_err(|e| PlatformError::Other(format!("Failed to get call stack for step-out: {}", e)))?;
+            #[cfg(target_arch = "x86_64")]
+            {
+                // Get the call stack to find the return address and where it's stored on the stack.
+                let call_stack = platform.get_call_stack(pid, tid)
+                    .map_err(|e| PlatformError::Other(format!("Failed to get call stack for step-out: {}", e)))?;
 
-            if let (Some(_current_frame), Some(caller_frame)) = (call_stack.get(0), call_stack.get(1)) {
-                let stack_patch_addr = caller_frame.stack_pointer - 8;
-                let original_return_address = caller_frame.instruction_pointer;
-    
-                if stack_patch_addr == 0 {
-                    return Err(PlatformError::Other("Stack pointer is zero in call frame, cannot step out.".to_string()));
+                if let (Some(_current_frame), Some(caller_frame)) = (call_stack.get(0), call_stack.get(1)) {
+                    let stack_patch_addr = caller_frame.stack_pointer - 8;
+                    let original_return_address = caller_frame.instruction_pointer;
+
+                    if stack_patch_addr == 0 {
+                        return Err(PlatformError::Other("Stack pointer is zero in call frame, cannot step out.".to_string()));
+                    }
+
+                    // Generate a unique fake address.
+                    let fake_address = 0x13370000 + platform.step_out_breakpoints.len() as u64;
+
+                    // Write the fake address to the location of the return address on the stack.
+                    platform.write_memory(pid, stack_patch_addr, &fake_address.to_le_bytes())?;
+
+                    // Store the mapping of fake address to the original for later restoration.
+                    platform.step_out_breakpoints.insert(fake_address, (pid, tid, original_return_address));
+                    debug!(
+                        pid,
+                        tid,
+                        "Patched return address 0x{:X} at stack address 0x{:X} with fake address 0x{:X} for step-out.",
+                        original_return_address,
+                        stack_patch_addr,
+                        fake_address
+                    );
+                } else {
+                    // We are in the top-most frame, so we can't "step out".
+                    // We'll treat this as a "continue" and let the debugger run.
+                    warn!(pid, tid, "Cannot step out, no caller frame on the stack.");
                 }
+            }
 
-                // Generate a unique fake address.
-                let fake_address = 0x13370000 + platform.step_out_breakpoints.len() as u64;
+            #[cfg(target_arch = "aarch64")]
+            {
+                // On ARM64, set a persistent breakpoint at the caller frame's instruction pointer,
+                // filtered to the current thread so other threads ignore it.
+                let call_stack = platform.get_call_stack(pid, tid)
+                    .map_err(|e| PlatformError::Other(format!("Failed to get call stack for step-out: {}", e)))?;
 
-                // Write the fake address to the location of the return address on the stack.
-                platform.write_memory(pid, stack_patch_addr, &fake_address.to_le_bytes())?;
+                if let (Some(_current_frame), Some(caller_frame)) = (call_stack.get(0), call_stack.get(1)) {
+                    let return_address = caller_frame.instruction_pointer;
 
-                // Store the mapping of fake address to the original for later restoration.
-                platform.step_out_breakpoints.insert(fake_address, (pid, tid, original_return_address));
-                debug!(
-                    pid,
-                    tid,
-                    "Patched return address 0x{:X} at stack address 0x{:X} with fake address 0x{:X} for step-out.",
-                    original_return_address,
-                    stack_patch_addr,
-                    fake_address
-                );
-            } else {
-                // We are in the top-most frame, so we can't "step out".
-                // We'll treat this as a "continue" and let the debugger run.
-                warn!(pid, tid, "Cannot step out, no caller frame on the stack.");
+                    // Install a persistent, thread-filtered breakpoint at the caller's IP
+                    platform.set_breakpoint(pid, return_address, Some(tid))?;
+
+                    // Track this so the breakpoint handler can emit StepComplete::Out and clean up
+                    platform.step_out_breakpoints.insert(return_address, (pid, tid, return_address));
+                    debug!(
+                        pid,
+                        tid,
+                        "Set step-out breakpoint at caller IP 0x{:X} (ARM64)",
+                        return_address
+                    );
+                } else {
+                    warn!(pid, tid, "Cannot step out, no caller frame on the stack.");
+                }
             }
         }
     }

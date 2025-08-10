@@ -1,4 +1,5 @@
 use super::{utils, WindowsPlatform, stepper};
+use crate::interfaces::PlatformAPI;
 use crate::interfaces::Architecture;
 use crate::interfaces::PlatformError;
 use crate::protocol::ModuleInfo;
@@ -186,25 +187,18 @@ pub(super) fn continue_exec(
                         })
                     }
                 } else if process.persistent_breakpoints.contains_key(&address) {
-                    // Persistent breakpoint: restore original bytes, single-step, and re-arm after single-step
-                    trace!(address = %format!("0x{:X}", address), "Persistent breakpoint hit. Restoring original bytes and scheduling re-arm after single-step.");
+                    // Persistent breakpoint: restore original bytes, single-step, and optionally re-arm after single-step
+                    trace!(address = %format!("0x{:X}", address), "Persistent breakpoint hit. Restoring original bytes and handling re-arm or step-out.");
 
-                    // Check thread filter
+                    // Check thread filter, but do not early-return; we still need to restore/step over for other threads silently
+                    let mut is_thread_match = true;
                     if let Some(filter) = process.persistent_bp_tid_filters.get(&address).and_then(|&f| f) {
                         if filter != debug_event.dwThreadId {
-                            // Ignore this breakpoint for other threads: just continue execution
-                            return Ok(Some(crate::protocol::DebugEvent::Exception {
-                                pid: debug_event.dwProcessId,
-                                tid: debug_event.dwThreadId,
-                                code: ex_record.ExceptionCode as u32,
-                                address: ex_record.ExceptionAddress as u64,
-                                first_chance: ex_info.dwFirstChance == 1,
-                                parameters: vec![],
-                            }));
+                            is_thread_match = false;
                         }
                     }
 
-                    // Restore original
+                    // Restore original instruction bytes at the breakpoint location
                     if let Some(original_bytes) = process.persistent_breakpoints.get(&address).cloned() {
                         super::memory::write_memory_internal(process.process_handle.0, address, &original_bytes)?;
                     }
@@ -219,21 +213,54 @@ pub(super) fn continue_exec(
                     { context.Pc = address; }
                     super::thread_context::set_thread_context(platform, debug_event.dwProcessId, debug_event.dwThreadId, crate::protocol::ThreadContext::Win32RawContext(context.clone()))?;
 
-                    // Arm single-step for this thread and remember to re-arm the breakpoint on SS
+                    // Determine if this persistent breakpoint is being used for a step-out operation
+                    let is_step_out_hit = platform.step_out_breakpoints.contains_key(&address);
+
+                    if is_step_out_hit && is_thread_match {
+                        // Consume the step-out mapping and finalize StepOut
+                        if let Some((pid2, tid2, original_return_address)) = platform.step_out_breakpoints.remove(&address) {
+                            // Remove the persistent breakpoint permanently for this address
+                            let _ = platform.remove_breakpoint(debug_event.dwProcessId, address);
+                            // Also remove any lingering thread filter
+                            if let Ok(proc2) = platform.get_process_mut(debug_event.dwProcessId) {
+                                proc2.persistent_bp_tid_filters.remove(&address);
+                            }
+
+                            return Ok(Some(crate::protocol::DebugEvent::StepComplete {
+                                pid: pid2,
+                                tid: tid2,
+                                kind: crate::protocol::StepKind::Out,
+                                address: original_return_address,
+                            }));
+                        }
+                    }
+
+                    // Not a step-out completion: schedule a single-step to step past and re-arm the breakpoint
                     platform.pending_rearm_breakpoints.insert((debug_event.dwProcessId, debug_event.dwThreadId), (address, false));
-                    // Piggyback on single-step handling: use Trap Flag
                     let mut ctx2 = match super::thread_context::get_thread_context(platform, debug_event.dwProcessId, debug_event.dwThreadId)? {
                         crate::protocol::ThreadContext::Win32RawContext(ctx) => ctx,
                     };
                     super::stepper::set_single_step_flag_native(&mut ctx2)?;
                     super::thread_context::set_thread_context(platform, debug_event.dwProcessId, debug_event.dwThreadId, crate::protocol::ThreadContext::Win32RawContext(ctx2))?;
 
-                    // We'll emit a generic Breakpoint event to the client; re-arming will be handled on SS below
-                    Some(crate::protocol::DebugEvent::Breakpoint {
-                        pid: debug_event.dwProcessId,
-                        tid: debug_event.dwThreadId,
-                        address,
-                    })
+                    if is_thread_match {
+                        // Report generic breakpoint to client; re-arming handled on SS
+                        Some(crate::protocol::DebugEvent::Breakpoint {
+                            pid: debug_event.dwProcessId,
+                            tid: debug_event.dwThreadId,
+                            address,
+                        })
+                    } else {
+                        // For other threads: be silent to the client layer; report as an Exception to allow auto-continue policies
+                        return Ok(Some(crate::protocol::DebugEvent::Exception {
+                            pid: debug_event.dwProcessId,
+                            tid: debug_event.dwThreadId,
+                            code: ex_record.ExceptionCode as u32,
+                            address: ex_record.ExceptionAddress as u64,
+                            first_chance: ex_info.dwFirstChance == 1,
+                            parameters: vec![],
+                        }));
+                    }
                 } else {
                     // Check if this is the initial breakpoint for this process
                     // We consider it initial if it's the first breakpoint we've seen for this process
