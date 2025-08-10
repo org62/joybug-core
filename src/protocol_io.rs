@@ -115,11 +115,12 @@ impl<S> DebugSession<S> {
     where
         F: FnMut(&mut Self, u32, u32, u64, StepKind) -> Result<StepAction, anyhow::Error> + Send + 'static,
     {
-        if self.stepping_info.is_some() {
-            return Err(anyhow::anyhow!(
-                "Another stepping operation is already in progress."
-            ));
-        }
+        // TODO: handle multiple step requests, currently relaxed due to UI unbreak
+        //if self.stepping_info.is_some() {
+        //    return Err(anyhow::anyhow!(
+        //        "Another stepping operation is already in progress."
+        //    ));
+        //}
 
         self.stepping_info = Some(SteppingInfo {
             handler: Box::new(handler),
@@ -330,28 +331,29 @@ impl<S> DebugSession<S> {
                 address,
                 kind,
             } => {
-                let mut handler = if let Some(info) = self.stepping_info.take() {
-                    info.handler
+                if let Some(info) = self.stepping_info.take() {
+                    let mut handler = info.handler;
+                    let action = handler(self, *pid, *tid, *address, *kind)?;
+
+                    match action {
+                        StepAction::Continue(next_kind) => {
+                            let req = DebuggerRequest::Step {
+                                pid: *pid,
+                                tid: *tid,
+                                kind: next_kind,
+                            };
+                            self.send(&req)?;
+                            self.stepping_info = Some(SteppingInfo { handler });
+                        }
+                        StepAction::Stop => {
+                            // debug loop continues on itself we just don't need to setup the next step
+                        }
+                    }
                 } else {
-                    panic!("No stepping info, sending continue request");
+                    // TODO: handle multiple step requests, currently relaxed due to UI unbreak
+                    // panic!("No stepping info, sending continue request");
                 };
 
-                let action = handler(self, *pid, *tid, *address, *kind)?;
-
-                match action {
-                    StepAction::Continue(next_kind) => {
-                        let req = DebuggerRequest::Step {
-                            pid: *pid,
-                            tid: *tid,
-                            kind: next_kind,
-                        };
-                        self.send(&req)?;
-                        self.stepping_info = Some(SteppingInfo { handler });
-                    }
-                    StepAction::Stop => {
-                        // debug loop continues on itself we just don't need to setup the next step
-                    }
-                }
             }
             DebugEvent::Exception { .. } => {
                 // No-op. Auto-continue will handle it below.
