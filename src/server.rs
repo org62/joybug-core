@@ -177,29 +177,40 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<Mutex<PlatformIm
                     }
                 }
                 DebuggerRequest::Step { pid, tid, kind } => {
-                    // First, set up the stepping state
+                    // Set up stepping state; if it fails, translate to an error-like event so client can surface it without panic
                     match platform.step(pid, tid, kind) {
-                        Ok(_) => {
-                            DebuggerResponse::Ack
-                        }
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                        Ok(_) => DebuggerResponse::Ack,
+                        Err(e) => DebuggerResponse::Event { event: crate::protocol::DebugEvent::StepFailed {
+                            pid,
+                            tid,
+                            kind,
+                            message: e.to_string(),
+                        }},
                     }
                 }
             }
         };
         debug!(resp = %match &resp {
             DebuggerResponse::Event { event } => event.to_string(),
-            DebuggerResponse::ThreadContext { context } => context.to_string(),
+            DebuggerResponse::ThreadContext { context } => {
+                format!("ThreadContext {{ pc: 0x{:016x} }}", context.get_pc())
+            },
             DebuggerResponse::ModuleList { modules } => format!("ModuleList {{ modules: [..{} modules] }}", modules.len()),
             DebuggerResponse::ThreadList { threads } => format!("ThreadList {{ threads: [..{} threads] }}", threads.len()),
             DebuggerResponse::ProcessList { processes } => format!("ProcessList {{ processes: [..{} processes] }}", processes.len()),
             DebuggerResponse::Instructions { instructions } => {
-                use crate::interfaces::InstructionFormatter;
-                format!("Instructions {{\n{}}}", instructions.format_disassembly())
+                format!(
+                    "Instructions {{ instructions: [..{} instructions] }}",
+                    instructions.len()
+                )
             },
             DebuggerResponse::WideStringData { data } => format!("WideStringData {{ data: \"{}\" }}", data),
             DebuggerResponse::SymbolList { symbols } => format!("SymbolList {{ symbols: [..{} symbols] }}", symbols.len()),
             DebuggerResponse::ResolvedSymbolList { symbols } => format!("ResolvedSymbolList {{ symbols: [..{} symbols] }}", symbols.len()),
+            DebuggerResponse::CallStack { frames } => format!(
+                "CallStack {{ frames: [..{} frames] }}",
+                frames.len()
+            ),
             _ => format!("{:?}", resp),
         }, "Sending response");
         if let Err(e) = framed_stream.send(&resp) {

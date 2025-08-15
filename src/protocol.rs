@@ -222,6 +222,12 @@ pub mod request_response {
             kind: StepKind,
             address: u64,
         },
+        StepFailed {
+            pid: u32,
+            tid: u32,
+            kind: StepKind,
+            message: String,
+        },
         Unknown,
     }
 
@@ -241,6 +247,7 @@ pub mod request_response {
                 DebugEvent::DllUnloaded { pid, .. } => *pid,
                 DebugEvent::RipEvent { pid, .. } => *pid,
                 DebugEvent::StepComplete { pid, .. } => *pid,
+                DebugEvent::StepFailed { pid, .. } => *pid,
                 DebugEvent::Unknown => 0, // Or handle as an error
             }
         }
@@ -259,6 +266,7 @@ pub mod request_response {
                 DebugEvent::DllUnloaded { tid, .. } => *tid,
                 DebugEvent::RipEvent { tid, .. } => *tid,
                 DebugEvent::StepComplete { tid, .. } => *tid,
+                DebugEvent::StepFailed { tid, .. } => *tid,
                 DebugEvent::ProcessExited { .. } => 0,
                 DebugEvent::Unknown => 0,
             }

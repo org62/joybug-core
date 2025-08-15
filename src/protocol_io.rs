@@ -7,7 +7,7 @@ use std::collections::HashMap;
 pub use std::net::TcpStream;
 use std::sync::Mutex;
 use crate::framed_json_stream::FramedJsonStream;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 pub fn send_request(stream: &mut FramedJsonStream, req: &DebuggerRequest) -> anyhow::Result<()> {
     debug!("Sending request: {:?}", req);
@@ -16,10 +16,30 @@ pub fn send_request(stream: &mut FramedJsonStream, req: &DebuggerRequest) -> any
 
 pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<DebuggerResponse> {
     let resp: DebuggerResponse = stream.receive()?;
-    debug!("Received response: {:?}", resp);
-    if let DebuggerResponse::Error { message } = &resp {
-        panic!("Error: {}", message);
-    }
+    // Print only the response type, and for Instructions include the count
+    let summary = match &resp {
+        DebuggerResponse::Instructions { instructions } => {
+            format!("Instructions ({} instructions)", instructions.len())
+        }
+        DebuggerResponse::Ack => "Ack".to_string(),
+        DebuggerResponse::Error { .. } => "Error".to_string(),
+        DebuggerResponse::Event { .. } => "Event".to_string(),
+        DebuggerResponse::MemoryData { .. } => "MemoryData".to_string(),
+        DebuggerResponse::WriteAck => "WriteAck".to_string(),
+        DebuggerResponse::ThreadContext { .. } => "ThreadContext".to_string(),
+        DebuggerResponse::SetContextAck => "SetContextAck".to_string(),
+        DebuggerResponse::ModuleList { .. } => "ModuleList".to_string(),
+        DebuggerResponse::ThreadList { .. } => "ThreadList".to_string(),
+        DebuggerResponse::ProcessList { .. } => "ProcessList".to_string(),
+        DebuggerResponse::Symbol { .. } => "Symbol".to_string(),
+        DebuggerResponse::SymbolList { .. } => "SymbolList".to_string(),
+        DebuggerResponse::ResolvedSymbolList { .. } => "ResolvedSymbolList".to_string(),
+        DebuggerResponse::AddressSymbol { .. } => "AddressSymbol".to_string(),
+        DebuggerResponse::CallStack { .. } => "CallStack".to_string(),
+        DebuggerResponse::FunctionArguments { .. } => "FunctionArguments".to_string(),
+        DebuggerResponse::WideStringData { .. } => "WideStringData".to_string(),
+    };
+    debug!("Received response: {}", summary);
     Ok(resp)
 }
 
@@ -130,8 +150,22 @@ impl<S> DebugSession<S> {
             tid,
             kind: initial_kind,
         };
-        self.send(&req)?;
-        Ok(())
+        // Send step request and synchronously verify Ack/Error so caller can react to failures
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Event { event } => {
+                // Pass StepFailed through as an error to the caller; continue to allow UI to handle
+                match &event {
+                    DebugEvent::StepFailed { message, .. } => {
+                        return Err(anyhow::anyhow!(message.clone()));
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!(message)),
+            other => Err(anyhow::anyhow!("Unexpected response to Step: {:?}", other)),
+        }
     }
 
     /// Handle DLL load events (great for testing call stacks)
@@ -255,6 +289,10 @@ impl<S> DebugSession<S> {
         }
 
         match event {
+            DebugEvent::StepFailed { pid, tid, kind, message } => {
+                info!("StepFailed received: pid={}, tid={}, kind={:?}, message={}", pid, tid, kind, message);
+                // Do not panic; let higher-level on_event handler decide whether to stop/continue
+            }
             DebugEvent::InitialBreakpoint { pid, tid, address } => {
                 if let Some(ref mut handler) = on_initial_breakpoint {
                     handler(self, *pid, *tid, *address)?;
@@ -350,8 +388,7 @@ impl<S> DebugSession<S> {
                         }
                     }
                 } else {
-                    // TODO: handle multiple step requests, currently relaxed due to UI unbreak
-                    // panic!("No stepping info, sending continue request");
+                    warn!("No stepping info, sending continue request");
                 };
 
             }
@@ -398,7 +435,12 @@ impl<S> DebugSession<S> {
                     tid: *tid,
                 };
                 let mut stream = self.stream.lock().unwrap();
+                debug!("Auto-continue on event: {}", event);
                 send_request(&mut stream, &cont)?;
+            }
+            DebugEvent::StepFailed { .. } => {
+                // Do not auto-continue on step failure; let UI control flow
+                debug!("Not auto-continuing on StepFailed: {}", event);
             }
             DebugEvent::Unknown => {}
         }

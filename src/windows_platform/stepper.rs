@@ -43,8 +43,17 @@ pub(super) fn step(
             let updated_context = ThreadContext::Win32RawContext(context);
             super::thread_context::set_thread_context(platform, pid, tid, updated_context)?;
             // Track this stepping operation
-            platform.active_single_steps.insert((pid, tid), super::StepState { kind });
-            debug!(pid, tid, "Single-step flag set");
+            // Remove any pending re-arm for this thread to avoid misrouting the next SS
+            platform.pending_rearm_breakpoints.remove(&(pid, tid));
+            let replaced = platform
+                .active_single_steps
+                .insert((pid, tid), super::StepState { kind })
+                .is_some();
+            if replaced {
+                debug!(pid, tid, "Single-step flag set (replaced existing step record for this thread)");
+            } else {
+                debug!(pid, tid, "Single-step flag set");
+            }
         }
         StepKind::Over => {
             // Read and disassemble the current instruction.
@@ -82,8 +91,17 @@ pub(super) fn step(
                 let updated_context = ThreadContext::Win32RawContext(context);
                 super::thread_context::set_thread_context(platform, pid, tid, updated_context)?;
                 // Track this stepping operation
-                platform.active_single_steps.insert((pid, tid), super::StepState { kind });
-                debug!(pid, tid, "Step-into is used for step-over");
+                // Remove any pending re-arm for this thread to avoid misrouting the next SS
+                platform.pending_rearm_breakpoints.remove(&(pid, tid));
+                let replaced = platform
+                    .active_single_steps
+                    .insert((pid, tid), super::StepState { kind })
+                    .is_some();
+                if replaced {
+                    debug!(pid, tid, "Step-into is used for step-over (replaced existing step record for this thread)");
+                } else {
+                    debug!(pid, tid, "Step-into is used for step-over");
+                }
             }
         }
         StepKind::Out => {
@@ -111,6 +129,9 @@ pub(super) fn step(
                 } else {
                     // We are in the top-most frame, so we can't "step out".
                     warn!(pid, tid, "Cannot step out, no caller frame on the stack.");
+                    return Err(PlatformError::Other(
+                        "Cannot step out, no caller frame on the stack.".to_string(),
+                    ));
                 }
             }
 
@@ -137,6 +158,9 @@ pub(super) fn step(
                     );
                 } else {
                     warn!(pid, tid, "Cannot step out, no caller frame on the stack.");
+                    return Err(PlatformError::Other(
+                        "Cannot step out, no caller frame on the stack.".to_string(),
+                    ));
                 }
             }
         }

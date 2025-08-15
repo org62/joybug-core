@@ -175,6 +175,9 @@ impl std::fmt::Display for DebugEvent {
             DebugEvent::StepComplete { pid, tid, kind, address } => {
                 write!(f, "StepComplete(pid={}, tid={}, kind={:?}, address=0x{:X})", pid, tid, kind, address)
             }
+            DebugEvent::StepFailed { pid, tid, kind, message } => {
+                write!(f, "StepFailed(pid={}, tid={}, kind={:?}, message={})", pid, tid, kind, message)
+            }
             DebugEvent::Unknown => write!(f, "Unknown"),
         }
     }

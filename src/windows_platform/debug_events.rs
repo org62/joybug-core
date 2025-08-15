@@ -369,12 +369,19 @@ pub(super) fn continue_exec(
                     }
                 }
             } else if ex_record.ExceptionCode == STATUS_SINGLE_STEP {
-                trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, address = %format!("0x{:X}", ex_record.ExceptionAddress as u64), "Single-step event");
+                trace!(
+                    pid = debug_event.dwProcessId,
+                    tid = debug_event.dwThreadId,
+                    address = %format!("0x{:X}", ex_record.ExceptionAddress as u64),
+                    first_chance = ex_info.dwFirstChance == 1,
+                    "Single-step event"
+                );
                 
                 // Check if this is from an active stepper
                 let step_key = (debug_event.dwProcessId, debug_event.dwThreadId);
                 // Handle re-arming of persistent breakpoints first
                 if let Some((rearm_addr, _is_single_shot)) = platform.pending_rearm_breakpoints.remove(&step_key) {
+                    trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, rearm_addr = %format!("0x{:X}", rearm_addr), "SS used for persistent breakpoint re-arm");
                     // Clear TF
                     if let Err(e) = stepper::clear_single_step_flag_native2(platform, debug_event.dwProcessId, debug_event.dwThreadId) {
                         error!("Failed to clear single-step flag: {}", e);
@@ -406,7 +413,7 @@ pub(super) fn continue_exec(
                 }
                 if let Some(step_state) = platform.active_single_steps.remove(&step_key) {
                     // This is from an active stepping operation
-                    trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, kind = ?step_state.kind, "Single-step from active stepper");
+                    trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, kind = ?step_state.kind, address = %format!("0x{:X}", ex_record.ExceptionAddress as u64), "Single-step from active stepper");
                     
                     if let Err(e) = stepper::clear_single_step_flag_native2(platform, debug_event.dwProcessId, debug_event.dwThreadId) {
                         error!("Failed to clear single-step flag: {}", e);
@@ -441,7 +448,25 @@ pub(super) fn continue_exec(
                     })
                 } else {
                     // This is an unexpected single-step (not from our stepper)
-                    trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, "Unexpected single-step event");
+                    // Log extra context to help diagnose stray TF or kernel-generated SS
+                    let ctx_for_log = match super::thread_context::get_thread_context(platform, debug_event.dwProcessId, debug_event.dwThreadId) {
+                        Ok(crate::protocol::ThreadContext::Win32RawContext(c)) => Some(c),
+                        _ => None,
+                    };
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        if let Some(ref ctx) = ctx_for_log {
+                            trace!(
+                                pid = debug_event.dwProcessId,
+                                tid = debug_event.dwThreadId,
+                                rip = %format!("0x{:X}", ctx.Rip),
+                                eflags = %format!("0x{:X}", ctx.EFlags),
+                                "Unexpected single-step event (no active step record)"
+                            );
+                        } else {
+                            trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, "Unexpected single-step event (no active step record) - failed to fetch context for log");
+                        }
+                    }
                     
                     // Return as normal exception
                     Some(crate::protocol::DebugEvent::Exception {
