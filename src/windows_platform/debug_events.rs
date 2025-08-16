@@ -655,10 +655,49 @@ pub(super) fn continue_exec(
         }
         OUTPUT_DEBUG_STRING_EVENT => {
             trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, "OutputDebugString event");
+            let info = unsafe { debug_event.u.DebugString };
+            let pid = debug_event.dwProcessId;
+
+            // fUnicode indicates whether the string is UTF-16. nDebugStringLength is in characters.
+            let output = if info.fUnicode != 0 {
+                // Read UTF-16 string with known length
+                match super::memory::read_wide_string(
+                    platform,
+                    pid,
+                    info.lpDebugStringData as u64,
+                    Some(info.nDebugStringLength as usize),
+                ) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(pid, tid = debug_event.dwThreadId, error = %e, "Failed to read wide debug string");
+                        "<invalid wide debug string>".to_string()
+                    }
+                }
+            } else {
+                // ANSI string
+                let len = info.nDebugStringLength as usize;
+                match super::memory::read_memory(
+                    platform,
+                    pid,
+                    info.lpDebugStringData as u64,
+                    len,
+                ) {
+                    Ok(bytes) => {
+                        let mut s = String::from_utf8_lossy(&bytes).into_owned();
+                        if let Some(pos) = s.find('\0') { s.truncate(pos); }
+                        s.trim().to_string()
+                    }
+                    Err(e) => {
+                        warn!(pid, tid = debug_event.dwThreadId, error = %e, "Failed to read ansi debug string");
+                        "<invalid debug string>".to_string()
+                    }
+                }
+            };
+
             Some(crate::protocol::DebugEvent::Output {
-                pid: debug_event.dwProcessId,
+                pid,
                 tid: debug_event.dwThreadId,
-                output: "<TODO: extract debug string>".to_string(),
+                output,
             })
         }
         RIP_EVENT => {

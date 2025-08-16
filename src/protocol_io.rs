@@ -289,6 +289,9 @@ impl<S> DebugSession<S> {
         }
 
         match event {
+            DebugEvent::Output { pid, tid, output } => {
+                info!(pid, tid, msg = %output, "OutputDebugString");
+            }
             DebugEvent::StepFailed { pid, tid, kind, message } => {
                 info!("StepFailed received: pid={}, tid={}, kind={:?}, message={}", pid, tid, kind, message);
                 // Do not panic; let higher-level on_event handler decide whether to stop/continue
