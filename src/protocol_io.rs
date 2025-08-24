@@ -68,6 +68,8 @@ pub struct DebugSession<S> {
     stepping_info: Option<SteppingInfo<S>>,
     on_dll_loaded:
         Option<Box<dyn FnMut(&mut Self, u32, u32, &str, u64) -> anyhow::Result<()> + Send + 'static>>,
+    on_dll_unloaded:
+        Option<Box<dyn FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<()> + Send + 'static>>,
         on_thread_created:
         Option<Box<dyn FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<()> + Send + Sync + 'static>>,
     on_process_exited:
@@ -92,6 +94,7 @@ impl<S> DebugSession<S> {
             breakpoint_handlers: HashMap::new(),
             stepping_info: None,
             on_dll_loaded: None,
+            on_dll_unloaded: None,
             on_thread_created: None,
             on_process_exited: None,
             on_thread_exited: None,
@@ -175,6 +178,16 @@ impl<S> DebugSession<S> {
         F: FnMut(&mut Self, u32, u32, &str, u64) -> anyhow::Result<()> + Send + 'static,
     {
         self.on_dll_loaded = Some(Box::new(handler));
+        self
+    }
+
+    /// Handle DLL unload events
+    /// Callback receives: (session, pid, tid, base_address)
+    pub fn on_dll_unloaded<F>(mut self, handler: F) -> Self
+    where
+        F: FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<()> + Send + 'static,
+    {
+        self.on_dll_unloaded = Some(Box::new(handler));
         self
     }
 
@@ -275,6 +288,7 @@ impl<S> DebugSession<S> {
         // when handlers themselves need to modify the session (e.g., add new breakpoints)
         let mut on_initial_breakpoint = self.on_initial_breakpoint.take();
         let mut on_dll_loaded = self.on_dll_loaded.take();
+        let mut on_dll_unloaded = self.on_dll_unloaded.take();
         let mut on_thread_created = self.on_thread_created.take();
         let mut on_process_created = self.on_process_created.take();
         let mut on_process_exited = self.on_process_exited.take();
@@ -333,6 +347,11 @@ impl<S> DebugSession<S> {
                 if let Some(ref mut handler) = on_dll_loaded {
                     let name = dll_name.as_deref().unwrap_or("<unknown>");
                     handler(self, *pid, *tid, name, *base_of_dll)?;
+                }
+            }
+            DebugEvent::DllUnloaded { pid, tid, base_of_dll } => {
+                if let Some(ref mut handler) = on_dll_unloaded {
+                    handler(self, *pid, *tid, *base_of_dll)?;
                 }
             }
             DebugEvent::ThreadCreated {
@@ -410,6 +429,7 @@ impl<S> DebugSession<S> {
         self.on_process_exited = on_process_exited;
         self.on_thread_exited = on_thread_exited;
         self.on_process_created = on_process_created;
+        self.on_dll_unloaded = on_dll_unloaded;
         self.on_event = on_event;
 
         // If the on_event handler wants to stop, respect that
