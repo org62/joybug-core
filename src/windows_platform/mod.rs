@@ -10,18 +10,16 @@ mod symbol_provider;
 pub mod disassembler;
 mod callstack;
 mod stepper;
+mod debugged_process;
 
 use crate::interfaces::{PlatformAPI, PlatformError, ModuleSymbol, ResolvedSymbol, SymbolError, Architecture, DisassemblerError, Instruction, DisassemblerProvider, Stepper};
 use crate::protocol::{ModuleInfo, ProcessInfo, ThreadInfo, StepKind};
-use module_manager::ModuleManager;
-use thread_manager::ThreadManager;
 use symbol_manager::SymbolManager;
 use disassembler::CapstoneDisassembler;
-use windows_sys::Win32::System::Diagnostics::Debug::{SymCleanup, SymInitialize, CONTEXT};
-use windows_sys::Win32::Foundation::{CloseHandle, FALSE, GetLastError, HANDLE};
-use tracing::{error, trace, warn, info};
+use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use tracing::{trace, info};
 use std::collections::HashMap;
-use std::ptr;
 
 // Safe wrapper for HANDLE that automatically closes it
 #[derive(Debug)]
@@ -49,65 +47,15 @@ pub(crate) struct StepState {
     pub(crate) kind: StepKind,
 }
 
-/// Represents a single debugged process with its associated state
-#[derive(Debug)]
-    pub(crate) struct DebuggedProcess {
-    pub(crate) process_handle: HandleSafe,
-    pub(crate) architecture: Architecture,
-    pub(crate) module_manager: ModuleManager,
-    pub(crate) thread_manager: ThreadManager,
-    pub(crate) single_shot_breakpoints: HashMap<u64, Vec<u8>>,
-    pub(crate) persistent_breakpoints: HashMap<u64, Vec<u8>>,
-    pub(crate) persistent_bp_tid_filters: HashMap<u64, Option<u32>>,
-    /// Track whether this process has hit its initial breakpoint
-    pub(crate) has_hit_initial_breakpoint: bool,
-}
-
-impl DebuggedProcess {
-    pub fn new(pid: u32, process_handle: HANDLE, architecture: Architecture) -> Result<Self, PlatformError> {
-        if unsafe { SymInitialize(process_handle, ptr::null(), FALSE) } == FALSE {
-            let error = unsafe { GetLastError() };
-            error!(pid, "Failed to initialize symbol handler, error code: 0x{:x}", error);
-            return Err(PlatformError::OsError(format!("SymInitialize failed for pid {}: {}", pid, utils::error_message(error))));
-        }
-        Ok(Self {
-            process_handle: HandleSafe(process_handle),
-            architecture,
-            module_manager: ModuleManager::new(),
-            thread_manager: ThreadManager::new(),
-            single_shot_breakpoints: HashMap::new(),
-            persistent_breakpoints: HashMap::new(),
-            persistent_bp_tid_filters: HashMap::new(),
-            has_hit_initial_breakpoint: false,
-        })
-    }
-}
-
-impl Drop for DebuggedProcess {
-    fn drop(&mut self) {
-        if unsafe { SymCleanup(self.process_handle.0) } == FALSE {
-            let error = unsafe { GetLastError() };
-            warn!("Failed to cleanup symbol handler for process, error code: {}", error);
-        }
-    }
-}
+pub(crate) use debugged_process::DebuggedProcess;
 
 pub struct WindowsPlatform {
     /// Map of PID to DebuggedProcess for managing multiple processes
-    pub(crate) processes: HashMap<u32, DebuggedProcess>,
+    processes: HashMap<u32, DebuggedProcess>,
     /// Shared symbol manager for all processes
-    pub(crate) symbol_manager: Option<SymbolManager>,
+    symbol_manager: Option<SymbolManager>,
     /// Shared disassembler for all processes
-    pub(crate) disassembler: Option<CapstoneDisassembler>,
-    /// Track active stepping operations by (pid, tid)
-    pub(crate) active_single_steps: HashMap<(u32, u32), StepState>,
-    /// Track step-over breakpoints by address
-    pub(crate) step_over_breakpoints: HashMap<u64, (u32, u32, StepKind)>,
-    /// Track step-out breakpoints by fake address
-    pub(crate) step_out_breakpoints: HashMap<u64, (u32, u32, u64)>, // (pid, tid, original_return_address)
-    /// Track threads that need re-arming after a single-step:
-    /// (pid, tid) -> (address, is_single_shot)
-    pub(crate) pending_rearm_breakpoints: HashMap<(u32, u32), (u64, bool)>,
+    disassembler: Option<CapstoneDisassembler>,
 }
 
 impl WindowsPlatform {
@@ -118,69 +66,61 @@ impl WindowsPlatform {
             processes: HashMap::new(),
             symbol_manager,
             disassembler,
-            active_single_steps: HashMap::new(),
-            step_over_breakpoints: HashMap::new(),
-            step_out_breakpoints: HashMap::new(),
-            pending_rearm_breakpoints: HashMap::new(),
         }
     }
     
     /// Get a reference to a debugged process by PID
-    pub(crate) fn get_process(&self, pid: u32) -> Result<&DebuggedProcess, PlatformError> {
+    fn get_process(&self, pid: u32) -> Result<&DebuggedProcess, PlatformError> {
         self.processes.get(&pid)
             .ok_or_else(|| PlatformError::Other(format!("Process {} not found", pid)))
     }
     
     /// Get a mutable reference to a debugged process by PID
-    pub(crate) fn get_process_mut(&mut self, pid: u32) -> Result<&mut DebuggedProcess, PlatformError> {
+    fn get_process_mut(&mut self, pid: u32) -> Result<&mut DebuggedProcess, PlatformError> {
         self.processes.get_mut(&pid)
             .ok_or_else(|| PlatformError::Other(format!("Process {} not found", pid)))
     }
     
     /// Add a new debugged process
-    pub(crate) fn add_process(&mut self, pid: u32, process_handle: HANDLE, architecture: Architecture) -> Result<(), PlatformError> {
+    fn add_process(&mut self, pid: u32, process_handle: HANDLE, architecture: Architecture) -> Result<(), PlatformError> {
         let process = DebuggedProcess::new(pid, process_handle, architecture)?;
         self.processes.insert(pid, process);
         Ok(())
     }
     
     /// Remove a debugged process
-    pub(crate) fn remove_process(&mut self, pid: u32) {
+    fn remove_process(&mut self, pid: u32) {
         self.processes.remove(&pid);
     }
 
     /// Cleanup all step-related breakpoint state for a process
-    pub(crate) fn cleanup_step_state_for_process(&mut self, pid: u32) -> (usize, usize) {
-        let before_over = self.step_over_breakpoints.len();
-        self.step_over_breakpoints.retain(|_, (p, _t, _)| *p != pid);
-        let removed_over = before_over - self.step_over_breakpoints.len();
+    fn cleanup_step_state_for_process(&mut self, pid: u32) -> (usize, usize) {
+        if let Some(proc) = self.processes.get_mut(&pid) {
+            let removed_over = proc.clear_step_over_breakpoints();
+            let removed_out = proc.clear_step_out_breakpoints();
 
-        let before_out = self.step_out_breakpoints.len();
-        self.step_out_breakpoints.retain(|_, (p, _t, _orig)| *p != pid);
-        let removed_out = before_out - self.step_out_breakpoints.len();
-
-        if removed_over > 0 || removed_out > 0 {
-            trace!(pid, removed_over, removed_out, "Cleaned up step breakpoint state for process");
+            if removed_over > 0 || removed_out > 0 {
+                trace!(pid, removed_over, removed_out, "Cleaned up step breakpoint state for process");
+            }
+            (removed_over, removed_out)
+        } else {
+            (0, 0)
         }
-        (removed_over, removed_out)
     }
 
     /// Cleanup all step-related breakpoint state for a specific thread
-    pub(crate) fn cleanup_step_state_for_thread(&mut self, pid: u32, tid: u32) -> (usize, usize) {
-        let before_over = self.step_over_breakpoints.len();
-        self.step_over_breakpoints
-            .retain(|_, (p, t, _)| !(*p == pid && *t == tid));
-        let removed_over = before_over - self.step_over_breakpoints.len();
+    fn cleanup_step_state_for_thread(&mut self, pid: u32, tid: u32) -> (usize, usize) {
+        if let Some(proc) = self.processes.get_mut(&pid) {
+            let removed_over = proc.retain_step_over_breakpoints_excluding_tid(tid);
+            let removed_out = proc.retain_step_out_breakpoints_excluding_tid(tid);
 
-        let before_out = self.step_out_breakpoints.len();
-        self.step_out_breakpoints
-            .retain(|_, (p, t, _)| !(*p == pid && *t == tid));
-        let removed_out = before_out - self.step_out_breakpoints.len();
-
-        if removed_over > 0 || removed_out > 0 {
-            trace!(pid, tid, removed_over, removed_out, "Cleaned up step breakpoint state for thread");
+            if removed_over > 0 || removed_out > 0 {
+                trace!(pid, tid, removed_over, removed_out, "Cleaned up step breakpoint state for thread");
+            }
+            (removed_over, removed_out)
+        } else {
+            (0, 0)
         }
-        (removed_over, removed_out)
     }
 }
 
@@ -201,8 +141,8 @@ impl PlatformAPI for WindowsPlatform {
 
     fn set_single_shot_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError> {
         let process = self.get_process_mut(pid)?;
-        let process_handle = process.process_handle.0;
-        let arch = process.architecture;
+        let process_handle = process.handle();
+        let arch = process.architecture();
 
         let (breakpoint_bytes, original_bytes) = match arch {
             Architecture::X64 => {
@@ -217,7 +157,7 @@ impl PlatformAPI for WindowsPlatform {
         };
         
         // Store the original bytes
-        process.single_shot_breakpoints.insert(addr, original_bytes);
+        process.insert_single_shot_breakpoint(addr, original_bytes);
         
         // Write the breakpoint instruction
         memory::write_memory_internal(process_handle, addr, &breakpoint_bytes)
@@ -230,10 +170,10 @@ impl PlatformAPI for WindowsPlatform {
     fn set_breakpoint(&mut self, pid: u32, addr: u64, tid: Option<u32>) -> Result<(), PlatformError> {
         trace!(pid, addr, "WindowsPlatform::set_breakpoint called");
         let process = self.get_process_mut(pid)?;
-        let process_handle = process.process_handle.0;
-        let arch = process.architecture;
+        let process_handle = process.handle();
+        let arch = process.architecture();
 
-        if process.persistent_breakpoints.contains_key(&addr) {
+        if process.is_persistent_breakpoint(addr) {
             return Ok(());
         }
 
@@ -248,22 +188,14 @@ impl PlatformAPI for WindowsPlatform {
             }
         };
 
-        process.persistent_breakpoints.insert(addr, original_bytes);
-        process.persistent_bp_tid_filters.insert(addr, tid);
+        process.insert_persistent_breakpoint(addr, original_bytes, tid);
         memory::write_memory_internal(process_handle, addr, &breakpoint_bytes)
     }
 
     fn remove_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError> {
         trace!(pid, addr, "WindowsPlatform::remove_breakpoint called");
         let process = self.get_process_mut(pid)?;
-        let process_handle = process.process_handle.0;
-        if let Some(original) = process.persistent_breakpoints.remove(&addr) {
-            // Restore original bytes
-            memory::write_memory_internal(process_handle, addr, &original)
-        } else {
-            // If it's not a persistent breakpoint, noop
-            Ok(())
-        }
+        process.remove_breakpoint(addr)
     }
 
     fn launch(&mut self, command: &str) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
@@ -283,16 +215,16 @@ impl PlatformAPI for WindowsPlatform {
     }
 
     fn get_thread_context(&mut self, pid: u32, tid: u32) -> Result<crate::protocol::ThreadContext, PlatformError> {
-        thread_context::get_thread_context(self, pid, tid)
+        thread_context::get_thread_context(self.get_process_mut(pid)?, pid, tid)
     }
 
     fn set_thread_context(&mut self, pid: u32, tid: u32, context: crate::protocol::ThreadContext) -> Result<(), PlatformError> {
-        thread_context::set_thread_context(self, pid, tid, context)
+        thread_context::set_thread_context(self.get_process_mut(pid)?, pid, tid, context)
     }
 
     fn get_function_arguments(&mut self, pid: u32, tid: u32, count: usize) -> Result<Vec<u64>, PlatformError> {
         let process = self.get_process(pid)?;
-        let arch = process.architecture;
+        let arch = process.architecture();
         let context = self.get_thread_context(pid, tid)?;
 
         let mut arguments = Vec::with_capacity(count);
@@ -345,12 +277,12 @@ impl PlatformAPI for WindowsPlatform {
 
     fn list_modules(&self, pid: u32) -> Result<Vec<ModuleInfo>, PlatformError> {
         let process = self.get_process(pid)?;
-        Ok(process.module_manager.list_modules())
+        Ok(process.module_manager().list_modules())
     }
 
     fn list_threads(&self, pid: u32) -> Result<Vec<ThreadInfo>, PlatformError> {
         let process = self.get_process(pid)?;
-        Ok(process.thread_manager.list_threads())
+        Ok(process.thread_manager().list_threads())
     }
 
     fn list_processes(&self) -> Result<Vec<ProcessInfo>, PlatformError> {
@@ -387,7 +319,7 @@ impl PlatformAPI for WindowsPlatform {
     fn resolve_address_to_symbol(&self, pid: u32, address: u64) -> Result<Option<(String, ModuleSymbol, u64)>, SymbolError> {
         if let Some(ref symbol_manager) = self.symbol_manager {
             let modules = self.get_process(pid).map_err(|e| SymbolError::SymbolsNotFound(e.to_string()))?
-                .module_manager
+                .module_manager()
                 .list_modules();
             symbol_manager.resolve_address_to_symbol_raw(&modules, address)
         } else {
@@ -406,7 +338,7 @@ impl PlatformAPI for WindowsPlatform {
 
         let modules = self.get_process(pid)
             .map_err(|e| DisassemblerError::InvalidData(format!("Process not found: {}", e)))?
-            .module_manager
+            .module_manager()
             .list_modules();
 
         let symbol_manager = self.symbol_manager.as_ref();

@@ -40,14 +40,14 @@ pub fn get_call_stack(
     
     // Get the process and thread information
     let process = platform.get_process(pid)?;
-    let process_handle = process.process_handle.0;
-    let architecture = process.architecture;
+    let process_handle = process.handle();
+    let architecture = process.architecture();
     
     // Get the list of modules for address validation
-    let modules = process.module_manager.list_modules();
+    let modules = process.module_manager().list_modules();
     
     // Get the thread handle from the thread manager
-    let thread_handle = process.thread_manager.get_thread_handle(tid)
+    let thread_handle = process.thread_manager().get_thread_handle(tid)
         .filter(|h| !h.is_null())
         .ok_or_else(|| PlatformError::OsError(format!("Failed to get thread handle for {}", tid)))?;
 

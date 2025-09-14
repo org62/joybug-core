@@ -24,7 +24,7 @@ pub(super) fn step(
     trace!(pid, tid, kind = ?kind, "WindowsPlatform::step called");
 
     // Get current thread context using platform function
-    let thread_context = super::thread_context::get_thread_context(platform, pid, tid)?;
+    let thread_context = super::thread_context::get_thread_context(platform.get_process_mut(pid)?, pid, tid)?;
     
     let mut context = match thread_context {
         ThreadContext::Win32RawContext(ctx) => ctx,
@@ -41,18 +41,18 @@ pub(super) fn step(
             set_single_step_flag_native(&mut context)?;
             // Set the modified context back using platform function
             let updated_context = ThreadContext::Win32RawContext(context);
-            super::thread_context::set_thread_context(platform, pid, tid, updated_context)?;
+            super::thread_context::set_thread_context(platform.get_process_mut(pid)?, pid, tid, updated_context)?;
             // Track this stepping operation
             // Remove any pending re-arm for this thread to avoid misrouting the next SS
-            platform.pending_rearm_breakpoints.remove(&(pid, tid));
-            let replaced = platform
-                .active_single_steps
-                .insert((pid, tid), super::StepState { kind })
-                .is_some();
-            if replaced {
-                debug!(pid, tid, "Single-step flag set (replaced existing step record for this thread)");
-            } else {
-                debug!(pid, tid, "Single-step flag set");
+            {
+                let proc = platform.get_process_mut(pid)?;
+                let _ = proc.take_pending_rearm_for_tid(tid);
+                let replaced = proc.record_active_single_step(tid, kind);
+                if replaced {
+                    debug!(pid, tid, "Single-step flag set (replaced existing step record for this thread)");
+                } else {
+                    debug!(pid, tid, "Single-step flag set");
+                }
             }
         }
         StepKind::Over => {
@@ -82,25 +82,28 @@ pub(super) fn step(
                 // Set a one-shot breakpoint at the next instruction
                 platform.set_single_shot_breakpoint(pid, next_instruction_addr)?;
                 // Track this as a step-over breakpoint
-                platform.step_over_breakpoints.insert(next_instruction_addr, (pid, tid, kind));
+                {
+                    let proc = platform.get_process_mut(pid)?;
+                    proc.insert_step_over_breakpoint(next_instruction_addr, tid, kind);
+                }
                 debug!(pid, tid, "Set one-shot breakpoint for step-over at 0x{:X}", next_instruction_addr);
             } else {
                 // For other instructions, just do a step-into
                 set_single_step_flag_native(&mut context)?;
                 // Set the modified context back using platform function
                 let updated_context = ThreadContext::Win32RawContext(context);
-                super::thread_context::set_thread_context(platform, pid, tid, updated_context)?;
+                super::thread_context::set_thread_context(platform.get_process_mut(pid)?, pid, tid, updated_context)?;
                 // Track this stepping operation
                 // Remove any pending re-arm for this thread to avoid misrouting the next SS
-                platform.pending_rearm_breakpoints.remove(&(pid, tid));
-                let replaced = platform
-                    .active_single_steps
-                    .insert((pid, tid), super::StepState { kind })
-                    .is_some();
-                if replaced {
-                    debug!(pid, tid, "Step-into is used for step-over (replaced existing step record for this thread)");
-                } else {
-                    debug!(pid, tid, "Step-into is used for step-over");
+                {
+                    let proc = platform.get_process_mut(pid)?;
+                    let _ = proc.take_pending_rearm_for_tid(tid);
+                    let replaced = proc.record_active_single_step(tid, kind);
+                    if replaced {
+                        debug!(pid, tid, "Step-into is used for step-over (replaced existing step record for this thread)");
+                    } else {
+                        debug!(pid, tid, "Step-into is used for step-over");
+                    }
                 }
             }
         }
@@ -119,7 +122,10 @@ pub(super) fn step(
                     platform.set_breakpoint(pid, return_address, Some(tid))?;
 
                     // Track this so the breakpoint handler can emit StepComplete::Out and clean up
-                    platform.step_out_breakpoints.insert(return_address, (pid, tid, return_address));
+                    {
+                        let proc = platform.get_process_mut(pid)?;
+                        proc.insert_step_out_breakpoint(return_address, tid, return_address);
+                    }
                     debug!(
                         pid,
                         tid,
@@ -149,7 +155,10 @@ pub(super) fn step(
                     platform.set_breakpoint(pid, return_address, Some(tid))?;
 
                     // Track this so the breakpoint handler can emit StepComplete::Out and clean up
-                    platform.step_out_breakpoints.insert(return_address, (pid, tid, return_address));
+                    {
+                        let proc = platform.get_process_mut(pid)?;
+                        proc.insert_step_out_breakpoint(return_address, tid, return_address);
+                    }
                     debug!(
                         pid,
                         tid,
@@ -174,7 +183,7 @@ pub fn clear_single_step_flag_native2(platform: &mut WindowsPlatform, pid: u32, 
     trace!(pid, tid, "Clearing single-step flag");
     
     // Get current thread context using platform function
-    let thread_context = super::thread_context::get_thread_context(platform, pid, tid)?;
+    let thread_context = super::thread_context::get_thread_context(platform.get_process_mut(pid)?, pid, tid)?;
     
     let mut context = match thread_context {
         ThreadContext::Win32RawContext(ctx) => ctx,
@@ -185,7 +194,7 @@ pub fn clear_single_step_flag_native2(platform: &mut WindowsPlatform, pid: u32, 
 
     // Set the modified context back using platform function
     let updated_context = ThreadContext::Win32RawContext(context);
-    super::thread_context::set_thread_context(platform, pid, tid, updated_context)?;
+    super::thread_context::set_thread_context(platform.get_process_mut(pid)?, pid, tid, updated_context)?;
 
     debug!(pid, tid, "Single-step flag cleared");
     Ok(())

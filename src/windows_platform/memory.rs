@@ -50,7 +50,7 @@ pub(super) fn read_memory(
 ) -> Result<Vec<u8>, PlatformError> {
     trace!(pid, address = %format!("0x{:X}", address), size, "WindowsPlatform::read_memory called");
     let process = platform.get_process(pid)?;
-    let handle = process.process_handle.0;
+    let handle = process.handle();
     read_memory_internal(handle, address, size)
 }
 
@@ -121,7 +121,7 @@ pub(super) fn write_memory(
 ) -> Result<(), PlatformError> {
     trace!(pid, address = %format!("0x{:X}", address), data_len = data.len(), "WindowsPlatform::write_memory called");
     let process = platform.get_process(pid)?;
-    let handle = process.process_handle.0;
+    let handle = process.handle();
     write_memory_internal(handle, address, data)
 }
 

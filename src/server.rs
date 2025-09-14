@@ -5,7 +5,6 @@ use tracing::{info, error, debug};
 
 use std::sync::{Arc, Mutex};
 
-
 #[cfg(windows)]
 type PlatformImpl = crate::windows_platform::WindowsPlatform;
 

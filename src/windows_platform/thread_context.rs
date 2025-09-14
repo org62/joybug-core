@@ -1,6 +1,7 @@
-use super::{utils, WindowsPlatform, AlignedContext};
+use super::{utils, AlignedContext};
 use crate::interfaces::PlatformError;
 use crate::protocol::ThreadContext;
+use crate::windows_platform::DebuggedProcess;
 use tracing::{error, trace};
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -13,18 +14,16 @@ use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_ALL_AMD64;
 #[cfg(target_arch = "aarch64")]
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_ALL_ARM64;
 
-
 pub(super) fn get_thread_context(
-    platform: &mut WindowsPlatform,
+    process: &mut DebuggedProcess,
     pid: u32,
     tid: u32,
 ) -> Result<ThreadContext, PlatformError> {
     trace!(pid, tid, "WindowsPlatform::get_thread_context called");
     #[cfg(windows)]
     {
-        let process = platform.get_process(pid)?;
         let thread_handle = process
-            .thread_manager
+            .thread_manager()
             .get_thread_handle(tid)
             .ok_or_else(|| PlatformError::OsError(format!("No handle for thread {}", tid)))?;
 
@@ -63,7 +62,7 @@ pub(super) fn get_thread_context(
 }
 
 pub(super) fn set_thread_context(
-    platform: &mut WindowsPlatform,
+    process: &mut DebuggedProcess,
     pid: u32,
     tid: u32,
     context: ThreadContext,
@@ -71,9 +70,8 @@ pub(super) fn set_thread_context(
     trace!(pid, tid, "WindowsPlatform::set_thread_context called");
     #[cfg(windows)]
     unsafe {
-        let process = platform.get_process(pid)?;
         let thread_handle = process
-            .thread_manager
+            .thread_manager()
             .get_thread_handle(tid)
             .ok_or_else(|| PlatformError::OsError(format!("No handle for thread {}", tid)))?;
 
