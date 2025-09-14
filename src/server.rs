@@ -29,6 +29,27 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<Mutex<PlatformIm
             }
         };
         debug!(?req, "Received request");
+
+        // Handle termination without taking the platform lock to avoid deadlock with WaitForDebugEvent
+        if let DebuggerRequest::TerminateProcess { pid } = req {
+            #[cfg(windows)]
+            {
+                info!(pid, "TerminateProcess (unlocked) request received");
+                let resp = match crate::windows_platform::process::terminate_process_unlocked(pid) {
+                    Ok(()) => { info!(pid, "TerminateProcess executed successfully"); DebuggerResponse::Ack }
+                    Err(e) => { error!(pid, error = %e, "TerminateProcess failed"); DebuggerResponse::Error { message: e.to_string() } }
+                };
+                if let Err(e) = framed_stream.send(&resp) { error!(?e, "Failed to write response to socket"); break; }
+                continue;
+            }
+            #[cfg(not(windows))]
+            {
+                let resp = DebuggerResponse::Error { message: "TerminateProcess not supported on this platform".to_string() };
+                if let Err(e) = framed_stream.send(&resp) { error!(?e, "Failed to write response to socket"); break; }
+                continue;
+            }
+        }
+
         let resp = {
             let mut platform = platform.lock().unwrap();
             match req {
@@ -176,6 +197,7 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<Mutex<PlatformIm
                         Err(e) => DebuggerResponse::Error { message: e.to_string() },
                     }
                 }
+                DebuggerRequest::TerminateProcess { pid } => { let _ = pid; unreachable!() }
                 DebuggerRequest::Step { pid, tid, kind } => {
                     // Set up stepping state; if it fails, translate to an error-like event so client can surface it without panic
                     match platform.step(pid, tid, kind) {

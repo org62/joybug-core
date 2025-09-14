@@ -117,6 +117,9 @@ pub mod request_response {
             address: u64,
             max_len: Option<usize>,
         },
+        TerminateProcess {
+            pid: u32,
+        },
     }
 
     #[derive(Serialize, Deserialize, Clone)]

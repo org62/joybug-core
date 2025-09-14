@@ -798,4 +798,13 @@ impl<S> DebugSession<S> {
             }
         }
     }
+
+    pub fn terminate_process(&mut self, pid: u32) -> anyhow::Result<()> {
+        let req = DebuggerRequest::TerminateProcess { pid };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to terminate process: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to TerminateProcess: {:?}", other)),
+        }
+    }
 } 

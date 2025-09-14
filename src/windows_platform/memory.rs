@@ -3,6 +3,7 @@ use crate::interfaces::{PlatformAPI, PlatformError};
 use tracing::{error, trace, warn};
 use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE, HANDLE};
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
+use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_VM_READ};
 
 pub(super) fn read_memory_internal(
     handle: HANDLE,
@@ -51,6 +52,30 @@ pub(super) fn read_memory(
     let process = platform.get_process(pid)?;
     let handle = process.process_handle.0;
     read_memory_internal(handle, address, size)
+}
+
+pub(super) fn read_memory_unlocked(
+    pid: u32,
+    address: u64,
+    size: usize,
+) -> Result<Vec<u8>, PlatformError> {
+    trace!(pid, address = %format!("0x{:X}", address), size, "read_memory_unlocked called");
+    unsafe {
+        let handle = OpenProcess(PROCESS_VM_READ, 0, pid);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            let error = GetLastError();
+            let error_str = utils::error_message(error);
+            error!(error, error_str, "OpenProcess(PROCESS_VM_READ) failed");
+            return Err(PlatformError::OsError(format!(
+                "OpenProcess(PROCESS_VM_READ) failed: {} ({})",
+                error, error_str
+            )));
+        }
+        let res = read_memory_internal(handle, address, size);
+        // Intentionally do not CloseHandle here: for PROCESS_VM_READ OpenProcess returns a handle we own; we should close it.
+        windows_sys::Win32::Foundation::CloseHandle(handle);
+        res
+    }
 }
 
 pub(super) fn write_memory_internal(

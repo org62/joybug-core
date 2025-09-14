@@ -1,7 +1,7 @@
 mod utils;
 mod module_manager;
 mod thread_manager;
-mod process;
+pub mod process;
 mod debug_events;
 mod memory;
 mod thread_context;
@@ -19,7 +19,7 @@ use symbol_manager::SymbolManager;
 use disassembler::CapstoneDisassembler;
 use windows_sys::Win32::System::Diagnostics::Debug::{SymCleanup, SymInitialize, CONTEXT};
 use windows_sys::Win32::Foundation::{CloseHandle, FALSE, GetLastError, HANDLE};
-use tracing::{error, trace, warn};
+use tracing::{error, trace, warn, info};
 use std::collections::HashMap;
 use std::ptr;
 
@@ -271,7 +271,7 @@ impl PlatformAPI for WindowsPlatform {
     }
 
     fn read_memory(&mut self, pid: u32, address: u64, size: usize) -> Result<Vec<u8>, PlatformError> {
-        memory::read_memory(self, pid, address, size)
+        memory::read_memory_unlocked(pid, address, size)
     }
 
     fn write_memory(&mut self, pid: u32, address: u64, data: &[u8]) -> Result<(), PlatformError> {
@@ -386,8 +386,9 @@ impl PlatformAPI for WindowsPlatform {
 
     fn resolve_address_to_symbol(&self, pid: u32, address: u64) -> Result<Option<(String, ModuleSymbol, u64)>, SymbolError> {
         if let Some(ref symbol_manager) = self.symbol_manager {
-            let process = self.get_process(pid).map_err(|e| SymbolError::SymbolsNotFound(e.to_string()))?;
-            let modules = process.module_manager.list_modules();
+            let modules = self.get_process(pid).map_err(|e| SymbolError::SymbolsNotFound(e.to_string()))?
+                .module_manager
+                .list_modules();
             symbol_manager.resolve_address_to_symbol_raw(&modules, address)
         } else {
             Err(SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()))
@@ -399,47 +400,41 @@ impl PlatformAPI for WindowsPlatform {
         if self.disassembler.is_none() {
             return Err(DisassemblerError::CapstoneError("Disassembler not initialized".to_string()));
         }
-        
-        // First read memory from the process
-        let data = self.read_memory(pid, address, count * 16) // Read up to 16 bytes per instruction estimate
+
+        let data = memory::read_memory_unlocked(pid, address, count * 16)
             .map_err(|e| DisassemblerError::InvalidData(format!("Failed to read memory: {}", e)))?;
-        
-        // Get the process modules for symbol resolution
-        let process = self.get_process(pid)
-            .map_err(|e| DisassemblerError::InvalidData(format!("Process not found: {}", e)))?;
-        let modules = process.module_manager.list_modules();
-        
-        // Create a symbol resolver closure
+
+        let modules = self.get_process(pid)
+            .map_err(|e| DisassemblerError::InvalidData(format!("Process not found: {}", e)))?
+            .module_manager
+            .list_modules();
+
         let symbol_manager = self.symbol_manager.as_ref();
         let symbol_resolver = move |addr: u64| -> Option<crate::interfaces::SymbolInfo> {
             if let Some(symbol_manager) = symbol_manager {
                 if let Ok(Some((module_path, symbol, offset))) = symbol_manager.resolve_address_to_symbol(&modules, addr) {
-                    // Extract module name from path
                     let module_name = std::path::Path::new(&module_path)
                         .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or(&module_path)
                         .to_string();
-                    
-                    Some(crate::interfaces::SymbolInfo {
-                        module_name,
-                        symbol_name: symbol.name,
-                        offset,
-                    })
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+                    Some(crate::interfaces::SymbolInfo { module_name, symbol_name: symbol.name, offset })
+                } else { None }
+            } else { None }
         };
-        
-        // Now safely access the disassembler with symbol resolution
+
         self.disassembler.as_ref().unwrap().disassemble_with_symbols(arch, &data, address, count, symbol_resolver)
     }
     
     fn get_call_stack(&mut self, pid: u32, tid: u32) -> Result<Vec<crate::interfaces::CallFrame>, PlatformError> {
         callstack::get_call_stack(self, pid, tid)
+    }
+
+    fn terminate_process(&mut self, pid: u32) -> Result<(), PlatformError> {
+        // Avoid holding internal mutex/state that the debug loop uses.
+        // Delegate to an unlocked helper that uses OpenProcess/TerminateProcess directly.
+        info!(pid, "WindowsPlatform::terminate_process invoked");
+        process::terminate_process_unlocked(pid)
     }
 
 }

@@ -223,6 +223,8 @@ pub trait PlatformAPI: Send + Sync {
     
     // Call stack methods
     fn get_call_stack(&mut self, pid: u32, tid: u32) -> Result<Vec<CallFrame>, PlatformError>;
+    // Process control
+    fn terminate_process(&mut self, pid: u32) -> Result<(), PlatformError>;
     
     // ... add more as needed
 }
