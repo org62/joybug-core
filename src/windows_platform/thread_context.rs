@@ -15,7 +15,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_ALL_AMD64;
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_ALL_ARM64;
 
 pub(super) fn get_thread_context(
-    process: &mut DebuggedProcess,
+    process: &DebuggedProcess,
     pid: u32,
     tid: u32,
 ) -> Result<ThreadContext, PlatformError> {
@@ -62,7 +62,7 @@ pub(super) fn get_thread_context(
 }
 
 pub(super) fn set_thread_context(
-    process: &mut DebuggedProcess,
+    process: &DebuggedProcess,
     pid: u32,
     tid: u32,
     context: ThreadContext,

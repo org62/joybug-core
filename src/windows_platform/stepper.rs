@@ -24,7 +24,7 @@ pub(super) fn step(
     trace!(pid, tid, kind = ?kind, "WindowsPlatform::step called");
 
     // Get current thread context using platform function
-    let thread_context = super::thread_context::get_thread_context(platform.get_process_mut(pid)?, pid, tid)?;
+    let thread_context = super::thread_context::get_thread_context(platform.get_process(pid)?, pid, tid)?;
     
     let mut context = match thread_context {
         ThreadContext::Win32RawContext(ctx) => ctx,
@@ -41,7 +41,7 @@ pub(super) fn step(
             set_single_step_flag_native(&mut context)?;
             // Set the modified context back using platform function
             let updated_context = ThreadContext::Win32RawContext(context);
-            super::thread_context::set_thread_context(platform.get_process_mut(pid)?, pid, tid, updated_context)?;
+            super::thread_context::set_thread_context(platform.get_process(pid)?, pid, tid, updated_context)?;
             // Track this stepping operation
             // Remove any pending re-arm for this thread to avoid misrouting the next SS
             {
@@ -92,7 +92,7 @@ pub(super) fn step(
                 set_single_step_flag_native(&mut context)?;
                 // Set the modified context back using platform function
                 let updated_context = ThreadContext::Win32RawContext(context);
-                super::thread_context::set_thread_context(platform.get_process_mut(pid)?, pid, tid, updated_context)?;
+                super::thread_context::set_thread_context(platform.get_process(pid)?, pid, tid, updated_context)?;
                 // Track this stepping operation
                 // Remove any pending re-arm for this thread to avoid misrouting the next SS
                 {

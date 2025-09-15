@@ -32,7 +32,7 @@ fn mask_aarch64_addresses(
 
 /// Get the call stack for a specific thread within a debugged process
 pub fn get_call_stack(
-    platform: &mut WindowsPlatform,
+    platform: &WindowsPlatform,
     pid: u32,
     tid: u32,
 ) -> Result<Vec<CallFrame>, PlatformError> {

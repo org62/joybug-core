@@ -202,12 +202,12 @@ pub trait PlatformAPI: Send + Sync {
     fn remove_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError>;
     fn set_single_shot_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError>;
     fn launch(&mut self, command: &str) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>;
-    fn read_memory(&mut self, pid: u32, address: u64, size: usize) -> Result<Vec<u8>, PlatformError>;
-    fn write_memory(&mut self, pid: u32, address: u64, data: &[u8]) -> Result<(), PlatformError>;
-    fn read_wide_string(&mut self, pid: u32, address: u64, max_len: Option<usize>) -> Result<String, PlatformError>;
-    fn get_thread_context(&mut self, pid: u32, tid: u32) -> Result<crate::protocol::ThreadContext, PlatformError>;
-    fn set_thread_context(&mut self, pid: u32, tid: u32, context: crate::protocol::ThreadContext) -> Result<(), PlatformError>;
-    fn get_function_arguments(&mut self, pid: u32, tid: u32, count: usize) -> Result<Vec<u64>, PlatformError>;
+    fn read_memory(&self, pid: u32, address: u64, size: usize) -> Result<Vec<u8>, PlatformError>;
+    fn write_memory(&self, pid: u32, address: u64, data: &[u8]) -> Result<(), PlatformError>;
+    fn read_wide_string(&self, pid: u32, address: u64, max_len: Option<usize>) -> Result<String, PlatformError>;
+    fn get_thread_context(&self, pid: u32, tid: u32) -> Result<crate::protocol::ThreadContext, PlatformError>;
+    fn set_thread_context(&self, pid: u32, tid: u32, context: crate::protocol::ThreadContext) -> Result<(), PlatformError>;
+    fn get_function_arguments(&self, pid: u32, tid: u32, count: usize) -> Result<Vec<u64>, PlatformError>;
     fn list_modules(&self, pid: u32) -> Result<Vec<ModuleInfo>, PlatformError>;
     fn list_threads(&self, pid: u32) -> Result<Vec<ThreadInfo>, PlatformError>;
     fn list_processes(&self) -> Result<Vec<ProcessInfo>, PlatformError>;
@@ -219,12 +219,12 @@ pub trait PlatformAPI: Send + Sync {
     fn resolve_address_to_symbol(&self, pid: u32, address: u64) -> Result<Option<(String, ModuleSymbol, u64)>, SymbolError>; // Returns (module_path, symbol, offset_from_symbol)
     
     // Symbolized disassembly methods
-    fn disassemble_memory(&mut self, pid: u32, address: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError>;
+    fn disassemble_memory(&self, pid: u32, address: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError>;
     
     // Call stack methods
-    fn get_call_stack(&mut self, pid: u32, tid: u32) -> Result<Vec<CallFrame>, PlatformError>;
+    fn get_call_stack(&self, pid: u32, tid: u32) -> Result<Vec<CallFrame>, PlatformError>;
     // Process control
-    fn terminate_process(&mut self, pid: u32) -> Result<(), PlatformError>;
+    fn terminate_process(&self, pid: u32) -> Result<(), PlatformError>;
     
     // ... add more as needed
 }

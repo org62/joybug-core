@@ -43,7 +43,7 @@ pub(super) fn read_memory_internal(
 }
 
 pub(super) fn read_memory(
-    platform: &mut WindowsPlatform,
+    platform: &WindowsPlatform,
     pid: u32,
     address: u64,
     size: usize,
@@ -114,7 +114,7 @@ pub(super) fn write_memory_internal(
 }
 
 pub(super) fn write_memory(
-    platform: &mut WindowsPlatform,
+    platform: &WindowsPlatform,
     pid: u32,
     address: u64,
     data: &[u8],
@@ -126,7 +126,7 @@ pub(super) fn write_memory(
 }
 
 pub(super) fn read_wide_string(
-    platform: &mut WindowsPlatform,
+    platform: &WindowsPlatform,
     pid: u32,
     address: u64,
     max_len: Option<usize>, // Number of characters

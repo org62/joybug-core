@@ -205,27 +205,28 @@ impl PlatformAPI for WindowsPlatform {
         process::launch(self, command)
     }
 
-    fn read_memory(&mut self, pid: u32, address: u64, size: usize) -> Result<Vec<u8>, PlatformError> {
+    fn read_memory(&self, pid: u32, address: u64, size: usize) -> Result<Vec<u8>, PlatformError> {
         memory::read_memory_unlocked(pid, address, size)
     }
 
-    fn write_memory(&mut self, pid: u32, address: u64, data: &[u8]) -> Result<(), PlatformError> {
+    fn write_memory(&self, pid: u32, address: u64, data: &[u8]) -> Result<(), PlatformError> {
         memory::write_memory(self, pid, address, data)
     }
 
-    fn read_wide_string(&mut self, pid: u32, address: u64, max_len: Option<usize>) -> Result<String, PlatformError> {
+    fn read_wide_string(&self, pid: u32, address: u64, max_len: Option<usize>) -> Result<String, PlatformError> {
         memory::read_wide_string(self, pid, address, max_len)
     }
 
-    fn get_thread_context(&mut self, pid: u32, tid: u32) -> Result<crate::protocol::ThreadContext, PlatformError> {
-        thread_context::get_thread_context(self.get_process_mut(pid)?, pid, tid)
+    fn get_thread_context(&self, pid: u32, tid: u32) -> Result<crate::protocol::ThreadContext, PlatformError> {
+        // Only read access to process state is needed here
+        thread_context::get_thread_context(self.get_process(pid)?, pid, tid)
     }
 
-    fn set_thread_context(&mut self, pid: u32, tid: u32, context: crate::protocol::ThreadContext) -> Result<(), PlatformError> {
-        thread_context::set_thread_context(self.get_process_mut(pid)?, pid, tid, context)
+    fn set_thread_context(&self, pid: u32, tid: u32, context: crate::protocol::ThreadContext) -> Result<(), PlatformError> {
+        thread_context::set_thread_context(self.get_process(pid)?, pid, tid, context)
     }
 
-    fn get_function_arguments(&mut self, pid: u32, tid: u32, count: usize) -> Result<Vec<u64>, PlatformError> {
+    fn get_function_arguments(&self, pid: u32, tid: u32, count: usize) -> Result<Vec<u64>, PlatformError> {
         let process = self.get_process(pid)?;
         let arch = process.architecture();
         let context = self.get_thread_context(pid, tid)?;
@@ -331,7 +332,7 @@ impl PlatformAPI for WindowsPlatform {
     }
     
     // Symbolized disassembly methods
-    fn disassemble_memory(&mut self, pid: u32, address: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
+    fn disassemble_memory(&self, pid: u32, address: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
         if self.disassembler.is_none() {
             return Err(DisassemblerError::CapstoneError("Disassembler not initialized".to_string()));
         }
@@ -361,11 +362,11 @@ impl PlatformAPI for WindowsPlatform {
         self.disassembler.as_ref().unwrap().disassemble_with_symbols(arch, &data, address, count, symbol_resolver)
     }
     
-    fn get_call_stack(&mut self, pid: u32, tid: u32) -> Result<Vec<crate::interfaces::CallFrame>, PlatformError> {
+    fn get_call_stack(&self, pid: u32, tid: u32) -> Result<Vec<crate::interfaces::CallFrame>, PlatformError> {
         callstack::get_call_stack(self, pid, tid)
     }
 
-    fn terminate_process(&mut self, pid: u32) -> Result<(), PlatformError> {
+    fn terminate_process(&self, pid: u32) -> Result<(), PlatformError> {
         // Avoid holding internal mutex/state that the debug loop uses.
         // Delegate to an unlocked helper that uses OpenProcess/TerminateProcess directly.
         info!(pid, "WindowsPlatform::terminate_process invoked");
