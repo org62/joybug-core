@@ -85,6 +85,31 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
             }
         }
 
+        // Handle BreakInto without holding the platform lock; do not wait
+        if let DebuggerRequest::BreakInto { pid } = req {
+            #[cfg(windows)]
+            {
+                // Trigger debug break without lock and immediately respond
+                match crate::windows_platform::process::debug_break_process_unlocked(pid) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        let resp = DebuggerResponse::Error { message: e.to_string() };
+                        if let Err(e) = framed_stream.send(&resp) { error!(?e, "Failed to write response to socket"); break; }
+                        continue;
+                    }
+                }
+                let resp = DebuggerResponse::Ack;
+                if let Err(e) = framed_stream.send(&resp) { error!(?e, "Failed to write response to socket"); break; }
+                continue;
+            }
+            #[cfg(not(windows))]
+            {
+                let resp = DebuggerResponse::Error { message: "BreakInto not supported on this platform".to_string() };
+                if let Err(e) = framed_stream.send(&resp) { error!(?e, "Failed to write response to socket"); break; }
+                continue;
+            }
+        }
+
         let resp = match req {
             DebuggerRequest::Attach { pid } => {
                 let mut p = platform.write().unwrap();
@@ -102,6 +127,10 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                 }
             }
             DebuggerRequest::Continue { pid: _, tid: _ } => {
+                // Should have been handled by the unlocked fast-path above
+                DebuggerResponse::Ack
+            }
+            DebuggerRequest::BreakInto { pid: _ } => {
                 // Should have been handled by the unlocked fast-path above
                 DebuggerResponse::Ack
             }

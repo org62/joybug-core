@@ -69,6 +69,11 @@ impl WindowsPlatform {
         }
     }
     
+    /// Public accessor to retrieve a raw process handle for a PID
+    pub fn process_handle(&self, pid: u32) -> Result<HANDLE, PlatformError> {
+        Ok(self.get_process(pid)?.handle())
+    }
+    
     /// Get a reference to a debugged process by PID
     fn get_process(&self, pid: u32) -> Result<&DebuggedProcess, PlatformError> {
         self.processes.get(&pid)
@@ -371,6 +376,12 @@ impl PlatformAPI for WindowsPlatform {
         // Delegate to an unlocked helper that uses OpenProcess/TerminateProcess directly.
         info!(pid, "WindowsPlatform::terminate_process invoked");
         process::terminate_process_unlocked(pid)
+    }
+
+    fn break_into(&self, pid: u32) -> Result<(), PlatformError> {
+        // Trigger a breakpoint in the target without holding internal locks; do not wait.
+        info!(pid, "WindowsPlatform::break_into invoked");
+        process::debug_break_process_unlocked(pid)
     }
 
 }

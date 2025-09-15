@@ -41,6 +41,9 @@ pub mod request_response {
             pid: u32,
             tid: u32,
         },
+        BreakInto {
+            pid: u32,
+        },
         SetBreakpoint {
             pid: u32,
             addr: u64,
