@@ -14,6 +14,37 @@ use std::ffi::CString;
 use std::ptr;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 
+// Non-locking helpers to minimize lock holding in server
+pub fn continue_only(pid: u32, tid: u32) -> Result<(), PlatformError> {
+    trace!(pid, tid, "ContinueDebugEvent only");
+    let cont_res = unsafe { ContinueDebugEvent(pid, tid, DBG_CONTINUE) };
+    if cont_res == FALSE {
+        let error = unsafe { GetLastError() };
+        let error_str = utils::error_message(error);
+        error!(error, error_str, "ContinueDebugEvent failed");
+        return Err(PlatformError::OsError(format!(
+            "ContinueDebugEvent failed: {} ({})",
+            error, error_str
+        )));
+    }
+    Ok(())
+}
+
+pub fn wait_for_debug_event_blocking() -> Result<DEBUG_EVENT, PlatformError> {
+    let mut debug_event: DEBUG_EVENT = unsafe { std::mem::zeroed() };
+    let wait_res = unsafe { WaitForDebugEvent(&mut debug_event, INFINITE) };
+    if wait_res == FALSE {
+        let error = unsafe { GetLastError() };
+        let error_str = utils::error_message(error);
+        error!(error, error_str, "WaitForDebugEvent failed");
+        return Err(PlatformError::OsError(format!(
+            "WaitForDebugEvent failed: {} ({})",
+            error, error_str
+        )));
+    }
+    Ok(debug_event)
+}
+
 pub(super) fn handle_create_process_event(
     platform: &mut WindowsPlatform,
     debug_event: &DEBUG_EVENT,
@@ -380,33 +411,10 @@ pub(super) fn handle_exception_event(
     Ok(Some(crate::protocol::DebugEvent::Exception { pid, tid, code: ex_record.ExceptionCode as u32, address: ex_record.ExceptionAddress as u64, first_chance: ex_info.dwFirstChance == 1, parameters: params }))
 }
 
-pub(super) fn continue_exec(
+pub fn handle_debug_event(
     platform: &mut WindowsPlatform,
-    pid: u32,
-    tid: u32,
+    debug_event: &DEBUG_EVENT,
 ) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
-    trace!(pid, tid, "WindowsPlatform::continue_exec called");
-    let cont_res = unsafe { ContinueDebugEvent(pid, tid, DBG_CONTINUE) };
-    if cont_res == FALSE {
-        let error = unsafe { GetLastError() };
-        let error_str = utils::error_message(error);
-        error!(error, error_str, "ContinueDebugEvent failed");
-        return Err(PlatformError::OsError(format!(
-            "ContinueDebugEvent failed: {} ({})",
-            error, error_str
-        )));
-    }
-    let mut debug_event: DEBUG_EVENT = unsafe { std::mem::zeroed() };
-    let wait_res = unsafe { WaitForDebugEvent(&mut debug_event, INFINITE) };
-    if wait_res == FALSE {
-        let error = unsafe { GetLastError() };
-        let error_str = utils::error_message(error);
-        error!(error, error_str, "WaitForDebugEvent failed");
-        return Err(PlatformError::OsError(format!(
-            "WaitForDebugEvent failed: {} ({})",
-            error, error_str
-        )));
-    }
     let event = match debug_event.dwDebugEventCode {
         EXCEPTION_DEBUG_EVENT => match handle_exception_event(platform, &debug_event) {
             Ok(ev) => ev,

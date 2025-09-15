@@ -2,7 +2,7 @@ mod utils;
 mod module_manager;
 mod thread_manager;
 pub mod process;
-mod debug_events;
+pub mod debug_events;
 mod memory;
 mod thread_context;
 mod symbol_manager;
@@ -164,7 +164,10 @@ impl PlatformAPI for WindowsPlatform {
     }
 
     fn continue_exec(&mut self, pid: u32, tid: u32) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
-        debug_events::continue_exec(self, pid, tid)
+        // Blocking variant retained for direct callers; server uses non-locking helpers
+        debug_events::continue_only(pid, tid)?;
+        let debug_event = debug_events::wait_for_debug_event_blocking()?;
+        debug_events::handle_debug_event(self, &debug_event)
     }
 
     fn set_breakpoint(&mut self, pid: u32, addr: u64, tid: Option<u32>) -> Result<(), PlatformError> {

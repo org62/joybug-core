@@ -49,6 +49,42 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<Mutex<PlatformIm
             }
         }
 
+        // Handle Continue without holding the platform lock across the blocking wait
+        if let DebuggerRequest::Continue { pid, tid } = req {
+            #[cfg(windows)]
+            {
+                // 1) Continue without lock
+                match crate::windows_platform::debug_events::continue_only(pid, tid) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        let resp = DebuggerResponse::Error { message: e.to_string() };
+                        if let Err(e) = framed_stream.send(&resp) { error!(?e, "Failed to write response to socket"); break; }
+                        continue;
+                    }
+                }
+
+                // 2) Wait for next debug event without lock
+                let debug_event = match crate::windows_platform::debug_events::wait_for_debug_event_blocking() {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        let resp = DebuggerResponse::Error { message: e.to_string() };
+                        if let Err(e) = framed_stream.send(&resp) { error!(?e, "Failed to write response to socket"); break; }
+                        continue;
+                    }
+                };
+
+                // 3) Reacquire lock only to handle the event and mutate state
+                let mut platform_guard = platform.lock().unwrap();
+                let resp = match crate::windows_platform::debug_events::handle_debug_event(&mut *platform_guard, &debug_event) {
+                    Ok(Some(event)) => DebuggerResponse::Event { event },
+                    Ok(None) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                };
+                if let Err(e) = framed_stream.send(&resp) { error!(?e, "Failed to write response to socket"); break; }
+                continue;
+            }
+        }
+
         let resp = {
             let mut platform = platform.lock().unwrap();
             match req {
