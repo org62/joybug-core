@@ -3,7 +3,7 @@ use crate::interfaces::{PlatformAPI, Stepper};
 use tokio::net::TcpListener;
 use tracing::{info, error, debug};
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 #[cfg(windows)]
 type PlatformImpl = crate::windows_platform::WindowsPlatform;
@@ -11,7 +11,7 @@ type PlatformImpl = crate::windows_platform::WindowsPlatform;
 use crate::framed_json_stream::FramedJsonStream;
 
 
-fn handle_connection(stream: std::net::TcpStream, platform: Arc<Mutex<PlatformImpl>>) {
+fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformImpl>>) {
     let mut framed_stream = FramedJsonStream::new(stream);
     loop {
         let req: DebuggerRequest = match framed_stream.receive() {
@@ -74,7 +74,7 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<Mutex<PlatformIm
                 };
 
                 // 3) Reacquire lock only to handle the event and mutate state
-                let mut platform_guard = platform.lock().unwrap();
+                let mut platform_guard = platform.write().unwrap();
                 let resp = match crate::windows_platform::debug_events::handle_debug_event(&mut *platform_guard, &debug_event) {
                     Ok(Some(event)) => DebuggerResponse::Event { event },
                     Ok(None) => DebuggerResponse::Ack,
@@ -85,165 +85,180 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<Mutex<PlatformIm
             }
         }
 
-        let resp = {
-            let mut platform = platform.lock().unwrap();
-            match req {
-                DebuggerRequest::Attach { pid } => {
-                    match platform.attach(pid) {
-                        Ok(Some(event)) => DebuggerResponse::Event { event },
-                        Ok(None) => DebuggerResponse::Ack,
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
+        let resp = match req {
+            DebuggerRequest::Attach { pid } => {
+                let mut p = platform.write().unwrap();
+                match p.attach(pid) {
+                    Ok(Some(event)) => DebuggerResponse::Event { event },
+                    Ok(None) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-                DebuggerRequest::Detach { pid } => {
-                    match platform.detach(pid) {
-                        Ok(_) => DebuggerResponse::Ack,
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
+            }
+            DebuggerRequest::Detach { pid } => {
+                let mut p = platform.write().unwrap();
+                match p.detach(pid) {
+                    Ok(_) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-                DebuggerRequest::Continue { pid, tid } => {
-                    match platform.continue_exec(pid, tid) {
-                        Ok(Some(event)) => DebuggerResponse::Event { event },
-                        Ok(None) => DebuggerResponse::Ack,
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
+            }
+            DebuggerRequest::Continue { pid: _, tid: _ } => {
+                // Should have been handled by the unlocked fast-path above
+                DebuggerResponse::Ack
+            }
+            DebuggerRequest::SetBreakpoint { pid, addr, tid } => {
+                let mut p = platform.write().unwrap();
+                match p.set_breakpoint(pid, addr, tid) {
+                    Ok(_) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-                DebuggerRequest::SetBreakpoint { pid, addr, tid } => {
-                    match platform.set_breakpoint(pid, addr, tid) {
-                        Ok(_) => DebuggerResponse::Ack,
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
+            }
+            DebuggerRequest::SetSingleShotBreakpoint { pid, addr } => {
+                let mut p = platform.write().unwrap();
+                match p.set_single_shot_breakpoint(pid, addr) {
+                    Ok(_) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-                DebuggerRequest::SetSingleShotBreakpoint { pid, addr } => {
-                    match platform.set_single_shot_breakpoint(pid, addr) {
-                        Ok(_) => DebuggerResponse::Ack,
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
+            }
+            DebuggerRequest::RemoveBreakpoint { pid, addr } => {
+                let mut p = platform.write().unwrap();
+                match p.remove_breakpoint(pid, addr) {
+                    Ok(_) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-                DebuggerRequest::RemoveBreakpoint { pid, addr } => {
-                    match platform.remove_breakpoint(pid, addr) {
-                        Ok(_) => DebuggerResponse::Ack,
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
+            }
+            DebuggerRequest::Launch { command } => {
+                let mut p = platform.write().unwrap();
+                match p.launch(&command) {
+                    Ok(Some(event)) => DebuggerResponse::Event { event },
+                    Ok(None) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-                DebuggerRequest::Launch { command } => {
-                    match platform.launch(&command) {
-                        Ok(Some(event)) => DebuggerResponse::Event { event },
-                        Ok(None) => DebuggerResponse::Ack,
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
+            }
+            DebuggerRequest::ReadMemory { pid, address, size } => {
+                let p = platform.read().unwrap();
+                match p.read_memory(pid, address, size) {
+                    Ok(data) => DebuggerResponse::MemoryData { data },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-                DebuggerRequest::ReadMemory { pid, address, size } => {
-                    match platform.read_memory(pid, address, size) {
-                        Ok(data) => DebuggerResponse::MemoryData { data },
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
+            }
+            DebuggerRequest::WriteMemory { pid, address, data } => {
+                let p = platform.read().unwrap();
+                match p.write_memory(pid, address, &data) {
+                    Ok(_) => DebuggerResponse::WriteAck,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-                DebuggerRequest::WriteMemory { pid, address, data } => {
-                    match platform.write_memory(pid, address, &data) {
-                        Ok(_) => DebuggerResponse::WriteAck,
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
+            }
+            DebuggerRequest::ReadWideString { pid, address, max_len } => {
+                let p = platform.read().unwrap();
+                match p.read_wide_string(pid, address, max_len) {
+                    Ok(data) => DebuggerResponse::WideStringData { data },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-                DebuggerRequest::ReadWideString { pid, address, max_len } => {
-                    match platform.read_wide_string(pid, address, max_len) {
-                        Ok(data) => DebuggerResponse::WideStringData { data },
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
+            }
+            DebuggerRequest::GetThreadContext { pid, tid } => {
+                let p = platform.read().unwrap();
+                match p.get_thread_context(pid, tid) {
+                    Ok(context) => DebuggerResponse::ThreadContext { context },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-                DebuggerRequest::GetThreadContext { pid, tid } => {
-                    match platform.get_thread_context(pid, tid) {
-                        Ok(context) => DebuggerResponse::ThreadContext { context },
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
+            }
+            DebuggerRequest::GetFunctionArguments { pid, tid, count } => {
+                let p = platform.read().unwrap();
+                match p.get_function_arguments(pid, tid, count) {
+                    Ok(arguments) => DebuggerResponse::FunctionArguments { arguments },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-                DebuggerRequest::GetFunctionArguments { pid, tid, count } => {
-                    match platform.get_function_arguments(pid, tid, count) {
-                        Ok(arguments) => DebuggerResponse::FunctionArguments { arguments },
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
+            }
+            DebuggerRequest::SetThreadContext { pid, tid, context } => {
+                let p = platform.read().unwrap();
+                match p.set_thread_context(pid, tid, context) {
+                    Ok(_) => DebuggerResponse::SetContextAck,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-                DebuggerRequest::SetThreadContext { pid, tid, context } => {
-                    match platform.set_thread_context(pid, tid, context) {
-                        Ok(_) => DebuggerResponse::SetContextAck,
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
+            }
+            DebuggerRequest::ListModules { pid } => {
+                let p = platform.read().unwrap();
+                match p.list_modules(pid) {
+                    Ok(modules) => DebuggerResponse::ModuleList { modules },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-                DebuggerRequest::ListModules { pid } => {
-                    match platform.list_modules(pid) {
-                        Ok(modules) => DebuggerResponse::ModuleList { modules },
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
+            }
+            DebuggerRequest::ListThreads { pid } => {
+                let p = platform.read().unwrap();
+                match p.list_threads(pid) {
+                    Ok(threads) => DebuggerResponse::ThreadList { threads },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-                DebuggerRequest::ListThreads { pid } => {
-                    match platform.list_threads(pid) {
-                        Ok(threads) => DebuggerResponse::ThreadList { threads },
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
+            }
+            DebuggerRequest::ListProcesses => {
+                let p = platform.read().unwrap();
+                match p.list_processes() {
+                    Ok(processes) => DebuggerResponse::ProcessList { processes },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-                DebuggerRequest::ListProcesses => {
-                    match platform.list_processes() {
-                        Ok(processes) => DebuggerResponse::ProcessList { processes },
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
+            }
+            DebuggerRequest::FindSymbol { symbol_name, max_results } => {
+                let p = platform.read().unwrap();
+                match p.find_symbol(&symbol_name, max_results) {
+                    Ok(symbols) => DebuggerResponse::ResolvedSymbolList { symbols },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-                DebuggerRequest::FindSymbol { symbol_name, max_results } => {
-                    match platform.find_symbol(&symbol_name, max_results) {
-                        Ok(symbols) => DebuggerResponse::ResolvedSymbolList { symbols },
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
+            }
+            DebuggerRequest::ListSymbols { module_path } => {
+                let p = platform.read().unwrap();
+                match p.list_symbols(&module_path) {
+                    Ok(symbols) => DebuggerResponse::SymbolList { symbols },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-                DebuggerRequest::ListSymbols { module_path } => {
-                    match platform.list_symbols(&module_path) {
-                        Ok(symbols) => DebuggerResponse::SymbolList { symbols },
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
+            }
+            DebuggerRequest::ResolveRvaToSymbol { module_path, rva } => {
+                let p = platform.read().unwrap();
+                match p.resolve_rva_to_symbol(&module_path, rva) {
+                    Ok(symbol) => DebuggerResponse::Symbol { symbol },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-                DebuggerRequest::ResolveRvaToSymbol { module_path, rva } => {
-                    match platform.resolve_rva_to_symbol(&module_path, rva) {
-                        Ok(symbol) => DebuggerResponse::Symbol { symbol },
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
+            }
+            DebuggerRequest::ResolveAddressToSymbol { pid, address } => {
+                let p = platform.read().unwrap();
+                match p.resolve_address_to_symbol(pid, address) {
+                    Ok(Some((module_path, symbol, offset))) => DebuggerResponse::AddressSymbol { 
+                        module_path: Some(module_path), 
+                        symbol: Some(symbol), 
+                        offset: Some(offset) 
+                    },
+                    Ok(None) => DebuggerResponse::AddressSymbol { 
+                        module_path: None, 
+                        symbol: None, 
+                        offset: None 
+                    },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-                DebuggerRequest::ResolveAddressToSymbol { pid, address } => {
-                    match platform.resolve_address_to_symbol(pid, address) {
-                        Ok(Some((module_path, symbol, offset))) => DebuggerResponse::AddressSymbol { 
-                            module_path: Some(module_path), 
-                            symbol: Some(symbol), 
-                            offset: Some(offset) 
-                        },
-                        Ok(None) => DebuggerResponse::AddressSymbol { 
-                            module_path: None, 
-                            symbol: None, 
-                            offset: None 
-                        },
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
+            }
+            DebuggerRequest::DisassembleMemory { pid, address, count, arch } => {
+                let p = platform.read().unwrap();
+                match p.disassemble_memory(pid, address, count, arch) {
+                    Ok(instructions) => DebuggerResponse::Instructions { instructions },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-                DebuggerRequest::DisassembleMemory { pid, address, count, arch } => {
-                    match platform.disassemble_memory(pid, address, count, arch) {
-                        Ok(instructions) => DebuggerResponse::Instructions { instructions },
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
+            }
+            DebuggerRequest::GetCallStack { pid, tid } => {
+                let p = platform.read().unwrap();
+                match p.get_call_stack(pid, tid) {
+                    Ok(frames) => DebuggerResponse::CallStack { frames },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-                DebuggerRequest::GetCallStack { pid, tid } => {
-                    match platform.get_call_stack(pid, tid) {
-                        Ok(frames) => DebuggerResponse::CallStack { frames },
-                        Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                    }
-                }
-                DebuggerRequest::TerminateProcess { pid } => { let _ = pid; unreachable!() }
-                DebuggerRequest::Step { pid, tid, kind } => {
-                    // Set up stepping state; if it fails, translate to an error-like event so client can surface it without panic
-                    match platform.step(pid, tid, kind) {
-                        Ok(_) => DebuggerResponse::Ack,
-                        Err(e) => DebuggerResponse::Event { event: crate::protocol::DebugEvent::StepFailed {
-                            pid,
-                            tid,
-                            kind,
-                            message: e.to_string(),
-                        }},
-                    }
+            }
+            DebuggerRequest::TerminateProcess { pid } => { let _ = pid; unreachable!() }
+            DebuggerRequest::Step { pid, tid, kind } => {
+                let mut p = platform.write().unwrap();
+                match p.step(pid, tid, kind) {
+                    Ok(_) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Event { event: crate::protocol::DebugEvent::StepFailed {
+                        pid,
+                        tid,
+                        kind,
+                        message: e.to_string(),
+                    }},
                 }
             }
         };
@@ -282,7 +297,7 @@ pub async fn run_server() -> anyhow::Result<()> {
     info!("Server listening on 127.0.0.1:9000");
     
     // Create a single shared platform instance
-    let shared_platform = Arc::new(Mutex::new(PlatformImpl::new()));
+    let shared_platform = Arc::new(RwLock::new(PlatformImpl::new()));
     
     loop {
         let (socket, addr) = listener.accept().await?;
