@@ -20,8 +20,9 @@ impl ThreadManager {
         self.threads.insert(tid, (info, HandleSafe(handle)));
     }
 
-    pub fn remove_thread(&mut self, tid: u32) {
-        self.threads.remove(&tid);
+    pub fn remove_thread(&mut self, _tid: u32) {
+        // TODO: don't remove for now, on exit thread event we still need the handle
+        //self.threads.remove(&tid);
     }
 
     pub fn get_thread_handle(&self, tid: u32) -> Option<HANDLE> {
