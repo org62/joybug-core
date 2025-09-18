@@ -2,32 +2,127 @@ pub use serde::{Serialize, Deserialize};
 
 pub use self::request_response::*;
 
-mod request_response {
+pub mod request_response {
     use super::*;
 
-    #[derive(Debug, Serialize, Deserialize)]
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+    pub enum StepKind {
+        Into,
+        Over,
+        Out,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+    pub enum StepAction {
+        Continue(StepKind),
+        Stop,
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone)]
     #[serde(tag = "type", content = "data")]
     pub enum DebuggerRequest {
-        Attach { pid: u32 },
-        Detach { pid: u32 },
-        Continue { pid: u32, tid: u32 },
-        SetBreakpoint { addr: u64 },
-        Launch { command: String },
-        ReadMemory { pid: u32, address: u64, size: usize },
-        WriteMemory { pid: u32, address: u64, data: Vec<u8> },
-        GetThreadContext { pid: u32, tid: u32 },
-        SetThreadContext { pid: u32, tid: u32, context: ThreadContext },
-        ListModules { pid: u32 },
-        ListThreads { pid: u32 },
         ListProcesses,
+        ListModules {
+            pid: u32,
+        },
+        ListThreads {
+            pid: u32,
+        },
+        Attach {
+            pid: u32,
+        },
+        Detach {
+            pid: u32,
+        },
+        Launch {
+            command: String,
+        },
+        Continue {
+            pid: u32,
+            tid: u32,
+        },
+        BreakInto {
+            pid: u32,
+        },
+        SetBreakpoint {
+            pid: u32,
+            addr: u64,
+            tid: Option<u32>,
+        },
+        SetSingleShotBreakpoint {
+            pid: u32,
+            addr: u64,
+        },
+        RemoveBreakpoint {
+            pid: u32,
+            addr: u64,
+        },
+        ReadMemory {
+            pid: u32,
+            address: u64,
+            size: usize,
+        },
+        WriteMemory {
+            pid: u32,
+            address: u64,
+            data: Vec<u8>,
+        },
+        GetThreadContext {
+            pid: u32,
+            tid: u32,
+        },
+        SetThreadContext {
+            pid: u32,
+            tid: u32,
+            context: ThreadContext,
+        },
         // Symbol-related requests
-        FindSymbol { symbol_name: String, max_results: usize },
-        ListSymbols { module_path: String },
-        ResolveRvaToSymbol { module_path: String, rva: u32 },
-        ResolveAddressToSymbol { pid: u32, address: u64 },
-        DisassembleMemory { pid: u32, address: u64, count: usize, arch: crate::interfaces::Architecture },
-        GetCallStack { pid: u32, tid: u32 },
-        // ... add more as needed
+        FindSymbol {
+            symbol_name: String,
+            max_results: usize,
+        },
+        ListSymbols {
+            module_path: String,
+        },
+        ResolveRvaToSymbol {
+            module_path: String,
+            rva: u32,
+        },
+        ResolveAddressToSymbol {
+            pid: u32,
+            address: u64,
+        },
+        DisassembleMemory {
+            pid: u32,
+            address: u64,
+            count: usize,
+            arch: crate::interfaces::Architecture,
+        },
+        GetCallStack {
+            pid: u32,
+            tid: u32,
+        },
+        // Step request
+        Step {
+            pid: u32,
+            tid: u32,
+            kind: StepKind,
+        },
+        // Get function arguments
+        GetFunctionArguments {
+            pid: u32,
+            tid: u32,
+            count: usize,
+        },
+        // Read wide string
+        ReadWideString {
+            pid: u32,
+            address: u64,
+            max_len: Option<usize>,
+        },
+        TerminateProcess {
+            pid: u32,
+        },
     }
 
     #[derive(Serialize, Deserialize, Clone)]
@@ -47,11 +142,19 @@ mod request_response {
         Symbol { symbol: Option<crate::interfaces::ModuleSymbol> },
         SymbolList { symbols: Vec<crate::interfaces::ModuleSymbol> },
         ResolvedSymbolList { symbols: Vec<crate::interfaces::ResolvedSymbol> },
-        AddressSymbol { module_path: Option<String>, symbol: Option<crate::interfaces::ModuleSymbol>, offset: Option<u64> },
+        AddressSymbol {
+            module_path: Option<String>,
+            symbol: Option<crate::interfaces::ModuleSymbol>,
+            offset: Option<u64>,
+        },
         // Disassembly responses
         Instructions { instructions: Vec<crate::interfaces::Instruction> },
         // Call stack responses
         CallStack { frames: Vec<crate::interfaces::CallFrame> },
+        // Argument responses
+        FunctionArguments { arguments: Vec<u64> },
+        // String responses
+        WideStringData { data: String },
         // ... add more as needed
     }
 
@@ -70,6 +173,16 @@ mod request_response {
             parameters: Vec<u64>,
         },
         Breakpoint {
+            pid: u32,
+            tid: u32,
+            address: u64,
+        },
+        InitialBreakpoint {
+            pid: u32,
+            tid: u32,
+            address: u64,
+        },
+        SingleShotBreakpoint {
             pid: u32,
             tid: u32,
             address: u64,
@@ -109,6 +222,18 @@ mod request_response {
             error: u32,
             event_type: u32,
         },
+        StepComplete {
+            pid: u32,
+            tid: u32,
+            kind: StepKind,
+            address: u64,
+        },
+        StepFailed {
+            pid: u32,
+            tid: u32,
+            kind: StepKind,
+            message: String,
+        },
         Unknown,
     }
 
@@ -119,12 +244,16 @@ mod request_response {
                 DebugEvent::Output { pid, .. } => *pid,
                 DebugEvent::Exception { pid, .. } => *pid,
                 DebugEvent::Breakpoint { pid, .. } => *pid,
+                DebugEvent::InitialBreakpoint { pid, .. } => *pid,
+                DebugEvent::SingleShotBreakpoint { pid, .. } => *pid,
                 DebugEvent::ProcessCreated { pid, .. } => *pid,
                 DebugEvent::ThreadCreated { pid, .. } => *pid,
                 DebugEvent::ThreadExited { pid, .. } => *pid,
                 DebugEvent::DllLoaded { pid, .. } => *pid,
                 DebugEvent::DllUnloaded { pid, .. } => *pid,
                 DebugEvent::RipEvent { pid, .. } => *pid,
+                DebugEvent::StepComplete { pid, .. } => *pid,
+                DebugEvent::StepFailed { pid, .. } => *pid,
                 DebugEvent::Unknown => 0, // Or handle as an error
             }
         }
@@ -134,12 +263,16 @@ mod request_response {
                 DebugEvent::Output { tid, .. } => *tid,
                 DebugEvent::Exception { tid, .. } => *tid,
                 DebugEvent::Breakpoint { tid, .. } => *tid,
+                DebugEvent::InitialBreakpoint { tid, .. } => *tid,
+                DebugEvent::SingleShotBreakpoint { tid, .. } => *tid,
                 DebugEvent::ProcessCreated { tid, .. } => *tid,
                 DebugEvent::ThreadCreated { tid, .. } => *tid,
                 DebugEvent::ThreadExited { tid, .. } => *tid,
                 DebugEvent::DllLoaded { tid, .. } => *tid,
                 DebugEvent::DllUnloaded { tid, .. } => *tid,
                 DebugEvent::RipEvent { tid, .. } => *tid,
+                DebugEvent::StepComplete { tid, .. } => *tid,
+                DebugEvent::StepFailed { tid, .. } => *tid,
                 DebugEvent::ProcessExited { .. } => 0,
                 DebugEvent::Unknown => 0,
             }
@@ -161,10 +294,46 @@ mod request_response {
 
 
 
-    #[derive(Clone)]
     pub enum ThreadContext {
         #[cfg(windows)]
         Win32RawContext(crate::protocol::CONTEXT),
+    }
+
+    // get PC from ThreadContext, on x64 it's RIP on arm64 it's PC
+    impl ThreadContext {
+        pub fn get_pc(&self) -> u64 {
+            #[cfg(target_arch = "x86_64")]
+            {
+                match self {
+                    ThreadContext::Win32RawContext(ctx) => ctx.Rip,
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                match self {
+                    ThreadContext::Win32RawContext(ctx) => ctx.Pc,
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    impl Clone for ThreadContext {
+        fn clone(&self) -> Self {
+            match self {
+                ThreadContext::Win32RawContext(ctx) => {
+                    let mut new_ctx: CONTEXT = unsafe { std::mem::zeroed() };
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            ctx as *const CONTEXT as *const u8,
+                            &mut new_ctx as *mut CONTEXT as *mut u8,
+                            std::mem::size_of::<CONTEXT>(),
+                        );
+                    }
+                    ThreadContext::Win32RawContext(new_ctx)
+                }
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -206,10 +375,6 @@ mod request_response {
             }
         }
     }
-
-
-
-
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
     pub struct ThreadInfo {

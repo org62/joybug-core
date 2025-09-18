@@ -20,11 +20,12 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, IsWow64Process2,
-    DEBUG_PROCESS, INFINITE, PROCESS_INFORMATION, STARTUPINFOW,
+    DEBUG_PROCESS, INFINITE, PROCESS_INFORMATION, STARTUPINFOW, OpenProcess, TerminateProcess, PROCESS_TERMINATE, PROCESS_ALL_ACCESS,
 };
 use windows_sys::Win32::System::SystemInformation::{
     IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_UNKNOWN
 };
+use windows_sys::Win32::System::Diagnostics::Debug::DebugBreakProcess;
 
 fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(Some(0)).collect()
@@ -203,5 +204,49 @@ pub(super) fn list_processes() -> Result<Vec<ProcessInfo>, PlatformError> {
 
         CloseHandle(snapshot);
         Ok(processes)
+    }
+}
+
+pub fn terminate_process_unlocked(pid: u32) -> Result<(), PlatformError> {
+    unsafe {
+        let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if h.is_null() {
+            let e = GetLastError();
+            let err = utils::error_message(e);
+            error!(pid, code = e, err, "OpenProcess(PROCESS_TERMINATE) failed");
+            return Err(PlatformError::OsError(format!("OpenProcess(PROCESS_TERMINATE) failed: {} ({})", e, err)));
+        }
+        let rc = TerminateProcess(h, 1);
+        CloseHandle(h);
+        if rc == 0 {
+            let e = GetLastError();
+            let err = utils::error_message(e);
+            error!(pid, code = e, err, "TerminateProcess failed");
+            return Err(PlatformError::OsError(format!("TerminateProcess failed: {} ({})", e, err)));
+        }
+        trace!(pid, "TerminateProcess succeeded (unlocked)");
+        Ok(())
+    }
+}
+
+pub fn debug_break_process_unlocked(pid: u32) -> Result<(), PlatformError> {
+    unsafe {
+        let h = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);
+        if h.is_null() {
+            let e = GetLastError();
+            let err = utils::error_message(e);
+            error!(pid, code = e, err, "OpenProcess(PROCESS_ALL_ACCESS) failed");
+            return Err(PlatformError::OsError(format!("OpenProcess(PROCESS_ALL_ACCESS) failed: {} ({})", e, err)));
+        }
+        let rc = DebugBreakProcess(h);
+        CloseHandle(h);
+        if rc == 0 {
+            let e = GetLastError();
+            let err = utils::error_message(e);
+            error!(pid, code = e, err, "DebugBreakProcess failed");
+            return Err(PlatformError::OsError(format!("DebugBreakProcess failed: {} ({})", e, err)));
+        }
+        trace!(pid, "DebugBreakProcess succeeded (unlocked)");
+        Ok(())
     }
 }

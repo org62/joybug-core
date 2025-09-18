@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
-use joybug2::protocol::{DebuggerResponse, DebugEvent, ModuleInfo};
-use joybug2::protocol_io::DebugClient;
+use joybug2::protocol::{DebugEvent, ModuleInfo};
+use joybug2::protocol_io::DebugSession;
 use std::thread;
 use tokio;
 use windows_sys::Win32::System::Threading::{
@@ -11,7 +11,6 @@ use windows_sys::Win32::Foundation::CloseHandle;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
-use std::time::Duration;
 
 fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(Some(0)).collect()
@@ -47,9 +46,23 @@ fn test_attach_and_list_modules() {
     };
     assert_ne!(success, 0, "CreateProcessW failed");
 
-    let mut client = DebugClient::connect(None).expect("connect");
+    struct TestState {
+        modules: Vec<ModuleInfo>,
+        events: Vec<DebugEvent>,
+        pid: u32,
+    }
 
-    let processes = client.list_processes().expect("list_processes");
+    let mut session = DebugSession::new(
+        TestState {
+            modules: Vec::new(),
+            events: Vec::new(),
+            pid: 0,
+        },
+        None,
+    )
+    .expect("connect");
+
+    let processes = session.list_processes().expect("list_processes");
     let target_process = processes
         .iter()
         .find(|p| p.pid == process_info.dwProcessId);
@@ -57,39 +70,64 @@ fn test_attach_and_list_modules() {
     assert!(target_process.is_some(), "Could not find target process");
     assert_eq!(target_process.unwrap().name, "cmd.exe");
 
-    struct TestState {
-        modules: Vec<ModuleInfo>,
-        events: Vec<DebugEvent>,
-    }
-    let mut state = TestState { modules: Vec::new(), events: Vec::new() };
+    let final_state = DebugSession::new(
+        TestState {
+            modules: Vec::new(),
+            events: Vec::new(),
+            pid: 0,
+        },
+        None,
+    )
+    .expect("connect")
+    .on_process_created(|sess, pid, _tid, _name, _base| {
+        sess.state.pid = pid;
+        Ok(())
+    })
+    .on_dll_loaded(|_sess, _pid, _tid, _name, _base| Ok(()))
+    .on_event(|sess, event| {
+        sess.state.events.push(event.clone());
+        Ok(true)
+    })
+    .attach(process_info.dwProcessId)
+    .expect("debug loop");
 
-    // wait for 500 milliseconds before attaching
-    thread::sleep(Duration::from_millis(500));
-
-    client.attach(process_info.dwProcessId, &mut state, |client, state, resp| {
-        match resp {
-            DebuggerResponse::Event { event } => {
-                state.events.push(event.clone());
-                if let DebugEvent::ProcessExited { pid, .. } = &event {
-                    let modules = client.list_modules(*pid).expect("Should get module list");
-                    state.modules.extend(modules);
-                    println!("modules: {:?}", state.modules);
-                    return false;
-                }
-            }
-            _ => {}
-        }
-        true
-    }).expect("debug loop");
+    let mut final_session = DebugSession::new(final_state, None).expect("reconnect");
+    let modules = final_session
+        .list_modules(final_session.state.pid)
+        .expect("Should get module list");
+    final_session.state.modules.extend(modules);
+    println!("modules: {:?}", final_session.state.modules);
 
     unsafe {
         CloseHandle(process_info.hProcess);
         CloseHandle(process_info.hThread);
     }
-    
-    let process_created = state.events.iter().filter(|e| matches!(e, DebugEvent::ProcessCreated { .. })).count();
-    let process_exited = state.events.iter().filter(|e| matches!(e, DebugEvent::ProcessExited { .. })).count();
-    assert_eq!(process_created, 1, "Should be exactly one process created event");
-    assert_eq!(process_exited, 1, "Should be exactly one process exited event");
-    assert!(state.modules.iter().any(|m| m.name.ends_with("cmd.exe")));
+
+    let process_created = final_session
+        .state
+        .events
+        .iter()
+        .filter(|e| matches!(e, DebugEvent::ProcessCreated { .. }))
+        .count();
+    let process_exited = final_session
+        .state
+        .events
+        .iter()
+        .filter(|e| matches!(e, DebugEvent::ProcessExited { .. }))
+        .count();
+    assert_eq!(
+        process_created,
+        1,
+        "Should be exactly one process created event"
+    );
+    assert_eq!(
+        process_exited,
+        1,
+        "Should be exactly one process exited event"
+    );
+    assert!(final_session
+        .state
+        .modules
+        .iter()
+        .any(|m| m.name.ends_with("cmd.exe")));
 } 

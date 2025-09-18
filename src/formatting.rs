@@ -13,7 +13,7 @@ impl std::fmt::Debug for DebuggerResponse {
             // Add other variants here, using a default debug format
             DebuggerResponse::Ack => write!(f, "Ack"),
             DebuggerResponse::Error { message } => f.debug_struct("Error").field("message", message).finish(),
-            DebuggerResponse::Event { event } => f.debug_struct("Event").field("event", event).finish(),
+            DebuggerResponse::Event { event } => f.debug_struct("Event").field("event", &format_args!("{}", event)).finish(),
             DebuggerResponse::MemoryData { data } => f.debug_struct("MemoryData").field("data", data).finish(),
             DebuggerResponse::WriteAck => write!(f, "WriteAck"),
             DebuggerResponse::ThreadContext { context } => f.debug_struct("ThreadContext").field("context", context).finish(),
@@ -26,6 +26,8 @@ impl std::fmt::Debug for DebuggerResponse {
             DebuggerResponse::ResolvedSymbolList { symbols } => f.debug_struct("ResolvedSymbolList").field("symbols", symbols).finish(),
             DebuggerResponse::AddressSymbol { module_path, symbol, offset } => f.debug_struct("AddressSymbol").field("module_path", module_path).field("symbol", symbol).field("offset", offset).finish(),
             DebuggerResponse::Instructions { instructions } => f.debug_struct("Instructions").field("instructions", instructions).finish(),
+            DebuggerResponse::FunctionArguments { arguments } => f.debug_struct("FunctionArguments").field("arguments", arguments).finish(),
+            DebuggerResponse::WideStringData { data } => f.debug_struct("WideStringData").field("data", data).finish(),
         }
     }
 }
@@ -132,16 +134,50 @@ impl std::fmt::Display for ModuleInfo {
 impl std::fmt::Display for DebugEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DebugEvent::ProcessExited { pid, exit_code } => write!(f, "ProcessExited {{ pid: {}, exit_code: 0x{:X} }}", pid, exit_code),
-            DebugEvent::Output { pid, tid, output } => write!(f, "Output {{ pid: {}, tid: {}, output: {} }}", pid, tid, output),
-            DebugEvent::Exception { pid, tid, code, address, first_chance, parameters } => write!(f, "Exception {{ pid: {}, tid: {}, code: 0x{:X}, address: 0x{:X}, first_chance: {}, parameters: {:?} }}", pid, tid, code, address, first_chance, parameters),
-            DebugEvent::Breakpoint { pid, tid, address } => write!(f, "Breakpoint {{ pid: {}, tid: {}, address: 0x{:X} }}", pid, tid, address),
-            DebugEvent::ProcessCreated { pid, tid, image_file_name, base_of_image, size_of_image } => write!(f, "ProcessCreated {{ pid: {}, tid: {}, image_file_name: {:?}, base_of_image: 0x{:X}, size_of_image: {:?} }}", pid, tid, image_file_name, base_of_image, size_of_image.as_ref().map(|v| format!("0x{:X}", v))),
-            DebugEvent::ThreadCreated { pid, tid, start_address } => write!(f, "ThreadCreated {{ pid: {}, tid: {}, start_address: 0x{:X} }}", pid, tid, start_address),
-            DebugEvent::ThreadExited { pid, tid, exit_code } => write!(f, "ThreadExited {{ pid: {}, tid: {}, exit_code: 0x{:X} }}", pid, tid, exit_code),
-            DebugEvent::DllLoaded { pid, tid, dll_name, base_of_dll, size_of_dll } => write!(f, "DllLoaded {{ pid: {}, tid: {}, dll_name: {:?}, base_of_dll: 0x{:X}, size_of_dll: {:?} }}", pid, tid, dll_name, base_of_dll, size_of_dll.as_ref().map(|v| format!("0x{:X}", v))),
-            DebugEvent::DllUnloaded { pid, tid, base_of_dll } => write!(f, "DllUnloaded {{ pid: {}, tid: {}, base_of_dll: 0x{:X} }}", pid, tid, base_of_dll),
-            DebugEvent::RipEvent { pid, tid, error, event_type } => write!(f, "RipEvent {{ pid: {}, tid: {}, error: 0x{:X}, event_type: 0x{:X} }}", pid, tid, error, event_type),
+            DebugEvent::ProcessExited { pid, exit_code } => {
+                write!(f, "ProcessExited(pid={}, exit_code=0x{:X})", pid, exit_code)
+            }
+            DebugEvent::Output { pid, tid, output } => {
+                write!(f, "Output(pid={}, tid={}, output={})", pid, tid, output)
+            }
+            DebugEvent::Exception { pid, tid, code, address, first_chance, .. } => {
+                write!(f, "Exception(pid={}, tid={}, code=0x{:X}, address=0x{:X}, first_chance={})", pid, tid, code, address, first_chance)
+            }
+            DebugEvent::Breakpoint { pid, tid, address } => {
+                write!(f, "Breakpoint(pid={}, tid={}, address=0x{:X})", pid, tid, address)
+            }
+            DebugEvent::InitialBreakpoint { pid, tid, address } => {
+                write!(f, "InitialBreakpoint(pid={}, tid={}, address=0x{:X})", pid, tid, address)
+            }
+            DebugEvent::SingleShotBreakpoint { pid, tid, address } => {
+                write!(f, "SingleShotBreakpoint(pid={}, tid={}, address=0x{:X})", pid, tid, address)
+            }
+            DebugEvent::ProcessCreated { pid, tid, image_file_name, base_of_image, size_of_image } => {
+                write!(f, "ProcessCreated(pid={}, tid={}, image={}, base=0x{:X}, size={:X?})", 
+                    pid, tid, image_file_name.as_deref().unwrap_or("<unknown>"), base_of_image, size_of_image)
+            }
+            DebugEvent::ThreadCreated { pid, tid, start_address } => {
+                write!(f, "ThreadCreated(pid={}, tid={}, start=0x{:X})", pid, tid, start_address)
+            }
+            DebugEvent::ThreadExited { pid, tid, exit_code } => {
+                write!(f, "ThreadExited(pid={}, tid={}, exit_code=0x{:X})", pid, tid, exit_code)
+            }
+            DebugEvent::DllLoaded { pid, tid, dll_name, base_of_dll, size_of_dll } => {
+                write!(f, "DllLoaded(pid={}, tid={}, dll={}, base=0x{:X}, size={:X?})", 
+                    pid, tid, dll_name.as_deref().unwrap_or("<unknown>"), base_of_dll, size_of_dll)
+            }
+            DebugEvent::DllUnloaded { pid, tid, base_of_dll } => {
+                write!(f, "DllUnloaded(pid={}, tid={}, base=0x{:X})", pid, tid, base_of_dll)
+            }
+            DebugEvent::RipEvent { pid, tid, error, event_type } => {
+                write!(f, "RipEvent(pid={}, tid={}, error=0x{:X}, type=0x{:X})", pid, tid, error, event_type)
+            }
+            DebugEvent::StepComplete { pid, tid, kind, address } => {
+                write!(f, "StepComplete(pid={}, tid={}, kind={:?}, address=0x{:X})", pid, tid, kind, address)
+            }
+            DebugEvent::StepFailed { pid, tid, kind, message } => {
+                write!(f, "StepFailed(pid={}, tid={}, kind={:?}, message={})", pid, tid, kind, message)
+            }
             DebugEvent::Unknown => write!(f, "Unknown"),
         }
     }

@@ -3,6 +3,7 @@ use crate::protocol::ModuleInfo;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use tracing::{trace, warn};
 use crate::windows_platform::symbol_provider::WindowsSymbolProvider;
 
@@ -21,6 +22,8 @@ pub struct SymbolManager {
     /// Store loaded symbols for fast access (module_path -> ModuleSymbols)
     /// All symbols are stored as RVAs, independent of process loading addresses
     symbol_cache: Arc<Mutex<HashMap<String, ModuleSymbols>>>,
+    /// Maximum time to wait for a symbol loading task before giving up
+    wait_timeout: Duration,
 }
 
 impl SymbolManager {
@@ -28,7 +31,18 @@ impl SymbolManager {
         Ok(Self {
             loading_tasks: Arc::new(Mutex::new(HashMap::new())),
             symbol_cache: Arc::new(Mutex::new(HashMap::new())),
+            wait_timeout: Self::read_timeout_from_env(),
         })
+    }
+
+    fn read_timeout_from_env() -> Duration {
+        // Prefer milliseconds override, then seconds; fallback 5 seconds
+        if let Ok(sec_str) = std::env::var("JOYBUG_SYMBOL_WAIT_TIMEOUT_SECS") {
+            if let Ok(secs) = sec_str.parse::<u64>() {
+                return Duration::from_secs(secs);
+            }
+        }
+        Duration::from_secs(5)
     }
 
     /// Start loading symbols for a module in the background
@@ -94,44 +108,103 @@ impl SymbolManager {
         }
     }
 
-    /// Wait for symbol loading to complete for a module if it's in progress
+    /// Wait for symbol loading to complete for a module if it's in progress, with timeout
     fn wait_for_loading(&self, module_path: &str) -> Result<(), SymbolError> {
-        // Check if there's a task for this module and wait for it to complete
+        let start = Instant::now();
         loop {
-            let task_handle = {
-                let mut tasks_guard = self.loading_tasks.lock().unwrap();
-                tasks_guard.remove(module_path)
+            // Fast path: check if there is a task and whether it has finished
+            let maybe_finished = {
+                let tasks_guard = self.loading_tasks.lock().unwrap();
+                match tasks_guard.get(module_path) {
+                    Some(handle) => handle.is_finished(),
+                    None => return Ok(()), // No task running
+                }
             };
-            
-            if let Some(handle) = task_handle {
-                trace!(module_path, "Waiting for symbol loading thread to complete");
-                // Wait for the thread to complete
-                match handle.join() {
-                    Ok(result) => {
-                        match result {
-                            Ok(()) => trace!(module_path, "Symbol loading completed successfully"),
-                            Err(e) => warn!(module_path, error = %e, "Symbol loading failed"),
+
+            if maybe_finished {
+                // Take ownership and join quickly
+                let handle = {
+                    let mut tasks_guard = self.loading_tasks.lock().unwrap();
+                    tasks_guard.remove(module_path)
+                };
+                if let Some(handle) = handle {
+                    trace!(module_path, "Joining finished symbol loading thread");
+                    match handle.join() {
+                        Ok(result) => {
+                            match result {
+                                Ok(()) => trace!(module_path, "Symbol loading completed successfully"),
+                                Err(e) => warn!(module_path, error = %e, "Symbol loading failed"),
+                            }
                         }
-                        break;
-                    }
-                    Err(_) => {
-                        warn!(module_path, "Symbol loading thread panicked");
-                        break;
+                        Err(_) => warn!(module_path, "Symbol loading thread panicked"),
                     }
                 }
-            } else {
-                // No task running for this module
+                return Ok(());
+            }
+
+            if start.elapsed() >= self.wait_timeout {
+                trace!(module_path, timeout_ms = self.wait_timeout.as_millis() as u64, "Timeout waiting for symbol loading; continuing without symbols");
+                return Ok(());
+            }
+
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    pub fn wait_for_all_loading(&self) {
+        let start = Instant::now();
+        loop {
+            let finished_modules: Vec<String> = {
+                let tasks = self.loading_tasks.lock().unwrap();
+                tasks
+                    .iter()
+                    .filter_map(|(k, h)| if h.is_finished() { Some(k.clone()) } else { None })
+                    .collect()
+            };
+
+            if finished_modules.is_empty() {
+                if start.elapsed() >= self.wait_timeout {
+                    trace!(timeout_ms = self.wait_timeout.as_millis() as u64, remaining = self.loading_tasks.lock().unwrap().len(), "Timeout waiting for all symbol loading tasks; proceeding");
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+                // Re-check
+                let remaining = self.loading_tasks.lock().unwrap().len();
+                if remaining == 0 {
+                    break;
+                }
+                continue;
+            }
+
+            for module_path in finished_modules {
+                let handle = {
+                    let mut tasks = self.loading_tasks.lock().unwrap();
+                    tasks.remove(&module_path)
+                };
+                if let Some(handle) = handle {
+                    match handle.join() {
+                        Ok(Ok(())) => trace!(module_path, "Symbol loading finished successfully."),
+                        Ok(Err(e)) => warn!(module_path, error = %e, "Symbol loading finished with an error."),
+                        Err(_) => warn!(module_path, "Symbol loading thread panicked."),
+                    }
+                }
+            }
+
+            if self.loading_tasks.lock().unwrap().is_empty() {
+                trace!("All pending symbol loading tasks are complete.");
                 break;
             }
         }
-        Ok(())
     }
 
     /// Find symbols across all loaded modules, returning up to max_results matches
     /// Supports Windows-style "module!symbol" format (e.g., "ntdll!NtCreateFile")
     pub fn find_symbol_across_all_modules(&self, symbol_name: &str, max_results: usize) -> Result<Vec<ResolvedSymbol>, SymbolError> {
+        self.wait_for_all_loading();
         let cache = self.symbol_cache.lock().unwrap();
         let mut found_symbols = Vec::new();
+
+        trace!(loaded_modules = ?cache.keys(), "Searching for symbol in loaded modules");
         
         // Check if the symbol name contains module specification (module!symbol format)
         if let Some(exclamation_pos) = symbol_name.find('!') {
@@ -236,7 +309,8 @@ impl SymbolManager {
                         va: module_symbols.module_base + symbol.rva as u64,
                     };
                     
-                    trace!(module_path, rva = format!("0x{:X}", rva), symbol_name = %symbol.name, symbol_rva = format!("0x{:X}", symbol.rva), symbol_va = format!("0x{:X}", symbol_with_va.va), offset = rva - symbol.rva, "RVA resolved to symbol");
+                    // too much logging
+                    //trace!(module_path, rva = format!("0x{:X}", rva), symbol_name = %symbol.name, symbol_rva = format!("0x{:X}", symbol.rva), symbol_va = format!("0x{:X}", symbol_with_va.va), offset = rva - symbol.rva, "RVA resolved to symbol");
                     Ok(Some(symbol_with_va))
                 }
                 None => {
@@ -313,7 +387,7 @@ impl SymbolManager {
             
             match best_match {
                 Some(symbol) => {
-                    trace!(module_path, rva = format!("0x{:X}", rva), symbol_name = %symbol.name, symbol_rva = format!("0x{:X}", symbol.rva), offset = rva - symbol.rva, "RVA resolved to raw symbol");
+                    //trace!(module_path, rva = format!("0x{:X}", rva), symbol_name = %symbol.name, symbol_rva = format!("0x{:X}", symbol.rva), offset = rva - symbol.rva, "RVA resolved to raw symbol");
                     Ok(Some(symbol.clone()))
                 }
                 None => {
