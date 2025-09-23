@@ -28,6 +28,10 @@ impl std::fmt::Debug for DebuggerResponse {
             DebuggerResponse::Instructions { instructions } => f.debug_struct("Instructions").field("instructions", instructions).finish(),
             DebuggerResponse::FunctionArguments { arguments } => f.debug_struct("FunctionArguments").field("arguments", arguments).finish(),
             DebuggerResponse::WideStringData { data } => f.debug_struct("WideStringData").field("data", data).finish(),
+            DebuggerResponse::ModuleExtraInfo { info } => f.debug_struct("ModuleExtraInfo")
+                .field("dos_header", &info.dos_header)
+                .field("nt_headers", &info.nt_headers)
+                .finish(),
         }
     }
 }

@@ -228,6 +228,9 @@ pub trait PlatformAPI: Send + Sync {
     // Break into a running, debugged process (fire-and-forget)
     fn break_into(&self, pid: u32) -> Result<(), PlatformError>;
     
+    // Module extra info
+    fn get_module_extra_info(&self, pid: u32, module_base: u64) -> Result<crate::pe_types::ModuleExtraInfo, PlatformError>;
+    
     // ... add more as needed
 }
 

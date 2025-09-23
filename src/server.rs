@@ -277,6 +277,13 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::GetModuleExtraInfo { pid, module_base } => {
+                let p = platform.read().unwrap();
+                match p.get_module_extra_info(pid, module_base) {
+                    Ok(info) => DebuggerResponse::ModuleExtraInfo { info },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::TerminateProcess { pid } => { let _ = pid; unreachable!() }
             DebuggerRequest::Step { pid, tid, kind } => {
                 let mut p = platform.write().unwrap();

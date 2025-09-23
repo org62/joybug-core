@@ -87,7 +87,17 @@ pub(super) fn handle_create_process_event(
         size: size_of_image,
     };
     
-    process.module_manager_mut().add_module(main_module.clone());
+    {
+        let process = platform.get_process_mut(pid)?;
+        process.module_manager_mut().add_module(main_module.clone());
+    }
+
+    // Parse and cache extra module info for main module
+    if let Ok(extra) = platform.parse_module_extra_info(pid, main_module.base) {
+        if let Ok(process) = platform.get_process_mut(pid) {
+            process.module_manager_mut().set_extra_info(main_module.base, extra);
+        }
+    }
 
     // Start loading symbols for the main executable in the background
     if let Some(ref symbol_manager) = platform.symbol_manager {
@@ -120,8 +130,17 @@ pub(super) fn handle_create_process_event(
     if let Some(ntdll_module) = try_build_ntdll_moduleinfo_from_self() {
         // Add to the target process' module list so address-to-module checks can succeed early.
         let ntdll_module_cloned = ntdll_module.clone();
-        let process = platform.get_process_mut(pid)?;
-        process.module_manager_mut().add_module(ntdll_module_cloned);
+        {
+            let process = platform.get_process_mut(pid)?;
+            process.module_manager_mut().add_module(ntdll_module_cloned.clone());
+        }
+
+        // Parse and cache extra info for synthetic ntdll entry as well
+        if let Ok(extra) = platform.parse_module_extra_info(pid, ntdll_module_cloned.base) {
+            if let Ok(process) = platform.get_process_mut(pid) {
+                process.module_manager_mut().set_extra_info(ntdll_module_cloned.base, extra);
+            }
+        }
 
         // Start background symbol load for ntdll so RVA -> name mapping is available quickly.
         if let Some(ref symbol_manager) = platform.symbol_manager {
@@ -537,8 +556,17 @@ pub fn handle_debug_event(
                 size: size_of_dll,
             };
             
-            let process = platform.get_process_mut(debug_event.dwProcessId)?;
-            process.module_manager_mut().add_module(module_info.clone());
+            {
+                let process = platform.get_process_mut(debug_event.dwProcessId)?;
+                process.module_manager_mut().add_module(module_info.clone());
+            }
+
+            // Parse and cache extra info for the loaded DLL
+            if let Ok(extra) = platform.parse_module_extra_info(debug_event.dwProcessId, module_info.base) {
+                if let Ok(process) = platform.get_process_mut(debug_event.dwProcessId) {
+                    process.module_manager_mut().set_extra_info(module_info.base, extra);
+                }
+            }
 
             // Refresh the module list for the symbol handler
             // This is no longer needed as SymLoadModule64 handles incremental updates

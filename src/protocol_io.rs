@@ -1,4 +1,5 @@
 use crate::interfaces::{Architecture, Instruction, ModuleSymbol};
+use crate::pe_types::ModuleExtraInfo;
 pub use crate::protocol::{
     DebuggerRequest, DebuggerResponse, DebugEvent, ModuleInfo, ProcessInfo, StepAction, StepKind,
     ThreadContext, ThreadInfo,
@@ -38,6 +39,7 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::CallStack { .. } => "CallStack".to_string(),
         DebuggerResponse::FunctionArguments { .. } => "FunctionArguments".to_string(),
         DebuggerResponse::WideStringData { .. } => "WideStringData".to_string(),
+        DebuggerResponse::ModuleExtraInfo { .. } => "ModuleExtraInfo".to_string(),
     };
     debug!("Received response: {}", summary);
     Ok(resp)
@@ -783,6 +785,15 @@ impl<S> DebugSession<S> {
                 "Unexpected response to ReadMemory: {:?}",
                 other
             )),
+        }
+    }
+
+    pub fn get_module_extra_info(&mut self, pid: u32, module_base: u64) -> anyhow::Result<ModuleExtraInfo> {
+        let req = DebuggerRequest::GetModuleExtraInfo { pid, module_base };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::ModuleExtraInfo { info } => Ok(info),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to get module extra info: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to GetModuleExtraInfo: {:?}", other)),
         }
     }
 

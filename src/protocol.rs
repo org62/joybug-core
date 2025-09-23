@@ -123,6 +123,10 @@ pub mod request_response {
         TerminateProcess {
             pid: u32,
         },
+        GetModuleExtraInfo {
+            pid: u32,
+            module_base: u64,
+        },
     }
 
     #[derive(Serialize, Deserialize, Clone)]
@@ -155,6 +159,7 @@ pub mod request_response {
         FunctionArguments { arguments: Vec<u64> },
         // String responses
         WideStringData { data: String },
+        ModuleExtraInfo { info: crate::pe_types::ModuleExtraInfo },
         // ... add more as needed
     }
 

@@ -11,14 +11,16 @@ pub mod disassembler;
 mod callstack;
 mod stepper;
 mod debugged_process;
+mod module_extra;
 
 use crate::interfaces::{PlatformAPI, PlatformError, ModuleSymbol, ResolvedSymbol, SymbolError, Architecture, DisassemblerError, Instruction, DisassemblerProvider, Stepper};
+// no-op
 use crate::protocol::{ModuleInfo, ProcessInfo, ThreadInfo, StepKind};
 use symbol_manager::SymbolManager;
 use disassembler::CapstoneDisassembler;
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-use tracing::{trace, info};
+use tracing::{trace, info, error};
 use std::collections::HashMap;
 
 // Safe wrapper for HANDLE that automatically closes it
@@ -384,6 +386,17 @@ impl PlatformAPI for WindowsPlatform {
         process::debug_break_process_unlocked(pid)
     }
 
+    fn get_module_extra_info(&self, pid: u32, module_base: u64) -> Result<crate::pe_types::ModuleExtraInfo, PlatformError> {
+        // Try cached info first
+        if let Ok(process) = self.get_process(pid) {
+            if let Some(info) = process.module_manager().get_extra_info(module_base) {
+                return Ok(info);
+            }
+        }
+        // Fallback: parse from file
+        error!(pid, module_base, "Parsing module extra info from file");
+        self.parse_module_extra_info(pid, module_base)
+    }
 }
 
 impl Stepper for WindowsPlatform {
@@ -391,3 +404,5 @@ impl Stepper for WindowsPlatform {
         stepper::step(self, pid, tid, kind)
     }
 } 
+
+impl WindowsPlatform {}
