@@ -1,20 +1,20 @@
 #![cfg(windows)]
 
+mod common;
+
+use common::TestServer;
 use joybug2::protocol::DebugEvent;
 use joybug2::protocol_io::DebugSession;
 use std::thread;
-use tokio;
 
 #[test]
 fn test_multi_client_sessions() {
     joybug2::init_tracing();
-    // Spawn the server in a background thread.
-    thread::spawn(|| {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(joybug2::server::run_server()).unwrap();
-    });
+    let server = TestServer::spawn();
+    let server_addr = server.address().to_string();
 
-    let client1_thread = thread::spawn(|| {
+    let client1_addr = server_addr.clone();
+    let client1_thread = thread::spawn(move || {
         struct TestState {
             events: Vec<DebugEvent>,
         }
@@ -22,7 +22,7 @@ fn test_multi_client_sessions() {
             TestState {
                 events: Vec::new(),
             },
-            None,
+            Some(client1_addr.as_str()),
         )
         .expect("connect client 1")
         .on_event(|sess, event| {
@@ -33,7 +33,8 @@ fn test_multi_client_sessions() {
         .expect("debug loop for client 1")
     });
 
-    let client2_thread = thread::spawn(|| {
+    let client2_addr = server_addr.clone();
+    let client2_thread = thread::spawn(move || {
         struct TestState {
             events: Vec<DebugEvent>,
         }
@@ -41,7 +42,7 @@ fn test_multi_client_sessions() {
             TestState {
                 events: Vec::new(),
             },
-            None,
+            Some(client2_addr.as_str()),
         )
         .expect("connect client 2")
         .on_event(|sess, event| {

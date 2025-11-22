@@ -1,22 +1,21 @@
 #![cfg(windows)]
 
+mod common;
+
+use common::TestServer;
 use joybug2::protocol_io::DebugSession;
 use joybug2::pe_types::{ExportKind, ImportItem, ImportKind};
 use pelite::pe64::image::IMAGE_NT_HEADERS_SIGNATURE;
 use std::path::Path;
-use std::thread;
-use tokio;
 
 #[test]
 fn test_module_extra_info_print() {
     joybug2::init_tracing();
 
-    thread::spawn(|| {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(joybug2::server::run_server()).unwrap();
-    });
+    let server = TestServer::spawn();
+    let server_addr = server.address().to_string();
 
-    let _ = DebugSession::new((), None)
+    let _ = DebugSession::new((), Some(server_addr.as_str()))
         .expect("Failed to connect to debug server")
         .on_initial_breakpoint(|session, pid, _tid, _addr| {
             let modules = session.list_modules(pid)?;

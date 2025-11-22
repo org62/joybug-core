@@ -3,6 +3,8 @@ use crate::interfaces::{PlatformAPI, Stepper};
 use tokio::net::TcpListener;
 use tracing::{info, error, debug};
 
+use std::future::{pending, Future};
+use std::net::TcpListener as StdTcpListener;
 use std::sync::{Arc, RwLock};
 
 #[cfg(windows)]
@@ -10,6 +12,7 @@ type PlatformImpl = crate::windows_platform::WindowsPlatform;
 
 use crate::framed_json_stream::FramedJsonStream;
 
+const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9000";
 
 fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformImpl>>) {
     let mut framed_stream = FramedJsonStream::new(stream);
@@ -329,22 +332,59 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
 }
 
 pub async fn run_server() -> anyhow::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:9000").await?;
-    info!("Server listening on 127.0.0.1:9000");
-    
-    // Create a single shared platform instance
+    let listener = TcpListener::bind(DEFAULT_LISTEN_ADDR).await?;
+    run_server_with_listener(listener, pending()).await
+}
+
+pub async fn run_server_with_shutdown<F>(shutdown: F) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send,
+{
+    let listener = TcpListener::bind(DEFAULT_LISTEN_ADDR).await?;
+    run_server_with_listener(listener, shutdown).await
+}
+
+pub async fn run_server_with_std_listener<F>(
+    listener: StdTcpListener,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send,
+{
+    listener.set_nonblocking(true)?;
+    let listener = TcpListener::from_std(listener)?;
+    run_server_with_listener(listener, shutdown).await
+}
+
+async fn run_server_with_listener<F>(listener: TcpListener, shutdown: F) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send,
+{
+    let local_addr = listener.local_addr()?;
+    info!(%local_addr, "Server listening");
+
     let shared_platform = Arc::new(RwLock::new(PlatformImpl::new()));
+    tokio::pin!(shutdown);
     
     loop {
-        let (socket, addr) = listener.accept().await?;
-        info!(%addr, "Accepted connection");
-        let std_stream = socket.into_std()?;
-        std_stream.set_nonblocking(false)?;
-        
-        // Clone the Arc for the new thread
-        let platform = Arc::clone(&shared_platform);
-        std::thread::spawn(move || {
-            handle_connection(std_stream, platform);
-        });
+        tokio::select! {
+            _ = &mut shutdown => {
+                info!("Shutdown signal received; stopping server accept loop");
+                break;
+            }
+            accept_result = listener.accept() => {
+                let (socket, addr) = accept_result?;
+                info!(%addr, "Accepted connection");
+                let std_stream = socket.into_std()?;
+                std_stream.set_nonblocking(false)?;
+
+                let platform = Arc::clone(&shared_platform);
+                std::thread::spawn(move || {
+                    handle_connection(std_stream, platform);
+                });
+            }
+        }
     }
+
+    Ok(())
 }

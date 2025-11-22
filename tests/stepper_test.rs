@@ -1,11 +1,12 @@
 #![cfg(windows)]
 
+mod common;
+
+use common::TestServer;
 use joybug2::interfaces::{Architecture};
 use std::collections::VecDeque;
 use joybug2::protocol::{StepKind, StepAction};
 use joybug2::protocol_io::DebugSession;
-use std::thread;
-use tokio;
 use joybug2::interfaces::InstructionFormatter;
 
 /// Clean, simple test state for tracking events
@@ -65,14 +66,11 @@ fn assert_disasm_symbol_prefix(session: &mut DebugSession<TestState>, pid: u32, 
 fn test_stepper_test() {
     joybug2::init_tracing();
     
-    // Start the debug server
-    thread::spawn(|| {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(joybug2::server::run_server()).unwrap();
-    });
+    let server = TestServer::spawn();
+    let server_addr = server.address().to_string();
     
     // Launch process with clean stateful callback-based interface
-    let _final_state = DebugSession::new(TestState::new(), None)
+    let _final_state = DebugSession::new(TestState::new(), Some(server_addr.as_str()))
         .expect("Failed to connect to debug server")
         .on_initial_breakpoint(|session, pid, tid, address| {
             println!("Initial breakpoint hit at 0x{:016x}", address);

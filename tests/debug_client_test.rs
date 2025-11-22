@@ -1,10 +1,11 @@
 #![cfg(windows)]
 
+mod common;
+
+use common::TestServer;
 use joybug2::interfaces::CallFrame;
 use joybug2::protocol::{StepKind, StepAction};
 use joybug2::protocol_io::DebugSession;
-use std::thread;
-use tokio;
 use joybug2::interfaces::InstructionFormatter;
 use joybug2::interfaces::Architecture;
 
@@ -85,14 +86,11 @@ fn test_symbol_search(session: &mut DebugSession<TestState>) {
 fn test_debug_client_event_collection() {
     joybug2::init_tracing();
     
-    // Start the debug server
-    thread::spawn(|| {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(joybug2::server::run_server()).unwrap();
-    });
+    let server = TestServer::spawn();
+    let server_addr = server.address().to_string();
     
     // Launch process with clean stateful callback-based interface
-    let final_state = DebugSession::new(TestState::new(), None)
+    let final_state = DebugSession::new(TestState::new(), Some(server_addr.as_str()))
         .expect("Failed to connect to debug server")
         .on_initial_breakpoint(|session, pid, _tid, address| {
             println!("=== Hit Initial Breakpoint at 0x{:x} ===", address);

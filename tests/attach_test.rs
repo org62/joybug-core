@@ -1,9 +1,10 @@
 #![cfg(windows)]
 
+mod common;
+
+use common::TestServer;
 use joybug2::protocol::{DebugEvent, ModuleInfo};
 use joybug2::protocol_io::DebugSession;
-use std::thread;
-use tokio;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
 };
@@ -19,10 +20,8 @@ fn to_wide(s: &str) -> Vec<u16> {
 #[test]
 fn test_attach_and_list_modules() {
     joybug2::init_tracing();
-    thread::spawn(|| {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(joybug2::server::run_server()).unwrap();
-    });
+    let server = TestServer::spawn();
+    let server_addr = server.address().to_string();
 
     // Create a suspended process
     let cmd = to_wide("cmd /c \"echo Tick 1 & echo Tick 2 & ping localhost -n 2 >nul\"");
@@ -58,7 +57,7 @@ fn test_attach_and_list_modules() {
             events: Vec::new(),
             pid: 0,
         },
-        None,
+        Some(server_addr.as_str()),
     )
     .expect("connect");
 
@@ -76,7 +75,7 @@ fn test_attach_and_list_modules() {
             events: Vec::new(),
             pid: 0,
         },
-        None,
+        Some(server_addr.as_str()),
     )
     .expect("connect")
     .on_process_created(|sess, pid, _tid, _name, _base| {
@@ -91,7 +90,8 @@ fn test_attach_and_list_modules() {
     .attach(process_info.dwProcessId)
     .expect("debug loop");
 
-    let mut final_session = DebugSession::new(final_state, None).expect("reconnect");
+    let mut final_session =
+        DebugSession::new(final_state, Some(server_addr.as_str())).expect("reconnect");
     let modules = final_session
         .list_modules(final_session.state.pid)
         .expect("Should get module list");
