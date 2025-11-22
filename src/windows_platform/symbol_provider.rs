@@ -11,7 +11,7 @@ use pdb::{PDB, PublicSymbol, SymbolData, FallibleIterator};
 use symsrv::{SymsrvDownloader, parse_nt_symbol_path, get_symbol_path_from_environment, get_home_sym_dir};
 use tracing::{trace, debug};
 use uuid::Uuid;
-use tokio::runtime::Runtime;
+use tokio::runtime::{Runtime, Builder};
 
 use crate::interfaces::{Address, ModuleSymbol, ResolvedSymbol, SymbolError, SymbolProvider};
 
@@ -111,8 +111,11 @@ pub struct WindowsSymbolProvider {
 
 impl WindowsSymbolProvider {
     pub fn new() -> Result<Self, SymbolError> {
-        // Create tokio runtime for async operations
-        let runtime = Runtime::new()
+        // Create a single-threaded tokio runtime for async operations
+        // Using current_thread ensures we don't spawn extra threads that might linger
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
             .map_err(|e| SymbolError::SymSrvError(format!("Failed to create async runtime: {}", e)))?;
 
         // Parse the _NT_SYMBOL_PATH environment variable using symsrv

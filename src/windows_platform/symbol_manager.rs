@@ -1,10 +1,10 @@
 use crate::interfaces::{ModuleSymbol, ResolvedSymbol, SymbolError, SymbolProvider};
 use crate::protocol::ModuleInfo;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, Condvar, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
-use tracing::{trace, warn};
+use tracing::{trace, warn, error};
 use crate::windows_platform::symbol_provider::WindowsSymbolProvider;
 
 /// Cached symbols for a single module with RVA-based storage
@@ -17,22 +17,124 @@ pub struct ModuleSymbols {
 /// Manages symbol loading for modules in the Windows platform
 /// Uses RVA-based storage for efficient sharing across processes
 pub struct SymbolManager {
-    /// Track loading tasks for modules
-    loading_tasks: Arc<Mutex<HashMap<String, JoinHandle<Result<(), SymbolError>>>>>,
     /// Store loaded symbols for fast access (module_path -> ModuleSymbols)
-    /// All symbols are stored as RVAs, independent of process loading addresses
     symbol_cache: Arc<Mutex<HashMap<String, ModuleSymbols>>>,
+    
+    /// Set of modules currently being loaded
+    pending_loads: Arc<Mutex<HashSet<String>>>,
+    /// Condvar to notify waiters when a module finishes loading
+    pending_cv: Arc<Condvar>,
+    
+    /// Channel to send load requests to the worker thread
+    worker_tx: mpsc::Sender<ModuleInfo>,
+    
     /// Maximum time to wait for a symbol loading task before giving up
     wait_timeout: Duration,
+    
+    // worker_handle: Option<JoinHandle<()>>, // We can't easily join on Drop if we can't close the channel easily from here without taking self by value or something, but we can just let it detach.
+    // Actually, if we drop the sender, the receiver will error and the thread will exit.
 }
 
 impl SymbolManager {
     pub fn new() -> Result<Self, SymbolError> {
+        let symbol_cache = Arc::new(Mutex::new(HashMap::new()));
+        let pending_loads = Arc::new(Mutex::new(HashSet::new()));
+        let pending_cv = Arc::new(Condvar::new());
+        
+        let (worker_tx, worker_rx) = mpsc::channel::<ModuleInfo>();
+        // Wrap receiver in Arc<Mutex> to share among multiple worker threads
+        let worker_rx = Arc::new(Mutex::new(worker_rx));
+        
+        let worker_count = Self::read_worker_count_from_env();
+        trace!(worker_count, "Starting symbol worker threads");
+
+        for i in 0..worker_count {
+            let rx = worker_rx.clone();
+            let cache_clone = symbol_cache.clone();
+            let pending_clone = pending_loads.clone();
+            let cv_clone = pending_cv.clone();
+            
+            thread::spawn(move || {
+                trace!(worker_id = i, "Symbol worker thread started");
+                
+                // Create the provider (and its Runtime) ONCE per thread
+                let mut provider = match WindowsSymbolProvider::new() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        error!(worker_id = i, error = %e, "Failed to create WindowsSymbolProvider in worker thread");
+                        return;
+                    }
+                };
+                
+                loop {
+                    // Acquire lock to receive next job
+                    let module_info = {
+                        let lock = match rx.lock() {
+                            Ok(guard) => guard,
+                            Err(_) => break, // Poisoned mutex, exit
+                        };
+                        match lock.recv() {
+                            Ok(m) => m,
+                            Err(_) => break, // Channel closed (Sender dropped), exit
+                        }
+                    };
+
+                    let module_path = module_info.name.clone();
+                    trace!(worker_id = i, module_path = %module_path, "Worker processing load request");
+                    
+                    let module_base = module_info.base;
+                    let module_size = module_info.size.map(|s| s as usize);
+                    
+                    // Load symbols synchronously (but provider uses its internal runtime)
+                    let result = provider.load_symbols_for_module(&module_path, module_base, module_size);
+                    
+                    match result {
+                        Ok(()) => {
+                            trace!(worker_id = i, module_path = %module_path, "Symbol loading completed successfully");
+                            // Store in cache
+                            if let Ok(symbols) = provider.list_symbols(&module_path) {
+                                let mut cache = cache_clone.lock().unwrap();
+                                cache.insert(module_path.clone(), ModuleSymbols {
+                                    module_base,
+                                    symbols,
+                                });
+                            }
+                        },
+                        Err(e) => {
+                            warn!(worker_id = i, module_path = %module_path, error = %e, "Symbol loading failed");
+                        }
+                    }
+                    
+                    // Remove from pending and notify waiters
+                    {
+                        let mut pending = pending_clone.lock().unwrap();
+                        pending.remove(&module_path);
+                    }
+                    cv_clone.notify_all();
+                }
+                
+                trace!(worker_id = i, "Symbol worker thread exiting");
+            });
+        }
+
         Ok(Self {
-            loading_tasks: Arc::new(Mutex::new(HashMap::new())),
-            symbol_cache: Arc::new(Mutex::new(HashMap::new())),
+            symbol_cache,
+            pending_loads,
+            pending_cv,
+            worker_tx,
             wait_timeout: Self::read_timeout_from_env(),
         })
+    }
+
+    fn read_worker_count_from_env() -> usize {
+        if let Ok(count_str) = std::env::var("JOYBUG_SYMBOL_WORKER_COUNT") {
+            if let Ok(count) = count_str.parse::<usize>() {
+                if count > 0 {
+                    return count;
+                }
+            }
+        }
+        3 // Default to 3 worker threads
     }
 
     fn read_timeout_from_env() -> Duration {
@@ -48,150 +150,72 @@ impl SymbolManager {
     /// Start loading symbols for a module in the background
     pub fn start_loading_symbols(&self, module: &ModuleInfo) {
         let module_path = module.name.clone();
-        let module_base = module.base;
-        let module_size = module.size.map(|s| s as usize);
         
-        let tasks = Arc::clone(&self.loading_tasks);
-        let cache = Arc::clone(&self.symbol_cache);
-        let module_path_for_task = module_path.clone();
-        
-        let task = std::thread::spawn(move || {
-            trace!(module_path = %module_path_for_task, "Starting background symbol loading");
-            
-            // Create a temporary provider for this task
-            let mut temp_provider = match WindowsSymbolProvider::new() {
-                Ok(provider) => provider,
-                Err(e) => {
-                    warn!(module_path = %module_path_for_task, error = %e, "Failed to create symbol provider");
-                    let mut tasks_guard = tasks.lock().unwrap();
-                    tasks_guard.remove(&module_path_for_task);
-                    return Err(e);
-                }
-            };
-            
-            // Load symbols synchronously
-            let result = temp_provider.load_symbols_for_module(&module_path_for_task, module_base, module_size);
-            
-            match &result {
-                Ok(()) => {
-                    trace!(module_path = %module_path_for_task, "Symbol loading completed successfully");
-                    // Store the loaded symbols in the cache
-                    if let Ok(symbols) = temp_provider.list_symbols(&module_path_for_task) {
-                        let mut cache_guard = cache.lock().unwrap();
-                        let module_symbols = ModuleSymbols {
-                            module_base: module_base,
-                            symbols: symbols.clone(),
-                        };
-                        cache_guard.insert(module_path_for_task.clone(), module_symbols);
-                        trace!(count = symbols.len(), "Successfully stored symbols in cache");
-                    }
-                },
-                Err(e) => warn!(module_path = %module_path_for_task, error = %e, "Symbol loading failed"),
-            }
-            
-            // Remove the task from tracking when done
-            {
-                let mut tasks_guard = tasks.lock().unwrap();
-                tasks_guard.remove(&module_path_for_task);
-            }
-            
-            result
-        });
-        
-        // Store the task handle
+        // Check if already loaded
         {
-            let mut tasks_guard = self.loading_tasks.lock().unwrap();
-            if let Some(_old_task) = tasks_guard.insert(module_path, task) {
-                // Note: std::thread::JoinHandle doesn't have abort, so we just replace it
-                // The old thread will complete and remove itself from the map
+            let cache = self.symbol_cache.lock().unwrap();
+            if cache.contains_key(&module_path) {
+                return;
             }
+        }
+        
+        // Check if already pending
+        {
+            let mut pending = self.pending_loads.lock().unwrap();
+            if pending.contains(&module_path) {
+                return;
+            }
+            pending.insert(module_path.clone());
+        }
+        
+        // Send to worker
+        if let Err(e) = self.worker_tx.send(module.clone()) {
+            error!(module_path = %module_path, error = %e, "Failed to send symbol load request to worker");
+            // Remove from pending if send failed
+            let mut pending = self.pending_loads.lock().unwrap();
+            pending.remove(&module_path);
+            self.pending_cv.notify_all();
         }
     }
 
     /// Wait for symbol loading to complete for a module if it's in progress, with timeout
     fn wait_for_loading(&self, module_path: &str) -> Result<(), SymbolError> {
         let start = Instant::now();
-        loop {
-            // Fast path: check if there is a task and whether it has finished
-            let maybe_finished = {
-                let tasks_guard = self.loading_tasks.lock().unwrap();
-                match tasks_guard.get(module_path) {
-                    Some(handle) => handle.is_finished(),
-                    None => return Ok(()), // No task running
-                }
-            };
-
-            if maybe_finished {
-                // Take ownership and join quickly
-                let handle = {
-                    let mut tasks_guard = self.loading_tasks.lock().unwrap();
-                    tasks_guard.remove(module_path)
-                };
-                if let Some(handle) = handle {
-                    trace!(module_path, "Joining finished symbol loading thread");
-                    match handle.join() {
-                        Ok(result) => {
-                            match result {
-                                Ok(()) => trace!(module_path, "Symbol loading completed successfully"),
-                                Err(e) => warn!(module_path, error = %e, "Symbol loading failed"),
-                            }
-                        }
-                        Err(_) => warn!(module_path, "Symbol loading thread panicked"),
-                    }
-                }
+        let mut pending = self.pending_loads.lock().unwrap();
+        
+        while pending.contains(module_path) {
+            let elapsed = start.elapsed();
+            if elapsed >= self.wait_timeout {
+                trace!(module_path, timeout_ms = self.wait_timeout.as_millis() as u64, "Timeout waiting for symbol loading");
+                return Ok(()); // Return Ok even on timeout to allow partial results
+            }
+            
+            let remaining = self.wait_timeout - elapsed;
+            let (guard, timeout_result) = self.pending_cv.wait_timeout(pending, remaining).unwrap();
+            pending = guard;
+            if timeout_result.timed_out() {
+                trace!(module_path, timeout_ms = self.wait_timeout.as_millis() as u64, "Timeout waiting for symbol loading (cv)");
                 return Ok(());
             }
-
-            if start.elapsed() >= self.wait_timeout {
-                trace!(module_path, timeout_ms = self.wait_timeout.as_millis() as u64, "Timeout waiting for symbol loading; continuing without symbols");
-                return Ok(());
-            }
-
-            std::thread::sleep(Duration::from_millis(50));
         }
+        Ok(())
     }
 
     pub fn wait_for_all_loading(&self) {
         let start = Instant::now();
-        loop {
-            let finished_modules: Vec<String> = {
-                let tasks = self.loading_tasks.lock().unwrap();
-                tasks
-                    .iter()
-                    .filter_map(|(k, h)| if h.is_finished() { Some(k.clone()) } else { None })
-                    .collect()
-            };
-
-            if finished_modules.is_empty() {
-                if start.elapsed() >= self.wait_timeout {
-                    trace!(timeout_ms = self.wait_timeout.as_millis() as u64, remaining = self.loading_tasks.lock().unwrap().len(), "Timeout waiting for all symbol loading tasks; proceeding");
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-                // Re-check
-                let remaining = self.loading_tasks.lock().unwrap().len();
-                if remaining == 0 {
-                    break;
-                }
-                continue;
+        let mut pending = self.pending_loads.lock().unwrap();
+        
+        while !pending.is_empty() {
+            let elapsed = start.elapsed();
+            if elapsed >= self.wait_timeout {
+                trace!(timeout_ms = self.wait_timeout.as_millis() as u64, "Timeout waiting for all symbol loading");
+                break;
             }
-
-            for module_path in finished_modules {
-                let handle = {
-                    let mut tasks = self.loading_tasks.lock().unwrap();
-                    tasks.remove(&module_path)
-                };
-                if let Some(handle) = handle {
-                    match handle.join() {
-                        Ok(Ok(())) => trace!(module_path, "Symbol loading finished successfully."),
-                        Ok(Err(e)) => warn!(module_path, error = %e, "Symbol loading finished with an error."),
-                        Err(_) => warn!(module_path, "Symbol loading thread panicked."),
-                    }
-                }
-            }
-
-            if self.loading_tasks.lock().unwrap().is_empty() {
-                trace!("All pending symbol loading tasks are complete.");
+            
+            let remaining = self.wait_timeout - elapsed;
+            let (guard, timeout_result) = self.pending_cv.wait_timeout(pending, remaining).unwrap();
+            pending = guard;
+            if timeout_result.timed_out() {
                 break;
             }
         }
