@@ -12,6 +12,7 @@ mod callstack;
 mod stepper;
 mod debugged_process;
 mod module_extra;
+mod dbghelp;
 
 use crate::interfaces::{PlatformAPI, PlatformError, ModuleSymbol, ResolvedSymbol, SymbolError, Architecture, DisassemblerError, Instruction, DisassemblerProvider, Stepper};
 // no-op

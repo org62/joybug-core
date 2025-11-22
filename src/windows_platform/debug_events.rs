@@ -67,9 +67,12 @@ pub(super) fn handle_create_process_event(
             
     // Load the module into the symbol handler
     let c_name = CString::new(image_file_name.as_str()).unwrap();
-    if unsafe { SymLoadModule64(h_process, info.hFile, c_name.as_ptr() as *const u8, ptr::null(), info.lpBaseOfImage as u64, size_of_image.unwrap_or(0) as u32) } == 0 {
-        let error = unsafe { GetLastError() };
-        warn!(pid, "SymLoadModule64 failed in create_process for {}: 0x{:x}", image_file_name, error);
+    {
+        let _lock = super::dbghelp::DBGHELP_LOCK.lock().unwrap();
+        if unsafe { SymLoadModule64(h_process, info.hFile, c_name.as_ptr() as *const u8, ptr::null(), info.lpBaseOfImage as u64, size_of_image.unwrap_or(0) as u32) } == 0 {
+            let error = unsafe { GetLastError() };
+            warn!(pid, "SymLoadModule64 failed in create_process for {}: 0x{:x}", image_file_name, error);
+        }
     }
     
     // Now that we're done with hFile, close it.
@@ -540,9 +543,12 @@ pub fn handle_debug_event(
 
             // Load module into symbol handler
             let c_name = CString::new(dll_name.as_str()).unwrap();
-            if unsafe { SymLoadModule64(h_process, info.hFile, c_name.as_ptr() as *const u8, ptr::null(), info.lpBaseOfDll as u64, size_of_dll.unwrap_or(0) as u32) } == 0 {
-                 let error = unsafe { GetLastError() };
-                 warn!(pid = debug_event.dwProcessId, "SymLoadModule64 failed on DLL load for {}: 0x{:x}", dll_name, error);
+            {
+                let _lock = super::dbghelp::DBGHELP_LOCK.lock().unwrap();
+                if unsafe { SymLoadModule64(h_process, info.hFile, c_name.as_ptr() as *const u8, ptr::null(), info.lpBaseOfDll as u64, size_of_dll.unwrap_or(0) as u32) } == 0 {
+                     let error = unsafe { GetLastError() };
+                     warn!(pid = debug_event.dwProcessId, "SymLoadModule64 failed on DLL load for {}: 0x{:x}", dll_name, error);
+                }
             }
 
             // now close handle
@@ -597,9 +603,12 @@ pub fn handle_debug_event(
                 // Unload from our manager
                 process.module_manager_mut().remove_module(info.lpBaseOfDll as u64);
                 // Unload from symbol handler
-                if unsafe { SymUnloadModule64(process.handle(), info.lpBaseOfDll as u64) } == FALSE {
-                    let error = unsafe { GetLastError() };
-                    warn!(pid = debug_event.dwProcessId, "SymUnloadModule64 failed: 0x{:x}", error);
+                {
+                    let _lock = super::dbghelp::DBGHELP_LOCK.lock().unwrap();
+                    if unsafe { SymUnloadModule64(process.handle(), info.lpBaseOfDll as u64) } == FALSE {
+                        let error = unsafe { GetLastError() };
+                        warn!(pid = debug_event.dwProcessId, "SymUnloadModule64 failed: 0x{:x}", error);
+                    }
                 }
             }
             

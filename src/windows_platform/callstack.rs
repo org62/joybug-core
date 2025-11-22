@@ -64,6 +64,9 @@ pub fn get_call_stack(
         Architecture::Arm64 => IMAGE_FILE_MACHINE_ARM64 as u32,
     };
     
+    // Acquire global DbgHelp lock for the duration of the stack walk
+    let _lock = super::dbghelp::DBGHELP_LOCK.lock().unwrap();
+
     for i in 0..MAX_STACK_FRAMES {
         let result = unsafe {
             StackWalk64(

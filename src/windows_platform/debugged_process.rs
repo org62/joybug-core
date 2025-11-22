@@ -27,14 +27,17 @@ pub(crate) struct DebuggedProcess {
 
 impl DebuggedProcess {
     pub(super) fn new(pid: u32, process_handle: HANDLE, architecture: Architecture) -> Result<Self, PlatformError> {
-        if unsafe { SymInitialize(process_handle, std::ptr::null(), FALSE) } == FALSE {
-            let error = unsafe { GetLastError() };
-            error!(pid, "Failed to initialize symbol handler, error code: 0x{:x}", error);
-            return Err(PlatformError::OsError(format!(
-                "SymInitialize failed for pid {}: {}",
-                pid,
-                super::utils::error_message(error)
-            )));
+        {
+            let _lock = super::dbghelp::DBGHELP_LOCK.lock().unwrap();
+            if unsafe { SymInitialize(process_handle, std::ptr::null(), FALSE) } == FALSE {
+                let error = unsafe { GetLastError() };
+                error!(pid, "Failed to initialize symbol handler, error code: 0x{:x}", error);
+                return Err(PlatformError::OsError(format!(
+                    "SymInitialize failed for pid {}: {}",
+                    pid,
+                    super::utils::error_message(error)
+                )));
+            }
         }
         Ok(Self {
             process_handle: super::HandleSafe(process_handle),
@@ -222,6 +225,7 @@ impl DebuggedProcess {
 
 impl Drop for DebuggedProcess {
     fn drop(&mut self) {
+        let _lock = super::dbghelp::DBGHELP_LOCK.lock().unwrap();
         if unsafe { SymCleanup(self.process_handle.0) } == FALSE {
             let error = unsafe { GetLastError() };
             warn!("Failed to cleanup symbol handler for process, error code: {}", error);
