@@ -21,7 +21,7 @@ fn test_module_extra_info_print() {
             let modules = session.list_modules(pid)?;
             println!("Modules: {:?}", modules);
             // Find kernel32.dll specifically (case-insensitive, matches by file name)
-            let kernel32_mod = modules.iter().find(|m| {
+            let kernelbase_mod = modules.iter().find(|m| {
                 let file_name = Path::new(&m.name)
                     .file_name()
                     .and_then(|s| s.to_str())
@@ -29,7 +29,7 @@ fn test_module_extra_info_print() {
                 file_name.eq_ignore_ascii_case("kernelbase.dll")
             });
 
-            if let Some(k32) = kernel32_mod {
+            if let Some(k32) = kernelbase_mod {
                 println!("Selected module: {} @ 0x{:x}", k32.name, k32.base);
                 let info = session.get_module_extra_info(pid, k32.base)?;
                 println!("DOS Header:\n{}", info.dos_header);

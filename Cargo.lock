@@ -840,8 +840,7 @@ dependencies = [
 [[package]]
 name = "pelite"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88dccf4bd32294364aeb7bd55d749604450e9db54605887551f21baea7617685"
+source = "git+https://github.com/expend20/pelite.git?branch=xdata#ef3734267d8fb67787bf7df383d67b052ec43f3b"
 dependencies = [
  "dataview",
  "libc",
@@ -853,8 +852,7 @@ dependencies = [
 [[package]]
 name = "pelite-macros"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a7cf3f8ecebb0f4895f4892a8be0a0dc81b498f9d56735cb769dc31bf00815b"
+source = "git+https://github.com/expend20/pelite.git?branch=xdata#ef3734267d8fb67787bf7df383d67b052ec43f3b"
 
 [[package]]
 name = "percent-encoding"

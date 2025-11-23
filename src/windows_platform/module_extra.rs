@@ -1,8 +1,10 @@
 use crate::interfaces::PlatformError;
 use crate::pe_types::{DosHeader as SerDosHeader, ImageFileHeader as SerImageFileHeader, ImageOptionalHeader64 as SerImageOptionalHeader64, ImageDataDirectory as SerImageDataDirectory, NtHeaders64 as SerNtHeaders64, ModuleExtraInfo, ImportDescriptorInfo, ImportEntry, ImportItem, ImportKind, ExportInfo, ExportEntry, ExportKind, RuntimeFunction};
 use super::WindowsPlatform;
+use pelite::pe64::exception_arm64::Arm64ExceptionExt;
 use pelite::pe64::{Pe, PeFile};
-use tracing::{trace};
+use tracing::trace;
+use windows_sys::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_ARM64;
 
 impl WindowsPlatform {
 
@@ -217,20 +219,41 @@ impl WindowsPlatform {
         };
 
         // Parse Exception Directory (Runtime Functions)
-        let runtime_functions: Option<Vec<RuntimeFunction>> = match pe.exception() {
-            Ok(exception_dir) => {
-                let entries = exception_dir.image();
-                let mut out: Vec<RuntimeFunction> = Vec::with_capacity(entries.len());
-                for rf in entries.iter() {
-                    out.push(RuntimeFunction {
-                        BeginAddress: rf.BeginAddress,
-                        EndAddress: rf.EndAddress,
-                        UnwindData: rf.UnwindData,
-                    });
+        let runtime_functions: Option<Vec<RuntimeFunction>> = if file_header.Machine == IMAGE_FILE_MACHINE_ARM64 {
+            match pe.exception_arm64() {
+                Ok(exception_dir) => {
+                    let entries = exception_dir.image();
+                    let mut out: Vec<RuntimeFunction> = Vec::with_capacity(entries.len());
+                    for func in exception_dir.functions() {
+                        let begin = func.begin_address();
+                        let unwind = func.raw_unwind_data();
+                        let end = func.end_address().ok().flatten().unwrap_or(0);
+                        out.push(RuntimeFunction {
+                            BeginAddress: begin,
+                            EndAddress: end,
+                            UnwindData: unwind,
+                        });
+                    }
+                    Some(out)
                 }
-                Some(out)
+                Err(_) => None,
             }
-            Err(_) => None,
+        } else {
+            match pe.exception() {
+                Ok(exception_dir) => {
+                    let entries = exception_dir.image();
+                    let mut out: Vec<RuntimeFunction> = Vec::with_capacity(entries.len());
+                    for rf in entries.iter() {
+                        out.push(RuntimeFunction {
+                            BeginAddress: rf.BeginAddress,
+                            EndAddress: rf.EndAddress,
+                            UnwindData: rf.UnwindData,
+                        });
+                    }
+                    Some(out)
+                }
+                Err(_) => None,
+            }
         };
 
         // Return dos + complete nt headers + sections + imports + exports + runtime functions
