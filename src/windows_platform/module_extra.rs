@@ -262,6 +262,5 @@ impl WindowsPlatform {
     }
 }
 
-// PlatformAPI method is implemented in mod.rs to avoid split impl blocks
 
 
