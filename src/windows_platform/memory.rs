@@ -30,7 +30,28 @@ pub(super) fn read_memory_internal(
         if ok == 0 {
             let error = GetLastError();
             let error_str = utils::error_message(error);
-            error!(error, error_str, "ReadProcessMemory failed");
+
+            // If we got partial data, return it with a warning instead of failing
+            if bytes_read > 0 {
+                warn!(
+                    address = %format!("0x{:X}", address),
+                    requested_size = size,
+                    bytes_read,
+                    error,
+                    error_str,
+                    "ReadProcessMemory partial read"
+                );
+                buffer.truncate(bytes_read);
+                return Ok(buffer);
+            }
+
+            error!(
+                address = %format!("0x{:X}", address),
+                size,
+                error,
+                error_str,
+                "ReadProcessMemory failed"
+            );
             return Err(PlatformError::OsError(format!(
                 "ReadProcessMemory failed: {} ({})",
                 error, error_str
