@@ -230,8 +230,10 @@ pub trait PlatformAPI: Send + Sync {
     
     // Module extra info
     fn get_module_extra_info(&self, pid: u32, module_base: u64) -> Result<crate::pe_types::ModuleExtraInfo, PlatformError>;
-    
-    // ... add more as needed
+
+    // Memory region queries
+    fn query_memory_region(&self, pid: u32, address: u64) -> Result<crate::protocol::MemoryRegionInfo, PlatformError>;
+    fn enumerate_memory_regions(&self, pid: u32) -> Result<Vec<crate::protocol::MemoryRegionInfo>, PlatformError>;
 }
 
 impl SymbolInfo {

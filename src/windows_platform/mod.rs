@@ -398,6 +398,14 @@ impl PlatformAPI for WindowsPlatform {
         error!(pid, module_base, "Parsing module extra info from file");
         self.parse_module_extra_info(pid, module_base)
     }
+
+    fn query_memory_region(&self, pid: u32, address: u64) -> Result<crate::protocol::MemoryRegionInfo, PlatformError> {
+        memory::query_memory_region_unlocked(pid, address)
+    }
+
+    fn enumerate_memory_regions(&self, pid: u32) -> Result<Vec<crate::protocol::MemoryRegionInfo>, PlatformError> {
+        memory::enumerate_memory_regions_unlocked(pid)
+    }
 }
 
 impl Stepper for WindowsPlatform {

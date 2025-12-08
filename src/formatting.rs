@@ -1,6 +1,53 @@
 use crate::protocol::*;
 use crate::interfaces::*;
 
+// Memory region formatting utilities
+#[cfg(windows)]
+pub mod memory {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE,
+        PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+        PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+    };
+
+    /// Convert memory state to string representation
+    pub fn state_to_str(state: u32) -> &'static str {
+        match state {
+            MEM_COMMIT => "MEM_COMMIT",
+            MEM_RESERVE => "MEM_RESERVE",
+            MEM_FREE => "MEM_FREE",
+            _ => "UNKNOWN",
+        }
+    }
+
+    /// Convert memory type to string representation
+    pub fn type_to_str(region_type: u32) -> &'static str {
+        match region_type {
+            MEM_PRIVATE => "MEM_PRIVATE",
+            MEM_MAPPED => "MEM_MAPPED",
+            MEM_IMAGE => "MEM_IMAGE",
+            0 => "NONE",
+            _ => "UNKNOWN",
+        }
+    }
+
+    /// Convert memory protection flags to string representation
+    pub fn protect_to_str(protect: u32) -> &'static str {
+        match protect & 0xFF {
+            PAGE_NOACCESS => "PAGE_NOACCESS",
+            PAGE_READONLY => "PAGE_READONLY",
+            PAGE_READWRITE => "PAGE_READWRITE",
+            PAGE_WRITECOPY => "PAGE_WRITECOPY",
+            PAGE_EXECUTE => "PAGE_EXECUTE",
+            PAGE_EXECUTE_READ => "PAGE_EXECUTE_READ",
+            PAGE_EXECUTE_READWRITE => "PAGE_EXECUTE_READWRITE",
+            PAGE_EXECUTE_WRITECOPY => "PAGE_EXECUTE_WRITECOPY",
+            0 => "NONE",
+            _ => "OTHER",
+        }
+    }
+}
+
 // Protocol Display and Debug implementations
 impl std::fmt::Debug for DebuggerResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -31,6 +78,15 @@ impl std::fmt::Debug for DebuggerResponse {
             DebuggerResponse::ModuleExtraInfo { info } => f.debug_struct("ModuleExtraInfo")
                 .field("dos_header", &info.dos_header)
                 .field("nt_headers", &info.nt_headers)
+                .finish(),
+            DebuggerResponse::MemoryRegionInfo { info } => f.debug_struct("MemoryRegionInfo")
+                .field("base_address", &format_args!("0x{:X}", info.base_address))
+                .field("region_size", &format_args!("0x{:X}", info.region_size))
+                .field("state", &format_args!("0x{:X}", info.state))
+                .field("protect", &format_args!("0x{:X}", info.protect))
+                .finish(),
+            DebuggerResponse::MemoryRegionList { regions } => f.debug_struct("MemoryRegionList")
+                .field("count", &regions.len())
                 .finish(),
         }
     }

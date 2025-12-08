@@ -287,6 +287,20 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::QueryMemoryRegion { pid, address } => {
+                let p = platform.read().unwrap();
+                match p.query_memory_region(pid, address) {
+                    Ok(info) => DebuggerResponse::MemoryRegionInfo { info },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::EnumerateMemoryRegions { pid } => {
+                let p = platform.read().unwrap();
+                match p.enumerate_memory_regions(pid) {
+                    Ok(regions) => DebuggerResponse::MemoryRegionList { regions },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::TerminateProcess { pid } => { let _ = pid; unreachable!() }
             DebuggerRequest::Step { pid, tid, kind } => {
                 let mut p = platform.write().unwrap();
@@ -321,6 +335,10 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
             DebuggerResponse::CallStack { frames } => format!(
                 "CallStack {{ frames: [..{} frames] }}",
                 frames.len()
+            ),
+            DebuggerResponse::MemoryRegionList { regions } => format!(
+                "MemoryRegionList {{ regions: [..{} regions] }}",
+                regions.len()
             ),
             _ => format!("{:?}", resp),
         }, "Sending response");

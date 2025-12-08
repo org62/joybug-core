@@ -3,7 +3,8 @@ use crate::interfaces::{PlatformAPI, PlatformError};
 use tracing::{error, trace, warn};
 use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE, HANDLE};
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
-use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_VM_READ};
+use windows_sys::Win32::System::Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION};
+use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_VM_READ, PROCESS_QUERY_INFORMATION};
 
 pub(super) fn read_memory_internal(
     handle: HANDLE,
@@ -190,7 +191,117 @@ pub(super) fn read_wide_string(
     let wide_chars: Vec<u16> = buffer.chunks_exact(2)
         .map(|a| u16::from_le_bytes([a[0], a[1]]))
         .collect();
-    
+
     let result = String::from_utf16_lossy(&wide_chars);
     Ok(result.trim().to_string())
+}
+
+pub(super) fn query_memory_region_unlocked(
+    pid: u32,
+    address: u64,
+) -> Result<crate::protocol::MemoryRegionInfo, PlatformError> {
+    trace!(pid, address = %format!("0x{:X}", address), "query_memory_region_unlocked");
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            let error = GetLastError();
+            let error_str = utils::error_message(error);
+            error!(error, error_str, "OpenProcess(PROCESS_QUERY_INFORMATION) failed");
+            return Err(PlatformError::OsError(format!(
+                "OpenProcess failed: {} ({})", error, error_str
+            )));
+        }
+
+        let mut mem_info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        let result = VirtualQueryEx(
+            handle,
+            address as *const std::ffi::c_void,
+            &mut mem_info,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        );
+        windows_sys::Win32::Foundation::CloseHandle(handle);
+
+        if result == 0 {
+            let error = GetLastError();
+            let error_str = utils::error_message(error);
+            error!(address = %format!("0x{:X}", address), error, error_str, "VirtualQueryEx failed");
+            return Err(PlatformError::OsError(format!(
+                "VirtualQueryEx failed: {} ({})", error, error_str
+            )));
+        }
+
+        trace!(
+            base_address = %format!("0x{:X}", mem_info.BaseAddress as u64),
+            region_size = %format!("0x{:X}", mem_info.RegionSize),
+            state = %format!("0x{:X}", mem_info.State),
+            "query_memory_region_unlocked succeeded"
+        );
+
+        Ok(crate::protocol::MemoryRegionInfo {
+            base_address: mem_info.BaseAddress as u64,
+            allocation_base: mem_info.AllocationBase as u64,
+            allocation_protect: mem_info.AllocationProtect,
+            region_size: mem_info.RegionSize as u64,
+            state: mem_info.State,
+            protect: mem_info.Protect,
+            region_type: mem_info.Type,
+        })
+    }
+}
+
+pub(super) fn enumerate_memory_regions_unlocked(
+    pid: u32,
+) -> Result<Vec<crate::protocol::MemoryRegionInfo>, PlatformError> {
+    trace!(pid, "enumerate_memory_regions_unlocked");
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            let error = GetLastError();
+            let error_str = utils::error_message(error);
+            error!(error, error_str, "OpenProcess(PROCESS_QUERY_INFORMATION) failed");
+            return Err(PlatformError::OsError(format!(
+                "OpenProcess failed: {} ({})", error, error_str
+            )));
+        }
+
+        let mut regions = Vec::new();
+        let mut address: u64 = 0;
+
+        loop {
+            let mut mem_info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let result = VirtualQueryEx(
+                handle,
+                address as *const std::ffi::c_void,
+                &mut mem_info,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            );
+
+            if result == 0 {
+                // End of address space or error - stop enumeration
+                break;
+            }
+
+            regions.push(crate::protocol::MemoryRegionInfo {
+                base_address: mem_info.BaseAddress as u64,
+                allocation_base: mem_info.AllocationBase as u64,
+                allocation_protect: mem_info.AllocationProtect,
+                region_size: mem_info.RegionSize as u64,
+                state: mem_info.State,
+                protect: mem_info.Protect,
+                region_type: mem_info.Type,
+            });
+
+            // Move to next region
+            let next_address = (mem_info.BaseAddress as u64).wrapping_add(mem_info.RegionSize as u64);
+            if next_address <= address {
+                // Overflow or no progress - stop
+                break;
+            }
+            address = next_address;
+        }
+
+        windows_sys::Win32::Foundation::CloseHandle(handle);
+        trace!(region_count = regions.len(), "enumerate_memory_regions complete");
+        Ok(regions)
+    }
 } 

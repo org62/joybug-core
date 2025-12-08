@@ -127,6 +127,13 @@ pub mod request_response {
             pid: u32,
             module_base: u64,
         },
+        QueryMemoryRegion {
+            pid: u32,
+            address: u64,
+        },
+        EnumerateMemoryRegions {
+            pid: u32,
+        },
     }
 
     #[derive(Serialize, Deserialize, Clone)]
@@ -160,7 +167,8 @@ pub mod request_response {
         // String responses
         WideStringData { data: String },
         ModuleExtraInfo { info: crate::pe_types::ModuleExtraInfo },
-        // ... add more as needed
+        MemoryRegionInfo { info: MemoryRegionInfo },
+        MemoryRegionList { regions: Vec<MemoryRegionInfo> },
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -295,6 +303,17 @@ pub mod request_response {
         pub name: String,
         pub base: u64,
         pub size: Option<u64>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct MemoryRegionInfo {
+        pub base_address: u64,
+        pub allocation_base: u64,
+        pub allocation_protect: u32,
+        pub region_size: u64,
+        pub state: u32,          // MEM_COMMIT=0x1000, MEM_RESERVE=0x2000, MEM_FREE=0x10000
+        pub protect: u32,        // PAGE_* flags
+        pub region_type: u32,    // MEM_PRIVATE=0x20000, MEM_MAPPED=0x40000, MEM_IMAGE=0x1000000
     }
 
 

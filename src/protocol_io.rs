@@ -40,6 +40,8 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::FunctionArguments { .. } => "FunctionArguments".to_string(),
         DebuggerResponse::WideStringData { .. } => "WideStringData".to_string(),
         DebuggerResponse::ModuleExtraInfo { .. } => "ModuleExtraInfo".to_string(),
+        DebuggerResponse::MemoryRegionInfo { .. } => "MemoryRegionInfo".to_string(),
+        DebuggerResponse::MemoryRegionList { regions } => format!("MemoryRegionList ({} regions)", regions.len()),
     };
     debug!("Received response: {}", summary);
     Ok(resp)
@@ -816,6 +818,24 @@ impl<S> DebugSession<S> {
             DebuggerResponse::Ack => Ok(()),
             DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to terminate process: {}", message)),
             other => Err(anyhow::anyhow!("Unexpected response to TerminateProcess: {:?}", other)),
+        }
+    }
+
+    pub fn query_memory_region(&mut self, pid: u32, address: u64) -> anyhow::Result<crate::protocol::MemoryRegionInfo> {
+        let req = DebuggerRequest::QueryMemoryRegion { pid, address };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::MemoryRegionInfo { info } => Ok(info),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to query memory region: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to QueryMemoryRegion: {:?}", other)),
+        }
+    }
+
+    pub fn enumerate_memory_regions(&mut self, pid: u32) -> anyhow::Result<Vec<crate::protocol::MemoryRegionInfo>> {
+        let req = DebuggerRequest::EnumerateMemoryRegions { pid };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::MemoryRegionList { regions } => Ok(regions),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to enumerate memory regions: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to EnumerateMemoryRegions: {:?}", other)),
         }
     }
 } 
