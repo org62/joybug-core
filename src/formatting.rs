@@ -88,6 +88,9 @@ impl std::fmt::Debug for DebuggerResponse {
             DebuggerResponse::MemoryRegionList { regions } => f.debug_struct("MemoryRegionList")
                 .field("count", &regions.len())
                 .finish(),
+            DebuggerResponse::DereferenceResult { entries } => f.debug_struct("DereferenceResult")
+                .field("count", &entries.len())
+                .finish(),
         }
     }
 }

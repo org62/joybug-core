@@ -134,6 +134,12 @@ pub mod request_response {
         EnumerateMemoryRegions {
             pid: u32,
         },
+        Dereference {
+            pid: u32,
+            address: u64,
+            count: usize,
+            reference_base: Option<u64>,
+        },
     }
 
     #[derive(Serialize, Deserialize, Clone)]
@@ -169,6 +175,7 @@ pub mod request_response {
         ModuleExtraInfo { info: crate::pe_types::ModuleExtraInfo },
         MemoryRegionInfo { info: MemoryRegionInfo },
         MemoryRegionList { regions: Vec<MemoryRegionInfo> },
+        DereferenceResult { entries: Vec<DereferenceEntry> },
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -314,6 +321,32 @@ pub mod request_response {
         pub state: u32,          // MEM_COMMIT=0x1000, MEM_RESERVE=0x2000, MEM_FREE=0x10000
         pub protect: u32,        // PAGE_* flags
         pub region_type: u32,    // MEM_PRIVATE=0x20000, MEM_MAPPED=0x40000, MEM_IMAGE=0x1000000
+    }
+
+    /// Entry for a single address in a dereference chain
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct DereferenceEntry {
+        /// Memory address being examined
+        pub address: u64,
+        /// Offset from reference_base
+        pub offset: i64,
+        /// Chain of dereferenced values
+        pub chain: Vec<DereferenceValue>,
+    }
+
+    /// A single value in the dereference chain
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub enum DereferenceValue {
+        /// Valid pointer to next address (address, optional symbol)
+        Pointer(u64, Option<String>),
+        /// Non-pointer value (cannot be dereferenced)
+        Value(u64),
+        /// Points to readable string
+        String(String),
+        /// Points to executable code (mnemonic + operands)
+        Instruction(String),
+        /// Pointer loop back to earlier address in chain
+        LoopDetected(u64),
     }
 
 

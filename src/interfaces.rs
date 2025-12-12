@@ -234,6 +234,15 @@ pub trait PlatformAPI: Send + Sync {
     // Memory region queries
     fn query_memory_region(&self, pid: u32, address: u64) -> Result<crate::protocol::MemoryRegionInfo, PlatformError>;
     fn enumerate_memory_regions(&self, pid: u32) -> Result<Vec<crate::protocol::MemoryRegionInfo>, PlatformError>;
+
+    // Dereference/telescope
+    fn dereference(
+        &self,
+        pid: u32,
+        address: u64,
+        count: usize,
+        reference_base: Option<u64>,
+    ) -> Result<Vec<crate::protocol::DereferenceEntry>, PlatformError>;
 }
 
 impl SymbolInfo {

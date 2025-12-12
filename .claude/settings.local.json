@@ -3,7 +3,11 @@
     "allow": [
       "Bash(cargo build:*)",
       "Bash(cargo check:*)",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(dumpbin /headers:*)",
+      "Bash(dumpbin:*)",
+      "Bash(findstr:*)",
+      "Bash(dir:*)"
     ],
     "deny": [],
     "ask": []

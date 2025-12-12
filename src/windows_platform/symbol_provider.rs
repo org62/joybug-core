@@ -156,14 +156,18 @@ impl WindowsSymbolProvider {
         let mut pdb_parser = PDB::open(file)
             .map_err(|e| SymbolError::PdbParsingFailed(format!("PDB::open for {}: {}", pdb_path.display(), e)))?;
 
-        let mut symbols_vec = Vec::new();
+        // Use a HashMap to deduplicate symbols by name.
+        // PDB files often contain multiple public symbol entries for the same symbol
+        // (e.g., both code and data symbols). We keep the first occurrence, which
+        // typically matches what WinDbg reports.
+        let mut symbols_map: HashMap<String, ModuleSymbol> = HashMap::new();
 
         let global_symbols = pdb_parser.global_symbols()
             .map_err(|e| SymbolError::PdbParsingFailed(format!("PDB global_symbols from {}: {}", pdb_path.display(), e)))?;
-        
+
         let address_map = pdb_parser.address_map()
             .map_err(|e| SymbolError::PdbParsingFailed(format!("PDB address_map from {}: {}", pdb_path.display(), e)))?;
-        
+
         let mut iter = global_symbols.iter();
         loop {
             match iter.next() {
@@ -177,16 +181,18 @@ impl WindowsSymbolProvider {
                             } else {
                                 symbol_name_str.into_owned()
                             };
-                            
+
                             let rva = offset.to_rva(&address_map).unwrap_or_default().0;
-                            
-                            symbols_vec.push(ModuleSymbol {
+
+                            // Only insert if this symbol name hasn't been seen yet.
+                            // This deduplicates multiple entries for the same symbol.
+                            symbols_map.entry(demangled_name.clone()).or_insert(ModuleSymbol {
                                 name: demangled_name,
                                 rva,
                             });
                         }
                         Ok(_other_data) => { /* Optionally handle other symbol types or log them */ }
-                        Err(pdb_parse_err) => { 
+                        Err(pdb_parse_err) => {
                             trace!(error = %pdb_parse_err, "Failed to parse some PDB symbol, skipping");
                         }
                     }
@@ -199,6 +205,7 @@ impl WindowsSymbolProvider {
             }
         }
 
+        let symbols_vec: Vec<ModuleSymbol> = symbols_map.into_values().collect();
         trace!(count = symbols_vec.len(), "Successfully parsed symbols from PDB");
         Ok(symbols_vec)
     }
@@ -212,29 +219,41 @@ impl SymbolProvider for WindowsSymbolProvider {
         module_size: Option<usize>,
     ) -> Result<(), SymbolError> {
         trace!(module_path = module_path_str, module_base = format!("0x{:X}", module_base), "Loading symbols for module");
-        
+
         if self.loaded_modules.contains_key(module_path_str) {
             trace!(module_path = module_path_str, "Symbols already loaded for module");
             return Ok(());
         }
-        
+
         let module_path = Path::new(module_path_str);
-        
+
         // Extract PDB identifier from the PE file
         let pdb_identifier = extract_pdb_identifier_from_file(module_path)?;
         let symsrv_id = pdb_identifier.to_symsrv_identifier();
-        
+
         trace!(pdb_name = %pdb_identifier.name, pdb_guid = %pdb_identifier.guid, pdb_age = pdb_identifier.age, symsrv_id = %symsrv_id, "Extracted PDB identifier");
-        
-        // Fetch the PDB file
-        let downloaded_pdb_path = self.internal_fetch_pdb(&pdb_identifier.name, &symsrv_id)?;
-        
+
+        // First, check if PDB exists in the same directory as the executable
+        let pdb_path = if let Some(parent_dir) = module_path.parent() {
+            let local_pdb_path = parent_dir.join(&pdb_identifier.name);
+            if local_pdb_path.exists() {
+                trace!(path = %local_pdb_path.display(), "Found PDB in same directory as executable");
+                local_pdb_path
+            } else {
+                // Fall back to symsrv download
+                self.internal_fetch_pdb(&pdb_identifier.name, &symsrv_id)?
+            }
+        } else {
+            // No parent directory, fall back to symsrv download
+            self.internal_fetch_pdb(&pdb_identifier.name, &symsrv_id)?
+        };
+
         // Parse the PDB file
-        let symbols = self.internal_parse_pdb_to_symbols(&downloaded_pdb_path)?;
-        
+        let symbols = self.internal_parse_pdb_to_symbols(&pdb_path)?;
+
         // Store the symbols
         self.loaded_modules.insert(module_path_str.to_string(), (module_base, module_size, symbols));
-        
+
         trace!(module_path = module_path_str, symbol_count = self.loaded_modules.get(module_path_str).unwrap().2.len(), "Successfully loaded symbols for module");
         Ok(())
     }

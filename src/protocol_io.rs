@@ -42,6 +42,7 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::ModuleExtraInfo { .. } => "ModuleExtraInfo".to_string(),
         DebuggerResponse::MemoryRegionInfo { .. } => "MemoryRegionInfo".to_string(),
         DebuggerResponse::MemoryRegionList { regions } => format!("MemoryRegionList ({} regions)", regions.len()),
+        DebuggerResponse::DereferenceResult { entries } => format!("DereferenceResult ({} entries)", entries.len()),
     };
     debug!("Received response: {}", summary);
     Ok(resp)
@@ -836,6 +837,28 @@ impl<S> DebugSession<S> {
             DebuggerResponse::MemoryRegionList { regions } => Ok(regions),
             DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to enumerate memory regions: {}", message)),
             other => Err(anyhow::anyhow!("Unexpected response to EnumerateMemoryRegions: {:?}", other)),
+        }
+    }
+
+    /// Dereference memory addresses, following pointer chains (telescope/dereference command).
+    ///
+    /// # Arguments
+    /// * `pid` - Process ID
+    /// * `address` - Starting address to dereference
+    /// * `count` - Number of consecutive pointer-sized slots to examine
+    /// * `reference_base` - Optional base address for offset calculation (defaults to `address`)
+    pub fn dereference(
+        &mut self,
+        pid: u32,
+        address: u64,
+        count: usize,
+        reference_base: Option<u64>,
+    ) -> anyhow::Result<Vec<crate::protocol::DereferenceEntry>> {
+        let req = DebuggerRequest::Dereference { pid, address, count, reference_base };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::DereferenceResult { entries } => Ok(entries),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to dereference: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to Dereference: {:?}", other)),
         }
     }
 } 

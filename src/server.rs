@@ -301,6 +301,13 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::Dereference { pid, address, count, reference_base } => {
+                let p = platform.read().unwrap();
+                match p.dereference(pid, address, count, reference_base) {
+                    Ok(entries) => DebuggerResponse::DereferenceResult { entries },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::TerminateProcess { pid } => { let _ = pid; unreachable!() }
             DebuggerRequest::Step { pid, tid, kind } => {
                 let mut p = platform.write().unwrap();
@@ -339,6 +346,10 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
             DebuggerResponse::MemoryRegionList { regions } => format!(
                 "MemoryRegionList {{ regions: [..{} regions] }}",
                 regions.len()
+            ),
+            DebuggerResponse::DereferenceResult { entries } => format!(
+                "DereferenceResult {{ entries: [..{} entries] }}",
+                entries.len()
             ),
             _ => format!("{:?}", resp),
         }, "Sending response");

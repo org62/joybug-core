@@ -13,6 +13,7 @@ mod stepper;
 mod debugged_process;
 mod module_extra;
 mod dbghelp;
+mod dereference;
 
 use crate::interfaces::{PlatformAPI, PlatformError, ModuleSymbol, ResolvedSymbol, SymbolError, Architecture, DisassemblerError, Instruction, DisassemblerProvider, Stepper};
 // no-op
@@ -405,6 +406,40 @@ impl PlatformAPI for WindowsPlatform {
 
     fn enumerate_memory_regions(&self, pid: u32) -> Result<Vec<crate::protocol::MemoryRegionInfo>, PlatformError> {
         memory::enumerate_memory_regions_unlocked(pid)
+    }
+
+    fn dereference(
+        &self,
+        pid: u32,
+        address: u64,
+        count: usize,
+        reference_base: Option<u64>,
+    ) -> Result<Vec<crate::protocol::DereferenceEntry>, PlatformError> {
+        // Determine architecture from process if available, otherwise use native
+        let arch = self.get_process(pid)
+            .map(|p| p.architecture())
+            .unwrap_or_else(|_| Architecture::from_native());
+
+        // Build symbol resolver for instruction operand symbolization
+        let modules = self.get_process(pid)
+            .map(|p| p.module_manager().list_modules())
+            .unwrap_or_default();
+        let symbol_manager = self.symbol_manager.as_ref();
+        let symbol_resolver = move |addr: u64| -> Option<crate::interfaces::SymbolInfo> {
+            if let Some(sm) = symbol_manager {
+                if let Ok(Some((module_path, symbol, offset))) = sm.resolve_address_to_symbol(&modules, addr) {
+                    let module_name = std::path::Path::new(&module_path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&module_path)
+                        .to_string();
+                    return Some(crate::interfaces::SymbolInfo { module_name, symbol_name: symbol.name, offset });
+                }
+            }
+            None
+        };
+
+        dereference::dereference(pid, address, count, reference_base, arch, Some(symbol_resolver))
     }
 }
 
