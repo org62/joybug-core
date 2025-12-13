@@ -1,15 +1,83 @@
 use crate::interfaces::{Architecture, PlatformError, SymbolInfo, symbolize_operands};
-use crate::protocol::{DereferenceEntry, DereferenceValue};
+use crate::protocol::{DereferenceEntry, DereferenceValue, MemoryRegionInfo};
 use std::collections::HashSet;
 
 /// Maximum depth for pointer chain traversal
 const MAX_CHAIN_DEPTH: usize = 8;
 
-/// Minimum address considered a valid pointer (below this is null guard page)
-const MIN_VALID_POINTER: u64 = 0x10000;
-
 /// Maximum string length to read
 const MAX_STRING_LEN: usize = 64;
+
+/// Windows memory state constants
+const MEM_COMMIT: u32 = 0x1000;
+
+/// Windows page protection constants
+const PAGE_NOACCESS: u32 = 0x01;
+const PAGE_GUARD: u32 = 0x100;
+
+/// Maximum valid user-mode address on x64 Windows
+const MAX_USER_MODE_ADDRESS: u64 = 0x00007FFFFFFFFFFF;
+
+/// Find the region containing the given address using binary search
+fn find_region(regions: &[MemoryRegionInfo], address: u64) -> Option<&MemoryRegionInfo> {
+    // Quick check: address must be within valid user-mode range
+    if address == 0 || address > MAX_USER_MODE_ADDRESS {
+        return None;
+    }
+
+    // Binary search for the region where base_address <= address
+    let idx = match regions.binary_search_by(|r| r.base_address.cmp(&address)) {
+        Ok(i) => i, // Exact match on base_address
+        Err(0) => return None, // Address is before all regions
+        Err(i) => i - 1, // Address is after regions[i-1].base_address
+    };
+
+    let region = &regions[idx];
+
+    // Check if address is within this region
+    if address >= region.base_address && address < region.base_address + region.region_size {
+        Some(region)
+    } else {
+        None
+    }
+}
+
+/// Check if an address is in a readable memory region
+fn is_readable(regions: &[MemoryRegionInfo], address: u64) -> bool {
+    let region = match find_region(regions, address) {
+        Some(r) => r,
+        None => return false,
+    };
+
+    // Must be committed memory
+    if region.state != MEM_COMMIT {
+        return false;
+    }
+
+    // Check protection - must not be NOACCESS or have GUARD flag
+    if region.protect == PAGE_NOACCESS || (region.protect & PAGE_GUARD) != 0 {
+        return false;
+    }
+
+    true
+}
+
+/// Check if an address is in an executable memory region
+fn is_executable(regions: &[MemoryRegionInfo], address: u64) -> bool {
+    let region = match find_region(regions, address) {
+        Some(r) => r,
+        None => return false,
+    };
+
+    // Must be committed memory
+    if region.state != MEM_COMMIT {
+        return false;
+    }
+
+    // Check for executable protection flags (PAGE_EXECUTE*)
+    // PAGE_EXECUTE = 0x10, PAGE_EXECUTE_READ = 0x20, PAGE_EXECUTE_READWRITE = 0x40, PAGE_EXECUTE_WRITECOPY = 0x80
+    (region.protect & 0xF0) != 0
+}
 
 /// Dereference memory starting at `address` for `count` consecutive pointer-sized slots.
 /// Returns a vector of DereferenceEntry, one for each slot examined.
@@ -31,13 +99,16 @@ where
     };
     let base = reference_base.unwrap_or(address);
 
+    // Query all memory regions once upfront
+    let regions = super::memory::enumerate_memory_regions_unlocked(pid)?;
+
     let mut entries = Vec::with_capacity(count);
 
     for i in 0..count {
         let slot_addr = address.wrapping_add((i * pointer_size) as u64);
         let offset = (slot_addr as i64).wrapping_sub(base as i64);
 
-        let chain = build_dereference_chain(pid, slot_addr, arch, &symbol_resolver)?;
+        let chain = build_dereference_chain(pid, slot_addr, arch, &symbol_resolver, &regions)?;
 
         entries.push(DereferenceEntry {
             address: slot_addr,
@@ -55,6 +126,7 @@ fn build_dereference_chain<F>(
     start_address: u64,
     arch: Architecture,
     symbol_resolver: &Option<F>,
+    regions: &[MemoryRegionInfo],
 ) -> Result<Vec<DereferenceValue>, PlatformError>
 where
     F: Fn(u64) -> Option<SymbolInfo>,
@@ -85,15 +157,13 @@ where
         };
 
         // Check if the value points to readable memory (i.e., is a valid pointer)
-        // A pointer is only a pointer if we can dereference it
-        let can_read_target = value >= MIN_VALID_POINTER
-            && read_pointer(pid, value, pointer_size).is_ok();
+        let can_read_target = is_readable(regions, value);
 
         if !can_read_target {
             // Not a dereferenceable pointer - check for string/instruction or output as Value
-            if let Some(s) = try_read_string(pid, value) {
+            if let Some(s) = try_read_string(pid, value, regions) {
                 chain.push(DereferenceValue::String(s));
-            } else if let Some(instr) = try_read_instruction(pid, value, arch, symbol_resolver) {
+            } else if let Some(instr) = try_read_instruction(pid, value, arch, symbol_resolver, regions) {
                 chain.push(DereferenceValue::Instruction(instr));
             } else {
                 chain.push(DereferenceValue::Value(value));
@@ -109,13 +179,13 @@ where
         chain.push(DereferenceValue::Pointer(value, symbol_str));
 
         // Check if the target is a string
-        if let Some(s) = try_read_string(pid, value) {
+        if let Some(s) = try_read_string(pid, value, regions) {
             chain.push(DereferenceValue::String(s));
             break;
         }
 
         // Check if the target is executable code
-        if let Some(instr) = try_read_instruction(pid, value, arch, symbol_resolver) {
+        if let Some(instr) = try_read_instruction(pid, value, arch, symbol_resolver, regions) {
             chain.push(DereferenceValue::Instruction(instr));
             break;
         }
@@ -144,7 +214,12 @@ fn read_pointer(pid: u32, address: u64, size: usize) -> Result<u64, PlatformErro
 }
 
 /// Try to read a string at the given address
-fn try_read_string(pid: u32, address: u64) -> Option<String> {
+fn try_read_string(pid: u32, address: u64, regions: &[MemoryRegionInfo]) -> Option<String> {
+    // Check if the address is in a readable memory region
+    if !is_readable(regions, address) {
+        return None;
+    }
+
     // First try ASCII string
     if let Some(s) = try_read_ascii_string(pid, address) {
         return Some(s);
@@ -231,17 +306,13 @@ fn try_read_instruction<F>(
     address: u64,
     arch: Architecture,
     symbol_resolver: &Option<F>,
+    regions: &[MemoryRegionInfo],
 ) -> Option<String>
 where
     F: Fn(u64) -> Option<SymbolInfo>,
 {
-    // Check if the memory is executable
-    let region = super::memory::query_memory_region_unlocked(pid, address).ok()?;
-
-    // Check for executable protection flags (PAGE_EXECUTE*)
-    // PAGE_EXECUTE = 0x10, PAGE_EXECUTE_READ = 0x20, PAGE_EXECUTE_READWRITE = 0x40, PAGE_EXECUTE_WRITECOPY = 0x80
-    let is_executable = (region.protect & 0xF0) != 0;
-    if !is_executable {
+    // Check if the address is in an executable memory region
+    if !is_executable(regions, address) {
         return None;
     }
 
