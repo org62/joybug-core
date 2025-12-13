@@ -242,24 +242,47 @@ impl SymbolManager {
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or(module_path);
-                
+
                 // Check if this is the target module (case-insensitive)
                 if module_name.to_lowercase() == target_module_name.to_lowercase() {
-                    // Find all matching symbols in this specific module
+                    // First pass: exact matches only (prioritize exact over partial)
                     for symbol in &module_symbols.symbols {
-                        if symbol.name.to_lowercase().contains(&target_symbol_name.to_lowercase()) {
+                        if symbol.name.to_lowercase() == target_symbol_name.to_lowercase() {
                             let symbol_name_with_module = format!("{}!{}", module_name, symbol.name);
-                            found_symbols.push(ResolvedSymbol { 
-                                name: symbol_name_with_module, 
+                            found_symbols.push(ResolvedSymbol {
+                                name: symbol_name_with_module,
                                 module_name: module_name.to_string(),
                                 rva: symbol.rva,
                                 va: module_symbols.module_base + symbol.rva as u64,
                             });
-                            
-                            // Stop if we've reached the maximum number of results
+
                             if found_symbols.len() >= max_results {
-                                trace!(symbol_name, found_count = found_symbols.len(), max_results, "Module-specific symbol search completed (max results reached)");
+                                trace!(symbol_name, found_count = found_symbols.len(), max_results, "Module-specific symbol search completed (exact match, max results reached)");
                                 return Ok(found_symbols);
+                            }
+                        }
+                    }
+
+                    // Second pass: contains matches (only if we need more results)
+                    if found_symbols.len() < max_results {
+                        for symbol in &module_symbols.symbols {
+                            // Skip exact matches (already added)
+                            if symbol.name.to_lowercase() == target_symbol_name.to_lowercase() {
+                                continue;
+                            }
+                            if symbol.name.to_lowercase().contains(&target_symbol_name.to_lowercase()) {
+                                let symbol_name_with_module = format!("{}!{}", module_name, symbol.name);
+                                found_symbols.push(ResolvedSymbol {
+                                    name: symbol_name_with_module,
+                                    module_name: module_name.to_string(),
+                                    rva: symbol.rva,
+                                    va: module_symbols.module_base + symbol.rva as u64,
+                                });
+
+                                if found_symbols.len() >= max_results {
+                                    trace!(symbol_name, found_count = found_symbols.len(), max_results, "Module-specific symbol search completed (contains match, max results reached)");
+                                    return Ok(found_symbols);
+                                }
                             }
                         }
                     }
