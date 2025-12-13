@@ -457,6 +457,57 @@ fn test_dereference_basic() {
             assert_eq!(entries[4].offset, 0x00, "Fifth entry offset should be 0x00");
             println!("✓ Custom reference base offsets are correct");
 
+            // =============================================
+            // TEST 10: Direct string address dereference
+            // Tests the fix for registers pointing directly to strings.
+            // When dereferencing a string ADDRESS (not a pointer TO a string),
+            // should return [String("...")] directly, not interpret string bytes as pointer.
+            // =============================================
+            println!("\n----- TEST 10: Direct string address dereference -----\n");
+
+            // First, get the string address from g_string_ptr
+            let string_symbols = session.find_symbols("dereference_test!g_string_ptr", 10)?;
+            let string_sym = string_symbols.iter().find(|s| s.name.contains("g_string_ptr"))
+                .expect("g_string_ptr symbol must be found");
+
+            let ptr_entries = session.dereference(pid, string_sym.va, 1, None)?;
+            let string_addr = match &ptr_entries[0].chain[0] {
+                DereferenceValue::Pointer(addr, _) => *addr,
+                other => panic!("Expected Pointer, got {:?}", other),
+            };
+            println!("String address (from g_string_ptr): {:#x}", string_addr);
+
+            // Now dereference the string address DIRECTLY
+            // This simulates a register containing a string address (like RBX = string_addr)
+            let entries = session.dereference(pid, string_addr, 1, None)?;
+            assert_eq!(entries.len(), 1);
+            println!("{}", format_entry(&entries[0]));
+
+            // Verify chain: should be just [String("Hello, Dereference!")]
+            // NOT [Value(garbage)] which would happen if string bytes were read as pointer
+            assert_eq!(
+                entries[0].chain.len(), 1,
+                "Direct string dereference should have exactly 1 element (String)"
+            );
+            match &entries[0].chain[0] {
+                DereferenceValue::String(s) => {
+                    assert!(
+                        s.contains("Hello, Dereference!"),
+                        "String should contain 'Hello, Dereference!', got: {}",
+                        s
+                    );
+                    println!("✓ Direct string address correctly returns String: {}", s);
+                }
+                DereferenceValue::Value(val) => {
+                    panic!(
+                        "BUG: String bytes were interpreted as pointer value {:#x}. \
+                        Expected String type for direct string address dereference.",
+                        val
+                    );
+                }
+                other => panic!("Expected String, got {:?}", other),
+            }
+
             session.state.dereference_tested = true;
 
             println!("\n========== ALL DEREFERENCE TESTS PASSED ==========\n");

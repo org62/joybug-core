@@ -139,6 +139,17 @@ where
     let mut visited = HashSet::new();
     let mut current_addr = start_address;
 
+    // Check if start_address itself contains recognizable data (string/instruction)
+    // before trying to read it as a pointer. This handles registers pointing directly
+    // to strings, where we want to show the string content, not interpret string bytes
+    // as a pointer value.
+    if let Some(s) = try_read_string(pid, start_address, regions) {
+        return Ok(vec![DereferenceValue::String(s)]);
+    }
+    if let Some(instr) = try_read_instruction(pid, start_address, arch, symbol_resolver, regions) {
+        return Ok(vec![DereferenceValue::Instruction(instr)]);
+    }
+
     for _depth in 0..MAX_CHAIN_DEPTH {
         // Check for loop
         if visited.contains(&current_addr) {
