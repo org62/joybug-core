@@ -840,7 +840,7 @@ dependencies = [
 [[package]]
 name = "pelite"
 version = "0.10.0"
-source = "git+https://github.com/expend20/pelite.git?branch=xdata#ef3734267d8fb67787bf7df383d67b052ec43f3b"
+source = "git+https://github.com/expend20/pelite.git?branch=eh_patching#127244e914781e86dac4cf23dcee6b56b338c87a"
 dependencies = [
  "dataview",
  "libc",
@@ -852,7 +852,7 @@ dependencies = [
 [[package]]
 name = "pelite-macros"
 version = "0.1.1"
-source = "git+https://github.com/expend20/pelite.git?branch=xdata#ef3734267d8fb67787bf7df383d67b052ec43f3b"
+source = "git+https://github.com/expend20/pelite.git?branch=eh_patching#127244e914781e86dac4cf23dcee6b56b338c87a"
 
 [[package]]
 name = "percent-encoding"
