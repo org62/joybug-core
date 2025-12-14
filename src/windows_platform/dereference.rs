@@ -158,11 +158,17 @@ where
         }
         visited.insert(current_addr);
 
+        // Check if address is readable before attempting to read
+        if !is_readable(regions, current_addr) {
+            // Address not in a readable region - end of chain
+            break;
+        }
+
         // Try to read the value at current address
         let value = match read_pointer(pid, current_addr, pointer_size) {
             Ok(v) => v,
             Err(_) => {
-                // Memory not readable - end of chain
+                // Memory read failed - end of chain
                 break;
             }
         };
