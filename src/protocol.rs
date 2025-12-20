@@ -19,7 +19,6 @@ pub mod request_response {
     }
 
     #[derive(Serialize, Deserialize, Debug, Clone)]
-    #[serde(tag = "type", content = "data")]
     pub enum DebuggerRequest {
         ListProcesses,
         ListModules {
@@ -140,10 +139,16 @@ pub mod request_response {
             count: usize,
             reference_base: Option<u64>,
         },
+        /// Disassemble a function with bounds detection using exception directory
+        DisassembleFunction {
+            pid: u32,
+            address: u64,
+            max_instructions: usize,
+            arch: crate::interfaces::Architecture,
+        },
     }
 
     #[derive(Serialize, Deserialize, Clone)]
-    #[serde(tag = "type", content = "data")]
     pub enum DebuggerResponse {
         Ack,
         Error { message: String },
@@ -166,6 +171,13 @@ pub mod request_response {
         },
         // Disassembly responses
         Instructions { instructions: Vec<crate::interfaces::Instruction> },
+        /// Function disassembly with bounds from exception directory
+        FunctionDisassembly {
+            instructions: Vec<crate::interfaces::Instruction>,
+            function_start: Option<u64>,
+            function_end: Option<u64>,
+            function_name: Option<String>,
+        },
         // Call stack responses
         CallStack { frames: Vec<crate::interfaces::CallFrame> },
         // Argument responses
@@ -179,7 +191,6 @@ pub mod request_response {
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
-    #[serde(tag = "event_type", content = "data")]
     pub enum DebugEvent {
         //ProcessStarted { pid: u32 },
         ProcessExited { pid: u32, exit_code: u32 },
@@ -343,8 +354,8 @@ pub mod request_response {
         Value(u64),
         /// Points to readable string
         String(String),
-        /// Points to executable code (mnemonic + operands)
-        Instruction(String),
+        /// Points to executable code (mnemonic + operands, optional symbol)
+        Instruction(String, Option<String>),
         /// Pointer loop back to earlier address in chain
         LoopDetected(u64),
     }

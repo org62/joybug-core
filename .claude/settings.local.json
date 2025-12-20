@@ -7,7 +7,11 @@
       "Bash(dumpbin /headers:*)",
       "Bash(dumpbin:*)",
       "Bash(findstr:*)",
-      "Bash(dir:*)"
+      "Bash(dir:*)",
+      "Bash(cargo doc:*)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:github.com)",
+      "Bash(cat:*)"
     ],
     "deny": [],
     "ask": []

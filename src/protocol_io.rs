@@ -43,6 +43,7 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::MemoryRegionInfo { .. } => "MemoryRegionInfo".to_string(),
         DebuggerResponse::MemoryRegionList { regions } => format!("MemoryRegionList ({} regions)", regions.len()),
         DebuggerResponse::DereferenceResult { entries } => format!("DereferenceResult ({} entries)", entries.len()),
+        DebuggerResponse::FunctionDisassembly { instructions, .. } => format!("FunctionDisassembly ({} instructions)", instructions.len()),
     };
     debug!("Received response: {}", summary);
     Ok(resp)
@@ -739,6 +740,37 @@ impl<S> DebugSession<S> {
             }
             other => Err(anyhow::anyhow!(
                 "Unexpected response to DisassembleMemory: {:?}",
+                other
+            )),
+        }
+    }
+
+    /// Disassemble a function with bounds detection using exception directory
+    pub fn disassemble_function(
+        &mut self,
+        pid: u32,
+        address: u64,
+        max_instructions: usize,
+        arch: Architecture,
+    ) -> anyhow::Result<(Vec<Instruction>, Option<u64>, Option<u64>, Option<String>)> {
+        let req = DebuggerRequest::DisassembleFunction {
+            pid,
+            address,
+            max_instructions,
+            arch,
+        };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::FunctionDisassembly {
+                instructions,
+                function_start,
+                function_end,
+                function_name,
+            } => Ok((instructions, function_start, function_end, function_name)),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to disassemble function: {}", message))
+            }
+            other => Err(anyhow::anyhow!(
+                "Unexpected response to DisassembleFunction: {:?}",
                 other
             )),
         }

@@ -5,7 +5,30 @@ use tracing::{info, error, debug};
 
 use std::future::{pending, Future};
 use std::net::TcpListener as StdTcpListener;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
+
+// Server-side timing stats
+static SERVER_RECV_US: AtomicU64 = AtomicU64::new(0);
+static SERVER_HANDLE_US: AtomicU64 = AtomicU64::new(0);
+static SERVER_SEND_US: AtomicU64 = AtomicU64::new(0);
+static SERVER_REQ_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn print_server_stats() {
+    let count = SERVER_REQ_COUNT.load(Ordering::Relaxed);
+    if count > 0 && count % 1000 == 0 {
+        let recv = SERVER_RECV_US.load(Ordering::Relaxed) as f64 / 1000.0;
+        let handle = SERVER_HANDLE_US.load(Ordering::Relaxed) as f64 / 1000.0;
+        let send = SERVER_SEND_US.load(Ordering::Relaxed) as f64 / 1000.0;
+        eprintln!("=== SERVER STATS after {} requests ===", count);
+        eprintln!("  Receive:  {:>8.2} ms", recv);
+        eprintln!("  Handle:   {:>8.2} ms", handle);
+        eprintln!("  Send:     {:>8.2} ms", send);
+        eprintln!("  Total:    {:>8.2} ms", recv + handle + send);
+        eprintln!("======================================");
+    }
+}
 
 #[cfg(windows)]
 type PlatformImpl = crate::windows_platform::WindowsPlatform;
@@ -17,6 +40,7 @@ const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9000";
 fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformImpl>>) {
     let mut framed_stream = FramedJsonStream::new(stream);
     loop {
+        let recv_start = Instant::now();
         let req: DebuggerRequest = match framed_stream.receive() {
             Ok(req) => req,
             Err(e) => {
@@ -30,7 +54,9 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                 break;
             }
         };
+        SERVER_RECV_US.fetch_add(recv_start.elapsed().as_micros() as u64, Ordering::Relaxed);
         debug!(?req, "Received request");
+        let handle_start = Instant::now();
 
         // Handle termination without taking the platform lock to avoid deadlock with WaitForDebugEvent
         if let DebuggerRequest::TerminateProcess { pid } = req {
@@ -308,6 +334,20 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::DisassembleFunction { pid, address, max_instructions, arch } => {
+                let p = platform.read().unwrap();
+                match p.disassemble_function(pid, address, max_instructions, arch) {
+                    Ok((instructions, function_start, function_end, function_name)) => {
+                        DebuggerResponse::FunctionDisassembly {
+                            instructions,
+                            function_start,
+                            function_end,
+                            function_name,
+                        }
+                    }
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::TerminateProcess { pid } => { let _ = pid; unreachable!() }
             DebuggerRequest::Step { pid, tid, kind } => {
                 let mut p = platform.write().unwrap();
@@ -322,6 +362,7 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                 }
             }
         };
+        SERVER_HANDLE_US.fetch_add(handle_start.elapsed().as_micros() as u64, Ordering::Relaxed);
         debug!(resp = %match &resp {
             DebuggerResponse::Event { event } => event.to_string(),
             DebuggerResponse::ThreadContext { context } => {
@@ -353,10 +394,14 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
             ),
             _ => format!("{:?}", resp),
         }, "Sending response");
+        let send_start = Instant::now();
         if let Err(e) = framed_stream.send(&resp) {
             error!(?e, "Failed to write response to socket");
             break;
         }
+        SERVER_SEND_US.fetch_add(send_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+        SERVER_REQ_COUNT.fetch_add(1, Ordering::Relaxed);
+        print_server_stats();
     }
 }
 

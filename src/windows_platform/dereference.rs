@@ -1,4 +1,4 @@
-use crate::interfaces::{Architecture, PlatformError, SymbolInfo, symbolize_operands};
+use crate::interfaces::{Architecture, PlatformError, SymbolInfo};
 use crate::protocol::{DereferenceEntry, DereferenceValue, MemoryRegionInfo};
 use std::collections::HashSet;
 
@@ -146,8 +146,8 @@ where
     if let Some(s) = try_read_string(pid, start_address, regions) {
         return Ok(vec![DereferenceValue::String(s)]);
     }
-    if let Some(instr) = try_read_instruction(pid, start_address, arch, symbol_resolver, regions) {
-        return Ok(vec![DereferenceValue::Instruction(instr)]);
+    if let Some((instr, symbol)) = try_read_instruction(pid, start_address, arch, symbol_resolver, regions) {
+        return Ok(vec![DereferenceValue::Instruction(instr, symbol)]);
     }
 
     for _depth in 0..MAX_CHAIN_DEPTH {
@@ -180,8 +180,8 @@ where
             // Not a dereferenceable pointer - check for string/instruction or output as Value
             if let Some(s) = try_read_string(pid, value, regions) {
                 chain.push(DereferenceValue::String(s));
-            } else if let Some(instr) = try_read_instruction(pid, value, arch, symbol_resolver, regions) {
-                chain.push(DereferenceValue::Instruction(instr));
+            } else if let Some((instr, symbol)) = try_read_instruction(pid, value, arch, symbol_resolver, regions) {
+                chain.push(DereferenceValue::Instruction(instr, symbol));
             } else {
                 chain.push(DereferenceValue::Value(value));
             }
@@ -202,8 +202,8 @@ where
         }
 
         // Check if the target is executable code
-        if let Some(instr) = try_read_instruction(pid, value, arch, symbol_resolver, regions) {
-            chain.push(DereferenceValue::Instruction(instr));
+        if let Some((instr, symbol)) = try_read_instruction(pid, value, arch, symbol_resolver, regions) {
+            chain.push(DereferenceValue::Instruction(instr, symbol));
             break;
         }
 
@@ -318,13 +318,14 @@ fn try_read_utf16_string(pid: u32, address: u64) -> Option<String> {
 }
 
 /// Try to disassemble an instruction at the given address
+/// Returns (disassembly_text, optional_symbol)
 fn try_read_instruction<F>(
     pid: u32,
     address: u64,
     arch: Architecture,
     symbol_resolver: &Option<F>,
     regions: &[MemoryRegionInfo],
-) -> Option<String>
+) -> Option<(String, Option<String>)>
 where
     F: Fn(u64) -> Option<SymbolInfo>,
 {
@@ -352,18 +353,32 @@ where
     let instructions = disasm.disassemble(arch, &data, address, 1).ok()?;
 
     if let Some(instr) = instructions.first() {
-        let raw_instr = if instr.op_str.is_empty() {
+        let mut op_str = instr.op_str.clone();
+
+        // Symbolize operand addresses using pre-extracted address list (no regex)
+        if let Some(resolver) = symbol_resolver {
+            for addr in &instr.addresses_to_symbolize {
+                if let Some(symbol) = resolver(*addr) {
+                    let hex_lower = format!("0x{:x}", addr);
+                    let hex_upper = format!("0x{:X}", addr);
+                    op_str = op_str.replace(&hex_lower, &symbol.format_symbol());
+                    op_str = op_str.replace(&hex_upper, &symbol.format_symbol());
+                }
+            }
+        }
+
+        // Resolve symbol for the instruction's address itself
+        let instr_symbol = symbol_resolver.as_ref().and_then(|resolver| {
+            resolver(address).map(|info| info.format_symbol())
+        });
+
+        let disasm_text = if op_str.is_empty() {
             instr.mnemonic.clone()
         } else {
-            format!("{} {}", instr.mnemonic, instr.op_str)
+            format!("{} {}", instr.mnemonic, op_str)
         };
 
-        // Symbolize operands if resolver is available
-        if let Some(resolver) = symbol_resolver {
-            Some(symbolize_operands(&raw_instr, resolver))
-        } else {
-            Some(raw_instr)
-        }
+        Some((disasm_text, instr_symbol))
     } else {
         None
     }

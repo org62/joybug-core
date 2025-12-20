@@ -342,21 +342,51 @@ impl PlatformAPI for WindowsPlatform {
     
     // Symbolized disassembly methods
     fn disassemble_memory(&self, pid: u32, address: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
+        use std::time::Instant;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::cell::Cell;
+
+        // Thread-local timing accumulators
+        thread_local! {
+            static MEMORY_READ_US: Cell<u64> = const { Cell::new(0) };
+            static MODULE_LIST_US: Cell<u64> = const { Cell::new(0) };
+            static DISASM_US: Cell<u64> = const { Cell::new(0) };
+            static SYMBOL_US: Cell<u64> = const { Cell::new(0) };
+            static CALL_COUNT: Cell<u64> = const { Cell::new(0) };
+            static SYMBOL_CALLS: Cell<u64> = const { Cell::new(0) };
+        }
+
         if self.disassembler.is_none() {
             return Err(DisassemblerError::CapstoneError("Disassembler not initialized".to_string()));
         }
 
+        // Time memory read
+        let t0 = Instant::now();
         let data = memory::read_memory_unlocked(pid, address, count * 16)
             .map_err(|e| DisassemblerError::InvalidData(format!("Failed to read memory: {}", e)))?;
+        let memory_time = t0.elapsed();
 
-        let modules = self.get_process(pid)
+        // Time module list fetch
+        let t1 = Instant::now();
+        let mut modules = self.get_process(pid)
             .map_err(|e| DisassemblerError::InvalidData(format!("Process not found: {}", e)))?
             .module_manager()
             .list_modules();
+        // Sort modules by base address for binary search
+        modules.sort_by_key(|m| m.base);
+        let module_time = t1.elapsed();
 
         let symbol_manager = self.symbol_manager.as_ref();
+
+        // Track symbol resolution time
+        let symbol_time_us = std::sync::Arc::new(AtomicU64::new(0));
+        let symbol_call_count = std::sync::Arc::new(AtomicU64::new(0));
+        let symbol_time_clone = symbol_time_us.clone();
+        let symbol_count_clone = symbol_call_count.clone();
+
         let symbol_resolver = move |addr: u64| -> Option<crate::interfaces::SymbolInfo> {
-            if let Some(symbol_manager) = symbol_manager {
+            let t = Instant::now();
+            let result = if let Some(symbol_manager) = symbol_manager {
                 if let Ok(Some((module_path, symbol, offset))) = symbol_manager.resolve_address_to_symbol(&modules, addr) {
                     let module_name = std::path::Path::new(&module_path)
                         .file_stem()
@@ -365,10 +395,42 @@ impl PlatformAPI for WindowsPlatform {
                         .to_string();
                     Some(crate::interfaces::SymbolInfo { module_name, symbol_name: symbol.name, offset })
                 } else { None }
-            } else { None }
+            } else { None };
+            symbol_time_clone.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+            symbol_count_clone.fetch_add(1, Ordering::Relaxed);
+            result
         };
 
-        self.disassembler.as_ref().unwrap().disassemble_with_symbols(arch, &data, address, count, symbol_resolver)
+        // Time disassembly
+        let t2 = Instant::now();
+        let result = self.disassembler.as_ref().unwrap().disassemble_with_symbols(arch, &data, address, count, symbol_resolver);
+        let disasm_time = t2.elapsed();
+
+        // Accumulate timing stats
+        MEMORY_READ_US.with(|c| c.set(c.get() + memory_time.as_micros() as u64));
+        MODULE_LIST_US.with(|c| c.set(c.get() + module_time.as_micros() as u64));
+        DISASM_US.with(|c| c.set(c.get() + disasm_time.as_micros() as u64));
+        SYMBOL_US.with(|c| c.set(c.get() + symbol_time_us.load(Ordering::Relaxed)));
+        SYMBOL_CALLS.with(|c| c.set(c.get() + symbol_call_count.load(Ordering::Relaxed)));
+        let call_count = CALL_COUNT.with(|c| { c.set(c.get() + 1); c.get() });
+
+        // Print stats every 1000 calls
+        if call_count % 1000 == 0 {
+            let mem_ms = MEMORY_READ_US.with(|c| c.get()) as f64 / 1000.0;
+            let mod_ms = MODULE_LIST_US.with(|c| c.get()) as f64 / 1000.0;
+            let dis_ms = DISASM_US.with(|c| c.get()) as f64 / 1000.0;
+            let sym_ms = SYMBOL_US.with(|c| c.get()) as f64 / 1000.0;
+            let sym_calls = SYMBOL_CALLS.with(|c| c.get());
+            println!("\n=== TIMING STATS after {} calls ===", call_count);
+            println!("  Memory read:    {:8.2} ms", mem_ms);
+            println!("  Module list:    {:8.2} ms", mod_ms);
+            println!("  Disassembly:    {:8.2} ms (includes symbol resolution)", dis_ms);
+            println!("  Symbol resolve: {:8.2} ms ({} calls, {:.3} ms/call avg)",
+                sym_ms, sym_calls, if sym_calls > 0 { sym_ms / sym_calls as f64 } else { 0.0 });
+            println!("=====================================\n");
+        }
+
+        result
     }
     
     fn get_call_stack(&self, pid: u32, tid: u32) -> Result<Vec<crate::interfaces::CallFrame>, PlatformError> {
@@ -415,15 +477,14 @@ impl PlatformAPI for WindowsPlatform {
         count: usize,
         reference_base: Option<u64>,
     ) -> Result<Vec<crate::protocol::DereferenceEntry>, PlatformError> {
-        // Determine architecture from process if available, otherwise use native
-        let arch = self.get_process(pid)
-            .map(|p| p.architecture())
-            .unwrap_or_else(|_| Architecture::from_native());
+        // Get process - required for module list and architecture
+        let process = self.get_process(pid)?;
+        let arch = process.architecture();
 
         // Build symbol resolver for instruction operand symbolization
-        let modules = self.get_process(pid)
-            .map(|p| p.module_manager().list_modules())
-            .unwrap_or_default();
+        let mut modules = process.module_manager().list_modules();
+        // Sort modules by base address for binary search in symbol resolution
+        modules.sort_by_key(|m| m.base);
         let symbol_manager = self.symbol_manager.as_ref();
         let symbol_resolver = move |addr: u64| -> Option<crate::interfaces::SymbolInfo> {
             if let Some(sm) = symbol_manager {
@@ -447,6 +508,124 @@ impl Stepper for WindowsPlatform {
     fn step(&mut self, pid: u32, tid: u32, kind: StepKind) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
         stepper::step(self, pid, tid, kind)
     }
-} 
+}
 
-impl WindowsPlatform {}
+impl WindowsPlatform {
+    /// Find function boundaries for an address using the exception directory (RuntimeFunction).
+    /// Returns (function_start_va, function_end_va, function_name) if found.
+    pub fn find_function_bounds(&self, pid: u32, address: u64) -> Result<Option<(u64, u64, Option<String>)>, PlatformError> {
+        let process = self.get_process(pid)?;
+        let modules = process.module_manager().list_modules();
+
+        // Find which module contains this address
+        let containing_module = modules.iter().find(|m| {
+            let end = m.base + m.size.unwrap_or(0);
+            address >= m.base && address < end
+        });
+
+        let module = match containing_module {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+
+        // Get module extra info (which contains runtime_functions)
+        let extra_info = match self.get_module_extra_info(pid, module.base) {
+            Ok(info) => info,
+            Err(_) => return Ok(None),
+        };
+
+        let runtime_functions = match &extra_info.runtime_functions {
+            Some(funcs) if !funcs.is_empty() => funcs,
+            _ => return Ok(None),
+        };
+
+        // Convert address to RVA
+        let rva = (address - module.base) as u32;
+
+        // Binary search for the function containing this RVA
+        let result = runtime_functions.binary_search_by(|rf| {
+            if rva < rf.BeginAddress {
+                std::cmp::Ordering::Greater
+            } else if rva >= rf.EndAddress {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+
+        match result {
+            Ok(idx) => {
+                let rf = &runtime_functions[idx];
+                let func_start = module.base + rf.BeginAddress as u64;
+                let func_end = module.base + rf.EndAddress as u64;
+
+                // Try to get function name from symbol
+                let func_name = if let Some(ref symbol_manager) = self.symbol_manager {
+                    symbol_manager
+                        .resolve_address_to_symbol_raw(&modules, func_start)
+                        .ok()
+                        .flatten()
+                        .map(|(module_path, symbol, _offset)| {
+                            let module_name = std::path::Path::new(&module_path)
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or(&module_path)
+                                .to_string();
+                            format!("{}!{}", module_name, symbol.name)
+                        })
+                } else {
+                    None
+                };
+
+                Ok(Some((func_start, func_end, func_name)))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Disassemble a function with bounds detection.
+    /// Returns (instructions, function_start, function_end, function_name).
+    pub fn disassemble_function(
+        &self,
+        pid: u32,
+        address: u64,
+        max_instructions: usize,
+        arch: Architecture,
+    ) -> Result<(Vec<Instruction>, Option<u64>, Option<u64>, Option<String>), crate::interfaces::DisassemblerError> {
+        // Try to find function bounds
+        let bounds = self.find_function_bounds(pid, address)
+            .ok()
+            .flatten();
+
+        let (disasm_start, disasm_count, func_start, func_end, func_name) = match bounds {
+            Some((start, end, name)) => {
+                // Calculate how many instructions we might need based on function size
+                // Assume average instruction size of ~2 bytes for a conservative estimate
+                // Don't cap by max_instructions here - we want the full function
+                let func_size = (end - start) as usize;
+                let estimated_count = (func_size / 2).max(1);
+                (start, estimated_count, Some(start), Some(end), name)
+            }
+            None => {
+                // No bounds found, just disassemble from the address with limit
+                (address, max_instructions, None, None, None)
+            }
+        };
+
+        // Disassemble the function
+        let instructions = self.disassemble_memory(pid, disasm_start, disasm_count, arch)?;
+
+        // If we have bounds, filter to only instructions within the function (no cap)
+        // If no bounds, use max_instructions as a safety limit
+        let filtered_instructions = if let (Some(start), Some(end)) = (func_start, func_end) {
+            instructions
+                .into_iter()
+                .filter(|i| i.address >= start && i.address < end)
+                .collect()
+        } else {
+            instructions.into_iter().take(max_instructions).collect()
+        };
+
+        Ok((filtered_instructions, func_start, func_end, func_name))
+    }
+}

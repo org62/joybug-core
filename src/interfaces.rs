@@ -1,6 +1,5 @@
 use thiserror::Error;
 use crate::protocol::{ModuleInfo, ProcessInfo, ThreadInfo};
-use regex;
 
 pub type Address = u64;
 
@@ -67,6 +66,11 @@ pub struct Instruction {
     pub size: usize,
     pub symbol_info: Option<SymbolInfo>,
     pub symbolized_op_str: Option<String>, // Operands with symbolized addresses
+    pub is_jump: bool,           // jmp, jcc instructions (conditional/unconditional jumps)
+    pub is_call: bool,           // call instruction
+    pub is_ret: bool,            // ret instruction
+    pub jump_target: Option<u64>, // Target address if resolvable (for jumps/calls)
+    pub addresses_to_symbolize: Vec<u64>, // Addresses extracted from operands for symbolization
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -177,12 +181,21 @@ pub trait DisassemblerProvider: Send + Sync {
         let mut instructions = self.disassemble(arch, data, address, count)?;
         for instruction in &mut instructions {
             instruction.symbol_info = symbol_resolver(instruction.address);
-            
-            // Also symbolize operands
-            if !instruction.op_str.is_empty() {
-                let symbolized_ops = symbolize_operands(&instruction.op_str, &symbol_resolver);
-                if symbolized_ops != instruction.op_str {
-                    instruction.symbolized_op_str = Some(symbolized_ops);
+
+            // Symbolize operand addresses using pre-extracted address list (no regex)
+            if !instruction.addresses_to_symbolize.is_empty() {
+                let mut op_str = instruction.op_str.clone();
+                for addr in &instruction.addresses_to_symbolize {
+                    if let Some(symbol) = symbol_resolver(*addr) {
+                        // Replace hex address with symbol name
+                        let hex_lower = format!("0x{:x}", addr);
+                        let hex_upper = format!("0x{:X}", addr);
+                        op_str = op_str.replace(&hex_lower, &symbol.format_symbol());
+                        op_str = op_str.replace(&hex_upper, &symbol.format_symbol());
+                    }
+                }
+                if op_str != instruction.op_str {
+                    instruction.symbolized_op_str = Some(op_str);
                 }
             }
         }
@@ -250,29 +263,3 @@ impl SymbolInfo {
         format!("{}!{}+0x{:x}", self.module_name, self.symbol_name, self.offset)
     }
 }
-
-/// Symbolizes addresses in instruction operands
-pub fn symbolize_operands<F>(op_str: &str, symbol_resolver: F) -> String
-where
-    F: Fn(u64) -> Option<SymbolInfo>,
-{
-    // Regex to find hexadecimal addresses in operands
-    // Matches patterns like 0x1234567890abcdef, 0x1234, etc.
-    let re = regex::Regex::new(r"0x([0-9a-fA-F]+)").unwrap();
-    
-    let result = re.replace_all(op_str, |caps: &regex::Captures| {
-        if let Ok(addr) = u64::from_str_radix(&caps[1], 16) {
-            // Only symbolize addresses that look like code addresses (not small constants)
-            if addr > 0x10000 {
-                if let Some(symbol_info) = symbol_resolver(addr) {
-                    return symbol_info.format_symbol();
-                }
-            }
-        }
-        caps[0].to_string() // Return original if no symbol found
-    });
-    
-    result.to_string()
-}
-
- 

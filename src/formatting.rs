@@ -91,6 +91,14 @@ impl std::fmt::Debug for DebuggerResponse {
             DebuggerResponse::DereferenceResult { entries } => f.debug_struct("DereferenceResult")
                 .field("count", &entries.len())
                 .finish(),
+            DebuggerResponse::FunctionDisassembly { instructions, function_start, function_end, function_name } => {
+                f.debug_struct("FunctionDisassembly")
+                    .field("instructions_count", &instructions.len())
+                    .field("function_start", &function_start.map(|a| format!("0x{:X}", a)))
+                    .field("function_end", &function_end.map(|a| format!("0x{:X}", a)))
+                    .field("function_name", function_name)
+                    .finish()
+            }
         }
     }
 }

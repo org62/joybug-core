@@ -92,7 +92,9 @@ impl SymbolManager {
                         Ok(()) => {
                             trace!(worker_id = i, module_path = %module_path, "Symbol loading completed successfully");
                             // Store in cache
-                            if let Ok(symbols) = provider.list_symbols(&module_path) {
+                            if let Ok(mut symbols) = provider.list_symbols(&module_path) {
+                                // Sort symbols by RVA for binary search
+                                symbols.sort_by_key(|s| s.rva);
                                 let mut cache = cache_clone.lock().unwrap();
                                 cache.insert(module_path.clone(), ModuleSymbols {
                                     module_base,
@@ -328,43 +330,43 @@ impl SymbolManager {
     /// This method works directly with RVAs since symbols are stored as RVAs
     pub fn resolve_rva_to_symbol(&self, module_path: &str, rva: u32) -> Result<Option<ResolvedSymbol>, SymbolError> {
         self.wait_for_loading(module_path)?;
-        
+
         let cache = self.symbol_cache.lock().unwrap();
         if let Some(module_symbols) = cache.get(module_path) {
-            // Find the symbol with the highest RVA that is still <= the target RVA
-            let mut best_match: Option<&ModuleSymbol> = None;
-            for symbol in &module_symbols.symbols {
-                if symbol.rva <= rva && (best_match.is_none() || symbol.rva > best_match.unwrap().rva) {
-                    best_match = Some(symbol);
-                }
+            // Binary search: find the rightmost symbol with rva <= target rva
+            // Symbols are sorted by RVA
+            let symbols = &module_symbols.symbols;
+            if symbols.is_empty() {
+                return Ok(None);
             }
-            
-            match best_match {
-                Some(symbol) => {
-                    // Extract module name from path
-                    let module_name = std::path::Path::new(module_path)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(module_path)
-                        .to_string();
-                        
-                    // Calculate VA for the returned symbol
-                    let symbol_with_va = ResolvedSymbol {
-                        name: symbol.name.clone(),
-                        module_name,
-                        rva: symbol.rva,
-                        va: module_symbols.module_base + symbol.rva as u64,
-                    };
-                    
-                    // too much logging
-                    //trace!(module_path, rva = format!("0x{:X}", rva), symbol_name = %symbol.name, symbol_rva = format!("0x{:X}", symbol.rva), symbol_va = format!("0x{:X}", symbol_with_va.va), offset = rva - symbol.rva, "RVA resolved to symbol");
-                    Ok(Some(symbol_with_va))
-                }
-                None => {
-                    trace!(module_path, rva = format!("0x{:X}", rva), "No symbol found for RVA");
-                    Ok(None)
-                }
+
+            // Find insertion point - first symbol with rva > target
+            let idx = symbols.partition_point(|s| s.rva <= rva);
+
+            if idx == 0 {
+                // No symbol with rva <= target
+                return Ok(None);
             }
+
+            // The symbol at idx-1 is the best match (highest rva <= target)
+            let symbol = &symbols[idx - 1];
+
+            // Extract module name from path
+            let module_name = std::path::Path::new(module_path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(module_path)
+                .to_string();
+
+            // Calculate VA for the returned symbol
+            let symbol_with_va = ResolvedSymbol {
+                name: symbol.name.clone(),
+                module_name,
+                rva: symbol.rva,
+                va: module_symbols.module_base + symbol.rva as u64,
+            };
+
+            Ok(Some(symbol_with_va))
         } else {
             trace!(module_path, rva = format!("0x{:X}", rva), "No symbols loaded for module");
             Ok(None)
@@ -374,16 +376,14 @@ impl SymbolManager {
     /// Resolve an absolute address to a symbol by finding the appropriate module
     /// This is the new implementation that properly uses RVA-based symbol storage
     pub fn resolve_address_to_symbol(&self, modules: &[ModuleInfo], address: u64) -> Result<Option<(String, ResolvedSymbol, u64)>, SymbolError> {
-        // Find the module that contains this address
-        let containing_module = modules.iter().find(|module| {
-            let module_end = module.base + module.size.unwrap_or(0);
-            address >= module.base && address < module_end
-        });
+        // Use binary search to find the module containing this address
+        // Assumes modules are sorted by base address (they typically are from the OS)
+        let containing_module = Self::find_module_binary_search(modules, address);
 
         if let Some(module) = containing_module {
             // Calculate the RVA (Relative Virtual Address) from the module base
             let rva = (address - module.base) as u32;
-            
+
             // Use the RVA-based symbol resolution
             match self.resolve_rva_to_symbol(&module.name, rva)? {
                 Some(symbol) => {
@@ -401,6 +401,31 @@ impl SymbolManager {
             }
         } else {
             Ok(None)
+        }
+    }
+
+    /// Binary search to find the module containing an address
+    /// Much faster than linear scan for large module lists
+    fn find_module_binary_search(modules: &[ModuleInfo], address: u64) -> Option<&ModuleInfo> {
+        if modules.is_empty() {
+            return None;
+        }
+
+        // Binary search: find the rightmost module with base <= address
+        let idx = modules.partition_point(|m| m.base <= address);
+
+        if idx == 0 {
+            // Address is before all modules
+            return None;
+        }
+
+        // Check if the module at idx-1 contains the address
+        let module = &modules[idx - 1];
+        let module_end = module.base + module.size.unwrap_or(0);
+        if address >= module.base && address < module_end {
+            Some(module)
+        } else {
+            None
         }
     }
     
