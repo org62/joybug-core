@@ -35,7 +35,7 @@ fn format_entry(entry: &DereferenceEntry) -> String {
             DereferenceValue::String(s) => {
                 result.push_str(s);
             }
-            DereferenceValue::Instruction(instr) => {
+            DereferenceValue::Instruction(instr, _) => {
                 result.push_str(&format!("<{}>", instr));
             }
             DereferenceValue::LoopDetected(addr) => {
@@ -290,7 +290,7 @@ fn test_dereference_basic() {
                 other => panic!("First element should be Pointer, got {:?}", other),
             }
             match &entries[0].chain[1] {
-                DereferenceValue::Instruction(instr) => {
+                DereferenceValue::Instruction(instr, _) => {
                     println!("✓ g_main_ptr correctly dereferences to instruction: <{}>", instr);
                 }
                 other => panic!("Second element should be Instruction (disassembly of main), got {:?}", other),
