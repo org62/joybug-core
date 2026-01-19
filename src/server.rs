@@ -361,6 +361,22 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                     }},
                 }
             }
+            // Emulator handlers (one-shot)
+            DebuggerRequest::EmulateInstructions { pid, tid, max_instructions, mode } => {
+                let p = platform.read().unwrap();
+                match p.emulate_with_mode(pid, tid, max_instructions, mode) {
+                    Ok(result) => DebuggerResponse::EmulationResult {
+                        final_pc: result.final_pc,
+                        instructions_executed: result.instructions_executed,
+                        stop_reason: format!("{}", result.stop_reason),
+                        emulation_time_us: result.emulation_time_us,
+                        pages_loaded: result.pages_loaded,
+                        basic_blocks: result.basic_blocks,
+                        instruction_trace: result.instruction_trace,
+                    },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
         };
         SERVER_HANDLE_US.fetch_add(handle_start.elapsed().as_micros() as u64, Ordering::Relaxed);
         debug!(resp = %match &resp {

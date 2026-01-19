@@ -256,6 +256,11 @@ pub trait PlatformAPI: Send + Sync {
         count: usize,
         reference_base: Option<u64>,
     ) -> Result<Vec<crate::protocol::DereferenceEntry>, PlatformError>;
+
+    // Thread Environment Block (TEB) address - used for emulator GS segment setup
+    fn get_teb_address(&self, _pid: u32, _tid: u32) -> Result<u64, PlatformError> {
+        Err(PlatformError::NotImplemented)
+    }
 }
 
 impl SymbolInfo {

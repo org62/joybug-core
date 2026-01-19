@@ -6,6 +6,7 @@ pub mod pe_types;
 pub mod windows_platform;
 pub mod server;
 pub mod framed_json_stream;
+pub mod emulator;
 
 #[cfg(windows)]
 pub type PlatformImpl = windows_platform::WindowsPlatform;

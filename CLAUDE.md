@@ -39,7 +39,8 @@ WindowsPlatform (windows_platform/mod.rs)
 ├── Module/Thread tracking (module_manager.rs, thread_manager.rs)
 ├── Symbol resolution (symbol_manager.rs, symbol_provider.rs)
 ├── Disassembly (disassembler.rs) - Capstone x64/ARM64
-└── Stepping (stepper.rs) - Trap Flag/breakpoint based
+├── Stepping (stepper.rs) - Trap Flag/breakpoint based
+└── Emulator (emulator/) - Unicorn-based CPU emulation
 ```
 
 **Key patterns:**
@@ -63,5 +64,10 @@ Integration tests in `tests/` use compiled C programs from `tests/test_programs/
 - `protocol.rs` - All request/response/event types
 - `windows_platform/mod.rs` - Main WindowsPlatform implementation
 - `windows_platform/stepper.rs` - Step In/Over/Out implementation
+- `emulator/mod.rs` - Unicorn CPU emulator for forward execution
 - `callstack_proposal.md` - Design doc for call stack feature
 - `docs/stepping/` - Stepping algorithm analysis
+
+## Feature Documentation
+
+- [Emulator Feature](.claude/tasks/EMU.md) - CPU emulation with Unicorn engine

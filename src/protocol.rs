@@ -18,6 +18,22 @@ pub mod request_response {
         Stop,
     }
 
+    /// Emulation mode determines which hooks are installed during emulation
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum EmulationMode {
+        /// Run N instructions with no per-instruction hooks (fastest)
+        #[default]
+        Basic,
+        /// Record every instruction (address, size) - CODE hook overhead
+        InstructionTrace,
+        /// Collect basic block addresses - efficient BLOCK hook
+        BasicBlock,
+        /// Stop when execution moves to different module
+        ModuleTransition,
+        /// Stop on first syscall
+        Syscall,
+    }
+
     #[derive(Serialize, Deserialize, Debug, Clone)]
     pub enum DebuggerRequest {
         ListProcesses,
@@ -146,6 +162,15 @@ pub mod request_response {
             max_instructions: usize,
             arch: crate::interfaces::Architecture,
         },
+        // Emulator requests (one-shot: create, emulate, destroy in single call)
+        /// Emulate N instructions from current debugger state
+        EmulateInstructions {
+            pid: u32,
+            tid: u32,
+            max_instructions: usize,
+            #[serde(default)]
+            mode: EmulationMode,
+        },
     }
 
     #[derive(Serialize, Deserialize, Clone)]
@@ -188,6 +213,20 @@ pub mod request_response {
         MemoryRegionInfo { info: MemoryRegionInfo },
         MemoryRegionList { regions: Vec<MemoryRegionInfo> },
         DereferenceResult { entries: Vec<DereferenceEntry> },
+        // Emulator responses
+        EmulationResult {
+            final_pc: u64,
+            instructions_executed: usize,
+            stop_reason: String,
+            /// Time taken for emulation in microseconds
+            emulation_time_us: u64,
+            /// Number of pages loaded during emulation
+            pages_loaded: usize,
+            basic_blocks: Vec<u64>,
+            /// Instruction trace: (address, size) pairs, only populated if mode=InstructionTrace
+            #[serde(default)]
+            instruction_trace: Vec<(u64, usize)>,
+        },
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone)]

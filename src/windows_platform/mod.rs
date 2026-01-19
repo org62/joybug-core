@@ -18,6 +18,7 @@ mod dereference;
 use crate::interfaces::{PlatformAPI, PlatformError, ModuleSymbol, ResolvedSymbol, SymbolError, Architecture, DisassemblerError, Instruction, DisassemblerProvider, Stepper};
 // no-op
 use crate::protocol::{ModuleInfo, ProcessInfo, ThreadInfo, StepKind};
+use crate::emulator::{Emulator, EmulationResult};
 use symbol_manager::SymbolManager;
 use disassembler::CapstoneDisassembler;
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
@@ -66,7 +67,7 @@ impl WindowsPlatform {
     pub fn new() -> Self {
         let symbol_manager = SymbolManager::new().ok(); // Log error but don't fail initialization
         let disassembler = CapstoneDisassembler::new().ok(); // Log error but don't fail initialization
-        Self { 
+        Self {
             processes: HashMap::new(),
             symbol_manager,
             disassembler,
@@ -129,6 +130,71 @@ impl WindowsPlatform {
             (removed_over, removed_out)
         } else {
             (0, 0)
+        }
+    }
+
+    // ==================== Emulator Methods (One-Shot) ====================
+    // Note: Emulators are created, used, and destroyed in a single call
+    // because Unicorn is not Send+Sync and can't be stored across threads.
+
+    /// Emulate with a specific mode (one-shot)
+    pub fn emulate_with_mode(&self, pid: u32, tid: u32, max_instructions: usize, mode: crate::protocol::EmulationMode) -> Result<EmulationResult, PlatformError> {
+        let mut emulator = Emulator::from_debugger_state(self, pid, tid)
+            .map_err(|e| PlatformError::Other(e.to_string()))?;
+
+        emulator.emulate_with_mode(self, max_instructions, mode)
+            .map_err(|e| PlatformError::Other(e.to_string()))
+    }
+
+    /// Get the TEB (Thread Environment Block) address for a thread
+    pub fn get_teb_address(&self, pid: u32, tid: u32) -> Result<u64, PlatformError> {
+        let process = self.get_process(pid)?;
+        let thread_handle = process.thread_manager().get_thread_handle(tid)
+            .ok_or_else(|| PlatformError::Other(format!("Thread {} not found", tid)))?;
+
+        // Use NtQueryInformationThread to get THREAD_BASIC_INFORMATION
+        #[repr(C)]
+        struct ThreadBasicInformation {
+            exit_status: i32,
+            teb_base_address: *mut std::ffi::c_void,
+            client_id_unique_process: usize,
+            client_id_unique_thread: usize,
+            affinity_mask: usize,
+            priority: i32,
+            base_priority: i32,
+        }
+
+        // Link to ntdll
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtQueryInformationThread(
+                thread_handle: HANDLE,
+                thread_information_class: u32,
+                thread_information: *mut std::ffi::c_void,
+                thread_information_length: u32,
+                return_length: *mut u32,
+            ) -> i32;
+        }
+
+        const THREAD_BASIC_INFORMATION: u32 = 0;
+
+        let mut info: ThreadBasicInformation = unsafe { std::mem::zeroed() };
+        let mut return_length: u32 = 0;
+
+        let status = unsafe {
+            NtQueryInformationThread(
+                thread_handle,
+                THREAD_BASIC_INFORMATION,
+                &mut info as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of::<ThreadBasicInformation>() as u32,
+                &mut return_length,
+            )
+        };
+
+        if status >= 0 {
+            Ok(info.teb_base_address as u64)
+        } else {
+            Err(PlatformError::Other(format!("NtQueryInformationThread failed: 0x{:08X}", status)))
         }
     }
 }
@@ -501,6 +567,11 @@ impl PlatformAPI for WindowsPlatform {
         };
 
         dereference::dereference(pid, address, count, reference_base, arch, Some(symbol_resolver))
+    }
+
+    fn get_teb_address(&self, pid: u32, tid: u32) -> Result<u64, PlatformError> {
+        // Call the method we defined on WindowsPlatform
+        WindowsPlatform::get_teb_address(self, pid, tid)
     }
 }
 
