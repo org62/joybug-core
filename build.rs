@@ -64,7 +64,6 @@ fn compile_test_program(manifest_dir: &str, out_dir: &str, name: &str, fixed_bas
     match cmd.output() {
         Ok(output) => {
             if output.status.success() {
-                println!("cargo:warning=Successfully compiled {}.exe with MSVC", name);
                 true
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
