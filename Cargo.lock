@@ -726,6 +726,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "capstone",
+ "cc",
  "dirs 5.0.1",
  "msvc-demangler",
  "pdb",

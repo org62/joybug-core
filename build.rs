@@ -1,6 +1,5 @@
 use std::env;
 use std::path::Path;
-use std::process::Command;
 
 /// Compile a test program with MSVC
 /// Returns true if compilation succeeded, false if skipped (cl.exe not available)
@@ -28,24 +27,31 @@ fn compile_test_program(manifest_dir: &str, out_dir: &str, name: &str) -> bool {
     let _ = std::fs::remove_file(&out_pdb);
     let _ = std::fs::remove_file(&out_obj);
 
-    // Compile with MSVC (cl.exe)
-    // This requires running from a Visual Studio Developer Command Prompt
-    // or having vcvars64.bat sourced
-    let cl_result = Command::new("cl.exe")
-        .args(&[
-            "/Od",                                      // Disable optimization
-            "/Zi",                                      // Generate debug info
-            "/W4",                                      // Warning level 4
-            &format!("/Fe:{}", out_exe.to_str().unwrap()),  // Output executable
-            &format!("/Fd:{}", out_pdb.to_str().unwrap()),  // PDB file
-            &format!("/Fo:{}", out_obj.to_str().unwrap()),  // Object file output
-            test_program_src.to_str().unwrap(),
-            "/link",
-            "/DEBUG",                                   // Generate debug info for linker
-        ])
-        .output();
+    // Use cc crate to find the MSVC compiler via registry/VS installation paths
+    // This works without requiring vcvarsall or Developer Command Prompt
+    let compiler = match cc::Build::new().try_get_compiler() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("cargo:warning=Could not find MSVC compiler: {}", e);
+            return false;
+        }
+    };
 
-    match cl_result {
+    // Use the compiler's command with proper environment variables set
+    let mut cmd = compiler.to_command();
+    cmd.args(&[
+        "/Od",                                              // Disable optimization
+        "/Zi",                                              // Generate debug info
+        "/W4",                                              // Warning level 4
+        &format!("/Fe:{}", out_exe.to_str().unwrap()),      // Output executable
+        &format!("/Fd:{}", out_pdb.to_str().unwrap()),      // PDB file
+        &format!("/Fo:{}", out_obj.to_str().unwrap()),      // Object file output
+        test_program_src.to_str().unwrap(),
+        "/link",
+        "/DEBUG",                                           // Generate debug info for linker
+    ]);
+
+    match cmd.output() {
         Ok(output) => {
             if output.status.success() {
                 println!("cargo:warning=Successfully compiled {}.exe with MSVC", name);
@@ -60,11 +66,10 @@ fn compile_test_program(manifest_dir: &str, out_dir: &str, name: &str) -> bool {
                 false
             }
         }
-        Err(_) => {
+        Err(e) => {
             println!(
-                "cargo:warning=cl.exe not found in PATH - skipping {} compilation. \
-                Run from Visual Studio Developer Command Prompt to compile test programs.",
-                name
+                "cargo:warning=Failed to run MSVC compiler: {}",
+                e
             );
             false
         }
