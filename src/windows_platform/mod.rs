@@ -14,6 +14,7 @@ mod debugged_process;
 mod module_extra;
 mod dbghelp;
 mod dereference;
+mod tracer;
 
 use crate::interfaces::{PlatformAPI, PlatformError, ModuleSymbol, ResolvedSymbol, SymbolError, Architecture, DisassemblerError, Instruction, DisassemblerProvider, Stepper};
 // no-op
@@ -144,6 +145,18 @@ impl WindowsPlatform {
 
         emulator.emulate_with_mode(self, max_instructions, mode)
             .map_err(|e| PlatformError::Other(e.to_string()))
+    }
+
+    /// Trace instructions using trap flag, capturing register state at each step
+    pub fn trace_instructions(
+        &mut self,
+        pid: u32,
+        tid: u32,
+        exit_condition: crate::protocol::TraceExitCondition,
+        max_instructions: usize,
+    ) -> Result<(Vec<crate::protocol::TraceEntry>, String, u64), PlatformError> {
+        let result = tracer::trace_instructions(self, pid, tid, exit_condition, max_instructions)?;
+        Ok((result.entries, result.stop_reason, result.trace_time_us))
     }
 
     /// Get the TEB (Thread Environment Block) address for a thread

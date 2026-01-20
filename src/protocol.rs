@@ -12,6 +12,73 @@ pub mod request_response {
         Out,
     }
 
+    /// Register snapshot for x64 - captures all general-purpose registers
+    #[derive(Debug, Serialize, Deserialize, Clone, Default)]
+    pub struct RegisterSnapshot {
+        pub rax: u64,
+        pub rbx: u64,
+        pub rcx: u64,
+        pub rdx: u64,
+        pub rsi: u64,
+        pub rdi: u64,
+        pub rbp: u64,
+        pub rsp: u64,
+        pub r8: u64,
+        pub r9: u64,
+        pub r10: u64,
+        pub r11: u64,
+        pub r12: u64,
+        pub r13: u64,
+        pub r14: u64,
+        pub r15: u64,
+        pub rip: u64,
+        pub rflags: u64,
+    }
+
+    impl RegisterSnapshot {
+        /// Create from Windows CONTEXT (x64)
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        pub fn from_context(ctx: &super::CONTEXT) -> Self {
+            Self {
+                rax: ctx.Rax,
+                rbx: ctx.Rbx,
+                rcx: ctx.Rcx,
+                rdx: ctx.Rdx,
+                rsi: ctx.Rsi,
+                rdi: ctx.Rdi,
+                rbp: ctx.Rbp,
+                rsp: ctx.Rsp,
+                r8: ctx.R8,
+                r9: ctx.R9,
+                r10: ctx.R10,
+                r11: ctx.R11,
+                r12: ctx.R12,
+                r13: ctx.R13,
+                r14: ctx.R14,
+                r15: ctx.R15,
+                rip: ctx.Rip,
+                rflags: ctx.EFlags as u64,
+            }
+        }
+    }
+
+    /// Instruction trace entry - address, size, and register state
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct TraceEntry {
+        pub address: u64,
+        pub size: usize,
+        pub registers: RegisterSnapshot,
+    }
+
+    /// Exit condition for instruction tracing
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub enum TraceExitCondition {
+        /// Stop when execution reaches this address
+        ReachAddress(u64),
+        /// Stop after executing this many instructions
+        InstructionLimit(usize),
+    }
+
     #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
     pub enum StepAction {
         Continue(StepKind),
@@ -171,6 +238,13 @@ pub mod request_response {
             #[serde(default)]
             mode: EmulationMode,
         },
+        /// Trace instructions using trap flag, capturing register state at each step
+        TraceInstructions {
+            pid: u32,
+            tid: u32,
+            exit_condition: TraceExitCondition,
+            max_instructions: usize,
+        },
     }
 
     #[derive(Serialize, Deserialize, Clone)]
@@ -226,6 +300,15 @@ pub mod request_response {
             /// Instruction trace: (address, size) pairs, only populated if mode=InstructionTrace
             #[serde(default)]
             instruction_trace: Vec<(u64, usize)>,
+            /// Register trace: full register state at each step, only populated if mode=InstructionTrace
+            #[serde(default)]
+            register_trace: Vec<RegisterSnapshot>,
+        },
+        /// Trap-flag based instruction trace result
+        InstructionTrace {
+            entries: Vec<TraceEntry>,
+            stop_reason: String,
+            trace_time_us: u64,
         },
     }
 

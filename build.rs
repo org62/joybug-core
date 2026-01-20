@@ -60,10 +60,11 @@ fn compile_test_program(manifest_dir: &str, out_dir: &str, name: &str) -> bool {
                 false
             }
         }
-        Err(e) => {
+        Err(_) => {
             println!(
-                "cargo:warning=Could not run cl.exe for {}: {}. Test programs will not be available.",
-                name, e
+                "cargo:warning=cl.exe not found in PATH - skipping {} compilation. \
+                Run from Visual Studio Developer Command Prompt to compile test programs.",
+                name
             );
             false
         }
@@ -80,5 +81,6 @@ fn main() {
         // Compile all test programs (failures are warnings, not errors)
         let _ = compile_test_program(&manifest_dir, &out_dir, "dereference_test");
         let _ = compile_test_program(&manifest_dir, &out_dir, "disassembly_test");
+        let _ = compile_test_program(&manifest_dir, &out_dir, "xtea_test");
     }
 }

@@ -373,6 +373,19 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                         pages_loaded: result.pages_loaded,
                         basic_blocks: result.basic_blocks,
                         instruction_trace: result.instruction_trace,
+                        register_trace: result.register_trace,
+                    },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            // Trap-flag based instruction tracer
+            DebuggerRequest::TraceInstructions { pid, tid, exit_condition, max_instructions } => {
+                let mut p = platform.write().unwrap();
+                match p.trace_instructions(pid, tid, exit_condition, max_instructions) {
+                    Ok((entries, stop_reason, trace_time_us)) => DebuggerResponse::InstructionTrace {
+                        entries,
+                        stop_reason,
+                        trace_time_us,
                     },
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }

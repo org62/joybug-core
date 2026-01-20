@@ -99,7 +99,7 @@ impl std::fmt::Debug for DebuggerResponse {
                     .field("function_name", function_name)
                     .finish()
             }
-            DebuggerResponse::EmulationResult { final_pc, instructions_executed, stop_reason, emulation_time_us, pages_loaded, basic_blocks, instruction_trace } => {
+            DebuggerResponse::EmulationResult { final_pc, instructions_executed, stop_reason, emulation_time_us, pages_loaded, basic_blocks, instruction_trace, register_trace } => {
                 f.debug_struct("EmulationResult")
                     .field("final_pc", &format_args!("0x{:X}", final_pc))
                     .field("instructions_executed", instructions_executed)
@@ -108,6 +108,14 @@ impl std::fmt::Debug for DebuggerResponse {
                     .field("pages_loaded", pages_loaded)
                     .field("basic_blocks_count", &basic_blocks.len())
                     .field("instruction_trace_count", &instruction_trace.len())
+                    .field("register_trace_count", &register_trace.len())
+                    .finish()
+            }
+            DebuggerResponse::InstructionTrace { entries, stop_reason, trace_time_us } => {
+                f.debug_struct("InstructionTrace")
+                    .field("entries_count", &entries.len())
+                    .field("stop_reason", stop_reason)
+                    .field("trace_time_us", trace_time_us)
                     .finish()
             }
         }

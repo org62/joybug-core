@@ -59,6 +59,7 @@ fn test_mode_basic(
             pages_loaded,
             basic_blocks,
             instruction_trace,
+            ..
         } => {
             println!("  Final PC: 0x{:016X}", final_pc);
             println!("  Instructions executed: {}", instructions_executed);

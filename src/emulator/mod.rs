@@ -20,7 +20,7 @@ use windows_sys::Win32::System::Memory::{
 };
 
 use crate::interfaces::{Architecture, PlatformAPI};
-use crate::protocol::{ThreadContext, EmulationMode};
+use crate::protocol::{ThreadContext, EmulationMode, RegisterSnapshot};
 
 mod error;
 mod registers;
@@ -60,6 +60,8 @@ pub struct EmulationResult {
     pub basic_blocks: Vec<u64>,
     /// Instruction trace: (address, size) pairs
     pub instruction_trace: Vec<(u64, usize)>,
+    /// Register trace: full register state at each step (only populated in InstructionTrace mode)
+    pub register_trace: Vec<RegisterSnapshot>,
 }
 
 /// Why emulation stopped
@@ -114,6 +116,31 @@ fn format_symbol_with_offset(sym: ModuleSymbol, offset: u64) -> String {
     }
 }
 
+/// Create RegisterSnapshot from Unicorn x64 emulator state
+#[cfg(target_arch = "x86_64")]
+fn snapshot_from_unicorn<D>(emu: &Unicorn<'_, D>, rip: u64) -> RegisterSnapshot {
+    RegisterSnapshot {
+        rax: emu.reg_read(RegisterX86::RAX).unwrap_or(0),
+        rbx: emu.reg_read(RegisterX86::RBX).unwrap_or(0),
+        rcx: emu.reg_read(RegisterX86::RCX).unwrap_or(0),
+        rdx: emu.reg_read(RegisterX86::RDX).unwrap_or(0),
+        rsi: emu.reg_read(RegisterX86::RSI).unwrap_or(0),
+        rdi: emu.reg_read(RegisterX86::RDI).unwrap_or(0),
+        rbp: emu.reg_read(RegisterX86::RBP).unwrap_or(0),
+        rsp: emu.reg_read(RegisterX86::RSP).unwrap_or(0),
+        r8: emu.reg_read(RegisterX86::R8).unwrap_or(0),
+        r9: emu.reg_read(RegisterX86::R9).unwrap_or(0),
+        r10: emu.reg_read(RegisterX86::R10).unwrap_or(0),
+        r11: emu.reg_read(RegisterX86::R11).unwrap_or(0),
+        r12: emu.reg_read(RegisterX86::R12).unwrap_or(0),
+        r13: emu.reg_read(RegisterX86::R13).unwrap_or(0),
+        r14: emu.reg_read(RegisterX86::R14).unwrap_or(0),
+        r15: emu.reg_read(RegisterX86::R15).unwrap_or(0),
+        rip,
+        rflags: emu.reg_read(RegisterX86::RFLAGS).unwrap_or(0),
+    }
+}
+
 /// Shared state for memory hook callbacks
 struct EmulatorSharedState {
     mapped_regions: HashMap<u64, MappedRegion>,
@@ -125,6 +152,8 @@ struct EmulatorSharedState {
     stop_requested: bool,
     /// Instruction trace (address, size) for InstructionTrace mode
     instruction_trace: Vec<(u64, usize)>,
+    /// Register trace (full register state at each step) for InstructionTrace mode
+    register_trace: Vec<RegisterSnapshot>,
     /// Last instruction address for basic block detection
     last_instruction_addr: Option<u64>,
     /// Last instruction size (from CODE hook) for basic block detection
@@ -178,6 +207,7 @@ impl<'a> Emulator<'a> {
             module_transition: None,
             stop_requested: false,
             instruction_trace: Vec::new(),
+            register_trace: Vec::new(),
             last_instruction_addr: None,
             last_instruction_size: None,
             syscall_address: None,
@@ -474,6 +504,30 @@ impl<'a> Emulator<'a> {
         }
     }
 
+    /// Build EmulationResult from current state
+    fn build_result(
+        &self,
+        instructions_executed: usize,
+        stop_reason: StopReason,
+        emulation_time_us: u64,
+        pages_before: usize,
+    ) -> Result<EmulationResult, EmulatorError> {
+        let final_pc = self.get_pc()?;
+        let state = self.shared_state.read().unwrap();
+        let pages_loaded = state.mapped_regions.len() - pages_before;
+
+        Ok(EmulationResult {
+            final_pc,
+            instructions_executed,
+            stop_reason,
+            emulation_time_us,
+            pages_loaded,
+            basic_blocks: state.basic_blocks.clone(),
+            instruction_trace: state.instruction_trace.clone(),
+            register_trace: state.register_trace.clone(),
+        })
+    }
+
     /// Emulate up to max_instructions
     pub fn emulate_instructions<P: PlatformAPI>(
         &mut self,
@@ -504,6 +558,7 @@ impl<'a> Emulator<'a> {
             state.last_instruction_addr = None;
             state.last_instruction_size = None;
             state.instruction_trace.clear();
+            state.register_trace.clear();
         }
 
         // Pre-load initial code region (loads entire region containing PC)
@@ -645,24 +700,8 @@ impl<'a> Emulator<'a> {
             }
         }
 
-        let final_pc = self.get_pc()?;
-        let (basic_blocks, instruction_trace, pages_after) = {
-            let state = self.shared_state.read().unwrap();
-            (state.basic_blocks.clone(), state.instruction_trace.clone(), state.mapped_regions.len())
-        };
-
         let emulation_time_us = start_time.elapsed().as_micros() as u64;
-        let pages_loaded = pages_after - pages_before;
-
-        Ok(EmulationResult {
-            final_pc,
-            instructions_executed,
-            stop_reason,
-            emulation_time_us,
-            pages_loaded,
-            basic_blocks,
-            instruction_trace,
-        })
+        self.build_result(instructions_executed, stop_reason, emulation_time_us, pages_before)
     }
 
     /// Emulate with a specific mode that determines which hooks are installed
@@ -703,6 +742,7 @@ impl<'a> Emulator<'a> {
             state.last_instruction_addr = None;
             state.last_instruction_size = None;
             state.instruction_trace.clear();
+            state.register_trace.clear();
             state.syscall_address = None;
 
             // Set current module for ModuleTransition mode
@@ -733,9 +773,13 @@ impl<'a> Emulator<'a> {
                     // Record instruction trace
                     state.instruction_trace.push((addr, size as usize));
                     let step = state.instruction_trace.len();
-                    let rflags = emu.reg_read(RegisterX86::RFLAGS).unwrap_or(0);
 
-                    tracing::trace!("step {} RIP=0x{:X} RFLAGS=0x{:X} size={}", step, addr, rflags, size);
+                    // Capture full register snapshot
+                    let snapshot = snapshot_from_unicorn(emu, addr);
+                    state.register_trace.push(snapshot);
+
+                    tracing::trace!("step {} RIP=0x{:X} RFLAGS=0x{:X} size={}", step, addr,
+                        emu.reg_read(RegisterX86::RFLAGS).unwrap_or(0), size);
 
                     // Track basic blocks via non-sequential jumps
                     if let (Some(last_addr), Some(last_size)) = (state.last_instruction_addr, state.last_instruction_size) {
@@ -1046,24 +1090,8 @@ impl<'a> Emulator<'a> {
             let _ = self.emu.remove_hook(hook);
         }
 
-        let final_pc = self.get_pc()?;
-        let (basic_blocks, instruction_trace, pages_after) = {
-            let state = self.shared_state.read().unwrap();
-            (state.basic_blocks.clone(), state.instruction_trace.clone(), state.mapped_regions.len())
-        };
-
         let emulation_time_us = start_time.elapsed().as_micros() as u64;
-        let pages_loaded = pages_after - pages_before;
-
-        Ok(EmulationResult {
-            final_pc,
-            instructions_executed,
-            stop_reason,
-            emulation_time_us,
-            pages_loaded,
-            basic_blocks,
-            instruction_trace,
-        })
+        self.build_result(instructions_executed, stop_reason, emulation_time_us, pages_before)
     }
 }
 
@@ -1083,6 +1111,7 @@ mod tests {
             module_transition: None,
             stop_requested: false,
             instruction_trace: Vec::new(),
+            register_trace: Vec::new(),
             last_instruction_addr: None,
             last_instruction_size: None,
             syscall_address: None,
@@ -1103,6 +1132,7 @@ mod tests {
             module_transition: None,
             stop_requested: false,
             instruction_trace: Vec::new(),
+            register_trace: Vec::new(),
             last_instruction_addr: None,
             last_instruction_size: None,
             syscall_address: None,
@@ -1133,6 +1163,7 @@ mod tests {
             module_transition: None,
             stop_requested: false,
             instruction_trace: Vec::new(),
+            register_trace: Vec::new(),
             last_instruction_addr: None,
             last_instruction_size: None,
             syscall_address: None,

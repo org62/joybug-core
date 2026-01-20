@@ -19,9 +19,10 @@ pub fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
+    // Use try_init() to avoid panic when called multiple times (e.g., in tests)
+    let _ = tracing_subscriber::fmt()
         .without_time()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
-        .init();
+        .try_init();
 }
