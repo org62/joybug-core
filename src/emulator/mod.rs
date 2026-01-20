@@ -20,7 +20,7 @@ use windows_sys::Win32::System::Memory::{
 };
 
 use crate::interfaces::{Architecture, PlatformAPI};
-use crate::protocol::{ThreadContext, EmulationMode, RegisterSnapshot};
+use crate::protocol::{ThreadContext, EmulationMode, RegisterSnapshot, MemoryAccess};
 
 mod error;
 mod registers;
@@ -62,6 +62,8 @@ pub struct EmulationResult {
     pub instruction_trace: Vec<(u64, usize)>,
     /// Register trace: full register state at each step (only populated in InstructionTrace mode)
     pub register_trace: Vec<RegisterSnapshot>,
+    /// Memory trace: memory accesses at each step (only populated in InstructionTrace mode)
+    pub memory_trace: Vec<Vec<MemoryAccess>>,
 }
 
 /// Why emulation stopped
@@ -83,6 +85,8 @@ pub enum StopReason {
     Syscall { address: u64 },
     /// Explicit stop requested
     Stopped,
+    /// Reached specified exit address
+    ReachedAddress(u64),
 }
 
 impl std::fmt::Display for StopReason {
@@ -101,6 +105,7 @@ impl std::fmt::Display for StopReason {
             StopReason::EndOfBasicBlock => write!(f, "EndOfBasicBlock"),
             StopReason::Syscall { address } => write!(f, "Syscall(0x{:X})", address),
             StopReason::Stopped => write!(f, "Stopped"),
+            StopReason::ReachedAddress(addr) => write!(f, "ReachedAddress(0x{:X})", addr),
         }
     }
 }
@@ -154,12 +159,18 @@ struct EmulatorSharedState {
     instruction_trace: Vec<(u64, usize)>,
     /// Register trace (full register state at each step) for InstructionTrace mode
     register_trace: Vec<RegisterSnapshot>,
+    /// Memory trace: memory accesses at each step for InstructionTrace mode
+    memory_trace: Vec<Vec<MemoryAccess>>,
+    /// Pending write operations: (address, size) to capture after instruction executes
+    pending_write_ops: Vec<(u64, usize)>,
     /// Last instruction address for basic block detection
     last_instruction_addr: Option<u64>,
     /// Last instruction size (from CODE hook) for basic block detection
     last_instruction_size: Option<u32>,
     /// Syscall address (set by syscall hook)
     syscall_address: Option<u64>,
+    /// Exit address (stop when this address is reached)
+    exit_address: Option<u64>,
 }
 
 /// CPU Emulator that initializes from debugger state
@@ -208,9 +219,12 @@ impl<'a> Emulator<'a> {
             stop_requested: false,
             instruction_trace: Vec::new(),
             register_trace: Vec::new(),
+            memory_trace: Vec::new(),
+            pending_write_ops: Vec::new(),
             last_instruction_addr: None,
             last_instruction_size: None,
             syscall_address: None,
+            exit_address: None,
         }));
 
         // Create Unicorn instance
@@ -525,6 +539,7 @@ impl<'a> Emulator<'a> {
             basic_blocks: state.basic_blocks.clone(),
             instruction_trace: state.instruction_trace.clone(),
             register_trace: state.register_trace.clone(),
+            memory_trace: state.memory_trace.clone(),
         })
     }
 
@@ -559,6 +574,8 @@ impl<'a> Emulator<'a> {
             state.last_instruction_size = None;
             state.instruction_trace.clear();
             state.register_trace.clear();
+            state.memory_trace.clear();
+            state.pending_write_ops.clear();
         }
 
         // Pre-load initial code region (loads entire region containing PC)
@@ -717,13 +734,22 @@ impl<'a> Emulator<'a> {
         platform: &P,
         max_instructions: usize,
         mode: EmulationMode,
+        exit_condition: Option<crate::protocol::TraceExitCondition>,
     ) -> Result<EmulationResult, EmulatorError> {
         use std::time::Instant;
+        use crate::protocol::TraceExitCondition;
+
         let start_time = Instant::now();
 
         let start_pc = self.get_pc()?;
         let mut instructions_executed = 0;
         let mut stop_reason = StopReason::InstructionLimit;
+
+        // Extract exit address from exit condition
+        let exit_address = match &exit_condition {
+            Some(TraceExitCondition::ReachAddress(addr)) => Some(*addr),
+            _ => None,
+        };
 
         // Track pages loaded before emulation
         let pages_before = {
@@ -743,7 +769,10 @@ impl<'a> Emulator<'a> {
             state.last_instruction_size = None;
             state.instruction_trace.clear();
             state.register_trace.clear();
+            state.memory_trace.clear();
+            state.pending_write_ops.clear();
             state.syscall_address = None;
+            state.exit_address = exit_address;
 
             // Set current module for ModuleTransition mode
             if mode == EmulationMode::ModuleTransition {
@@ -767,8 +796,31 @@ impl<'a> Emulator<'a> {
             EmulationMode::InstructionTrace => {
                 // CODE hook: fires on every instruction
                 let shared = self.shared_state.clone();
+                let arch = self.architecture;
                 let hook = self.emu.add_code_hook(0, u64::MAX, move |emu, addr, size| {
+                    use crate::memory_operand::analyze_memory_operands;
+                    use crate::protocol::{MemoryAccess, MemoryAccessType};
+
                     let mut state = shared.write().unwrap();
+
+                    // Step 1: Capture pending write data from previous instruction
+                    // (previous instruction has now completed execution)
+                    if !state.pending_write_ops.is_empty() && !state.memory_trace.is_empty() {
+                        // Drain pending writes into a local vector to avoid borrow conflicts
+                        let pending: Vec<_> = state.pending_write_ops.drain(..).collect();
+                        let last_mem = state.memory_trace.last_mut().unwrap();
+                        for (write_addr, write_size) in pending {
+                            if let Ok(data) = emu.mem_read_as_vec(write_addr, write_size) {
+                                last_mem.push(MemoryAccess {
+                                    access_type: MemoryAccessType::Write,
+                                    address: write_addr,
+                                    data,
+                                });
+                            }
+                        }
+                    } else {
+                        state.pending_write_ops.clear();
+                    }
 
                     // Record instruction trace
                     state.instruction_trace.push((addr, size as usize));
@@ -776,10 +828,56 @@ impl<'a> Emulator<'a> {
 
                     // Capture full register snapshot
                     let snapshot = snapshot_from_unicorn(emu, addr);
-                    state.register_trace.push(snapshot);
+                    state.register_trace.push(snapshot.clone());
 
                     tracing::trace!("step {} RIP=0x{:X} RFLAGS=0x{:X} size={}", step, addr,
                         emu.reg_read(RegisterX86::RFLAGS).unwrap_or(0), size);
+
+                    // Step 2: Analyze current instruction for memory operands
+                    let mut current_mem_accesses: Vec<MemoryAccess> = Vec::new();
+
+                    // Read instruction bytes from emulator memory
+                    if let Ok(insn_bytes) = emu.mem_read_as_vec(addr, size as usize) {
+                        let operands = analyze_memory_operands(&insn_bytes, addr, &snapshot, arch);
+
+                        for op in operands {
+                            if op.is_read {
+                                // For reads, capture data immediately (before execution)
+                                if let Ok(data) = emu.mem_read_as_vec(op.address, op.size) {
+                                    let access_type = if op.is_write {
+                                        MemoryAccessType::ReadWrite
+                                    } else {
+                                        MemoryAccessType::Read
+                                    };
+                                    current_mem_accesses.push(MemoryAccess {
+                                        access_type,
+                                        address: op.address,
+                                        data,
+                                    });
+                                }
+                            }
+                            if op.is_write && !op.is_read {
+                                // For write-only, queue for capture after execution
+                                state.pending_write_ops.push((op.address, op.size));
+                            } else if op.is_write && op.is_read {
+                                // For read-write, we already captured the read data
+                                // but also need to capture write data after execution
+                                // The write will update the data in-place
+                                state.pending_write_ops.push((op.address, op.size));
+                            }
+                        }
+                    }
+
+                    state.memory_trace.push(current_mem_accesses);
+
+                    // Check for exit address
+                    if let Some(exit_addr) = state.exit_address {
+                        if addr == exit_addr {
+                            state.stop_requested = true;
+                            emu.emu_stop().ok();
+                            return;
+                        }
+                    }
 
                     // Track basic blocks via non-sequential jumps
                     if let (Some(last_addr), Some(last_size)) = (state.last_instruction_addr, state.last_instruction_size) {
@@ -868,6 +966,19 @@ impl<'a> Emulator<'a> {
                     };
                     instructions_executed += executed;
                     remaining = remaining.saturating_sub(executed);
+
+                    // Check for stop_requested (e.g., exit address reached)
+                    {
+                        let state = self.shared_state.read().unwrap();
+                        if state.stop_requested {
+                            if let Some(addr) = state.exit_address {
+                                stop_reason = StopReason::ReachedAddress(addr);
+                            } else {
+                                stop_reason = StopReason::Stopped;
+                            }
+                            break;
+                        }
+                    }
                     continue;
                 }
                 Err(uc_error::READ_UNMAPPED) | Err(uc_error::FETCH_UNMAPPED) | Err(uc_error::WRITE_UNMAPPED) => {
@@ -1077,6 +1188,9 @@ impl<'a> Emulator<'a> {
                     // Check if it was a syscall
                     if let Some(addr) = state.syscall_address {
                         stop_reason = StopReason::Syscall { address: addr };
+                    } else if let Some(addr) = state.exit_address {
+                        // Reached exit address
+                        stop_reason = StopReason::ReachedAddress(addr);
                     } else {
                         stop_reason = StopReason::Stopped;
                     }
@@ -1088,6 +1202,26 @@ impl<'a> Emulator<'a> {
         // Remove hook if installed
         if let Some(hook) = hook_handle {
             let _ = self.emu.remove_hook(hook);
+        }
+
+        // Capture any final pending writes from the last instruction
+        // (only relevant for InstructionTrace mode)
+        if mode == EmulationMode::InstructionTrace {
+            use crate::protocol::{MemoryAccess, MemoryAccessType};
+            let mut state = self.shared_state.write().unwrap();
+            if !state.pending_write_ops.is_empty() && !state.memory_trace.is_empty() {
+                let pending_ops: Vec<_> = state.pending_write_ops.drain(..).collect();
+                let last_mem = state.memory_trace.last_mut().unwrap();
+                for (write_addr, write_size) in pending_ops {
+                    if let Ok(data) = self.emu.mem_read_as_vec(write_addr, write_size) {
+                        last_mem.push(MemoryAccess {
+                            access_type: MemoryAccessType::Write,
+                            address: write_addr,
+                            data,
+                        });
+                    }
+                }
+            }
         }
 
         let emulation_time_us = start_time.elapsed().as_micros() as u64;
@@ -1112,9 +1246,12 @@ mod tests {
             stop_requested: false,
             instruction_trace: Vec::new(),
             register_trace: Vec::new(),
+            memory_trace: Vec::new(),
+            pending_write_ops: Vec::new(),
             last_instruction_addr: None,
             last_instruction_size: None,
             syscall_address: None,
+            exit_address: None,
         }));
 
         let emu = Unicorn::new_with_data(Arch::X86, Mode::MODE_64, shared);
@@ -1133,9 +1270,12 @@ mod tests {
             stop_requested: false,
             instruction_trace: Vec::new(),
             register_trace: Vec::new(),
+            memory_trace: Vec::new(),
+            pending_write_ops: Vec::new(),
             last_instruction_addr: None,
             last_instruction_size: None,
             syscall_address: None,
+            exit_address: None,
         }));
 
         let mut emu = Unicorn::new_with_data(Arch::X86, Mode::MODE_64, shared).unwrap();
@@ -1164,9 +1304,12 @@ mod tests {
             stop_requested: false,
             instruction_trace: Vec::new(),
             register_trace: Vec::new(),
+            memory_trace: Vec::new(),
+            pending_write_ops: Vec::new(),
             last_instruction_addr: None,
             last_instruction_size: None,
             syscall_address: None,
+            exit_address: None,
         }));
 
         let mut emu = Unicorn::new_with_data(Arch::X86, Mode::MODE_64, shared).unwrap();

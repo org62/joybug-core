@@ -3,7 +3,8 @@ use std::path::Path;
 
 /// Compile a test program with MSVC
 /// Returns true if compilation succeeded, false if skipped (cl.exe not available)
-fn compile_test_program(manifest_dir: &str, out_dir: &str, name: &str) -> bool {
+/// If fixed_base is Some, the executable will be linked with that base address
+fn compile_test_program(manifest_dir: &str, out_dir: &str, name: &str, fixed_base: Option<u64>) -> bool {
     let test_program_src = Path::new(manifest_dir)
         .join("tests")
         .join("test_programs")
@@ -51,6 +52,15 @@ fn compile_test_program(manifest_dir: &str, out_dir: &str, name: &str) -> bool {
         "/DEBUG",                                           // Generate debug info for linker
     ]);
 
+    // Add fixed base address if specified (for predictable symbol addresses)
+    if let Some(base) = fixed_base {
+        cmd.args(&[
+            &format!("/BASE:0x{:X}", base),
+            "/DYNAMICBASE:NO",                              // Disable ASLR
+            "/FIXED",                                       // Fixed base address
+        ]);
+    }
+
     match cmd.output() {
         Ok(output) => {
             if output.status.success() {
@@ -84,8 +94,9 @@ fn main() {
         let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
 
         // Compile all test programs (failures are warnings, not errors)
-        let _ = compile_test_program(&manifest_dir, &out_dir, "dereference_test");
-        let _ = compile_test_program(&manifest_dir, &out_dir, "disassembly_test");
-        let _ = compile_test_program(&manifest_dir, &out_dir, "xtea_test");
+        let _ = compile_test_program(&manifest_dir, &out_dir, "dereference_test", None);
+        let _ = compile_test_program(&manifest_dir, &out_dir, "disassembly_test", None);
+        // xtea_test uses fixed base address for predictable symbol addresses in traces
+        let _ = compile_test_program(&manifest_dir, &out_dir, "xtea_test", Some(0x140000000));
     }
 }

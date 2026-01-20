@@ -48,6 +48,7 @@ fn test_mode_basic(
         tid,
         max_instructions: 1000,
         mode: EmulationMode::Basic,
+        exit_condition: None,
     };
 
     match session.send_and_receive(&req)? {
@@ -58,8 +59,6 @@ fn test_mode_basic(
             emulation_time_us,
             pages_loaded,
             basic_blocks,
-            instruction_trace,
-            ..
         } => {
             println!("  Final PC: 0x{:016X}", final_pc);
             println!("  Instructions executed: {}", instructions_executed);
@@ -67,7 +66,6 @@ fn test_mode_basic(
             println!("  Emulation time: {} us ({:.2} ms)", emulation_time_us, emulation_time_us as f64 / 1000.0);
             println!("  Pages loaded: {}", pages_loaded);
             println!("  Basic blocks: {} (should have 1, the start)", basic_blocks.len());
-            println!("  Instruction trace: {} (should be 0, no CODE hook)", instruction_trace.len());
             if instructions_executed > 0 {
                 println!("  Performance: {:.2} us/instruction", emulation_time_us as f64 / instructions_executed as f64);
             }
@@ -92,91 +90,43 @@ fn test_mode_instruction_trace(
     pid: u32,
     tid: u32,
 ) -> anyhow::Result<()> {
-    println!("\n=== Testing EmulationMode::InstructionTrace ===");
+    println!("\n=== Testing EmulationMode::InstructionTrace (Tenet format) ===");
 
     let req = DebuggerRequest::EmulateInstructions {
         pid,
         tid,
         max_instructions: 1500,
         mode: EmulationMode::InstructionTrace,
+        exit_condition: None,
     };
 
     match session.send_and_receive(&req)? {
-        DebuggerResponse::EmulationResult {
-            final_pc,
-            instructions_executed,
+        DebuggerResponse::TenetTrace {
+            trace_text,
             stop_reason,
-            emulation_time_us,
-            basic_blocks,
-            instruction_trace,
-            ..
+            trace_time_us,
         } => {
-            println!("  Final PC: 0x{:016X}", final_pc);
-            println!("  Instructions executed: {}", instructions_executed);
+            let line_count = trace_text.lines().count();
+            println!("  Tenet trace: {} lines", line_count);
             println!("  Stop reason: {}", stop_reason);
-            println!("  Emulation time: {} us ({:.2} ms)", emulation_time_us, emulation_time_us as f64 / 1000.0);
-            println!("  Basic blocks: {}", basic_blocks.len());
-            println!("  Instruction trace: {} (should match instructions_executed)", instruction_trace.len());
+            println!("  Trace time: {} us ({:.2} ms)", trace_time_us, trace_time_us as f64 / 1000.0);
 
-            // Verify trace matches instruction count
-            if instruction_trace.len() == instructions_executed {
-                println!("  ✓ Trace count matches instructions executed");
-            } else {
-                println!("  ⚠ Trace count ({}) differs from instructions ({})",
-                    instruction_trace.len(), instructions_executed);
-            }
-
-            // Show first few trace entries
-            if !instruction_trace.is_empty() {
-                println!("  First 5 traced instructions:");
-                for (i, (addr, size)) in instruction_trace.iter().take(5).enumerate() {
-                    println!("    [{:2}] 0x{:016X} (size: {})", i, addr, size);
-                }
-            }
-
-            // If exception occurred, show last 50 instructions with disassembly
-            if stop_reason.contains("Error") || stop_reason.contains("EXCEPTION") {
-                println!("\n  === EXCEPTION DEBUG INFO ===");
-
-                // Disassemble at exception location
-                let arch = Architecture::from_native();
-                if let Ok(insns) = session.disassemble_memory(pid, final_pc, 5, arch) {
-                    println!("  Instructions at exception (0x{:016X}):", final_pc);
-                    for insn in insns.iter().take(5) {
-                        println!("    0x{:016X}: {} {}", insn.address, insn.mnemonic, insn.op_str);
-                    }
-                }
-
-                // Show last 50 instructions leading to exception
-                let trace_len = instruction_trace.len();
-                let start_idx = trace_len.saturating_sub(50);
-                println!("\n  Last {} instructions before exception:", trace_len - start_idx);
-                for (i, (addr, size)) in instruction_trace.iter().skip(start_idx).enumerate() {
-                    let idx = start_idx + i;
-                    // Resolve symbol for each instruction
-                    let symbol_info = session.resolve_address_to_symbol(pid, *addr).ok();
-                    let symbol_str = if let Some((module, sym, offset)) = symbol_info {
-                        if let (Some(m), Some(s), Some(o)) = (module, sym, offset) {
-                            format!(" ({}!{}+0x{:x})", m, s.name, o)
-                        } else {
-                            String::new()
-                        }
+            // Show first few trace lines
+            if !trace_text.is_empty() {
+                println!("  First 5 trace lines:");
+                for (i, line) in trace_text.lines().take(5).enumerate() {
+                    // Truncate long lines
+                    let display = if line.len() > 100 {
+                        format!("{}...", &line[..100])
                     } else {
-                        String::new()
+                        line.to_string()
                     };
-
-                    // Disassemble this instruction
-                    let disasm_str = session.disassemble_memory(pid, *addr, 1, arch)
-                        .ok()
-                        .and_then(|insns| insns.first().map(|i| format!("{} {}", i.mnemonic, i.op_str)))
-                        .unwrap_or_default();
-
-                    println!("    [{:4}] 0x{:016X} ({}){}: {}", idx, addr, size, symbol_str, disasm_str);
+                    println!("    [{:2}] {}", i, display);
                 }
             }
 
             session.state.mode_instruction_trace_tested = true;
-            println!("  [PASS] InstructionTrace mode succeeded");
+            println!("  [PASS] InstructionTrace mode succeeded (Tenet format)");
         }
         DebuggerResponse::Error { message } => {
             println!("  [FAIL] InstructionTrace mode error: {}", message);
@@ -203,6 +153,7 @@ fn test_mode_basic_block(
         tid,
         max_instructions: 1000,
         mode: EmulationMode::BasicBlock,
+        exit_condition: None,
     };
 
     match session.send_and_receive(&req)? {
@@ -212,7 +163,6 @@ fn test_mode_basic_block(
             stop_reason,
             emulation_time_us,
             basic_blocks,
-            instruction_trace,
             ..
         } => {
             println!("  Final PC: 0x{:016X}", final_pc);
@@ -220,7 +170,6 @@ fn test_mode_basic_block(
             println!("  Stop reason: {}", stop_reason);
             println!("  Emulation time: {} us ({:.2} ms)", emulation_time_us, emulation_time_us as f64 / 1000.0);
             println!("  Basic blocks: {} (uses BLOCK hook)", basic_blocks.len());
-            println!("  Instruction trace: {} (should be 0, no CODE hook)", instruction_trace.len());
 
             if instructions_executed > 0 {
                 println!("  Performance: {:.2} us/instruction", emulation_time_us as f64 / instructions_executed as f64);
@@ -272,6 +221,7 @@ fn test_mode_module_transition(
         tid,
         max_instructions: 10000,
         mode: EmulationMode::ModuleTransition,
+        exit_condition: None,
     };
 
     match session.send_and_receive(&req)? {
@@ -322,6 +272,7 @@ fn test_mode_syscall(
         tid,
         max_instructions: 50000,  // May need many instructions to reach syscall
         mode: EmulationMode::Syscall,
+        exit_condition: None,
     };
 
     match session.send_and_receive(&req)? {

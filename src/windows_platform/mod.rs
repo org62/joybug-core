@@ -139,11 +139,18 @@ impl WindowsPlatform {
     // because Unicorn is not Send+Sync and can't be stored across threads.
 
     /// Emulate with a specific mode (one-shot)
-    pub fn emulate_with_mode(&self, pid: u32, tid: u32, max_instructions: usize, mode: crate::protocol::EmulationMode) -> Result<EmulationResult, PlatformError> {
+    pub fn emulate_with_mode(
+        &self,
+        pid: u32,
+        tid: u32,
+        max_instructions: usize,
+        mode: crate::protocol::EmulationMode,
+        exit_condition: Option<crate::protocol::TraceExitCondition>,
+    ) -> Result<EmulationResult, PlatformError> {
         let mut emulator = Emulator::from_debugger_state(self, pid, tid)
             .map_err(|e| PlatformError::Other(e.to_string()))?;
 
-        emulator.emulate_with_mode(self, max_instructions, mode)
+        emulator.emulate_with_mode(self, max_instructions, mode, exit_condition)
             .map_err(|e| PlatformError::Other(e.to_string()))
     }
 

@@ -45,7 +45,7 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::DereferenceResult { entries } => format!("DereferenceResult ({} entries)", entries.len()),
         DebuggerResponse::FunctionDisassembly { instructions, .. } => format!("FunctionDisassembly ({} instructions)", instructions.len()),
         DebuggerResponse::EmulationResult { instructions_executed, .. } => format!("EmulationResult ({} instructions)", instructions_executed),
-        DebuggerResponse::InstructionTrace { entries, .. } => format!("InstructionTrace ({} entries)", entries.len()),
+        DebuggerResponse::TenetTrace { trace_text, .. } => format!("TenetTrace ({} bytes)", trace_text.len()),
     };
     debug!("Received response: {}", summary);
     Ok(resp)

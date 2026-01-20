@@ -11,7 +11,12 @@ path = "src/lib.rs"
 name = "joybug2"
 path = "src/main.rs"
 
+[[bin]]
+name = "trace"
+path = "src/bin/trace.rs"
+
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 tokio = { version = "1.37", features = ["full", "rt"] }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"

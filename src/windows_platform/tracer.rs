@@ -4,7 +4,8 @@
 //! with the trap flag and capturing register state at each step.
 
 use crate::interfaces::{PlatformAPI, PlatformError, Architecture};
-use crate::protocol::{RegisterSnapshot, TraceEntry, TraceExitCondition, ThreadContext};
+use crate::memory_operand::analyze_memory_operands;
+use crate::protocol::{MemoryAccess, MemoryAccessType, RegisterSnapshot, TraceEntry, TraceExitCondition, ThreadContext};
 use super::WindowsPlatform;
 use super::stepper::{set_single_step_flag_native, clear_single_step_flag_native};
 use super::debug_events;
@@ -35,6 +36,9 @@ pub fn trace_instructions(
     // Get architecture for disassembly
     let arch = Architecture::from_native();
 
+    // Track pending write operations to capture after instruction executes
+    let mut pending_write_ops: Vec<(u64, usize)> = Vec::new();
+
     for step_count in 0..max_instructions {
         // Get current thread context
         let thread_context = platform.get_thread_context(pid, tid)?;
@@ -44,39 +48,93 @@ pub fn trace_instructions(
 
         let current_rip = context.Rip;
 
-        // Check exit condition before executing
-        match &exit_condition {
-            TraceExitCondition::ReachAddress(addr) => {
-                if current_rip == *addr {
-                    stop_reason = format!("ReachAddress(0x{:X})", addr);
-                    debug!(step_count, current_rip, "Reached target address");
-                    break;
+        // Step 1: Capture pending write data from previous instruction
+        // (previous instruction has now completed execution)
+        if !pending_write_ops.is_empty() && !entries.is_empty() {
+            let last_entry = entries.last_mut().unwrap();
+            for (write_addr, write_size) in pending_write_ops.drain(..) {
+                if let Ok(data) = platform.read_memory(pid, write_addr, write_size) {
+                    last_entry.memory_accesses.push(MemoryAccess {
+                        access_type: MemoryAccessType::Write,
+                        address: write_addr,
+                        data,
+                    });
                 }
             }
-            TraceExitCondition::InstructionLimit(limit) => {
-                if step_count >= *limit {
-                    stop_reason = format!("InstructionLimit({})", limit);
-                    break;
-                }
+        }
+        pending_write_ops.clear();
+
+        // Check instruction limit before processing
+        if let TraceExitCondition::InstructionLimit(limit) = &exit_condition {
+            if step_count >= *limit {
+                stop_reason = format!("InstructionLimit({})", limit);
+                break;
             }
         }
 
         // Capture register snapshot (before executing this instruction)
         let snapshot = RegisterSnapshot::from_context(&context);
 
-        // Get instruction size via disassembly
-        let insn_size = platform.disassemble_memory(pid, current_rip, 1, arch)
-            .map(|insns| insns.first().map(|i| i.size).unwrap_or(1))
-            .unwrap_or(1);
+        // Get instruction bytes and size via disassembly
+        let (insn_bytes, insn_size) = platform.disassemble_memory(pid, current_rip, 1, arch)
+            .map(|insns| {
+                insns.first()
+                    .map(|i| (i.bytes.clone(), i.size))
+                    .unwrap_or((vec![], 1))
+            })
+            .unwrap_or((vec![], 1));
+
+        // Step 2: Analyze current instruction for memory operands
+        let mut memory_accesses: Vec<MemoryAccess> = Vec::new();
+
+        if !insn_bytes.is_empty() {
+            let operands = analyze_memory_operands(&insn_bytes, current_rip, &snapshot, arch);
+
+            for op in operands {
+                if op.is_read {
+                    // For reads, capture data immediately (before execution)
+                    if let Ok(data) = platform.read_memory(pid, op.address, op.size) {
+                        let access_type = if op.is_write {
+                            MemoryAccessType::ReadWrite
+                        } else {
+                            MemoryAccessType::Read
+                        };
+                        memory_accesses.push(MemoryAccess {
+                            access_type,
+                            address: op.address,
+                            data,
+                        });
+                    }
+                }
+                if op.is_write && !op.is_read {
+                    // For write-only, queue for capture after execution
+                    pending_write_ops.push((op.address, op.size));
+                } else if op.is_write && op.is_read {
+                    // For read-write, we already captured the read data
+                    // but also need to capture write data after execution
+                    pending_write_ops.push((op.address, op.size));
+                }
+            }
+        }
 
         // Record trace entry
         entries.push(TraceEntry {
             address: current_rip,
             size: insn_size,
             registers: snapshot,
+            memory_accesses,
         });
 
         trace!(step = step_count, rip = format!("0x{:X}", current_rip), size = insn_size, "Traced instruction");
+
+        // Check if we reached the exit address (after recording the trace entry)
+        if let TraceExitCondition::ReachAddress(addr) = &exit_condition {
+            if current_rip == *addr {
+                stop_reason = format!("ReachAddress(0x{:X})", addr);
+                debug!(step_count, current_rip, "Reached target address");
+                break;
+            }
+        }
 
         // Set trap flag to single-step
         set_single_step_flag_native(&mut context)?;
@@ -111,6 +169,20 @@ pub fn trace_instructions(
                 _ => {
                     // Continue tracing for other events
                 }
+            }
+        }
+    }
+
+    // Capture any final pending writes from the last instruction
+    if !pending_write_ops.is_empty() && !entries.is_empty() {
+        let last_entry = entries.last_mut().unwrap();
+        for (write_addr, write_size) in pending_write_ops {
+            if let Ok(data) = platform.read_memory(pid, write_addr, write_size) {
+                last_entry.memory_accesses.push(MemoryAccess {
+                    access_type: MemoryAccessType::Write,
+                    address: write_addr,
+                    data,
+                });
             }
         }
     }

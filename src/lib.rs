@@ -7,6 +7,8 @@ pub mod windows_platform;
 pub mod server;
 pub mod framed_json_stream;
 pub mod emulator;
+pub mod memory_operand;
+pub mod tenet_format;
 
 #[cfg(windows)]
 pub type PlatformImpl = windows_platform::WindowsPlatform;

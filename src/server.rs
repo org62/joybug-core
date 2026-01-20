@@ -362,31 +362,54 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                 }
             }
             // Emulator handlers (one-shot)
-            DebuggerRequest::EmulateInstructions { pid, tid, max_instructions, mode } => {
+            DebuggerRequest::EmulateInstructions { pid, tid, max_instructions, mode, exit_condition } => {
+                use crate::protocol::EmulationMode;
                 let p = platform.read().unwrap();
-                match p.emulate_with_mode(pid, tid, max_instructions, mode) {
-                    Ok(result) => DebuggerResponse::EmulationResult {
-                        final_pc: result.final_pc,
-                        instructions_executed: result.instructions_executed,
-                        stop_reason: format!("{}", result.stop_reason),
-                        emulation_time_us: result.emulation_time_us,
-                        pages_loaded: result.pages_loaded,
-                        basic_blocks: result.basic_blocks,
-                        instruction_trace: result.instruction_trace,
-                        register_trace: result.register_trace,
-                    },
+                match p.emulate_with_mode(pid, tid, max_instructions, mode, exit_condition) {
+                    Ok(result) => {
+                        if mode == EmulationMode::InstructionTrace {
+                            // InstructionTrace mode returns Tenet format
+                            let trace_text = crate::tenet_format::traces_to_tenet(
+                                &result.register_trace,
+                                &result.memory_trace,
+                            );
+                            DebuggerResponse::TenetTrace {
+                                trace_text,
+                                stop_reason: format!("{}", result.stop_reason),
+                                trace_time_us: result.emulation_time_us,
+                            }
+                        } else {
+                            // Other modes return EmulationResult
+                            DebuggerResponse::EmulationResult {
+                                final_pc: result.final_pc,
+                                instructions_executed: result.instructions_executed,
+                                stop_reason: format!("{}", result.stop_reason),
+                                emulation_time_us: result.emulation_time_us,
+                                pages_loaded: result.pages_loaded,
+                                basic_blocks: result.basic_blocks,
+                            }
+                        }
+                    }
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
-            // Trap-flag based instruction tracer
+            // Trap-flag based instruction tracer - always returns Tenet format
             DebuggerRequest::TraceInstructions { pid, tid, exit_condition, max_instructions } => {
                 let mut p = platform.write().unwrap();
                 match p.trace_instructions(pid, tid, exit_condition, max_instructions) {
-                    Ok((entries, stop_reason, trace_time_us)) => DebuggerResponse::InstructionTrace {
-                        entries,
-                        stop_reason,
-                        trace_time_us,
-                    },
+                    Ok((entries, stop_reason, trace_time_us)) => {
+                        // Convert TraceEntry to (RegisterSnapshot, Vec<MemoryAccess>) pairs
+                        let trace_data: Vec<_> = entries
+                            .iter()
+                            .map(|e| (e.registers.clone(), e.memory_accesses.clone()))
+                            .collect();
+                        let trace_text = crate::tenet_format::trace_to_tenet(&trace_data);
+                        DebuggerResponse::TenetTrace {
+                            trace_text,
+                            stop_reason,
+                            trace_time_us,
+                        }
+                    }
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }

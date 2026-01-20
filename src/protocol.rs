@@ -12,6 +12,22 @@ pub mod request_response {
         Out,
     }
 
+    /// Memory access type for tracing
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+    pub enum MemoryAccessType {
+        Read,
+        Write,
+        ReadWrite,
+    }
+
+    /// Memory access record for tracing
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct MemoryAccess {
+        pub access_type: MemoryAccessType,
+        pub address: u64,
+        pub data: Vec<u8>,
+    }
+
     /// Register snapshot for x64 - captures all general-purpose registers
     #[derive(Debug, Serialize, Deserialize, Clone, Default)]
     pub struct RegisterSnapshot {
@@ -62,12 +78,15 @@ pub mod request_response {
         }
     }
 
-    /// Instruction trace entry - address, size, and register state
+    /// Instruction trace entry - address, size, register state, and memory accesses
     #[derive(Debug, Serialize, Deserialize, Clone)]
     pub struct TraceEntry {
         pub address: u64,
         pub size: usize,
         pub registers: RegisterSnapshot,
+        /// Memory accesses for this instruction (optional for backward compatibility)
+        #[serde(default)]
+        pub memory_accesses: Vec<MemoryAccess>,
     }
 
     /// Exit condition for instruction tracing
@@ -237,8 +256,12 @@ pub mod request_response {
             max_instructions: usize,
             #[serde(default)]
             mode: EmulationMode,
+            /// Optional exit condition (stop at address)
+            #[serde(default)]
+            exit_condition: Option<TraceExitCondition>,
         },
         /// Trace instructions using trap flag, capturing register state at each step
+        /// Returns TenetTrace with delta-encoded register/memory state
         TraceInstructions {
             pid: u32,
             tid: u32,
@@ -287,7 +310,7 @@ pub mod request_response {
         MemoryRegionInfo { info: MemoryRegionInfo },
         MemoryRegionList { regions: Vec<MemoryRegionInfo> },
         DereferenceResult { entries: Vec<DereferenceEntry> },
-        // Emulator responses
+        // Emulator responses (for non-trace modes: Basic, BasicBlock, ModuleTransition, Syscall)
         EmulationResult {
             final_pc: u64,
             instructions_executed: usize,
@@ -297,16 +320,10 @@ pub mod request_response {
             /// Number of pages loaded during emulation
             pages_loaded: usize,
             basic_blocks: Vec<u64>,
-            /// Instruction trace: (address, size) pairs, only populated if mode=InstructionTrace
-            #[serde(default)]
-            instruction_trace: Vec<(u64, usize)>,
-            /// Register trace: full register state at each step, only populated if mode=InstructionTrace
-            #[serde(default)]
-            register_trace: Vec<RegisterSnapshot>,
         },
-        /// Trap-flag based instruction trace result
-        InstructionTrace {
-            entries: Vec<TraceEntry>,
+        /// Tenet format trace result (for TraceInstructions and EmulateInstructions with InstructionTrace mode)
+        TenetTrace {
+            trace_text: String,
             stop_reason: String,
             trace_time_us: u64,
         },
