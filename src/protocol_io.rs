@@ -1,9 +1,35 @@
 use crate::interfaces::{Architecture, Instruction, ModuleSymbol};
 use crate::pe_types::ModuleExtraInfo;
 pub use crate::protocol::{
-    DebuggerRequest, DebuggerResponse, DebugEvent, ModuleInfo, ProcessInfo, StepAction, StepKind,
-    ThreadContext, ThreadInfo,
+    DebuggerRequest, DebuggerResponse, DebugEvent, EmulationMode, ModuleInfo, ProcessInfo,
+    StepAction, StepKind, ThreadContext, ThreadInfo, TraceExitCondition,
 };
+
+/// Result from trace_instructions()
+#[derive(Debug, Clone)]
+pub struct TenetTraceResult {
+    pub trace_text: String,
+    pub stop_reason: String,
+    pub trace_time_us: u64,
+}
+
+/// Result from emulate_instructions()
+#[derive(Debug, Clone)]
+pub enum EmulateResult {
+    Trace(TenetTraceResult),
+    Emulation(EmulationResultData),
+}
+
+/// Emulation result data for non-trace modes
+#[derive(Debug, Clone)]
+pub struct EmulationResultData {
+    pub final_pc: u64,
+    pub instructions_executed: usize,
+    pub stop_reason: String,
+    pub emulation_time_us: u64,
+    pub pages_loaded: usize,
+    pub basic_blocks: Vec<u64>,
+}
 use std::collections::HashMap;
 pub use std::net::TcpStream;
 use std::sync::Mutex;
@@ -893,6 +919,125 @@ impl<S> DebugSession<S> {
             DebuggerResponse::DereferenceResult { entries } => Ok(entries),
             DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to dereference: {}", message)),
             other => Err(anyhow::anyhow!("Unexpected response to Dereference: {:?}", other)),
+        }
+    }
+
+    /// Remove a breakpoint at the specified address.
+    ///
+    /// # Arguments
+    /// * `pid` - Process ID
+    /// * `addr` - Address of the breakpoint to remove
+    pub fn remove_breakpoint(&mut self, pid: u32, addr: u64) -> anyhow::Result<()> {
+        let req = DebuggerRequest::RemoveBreakpoint { pid, addr };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to remove breakpoint: {}", message))
+            }
+            other => Err(anyhow::anyhow!(
+                "Unexpected response to RemoveBreakpoint: {:?}",
+                other
+            )),
+        }
+    }
+
+    /// Trace instructions using trap flag, capturing register state at each step.
+    /// Returns Tenet format trace data.
+    ///
+    /// # Arguments
+    /// * `pid` - Process ID
+    /// * `tid` - Thread ID
+    /// * `exit_condition` - When to stop tracing (address or instruction limit)
+    /// * `max_instructions` - Maximum instructions to trace
+    pub fn trace_instructions(
+        &mut self,
+        pid: u32,
+        tid: u32,
+        exit_condition: TraceExitCondition,
+        max_instructions: usize,
+    ) -> anyhow::Result<TenetTraceResult> {
+        let req = DebuggerRequest::TraceInstructions {
+            pid,
+            tid,
+            exit_condition,
+            max_instructions,
+        };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::TenetTrace {
+                trace_text,
+                stop_reason,
+                trace_time_us,
+            } => Ok(TenetTraceResult {
+                trace_text,
+                stop_reason,
+                trace_time_us,
+            }),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to trace instructions: {}", message))
+            }
+            other => Err(anyhow::anyhow!(
+                "Unexpected response to TraceInstructions: {:?}",
+                other
+            )),
+        }
+    }
+
+    /// Emulate instructions using Unicorn engine.
+    /// Returns either a trace result (for InstructionTrace mode) or emulation data.
+    ///
+    /// # Arguments
+    /// * `pid` - Process ID
+    /// * `tid` - Thread ID
+    /// * `max_instructions` - Maximum instructions to emulate
+    /// * `mode` - Emulation mode (Basic, InstructionTrace, BasicBlock, ModuleTransition, Syscall)
+    /// * `exit_condition` - Optional exit condition (stop at address)
+    pub fn emulate_instructions(
+        &mut self,
+        pid: u32,
+        tid: u32,
+        max_instructions: usize,
+        mode: EmulationMode,
+        exit_condition: Option<TraceExitCondition>,
+    ) -> anyhow::Result<EmulateResult> {
+        let req = DebuggerRequest::EmulateInstructions {
+            pid,
+            tid,
+            max_instructions,
+            mode,
+            exit_condition,
+        };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::TenetTrace {
+                trace_text,
+                stop_reason,
+                trace_time_us,
+            } => Ok(EmulateResult::Trace(TenetTraceResult {
+                trace_text,
+                stop_reason,
+                trace_time_us,
+            })),
+            DebuggerResponse::EmulationResult {
+                final_pc,
+                instructions_executed,
+                stop_reason,
+                emulation_time_us,
+                pages_loaded,
+                basic_blocks,
+            } => Ok(EmulateResult::Emulation(EmulationResultData {
+                final_pc,
+                instructions_executed,
+                stop_reason,
+                emulation_time_us,
+                pages_loaded,
+                basic_blocks,
+            })),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to emulate instructions: {}", message))
+            }
+            other => Err(anyhow::anyhow!(
+                "Unexpected response to EmulateInstructions: {:?}",
+                other
+            )),
         }
     }
 } 

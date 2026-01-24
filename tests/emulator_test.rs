@@ -4,8 +4,9 @@ mod common;
 
 use common::TestServer;
 use joybug2::interfaces::Architecture;
-use joybug2::protocol::{DebuggerRequest, DebuggerResponse, EmulationMode};
-use joybug2::protocol_io::{BreakpointDecision, DebugSession};
+use joybug2::protocol_io::{
+    BreakpointDecision, DebugSession, EmulateResult, EmulationMode,
+};
 
 /// Test state for emulator tests
 struct EmulatorTestState {
@@ -43,42 +44,25 @@ fn test_mode_basic(
 ) -> anyhow::Result<()> {
     println!("\n=== Testing EmulationMode::Basic ===");
 
-    let req = DebuggerRequest::EmulateInstructions {
-        pid,
-        tid,
-        max_instructions: 1000,
-        mode: EmulationMode::Basic,
-        exit_condition: None,
-    };
+    let result = session.emulate_instructions(pid, tid, 1000, EmulationMode::Basic, None)?;
 
-    match session.send_and_receive(&req)? {
-        DebuggerResponse::EmulationResult {
-            final_pc,
-            instructions_executed,
-            stop_reason,
-            emulation_time_us,
-            pages_loaded,
-            basic_blocks,
-        } => {
-            println!("  Final PC: 0x{:016X}", final_pc);
-            println!("  Instructions executed: {}", instructions_executed);
-            println!("  Stop reason: {}", stop_reason);
-            println!("  Emulation time: {} us ({:.2} ms)", emulation_time_us, emulation_time_us as f64 / 1000.0);
-            println!("  Pages loaded: {}", pages_loaded);
-            println!("  Basic blocks: {} (should have 1, the start)", basic_blocks.len());
-            if instructions_executed > 0 {
-                println!("  Performance: {:.2} us/instruction", emulation_time_us as f64 / instructions_executed as f64);
+    match result {
+        EmulateResult::Emulation(data) => {
+            println!("  Final PC: 0x{:016X}", data.final_pc);
+            println!("  Instructions executed: {}", data.instructions_executed);
+            println!("  Stop reason: {}", data.stop_reason);
+            println!("  Emulation time: {} us ({:.2} ms)", data.emulation_time_us, data.emulation_time_us as f64 / 1000.0);
+            println!("  Pages loaded: {}", data.pages_loaded);
+            println!("  Basic blocks: {} (should have 1, the start)", data.basic_blocks.len());
+            if data.instructions_executed > 0 {
+                println!("  Performance: {:.2} us/instruction", data.emulation_time_us as f64 / data.instructions_executed as f64);
             }
             session.state.mode_basic_tested = true;
             println!("  [PASS] Basic mode succeeded");
         }
-        DebuggerResponse::Error { message } => {
-            println!("  [FAIL] Basic mode error: {}", message);
-            return Err(anyhow::anyhow!("Basic mode failed: {}", message));
-        }
-        other => {
-            println!("  [FAIL] Unexpected response: {:?}", other);
-            return Err(anyhow::anyhow!("Unexpected response: {:?}", other));
+        EmulateResult::Trace(_) => {
+            println!("  [FAIL] Unexpected TenetTrace for Basic mode");
+            return Err(anyhow::anyhow!("Expected EmulationResult for Basic mode"));
         }
     }
 
@@ -92,29 +76,19 @@ fn test_mode_instruction_trace(
 ) -> anyhow::Result<()> {
     println!("\n=== Testing EmulationMode::InstructionTrace (Tenet format) ===");
 
-    let req = DebuggerRequest::EmulateInstructions {
-        pid,
-        tid,
-        max_instructions: 1500,
-        mode: EmulationMode::InstructionTrace,
-        exit_condition: None,
-    };
+    let result = session.emulate_instructions(pid, tid, 1500, EmulationMode::InstructionTrace, None)?;
 
-    match session.send_and_receive(&req)? {
-        DebuggerResponse::TenetTrace {
-            trace_text,
-            stop_reason,
-            trace_time_us,
-        } => {
-            let line_count = trace_text.lines().count();
+    match result {
+        EmulateResult::Trace(trace) => {
+            let line_count = trace.trace_text.lines().count();
             println!("  Tenet trace: {} lines", line_count);
-            println!("  Stop reason: {}", stop_reason);
-            println!("  Trace time: {} us ({:.2} ms)", trace_time_us, trace_time_us as f64 / 1000.0);
+            println!("  Stop reason: {}", trace.stop_reason);
+            println!("  Trace time: {} us ({:.2} ms)", trace.trace_time_us, trace.trace_time_us as f64 / 1000.0);
 
             // Show first few trace lines
-            if !trace_text.is_empty() {
+            if !trace.trace_text.is_empty() {
                 println!("  First 5 trace lines:");
-                for (i, line) in trace_text.lines().take(5).enumerate() {
+                for (i, line) in trace.trace_text.lines().take(5).enumerate() {
                     // Truncate long lines
                     let display = if line.len() > 100 {
                         format!("{}...", &line[..100])
@@ -128,13 +102,9 @@ fn test_mode_instruction_trace(
             session.state.mode_instruction_trace_tested = true;
             println!("  [PASS] InstructionTrace mode succeeded (Tenet format)");
         }
-        DebuggerResponse::Error { message } => {
-            println!("  [FAIL] InstructionTrace mode error: {}", message);
-            return Err(anyhow::anyhow!("InstructionTrace mode failed: {}", message));
-        }
-        other => {
-            println!("  [FAIL] Unexpected response: {:?}", other);
-            return Err(anyhow::anyhow!("Unexpected response: {:?}", other));
+        EmulateResult::Emulation(_) => {
+            println!("  [FAIL] Expected TenetTrace for InstructionTrace mode");
+            return Err(anyhow::anyhow!("Expected TenetTrace for InstructionTrace mode"));
         }
     }
 
@@ -148,37 +118,24 @@ fn test_mode_basic_block(
 ) -> anyhow::Result<()> {
     println!("\n=== Testing EmulationMode::BasicBlock ===");
 
-    let req = DebuggerRequest::EmulateInstructions {
-        pid,
-        tid,
-        max_instructions: 1000,
-        mode: EmulationMode::BasicBlock,
-        exit_condition: None,
-    };
+    let result = session.emulate_instructions(pid, tid, 1000, EmulationMode::BasicBlock, None)?;
 
-    match session.send_and_receive(&req)? {
-        DebuggerResponse::EmulationResult {
-            final_pc,
-            instructions_executed,
-            stop_reason,
-            emulation_time_us,
-            basic_blocks,
-            ..
-        } => {
-            println!("  Final PC: 0x{:016X}", final_pc);
-            println!("  Instructions executed: {}", instructions_executed);
-            println!("  Stop reason: {}", stop_reason);
-            println!("  Emulation time: {} us ({:.2} ms)", emulation_time_us, emulation_time_us as f64 / 1000.0);
-            println!("  Basic blocks: {} (uses BLOCK hook)", basic_blocks.len());
+    match result {
+        EmulateResult::Emulation(data) => {
+            println!("  Final PC: 0x{:016X}", data.final_pc);
+            println!("  Instructions executed: {}", data.instructions_executed);
+            println!("  Stop reason: {}", data.stop_reason);
+            println!("  Emulation time: {} us ({:.2} ms)", data.emulation_time_us, data.emulation_time_us as f64 / 1000.0);
+            println!("  Basic blocks: {} (uses BLOCK hook)", data.basic_blocks.len());
 
-            if instructions_executed > 0 {
-                println!("  Performance: {:.2} us/instruction", emulation_time_us as f64 / instructions_executed as f64);
+            if data.instructions_executed > 0 {
+                println!("  Performance: {:.2} us/instruction", data.emulation_time_us as f64 / data.instructions_executed as f64);
             }
 
             // Show first few basic blocks
-            if !basic_blocks.is_empty() {
+            if !data.basic_blocks.is_empty() {
                 println!("  First 5 basic blocks:");
-                for (i, bb) in basic_blocks.iter().take(5).enumerate() {
+                for (i, bb) in data.basic_blocks.iter().take(5).enumerate() {
                     let symbol_info = session.resolve_address_to_symbol(pid, *bb).ok();
                     let symbol_str = if let Some((module, sym, offset)) = symbol_info {
                         if let (Some(m), Some(s), Some(o)) = (module, sym, offset) {
@@ -196,13 +153,9 @@ fn test_mode_basic_block(
             session.state.mode_basic_block_tested = true;
             println!("  [PASS] BasicBlock mode succeeded");
         }
-        DebuggerResponse::Error { message } => {
-            println!("  [FAIL] BasicBlock mode error: {}", message);
-            return Err(anyhow::anyhow!("BasicBlock mode failed: {}", message));
-        }
-        other => {
-            println!("  [FAIL] Unexpected response: {:?}", other);
-            return Err(anyhow::anyhow!("Unexpected response: {:?}", other));
+        EmulateResult::Trace(_) => {
+            println!("  [FAIL] Unexpected TenetTrace for BasicBlock mode");
+            return Err(anyhow::anyhow!("Expected EmulationResult for BasicBlock mode"));
         }
     }
 
@@ -216,29 +169,17 @@ fn test_mode_module_transition(
 ) -> anyhow::Result<()> {
     println!("\n=== Testing EmulationMode::ModuleTransition ===");
 
-    let req = DebuggerRequest::EmulateInstructions {
-        pid,
-        tid,
-        max_instructions: 10000,
-        mode: EmulationMode::ModuleTransition,
-        exit_condition: None,
-    };
+    let result = session.emulate_instructions(pid, tid, 10000, EmulationMode::ModuleTransition, None)?;
 
-    match session.send_and_receive(&req)? {
-        DebuggerResponse::EmulationResult {
-            final_pc,
-            instructions_executed,
-            stop_reason,
-            emulation_time_us,
-            ..
-        } => {
-            println!("  Final PC: 0x{:016X}", final_pc);
-            println!("  Instructions executed: {}", instructions_executed);
-            println!("  Stop reason: {}", stop_reason);
-            println!("  Emulation time: {} us ({:.2} ms)", emulation_time_us, emulation_time_us as f64 / 1000.0);
+    match result {
+        EmulateResult::Emulation(data) => {
+            println!("  Final PC: 0x{:016X}", data.final_pc);
+            println!("  Instructions executed: {}", data.instructions_executed);
+            println!("  Stop reason: {}", data.stop_reason);
+            println!("  Emulation time: {} us ({:.2} ms)", data.emulation_time_us, data.emulation_time_us as f64 / 1000.0);
 
             // Check if we found a module transition
-            if stop_reason.contains("ModuleTransition") {
+            if data.stop_reason.contains("ModuleTransition") {
                 println!("  ✓ Module transition detected!");
             } else {
                 println!("  ⚠ No module transition found within limit");
@@ -247,13 +188,9 @@ fn test_mode_module_transition(
             session.state.mode_module_transition_tested = true;
             println!("  [PASS] ModuleTransition mode succeeded");
         }
-        DebuggerResponse::Error { message } => {
-            println!("  [FAIL] ModuleTransition mode error: {}", message);
-            return Err(anyhow::anyhow!("ModuleTransition mode failed: {}", message));
-        }
-        other => {
-            println!("  [FAIL] Unexpected response: {:?}", other);
-            return Err(anyhow::anyhow!("Unexpected response: {:?}", other));
+        EmulateResult::Trace(_) => {
+            println!("  [FAIL] Unexpected TenetTrace for ModuleTransition mode");
+            return Err(anyhow::anyhow!("Expected EmulationResult for ModuleTransition mode"));
         }
     }
 
@@ -267,47 +204,35 @@ fn test_mode_syscall(
 ) -> anyhow::Result<()> {
     println!("\n=== Testing EmulationMode::Syscall ===");
 
-    let req = DebuggerRequest::EmulateInstructions {
-        pid,
-        tid,
-        max_instructions: 50000,  // May need many instructions to reach syscall
-        mode: EmulationMode::Syscall,
-        exit_condition: None,
-    };
+    let result = session.emulate_instructions(pid, tid, 50000, EmulationMode::Syscall, None)?;
 
-    match session.send_and_receive(&req)? {
-        DebuggerResponse::EmulationResult {
-            final_pc,
-            instructions_executed,
-            stop_reason,
-            emulation_time_us,
-            ..
-        } => {
-            println!("  Final PC: 0x{:016X}", final_pc);
-            println!("  Instructions executed: {}", instructions_executed);
-            println!("  Stop reason: {}", stop_reason);
-            println!("  Emulation time: {} us ({:.2} ms)", emulation_time_us, emulation_time_us as f64 / 1000.0);
+    match result {
+        EmulateResult::Emulation(data) => {
+            println!("  Final PC: 0x{:016X}", data.final_pc);
+            println!("  Instructions executed: {}", data.instructions_executed);
+            println!("  Stop reason: {}", data.stop_reason);
+            println!("  Emulation time: {} us ({:.2} ms)", data.emulation_time_us, data.emulation_time_us as f64 / 1000.0);
 
             // Check if we found a syscall
-            if stop_reason.contains("Syscall") {
-                println!("  ✓ Syscall detected at 0x{:016X}", final_pc);
+            if data.stop_reason.contains("Syscall") {
+                println!("  ✓ Syscall detected at 0x{:016X}", data.final_pc);
                 // Try to resolve the syscall address
-                if let Ok((module, sym, offset)) = session.resolve_address_to_symbol(pid, final_pc) {
+                if let Ok((module, sym, offset)) = session.resolve_address_to_symbol(pid, data.final_pc) {
                     if let (Some(m), Some(s), Some(o)) = (module, sym, offset) {
                         println!("    Location: {}!{}+0x{:x}", m, s.name, o);
                     }
                 }
             } else {
-                println!("  ⚠ No syscall found within limit (stop_reason: {})", stop_reason);
+                println!("  ⚠ No syscall found within limit (stop_reason: {})", data.stop_reason);
                 // Debug: show what instruction caused the stop
-                if let Ok((module, sym, offset)) = session.resolve_address_to_symbol(pid, final_pc) {
+                if let Ok((module, sym, offset)) = session.resolve_address_to_symbol(pid, data.final_pc) {
                     if let (Some(m), Some(s), Some(o)) = (module, sym, offset) {
                         println!("    Exception at: {}!{}+0x{:x}", m, s.name, o);
                     }
                 }
                 // Disassemble at the exception location
                 let arch = Architecture::from_native();
-                if let Ok(insns) = session.disassemble_memory(pid, final_pc, 5, arch) {
+                if let Ok(insns) = session.disassemble_memory(pid, data.final_pc, 5, arch) {
                     println!("    Instructions at exception:");
                     for insn in insns.iter().take(5) {
                         println!("      0x{:016X}: {} {}", insn.address, insn.mnemonic, insn.op_str);
@@ -318,13 +243,9 @@ fn test_mode_syscall(
             session.state.mode_syscall_tested = true;
             println!("  [PASS] Syscall mode succeeded");
         }
-        DebuggerResponse::Error { message } => {
-            println!("  [FAIL] Syscall mode error: {}", message);
-            return Err(anyhow::anyhow!("Syscall mode failed: {}", message));
-        }
-        other => {
-            println!("  [FAIL] Unexpected response: {:?}", other);
-            return Err(anyhow::anyhow!("Unexpected response: {:?}", other));
+        EmulateResult::Trace(_) => {
+            println!("  [FAIL] Unexpected TenetTrace for Syscall mode");
+            return Err(anyhow::anyhow!("Expected EmulationResult for Syscall mode"));
         }
     }
 

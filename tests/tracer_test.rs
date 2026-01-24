@@ -3,10 +3,9 @@
 mod common;
 
 use common::TestServer;
-use joybug2::protocol::{
-    DebuggerRequest, DebuggerResponse, EmulationMode, TraceExitCondition,
+use joybug2::protocol_io::{
+    BreakpointDecision, DebugSession, EmulateResult, EmulationMode, TraceExitCondition,
 };
-use joybug2::protocol_io::{BreakpointDecision, DebugSession};
 
 /// Test state for tracer tests
 struct TracerTestState {
@@ -110,50 +109,28 @@ fn run_tracer_comparison(
         // IMPORTANT: Remove the breakpoint BEFORE tracing so the emulator sees the same
         // bytes as the real CPU. The breakpoint byte (0xCC) would cause different execution.
         println!("Removing breakpoint to ensure consistent memory view...");
-        let remove_req = DebuggerRequest::RemoveBreakpoint { pid, addr: address };
-        match session.send_and_receive(&remove_req)? {
-            DebuggerResponse::Ack => {}
-            DebuggerResponse::Error { message } => {
-                return Err(anyhow::anyhow!("Failed to remove breakpoint: {}", message));
-            }
-            _ => {}
-        }
+        session.remove_breakpoint(pid, address)?;
 
         // Step 1: Run trap-flag tracer for N instructions
         let trace_limit = 100; // Trace first 100 instructions for comparison
         println!("Running trap-flag tracer for {} instructions...", trace_limit);
 
-        let trap_trace_req = DebuggerRequest::TraceInstructions {
+        let trap_result = session.trace_instructions(
             pid,
             tid,
-            exit_condition: TraceExitCondition::InstructionLimit(trace_limit),
-            max_instructions: trace_limit,
-        };
+            TraceExitCondition::InstructionLimit(trace_limit),
+            trace_limit,
+        )?;
 
-        let (trap_line_count, trap_trace_text) = match session.send_and_receive(&trap_trace_req)? {
-            DebuggerResponse::TenetTrace {
-                trace_text,
-                stop_reason,
-                trace_time_us,
-            } => {
-                let line_count = trace_text.lines().count();
-                println!(
-                    "  Trap-flag trace: {} lines, {} us, reason: {}",
-                    line_count,
-                    trace_time_us,
-                    stop_reason
-                );
-                session.state.trap_flag_trace_done = true;
-                (line_count, trace_text)
-            }
-            DebuggerResponse::Error { message } => {
-                println!("  Trap-flag trace error: {}", message);
-                return Err(anyhow::anyhow!("Trap-flag trace failed: {}", message));
-            }
-            other => {
-                return Err(anyhow::anyhow!("Unexpected response: {:?}", other));
-            }
-        };
+        let trap_line_count = trap_result.trace_text.lines().count();
+        println!(
+            "  Trap-flag trace: {} lines, {} us, reason: {}",
+            trap_line_count,
+            trap_result.trace_time_us,
+            trap_result.stop_reason
+        );
+        session.state.trap_flag_trace_done = true;
+        let trap_trace_text = trap_result.trace_text;
 
         // Step 2: Restore context to same starting point
         println!("\nRestoring context to initial state...");
@@ -162,36 +139,28 @@ fn run_tracer_comparison(
         // Step 3: Run emulator with InstructionTrace mode
         println!("Running emulator for {} instructions...", trap_line_count);
 
-        let emu_req = DebuggerRequest::EmulateInstructions {
+        let emu_result = session.emulate_instructions(
             pid,
             tid,
-            max_instructions: trap_line_count,
-            mode: EmulationMode::InstructionTrace,
-            exit_condition: None,
-        };
+            trap_line_count,
+            EmulationMode::InstructionTrace,
+            None,
+        )?;
 
-        let (emu_line_count, _emu_trace_text) = match session.send_and_receive(&emu_req)? {
-            DebuggerResponse::TenetTrace {
-                trace_text,
-                stop_reason,
-                trace_time_us,
-            } => {
-                let line_count = trace_text.lines().count();
+        let emu_line_count = match &emu_result {
+            EmulateResult::Trace(trace) => {
+                let line_count = trace.trace_text.lines().count();
                 println!(
                     "  Emulator trace: {} lines, {} us, reason: {}",
                     line_count,
-                    trace_time_us,
-                    stop_reason
+                    trace.trace_time_us,
+                    trace.stop_reason
                 );
                 session.state.emulator_trace_done = true;
-                (line_count, trace_text)
+                line_count
             }
-            DebuggerResponse::Error { message } => {
-                println!("  Emulator trace error: {}", message);
-                return Err(anyhow::anyhow!("Emulator trace failed: {}", message));
-            }
-            other => {
-                return Err(anyhow::anyhow!("Unexpected emulator response: {:?}", other));
+            EmulateResult::Emulation(_) => {
+                return Err(anyhow::anyhow!("Expected TenetTrace for InstructionTrace mode"));
             }
         };
 
@@ -321,45 +290,30 @@ fn test_trap_flag_tracer_simple() {
         println!("\n=== Initial breakpoint at 0x{:016X} ===", address);
 
         // Trace just 10 instructions
-        let req = DebuggerRequest::TraceInstructions {
+        let result = session.trace_instructions(
             pid,
             tid,
-            exit_condition: TraceExitCondition::InstructionLimit(10),
-            max_instructions: 10,
-        };
+            TraceExitCondition::InstructionLimit(10),
+            10,
+        )?;
 
-        match session.send_and_receive(&req)? {
-            DebuggerResponse::TenetTrace {
-                trace_text,
-                stop_reason,
-                trace_time_us,
-            } => {
-                let line_count = trace_text.lines().count();
-                println!("Traced {} lines in {} us (Tenet format)", line_count, trace_time_us);
-                println!("Stop reason: {}", stop_reason);
+        let line_count = result.trace_text.lines().count();
+        println!("Traced {} lines in {} us (Tenet format)", line_count, result.trace_time_us);
+        println!("Stop reason: {}", result.stop_reason);
 
-                // Print first few lines of Tenet trace
-                println!("\nFirst 5 trace lines:");
-                for (i, line) in trace_text.lines().take(5).enumerate() {
-                    let display = if line.len() > 80 {
-                        format!("{}...", &line[..80])
-                    } else {
-                        line.to_string()
-                    };
-                    println!("[{:2}] {}", i, display);
-                }
-
-                session.state.traced = true;
-                session.state.trace_count = line_count;
-            }
-            DebuggerResponse::Error { message } => {
-                println!("Trace error: {}", message);
-                return Err(anyhow::anyhow!("Trace failed: {}", message));
-            }
-            other => {
-                return Err(anyhow::anyhow!("Unexpected response: {:?}", other));
-            }
+        // Print first few lines of Tenet trace
+        println!("\nFirst 5 trace lines:");
+        for (i, line) in result.trace_text.lines().take(5).enumerate() {
+            let display = if line.len() > 80 {
+                format!("{}...", &line[..80])
+            } else {
+                line.to_string()
+            };
+            println!("[{:2}] {}", i, display);
         }
+
+        session.state.traced = true;
+        session.state.trace_count = line_count;
 
         Ok(())
     })
