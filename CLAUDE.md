@@ -8,6 +8,24 @@ Joybug2 is a Windows debugger library and TCP server written in Rust (edition 20
 
 ## Build & Test Commands
 
+**Prerequisites:** The build requires Visual Studio with MSVC and LLVM/Clang components installed.
+
+### One-liner for Claude Code (ARM64)
+
+Use these commands to build/test. LIBCLANG_PATH is set in bash so it's inherited by the child process (avoids `$env:` escaping issues with the VsDevShell script):
+
+```bash
+export LIBCLANG_PATH='C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\Llvm\ARM64\bin' && powershell -Command "& 'C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\Launch-VsDevShell.ps1' -Arch arm64 -SkipAutomaticLocation; cargo build 2>&1"
+```
+
+For tests:
+
+```bash
+export LIBCLANG_PATH='C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\Llvm\ARM64\bin' && powershell -Command "& 'C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\Launch-VsDevShell.ps1' -Arch arm64 -SkipAutomaticLocation; cargo test 2>&1"
+```
+
+### Common Commands
+
 ```bash
 cargo build                              # Debug build
 cargo build --release                    # Release build
@@ -18,7 +36,7 @@ RUST_LOG=trace cargo test -- --nocapture # With full tracing
 cargo run                                # Start server on 127.0.0.1:9000
 ```
 
-**Build requirements:** Rust toolchain, Windows SDK, MSVC compiler (cl.exe needed for test program compilation in build.rs)
+**Build requirements:** Rust toolchain, Windows SDK, MSVC compiler, LLVM/Clang (for LIBCLANG_PATH)
 
 ## Architecture
 

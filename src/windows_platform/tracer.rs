@@ -46,7 +46,11 @@ pub fn trace_instructions(
             ThreadContext::Win32RawContext(ctx) => ctx,
         };
 
-        let current_rip = context.Rip;
+        // Get program counter (Rip on x64, Pc on ARM64)
+        #[cfg(target_arch = "x86_64")]
+        let current_pc = context.Rip;
+        #[cfg(target_arch = "aarch64")]
+        let current_pc = context.Pc;
 
         // Step 1: Capture pending write data from previous instruction
         // (previous instruction has now completed execution)
@@ -76,7 +80,7 @@ pub fn trace_instructions(
         let snapshot = RegisterSnapshot::from_context(&context);
 
         // Get instruction bytes and size via disassembly
-        let (insn_bytes, insn_size) = platform.disassemble_memory(pid, current_rip, 1, arch)
+        let (insn_bytes, insn_size) = platform.disassemble_memory(pid, current_pc, 1, arch)
             .map(|insns| {
                 insns.first()
                     .map(|i| (i.bytes.clone(), i.size))
@@ -88,7 +92,7 @@ pub fn trace_instructions(
         let mut memory_accesses: Vec<MemoryAccess> = Vec::new();
 
         if !insn_bytes.is_empty() {
-            let operands = analyze_memory_operands(&insn_bytes, current_rip, &snapshot, arch);
+            let operands = analyze_memory_operands(&insn_bytes, current_pc, &snapshot, arch);
 
             for op in operands {
                 if op.is_read {
@@ -119,19 +123,19 @@ pub fn trace_instructions(
 
         // Record trace entry
         entries.push(TraceEntry {
-            address: current_rip,
+            address: current_pc,
             size: insn_size,
             registers: snapshot,
             memory_accesses,
         });
 
-        trace!(step = step_count, rip = format!("0x{:X}", current_rip), size = insn_size, "Traced instruction");
+        trace!(step = step_count, pc = format!("0x{:X}", current_pc), size = insn_size, "Traced instruction");
 
         // Check if we reached the exit address (after recording the trace entry)
         if let TraceExitCondition::ReachAddress(addr) = &exit_condition {
-            if current_rip == *addr {
+            if current_pc == *addr {
                 stop_reason = format!("ReachAddress(0x{:X})", addr);
-                debug!(step_count, current_rip, "Reached target address");
+                debug!(step_count, current_pc, "Reached target address");
                 break;
             }
         }

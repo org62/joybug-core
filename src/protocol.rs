@@ -30,7 +30,7 @@ pub mod request_response {
 
     /// Register snapshot for x64 - captures all general-purpose registers
     #[derive(Debug, Serialize, Deserialize, Clone, Default)]
-    pub struct RegisterSnapshot {
+    pub struct X64RegisterSnapshot {
         pub rax: u64,
         pub rbx: u64,
         pub rcx: u64,
@@ -51,11 +51,40 @@ pub mod request_response {
         pub rflags: u64,
     }
 
+    /// Register snapshot for ARM64 - captures all general-purpose registers
+    #[derive(Debug, Serialize, Deserialize, Clone, Default)]
+    pub struct Arm64RegisterSnapshot {
+        pub x: [u64; 29],  // X0-X28
+        pub fp: u64,       // X29 (frame pointer)
+        pub lr: u64,       // X30 (link register)
+        pub sp: u64,
+        pub pc: u64,
+        pub cpsr: u64,
+    }
+
+    /// Architecture-aware register snapshot
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub enum RegisterSnapshot {
+        X64(X64RegisterSnapshot),
+        Arm64(Arm64RegisterSnapshot),
+    }
+
+    impl Default for RegisterSnapshot {
+        fn default() -> Self {
+            #[cfg(target_arch = "x86_64")]
+            { RegisterSnapshot::X64(X64RegisterSnapshot::default()) }
+            #[cfg(target_arch = "aarch64")]
+            { RegisterSnapshot::Arm64(Arm64RegisterSnapshot::default()) }
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            { RegisterSnapshot::X64(X64RegisterSnapshot::default()) }
+        }
+    }
+
     impl RegisterSnapshot {
         /// Create from Windows CONTEXT (x64)
         #[cfg(all(windows, target_arch = "x86_64"))]
         pub fn from_context(ctx: &super::CONTEXT) -> Self {
-            Self {
+            RegisterSnapshot::X64(X64RegisterSnapshot {
                 rax: ctx.Rax,
                 rbx: ctx.Rbx,
                 rcx: ctx.Rcx,
@@ -74,6 +103,87 @@ pub mod request_response {
                 r15: ctx.R15,
                 rip: ctx.Rip,
                 rflags: ctx.EFlags as u64,
+            })
+        }
+
+        /// Create from Windows CONTEXT (ARM64)
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        pub fn from_context(ctx: &super::CONTEXT) -> Self {
+            unsafe {
+                let x_regs = ctx.Anonymous.X;
+                RegisterSnapshot::Arm64(Arm64RegisterSnapshot {
+                    x: [
+                        x_regs[0], x_regs[1], x_regs[2], x_regs[3], x_regs[4],
+                        x_regs[5], x_regs[6], x_regs[7], x_regs[8], x_regs[9],
+                        x_regs[10], x_regs[11], x_regs[12], x_regs[13], x_regs[14],
+                        x_regs[15], x_regs[16], x_regs[17], x_regs[18], x_regs[19],
+                        x_regs[20], x_regs[21], x_regs[22], x_regs[23], x_regs[24],
+                        x_regs[25], x_regs[26], x_regs[27], x_regs[28],
+                    ],
+                    fp: ctx.Anonymous.Anonymous.Fp,
+                    lr: ctx.Anonymous.Anonymous.Lr,
+                    sp: ctx.Sp,
+                    pc: ctx.Pc,
+                    cpsr: ctx.Cpsr as u64,
+                })
+            }
+        }
+
+        /// Get program counter (RIP on x64, PC on ARM64)
+        pub fn pc(&self) -> u64 {
+            match self {
+                RegisterSnapshot::X64(snap) => snap.rip,
+                RegisterSnapshot::Arm64(snap) => snap.pc,
+            }
+        }
+
+        /// Get stack pointer (RSP on x64, SP on ARM64)
+        pub fn sp(&self) -> u64 {
+            match self {
+                RegisterSnapshot::X64(snap) => snap.rsp,
+                RegisterSnapshot::Arm64(snap) => snap.sp,
+            }
+        }
+
+        /// Get frame pointer (RBP on x64, FP/X29 on ARM64)
+        pub fn fp(&self) -> u64 {
+            match self {
+                RegisterSnapshot::X64(snap) => snap.rbp,
+                RegisterSnapshot::Arm64(snap) => snap.fp,
+            }
+        }
+
+        /// Get flags register (RFLAGS on x64, CPSR on ARM64)
+        pub fn flags(&self) -> u64 {
+            match self {
+                RegisterSnapshot::X64(snap) => snap.rflags,
+                RegisterSnapshot::Arm64(snap) => snap.cpsr,
+            }
+        }
+
+        /// Check if this is an x64 snapshot
+        pub fn is_x64(&self) -> bool {
+            matches!(self, RegisterSnapshot::X64(_))
+        }
+
+        /// Check if this is an ARM64 snapshot
+        pub fn is_arm64(&self) -> bool {
+            matches!(self, RegisterSnapshot::Arm64(_))
+        }
+
+        /// Get x64 snapshot if this is x64, None otherwise
+        pub fn as_x64(&self) -> Option<&X64RegisterSnapshot> {
+            match self {
+                RegisterSnapshot::X64(snap) => Some(snap),
+                _ => None,
+            }
+        }
+
+        /// Get ARM64 snapshot if this is ARM64, None otherwise
+        pub fn as_arm64(&self) -> Option<&Arm64RegisterSnapshot> {
+            match self {
+                RegisterSnapshot::Arm64(snap) => Some(snap),
+                _ => None,
             }
         }
     }

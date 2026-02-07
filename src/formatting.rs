@@ -287,14 +287,8 @@ impl std::fmt::Display for ThreadContext {
         #[cfg(all(windows, target_arch = "aarch64"))]
         {
             let ThreadContext::Win32RawContext(ctx) = self;
-            
-            // TODO: Replace with actual register access once CONTEXT_0 layout is confirmed
-            // The Anonymous union should contain X0-X30 registers, possibly as:
-            // - ctx.Anonymous.X[0] through ctx.Anonymous.X[30], or
-            // - ctx.Anonymous.X0 through ctx.Anonymous.X30
-            
-            // For now, using placeholder values but with the correct format
-            return write!(f,
+
+            return unsafe { write!(f,
                 "X0:   {:016X}   X1:   {:016X}   X2:   {:016X}   \n\
                  X3:   {:016X}   X4:   {:016X}   X5:   {:016X}   \n\
                  X6:   {:016X}   X7:   {:016X}   X8:   {:016X}   \n\
@@ -306,36 +300,32 @@ impl std::fmt::Display for ThreadContext {
                  X24:  {:016X}   X25:  {:016X}   X26:  {:016X}   \n\
                  X27:  {:016X}   X28:  {:016X}   FP:   {:016X}   \n\
                  LR:   {:016X}   SP:   {:016X}   PC:   {:016X}   \n\
-                 CPSR: {:08X}   ELR:  {:016X}   SPSR: {:016X}   \n\
-                 LastErrorValue: 0x{:08X}\n\
-                 LastStatusValue: 0x{:08X}",
+                 CPSR: {:08X}",
                 // X0-X2
-                0, 0, 0,
-                // X3-X5  
-                0, 0, 0,
+                ctx.Anonymous.X[0], ctx.Anonymous.X[1], ctx.Anonymous.X[2],
+                // X3-X5
+                ctx.Anonymous.X[3], ctx.Anonymous.X[4], ctx.Anonymous.X[5],
                 // X6-X8
-                0, 0, 0,
+                ctx.Anonymous.X[6], ctx.Anonymous.X[7], ctx.Anonymous.X[8],
                 // X9-X11
-                0, 0, 0,
+                ctx.Anonymous.X[9], ctx.Anonymous.X[10], ctx.Anonymous.X[11],
                 // X12-X14
-                0, 0, 0,
+                ctx.Anonymous.X[12], ctx.Anonymous.X[13], ctx.Anonymous.X[14],
                 // X15-X17
-                0, 0, 0,
+                ctx.Anonymous.X[15], ctx.Anonymous.X[16], ctx.Anonymous.X[17],
                 // X18-X20
-                0, 0, 0,
+                ctx.Anonymous.X[18], ctx.Anonymous.X[19], ctx.Anonymous.X[20],
                 // X21-X23
-                0, 0, 0,
+                ctx.Anonymous.X[21], ctx.Anonymous.X[22], ctx.Anonymous.X[23],
                 // X24-X26
-                0, 0, 0,
+                ctx.Anonymous.X[24], ctx.Anonymous.X[25], ctx.Anonymous.X[26],
                 // X27-X28, FP (X29)
-                0, 0, 0,
+                ctx.Anonymous.X[27], ctx.Anonymous.X[28], ctx.Anonymous.X[29],
                 // LR (X30), SP, PC
-                0, ctx.Sp, ctx.Pc,
-                // CPSR, ELR, SPSR (placeholder values for ELR and SPSR)
-                ctx.Cpsr, 0u64, 0u64,
-                // LastErrorValue, LastStatusValue (placeholder values)
-                0u32, 0u32
-            );
+                ctx.Anonymous.X[30], ctx.Sp, ctx.Pc,
+                // CPSR
+                ctx.Cpsr,
+            ) };
         }
         
         #[cfg(not(any(all(windows, target_arch = "x86_64"), all(windows, target_arch = "aarch64"))))]

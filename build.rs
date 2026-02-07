@@ -53,12 +53,21 @@ fn compile_test_program(manifest_dir: &str, out_dir: &str, name: &str, fixed_bas
     ]);
 
     // Add fixed base address if specified (for predictable symbol addresses)
+    // Note: ARM64 doesn't support /FIXED, so we skip it on that target
     if let Some(base) = fixed_base {
-        cmd.args(&[
-            &format!("/BASE:0x{:X}", base),
-            "/DYNAMICBASE:NO",                              // Disable ASLR
-            "/FIXED",                                       // Fixed base address
-        ]);
+        let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        if target_arch == "aarch64" {
+            // ARM64 doesn't support /FIXED, only set preferred base (may be ignored due to ASLR)
+            cmd.args(&[
+                &format!("/BASE:0x{:X}", base),
+            ]);
+        } else {
+            cmd.args(&[
+                &format!("/BASE:0x{:X}", base),
+                "/DYNAMICBASE:NO",                          // Disable ASLR
+                "/FIXED",                                   // Fixed base address
+            ]);
+        }
     }
 
     match cmd.output() {
@@ -86,6 +95,15 @@ fn compile_test_program(manifest_dir: &str, out_dir: &str, name: &str, fixed_bas
 }
 
 fn main() {
+    // Require LIBCLANG_PATH to be set (needed for bindgen in dependencies like capstone-sys)
+    if env::var("LIBCLANG_PATH").is_err() {
+        panic!(
+            "LIBCLANG_PATH environment variable is not set.\n\
+             Please set it to the path containing libclang.dll, e.g.:\n\
+             set LIBCLANG_PATH=C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Tools\\Llvm\\ARM64\\bin"
+        );
+    }
+
     // Only compile test programs on Windows
     #[cfg(windows)]
     {

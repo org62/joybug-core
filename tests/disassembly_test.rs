@@ -603,8 +603,15 @@ fn test_disassembly_speed_kernelbase() {
         let mut functions_disassembled = 0usize;
         let mut total_instructions = 0usize;
         let mut errors = 0usize;
+        let mut skipped = 0usize;
 
         for rf in runtime_functions.iter().take(MAX_FUNCTIONS) {
+            // Skip entries with invalid EndAddress (ARM64 exception tables don't have EndAddress,
+            // it's computed from packed unwind data, and may be 0 if unavailable)
+            if rf.EndAddress <= rf.BeginAddress {
+                skipped += 1;
+                continue;
+            }
             let func_start = kernelbase.base + rf.BeginAddress as u64;
             let func_end = kernelbase.base + rf.EndAddress as u64;
             let func_size = (rf.EndAddress - rf.BeginAddress) as usize;
@@ -693,8 +700,16 @@ fn test_disassembly_speed_kernelbase() {
         }
 
         // Verify we disassembled a significant portion
-        let attempted = MAX_FUNCTIONS.min(runtime_functions.len());
-        let success_rate = functions_disassembled as f64 / attempted as f64;
+        // Exclude skipped entries (ARM64 entries without valid EndAddress) from the calculation
+        let attempted = MAX_FUNCTIONS.min(runtime_functions.len()).saturating_sub(skipped);
+        if skipped > 0 {
+            println!("Skipped (no valid EndAddress): {}", skipped);
+        }
+        let success_rate = if attempted > 0 {
+            functions_disassembled as f64 / attempted as f64
+        } else {
+            0.0
+        };
         println!("Success rate: {:.1}%", success_rate * 100.0);
 
         assert!(

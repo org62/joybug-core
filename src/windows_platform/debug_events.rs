@@ -410,7 +410,7 @@ pub(super) fn handle_exception_event(
         }
 
         // Unexpected SS
-        let ctx_for_log = match super::thread_context::get_thread_context(process, pid, tid) {
+        let _ctx_for_log = match super::thread_context::get_thread_context(process, pid, tid) {
             Ok(crate::protocol::ThreadContext::Win32RawContext(c)) => Some(c),
             _ => None,
         };

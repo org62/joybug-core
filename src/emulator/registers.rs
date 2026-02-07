@@ -1,6 +1,8 @@
 //! Register mapping between Windows CONTEXT and Unicorn registers
 
-use unicorn_engine::{Unicorn, RegisterX86};
+#[cfg(target_arch = "x86_64")]
+use unicorn_engine::RegisterX86;
+use unicorn_engine::Unicorn;
 use crate::protocol::ThreadContext;
 use super::error::EmulatorError;
 
@@ -126,9 +128,10 @@ pub fn write_arm64_registers<D>(
             }
 
             // Frame pointer (X29), Link register (X30)
-            emu.reg_write(RegisterARM64::X29, ctx.Fp)
+            // ARM64 CONTEXT has nested anonymous union for Fp/Lr
+            emu.reg_write(RegisterARM64::X29, unsafe { ctx.Anonymous.Anonymous.Fp })
                 .map_err(|e| EmulatorError::RegisterError(format!("FP: {:?}", e)))?;
-            emu.reg_write(RegisterARM64::X30, ctx.Lr)
+            emu.reg_write(RegisterARM64::X30, unsafe { ctx.Anonymous.Anonymous.Lr })
                 .map_err(|e| EmulatorError::RegisterError(format!("LR: {:?}", e)))?;
 
             // Stack pointer and Program counter

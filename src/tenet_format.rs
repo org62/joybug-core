@@ -15,13 +15,12 @@
 //! - Memory writes: `mw=addr:hexbytes`
 //! - Memory read+write: `mrw=addr:hexbytes`
 
-use crate::protocol::{MemoryAccess, MemoryAccessType, RegisterSnapshot};
+use crate::protocol::{MemoryAccess, MemoryAccessType, RegisterSnapshot, X64RegisterSnapshot, Arm64RegisterSnapshot};
 
-/// Compute the register delta between two snapshots.
-/// Returns a vector of (register_name, new_value) pairs for registers that changed.
-pub fn compute_register_delta(
-    prev: &RegisterSnapshot,
-    curr: &RegisterSnapshot,
+/// Compute the register delta between two x64 snapshots.
+fn compute_x64_register_delta(
+    prev: &X64RegisterSnapshot,
+    curr: &X64RegisterSnapshot,
 ) -> Vec<(&'static str, u64)> {
     let mut delta = Vec::new();
 
@@ -43,10 +42,50 @@ pub fn compute_register_delta(
     if prev.r13 != curr.r13 { delta.push(("r13", curr.r13)); }
     if prev.r14 != curr.r14 { delta.push(("r14", curr.r14)); }
     if prev.r15 != curr.r15 { delta.push(("r15", curr.r15)); }
-    // Note: rflags changes are not typically included in Tenet traces
-    // as they are not considered GPRs, but can be added if needed
 
     delta
+}
+
+/// Compute the register delta between two ARM64 snapshots.
+fn compute_arm64_register_delta(
+    prev: &Arm64RegisterSnapshot,
+    curr: &Arm64RegisterSnapshot,
+) -> Vec<(String, u64)> {
+    let mut delta = Vec::new();
+
+    // Compare X0-X28
+    for i in 0..29 {
+        if prev.x[i] != curr.x[i] {
+            delta.push((format!("x{}", i), curr.x[i]));
+        }
+    }
+    // FP (X29), LR (X30), SP
+    if prev.fp != curr.fp { delta.push(("fp".to_string(), curr.fp)); }
+    if prev.lr != curr.lr { delta.push(("lr".to_string(), curr.lr)); }
+    if prev.sp != curr.sp { delta.push(("sp".to_string(), curr.sp)); }
+
+    delta
+}
+
+/// Compute the register delta between two snapshots.
+/// Returns a vector of (register_name, new_value) pairs for registers that changed.
+pub fn compute_register_delta(
+    prev: &RegisterSnapshot,
+    curr: &RegisterSnapshot,
+) -> Vec<(String, u64)> {
+    match (prev, curr) {
+        (RegisterSnapshot::X64(p), RegisterSnapshot::X64(c)) => {
+            compute_x64_register_delta(p, c)
+                .into_iter()
+                .map(|(name, val)| (name.to_string(), val))
+                .collect()
+        }
+        (RegisterSnapshot::Arm64(p), RegisterSnapshot::Arm64(c)) => {
+            compute_arm64_register_delta(p, c)
+        }
+        // Mismatched architectures - return empty delta
+        _ => Vec::new(),
+    }
 }
 
 /// Format a single memory access for Tenet output.
@@ -64,18 +103,10 @@ pub fn format_memory_access(access: &MemoryAccess) -> String {
     format!("{}=0x{:x}:{}", prefix, access.address, hex_data)
 }
 
-/// Format a single Tenet trace line.
-///
-/// # Arguments
-/// * `prev` - Previous register state (None for first line)
-/// * `curr` - Current register state
-/// * `mem` - Memory accesses for this instruction
-///
-/// # Returns
-/// A Tenet format line with RIP first, then changed registers, then memory accesses
-pub fn format_tenet_line(
-    prev: Option<&RegisterSnapshot>,
-    curr: &RegisterSnapshot,
+/// Format a single x64 Tenet trace line
+fn format_x64_tenet_line(
+    prev: Option<&X64RegisterSnapshot>,
+    curr: &X64RegisterSnapshot,
     mem: &[MemoryAccess],
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -105,7 +136,7 @@ pub fn format_tenet_line(
         }
         Some(prev_regs) => {
             // Delta: only output changed registers
-            for (name, value) in compute_register_delta(prev_regs, curr) {
+            for (name, value) in compute_x64_register_delta(prev_regs, curr) {
                 parts.push(format!("{}=0x{:x}", name, value));
             }
         }
@@ -117,6 +148,69 @@ pub fn format_tenet_line(
     }
 
     parts.join(",")
+}
+
+/// Format a single ARM64 Tenet trace line
+fn format_arm64_tenet_line(
+    prev: Option<&Arm64RegisterSnapshot>,
+    curr: &Arm64RegisterSnapshot,
+    mem: &[MemoryAccess],
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    // PC is always first
+    parts.push(format!("pc=0x{:x}", curr.pc));
+
+    match prev {
+        None => {
+            // First line: dump all registers
+            for i in 0..29 {
+                parts.push(format!("x{}=0x{:x}", i, curr.x[i]));
+            }
+            parts.push(format!("fp=0x{:x}", curr.fp));
+            parts.push(format!("lr=0x{:x}", curr.lr));
+            parts.push(format!("sp=0x{:x}", curr.sp));
+        }
+        Some(prev_regs) => {
+            // Delta: only output changed registers
+            for (name, value) in compute_arm64_register_delta(prev_regs, curr) {
+                parts.push(format!("{}=0x{:x}", name, value));
+            }
+        }
+    }
+
+    // Add memory accesses
+    for access in mem {
+        parts.push(format_memory_access(access));
+    }
+
+    parts.join(",")
+}
+
+/// Format a single Tenet trace line.
+///
+/// # Arguments
+/// * `prev` - Previous register state (None for first line)
+/// * `curr` - Current register state
+/// * `mem` - Memory accesses for this instruction
+///
+/// # Returns
+/// A Tenet format line with PC/RIP first, then changed registers, then memory accesses
+pub fn format_tenet_line(
+    prev: Option<&RegisterSnapshot>,
+    curr: &RegisterSnapshot,
+    mem: &[MemoryAccess],
+) -> String {
+    match curr {
+        RegisterSnapshot::X64(curr_x64) => {
+            let prev_x64 = prev.and_then(|p| p.as_x64());
+            format_x64_tenet_line(prev_x64, curr_x64, mem)
+        }
+        RegisterSnapshot::Arm64(curr_arm64) => {
+            let prev_arm64 = prev.and_then(|p| p.as_arm64());
+            format_arm64_tenet_line(prev_arm64, curr_arm64, mem)
+        }
+    }
 }
 
 /// Convert a full trace to Tenet format.
@@ -183,8 +277,8 @@ pub fn traces_to_tenet(
 mod tests {
     use super::*;
 
-    fn make_regs(rip: u64, rax: u64, rsp: u64) -> RegisterSnapshot {
-        RegisterSnapshot {
+    fn make_x64_regs(rip: u64, rax: u64, rsp: u64) -> RegisterSnapshot {
+        RegisterSnapshot::X64(X64RegisterSnapshot {
             rax,
             rbx: 0,
             rcx: 0,
@@ -203,19 +297,19 @@ mod tests {
             r15: 0,
             rip,
             rflags: 0x246,
-        }
+        })
     }
 
     #[test]
     fn test_compute_register_delta() {
-        let prev = make_regs(0x1000, 0x100, 0x7FFF0000);
-        let curr = make_regs(0x1005, 0x200, 0x7FFF0000); // RAX changed, RSP same
+        let prev = make_x64_regs(0x1000, 0x100, 0x7FFF0000);
+        let curr = make_x64_regs(0x1005, 0x200, 0x7FFF0000); // RAX changed, RSP same
 
         let delta = compute_register_delta(&prev, &curr);
 
         // Should only contain RAX (RIP is handled separately)
         assert_eq!(delta.len(), 1);
-        assert_eq!(delta[0], ("rax", 0x200));
+        assert_eq!(delta[0], ("rax".to_string(), 0x200));
     }
 
     #[test]
@@ -244,7 +338,7 @@ mod tests {
 
     #[test]
     fn test_format_tenet_line_first() {
-        let regs = make_regs(0x140001000, 0x1234, 0x7FFF0000);
+        let regs = make_x64_regs(0x140001000, 0x1234, 0x7FFF0000);
         let mem = vec![
             MemoryAccess {
                 access_type: MemoryAccessType::Read,
@@ -264,8 +358,8 @@ mod tests {
 
     #[test]
     fn test_format_tenet_line_delta() {
-        let prev = make_regs(0x140001000, 0x100, 0x7FFF0000);
-        let curr = make_regs(0x140001005, 0x200, 0x7FFEF000); // RAX and RSP changed
+        let prev = make_x64_regs(0x140001000, 0x100, 0x7FFF0000);
+        let curr = make_x64_regs(0x140001005, 0x200, 0x7FFEF000); // RAX and RSP changed
 
         let line = format_tenet_line(Some(&prev), &curr, &[]);
 
@@ -281,11 +375,11 @@ mod tests {
     fn test_trace_to_tenet() {
         let entries = vec![
             (
-                make_regs(0x1000, 0x100, 0x7FFF0000),
+                make_x64_regs(0x1000, 0x100, 0x7FFF0000),
                 vec![],
             ),
             (
-                make_regs(0x1005, 0x200, 0x7FFF0000),
+                make_x64_regs(0x1005, 0x200, 0x7FFF0000),
                 vec![MemoryAccess {
                     access_type: MemoryAccessType::Write,
                     address: 0x2000,

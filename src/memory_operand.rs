@@ -9,7 +9,7 @@ use capstone::arch::x86::{X86OperandType, X86Reg};
 use std::cell::RefCell;
 
 use crate::interfaces::Architecture;
-use crate::protocol::{MemoryAccess, MemoryAccessType, RegisterSnapshot};
+use crate::protocol::{MemoryAccess, MemoryAccessType, RegisterSnapshot, X64RegisterSnapshot};
 
 // Thread-local Capstone engines for memory operand analysis
 thread_local! {
@@ -29,8 +29,8 @@ pub struct MemoryOperandInfo {
     pub size: usize,
 }
 
-/// Get the value of a register from a RegisterSnapshot using Capstone's X86Reg constants
-fn get_register_value(regs: &RegisterSnapshot, reg_id: u16) -> u64 {
+/// Get the value of a register from an X64RegisterSnapshot using Capstone's X86Reg constants
+fn get_x64_register_value(regs: &X64RegisterSnapshot, reg_id: u16) -> u64 {
     // Use Capstone's x86_reg constants (from capstone::arch::x86::X86Reg)
     // Cast to u16 for comparison with RegId.0
     match reg_id as u32 {
@@ -72,6 +72,15 @@ fn get_register_value(regs: &RegisterSnapshot, reg_id: u16) -> u64 {
         X86Reg::X86_REG_R15D => regs.r15 & 0xFFFFFFFF,
 
         _ => 0,
+    }
+}
+
+/// Get the value of a register from a RegisterSnapshot using Capstone's X86Reg constants
+/// Returns 0 if the snapshot is not x64 or register is unknown
+fn get_register_value(regs: &RegisterSnapshot, reg_id: u16) -> u64 {
+    match regs {
+        RegisterSnapshot::X64(x64_regs) => get_x64_register_value(x64_regs, reg_id),
+        RegisterSnapshot::Arm64(_) => 0, // ARM64 not supported in x64 memory operand analysis
     }
 }
 
@@ -311,7 +320,7 @@ mod tests {
 
     fn make_regs() -> RegisterSnapshot {
         // Use addresses above 0x10000 (null page guard region)
-        RegisterSnapshot {
+        RegisterSnapshot::X64(X64RegisterSnapshot {
             rax: 0x100000,
             rbx: 0x200000,
             rcx: 0x300000,
@@ -330,7 +339,7 @@ mod tests {
             r15: 0x1000000,
             rip: 0x140001000,
             rflags: 0x246,
-        }
+        })
     }
 
     #[test]

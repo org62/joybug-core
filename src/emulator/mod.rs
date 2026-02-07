@@ -20,7 +20,10 @@ use windows_sys::Win32::System::Memory::{
 };
 
 use crate::interfaces::{Architecture, PlatformAPI};
-use crate::protocol::{ThreadContext, EmulationMode, RegisterSnapshot, MemoryAccess};
+use crate::protocol::{ThreadContext, EmulationMode, RegisterSnapshot, Arm64RegisterSnapshot, MemoryAccess};
+
+#[cfg(target_arch = "x86_64")]
+use crate::protocol::X64RegisterSnapshot;
 
 mod error;
 mod registers;
@@ -123,8 +126,8 @@ fn format_symbol_with_offset(sym: ModuleSymbol, offset: u64) -> String {
 
 /// Create RegisterSnapshot from Unicorn x64 emulator state
 #[cfg(target_arch = "x86_64")]
-fn snapshot_from_unicorn<D>(emu: &Unicorn<'_, D>, rip: u64) -> RegisterSnapshot {
-    RegisterSnapshot {
+fn snapshot_from_unicorn<D>(emu: &Unicorn<'_, D>, pc: u64) -> RegisterSnapshot {
+    RegisterSnapshot::X64(X64RegisterSnapshot {
         rax: emu.reg_read(RegisterX86::RAX).unwrap_or(0),
         rbx: emu.reg_read(RegisterX86::RBX).unwrap_or(0),
         rcx: emu.reg_read(RegisterX86::RCX).unwrap_or(0),
@@ -141,9 +144,52 @@ fn snapshot_from_unicorn<D>(emu: &Unicorn<'_, D>, rip: u64) -> RegisterSnapshot 
         r13: emu.reg_read(RegisterX86::R13).unwrap_or(0),
         r14: emu.reg_read(RegisterX86::R14).unwrap_or(0),
         r15: emu.reg_read(RegisterX86::R15).unwrap_or(0),
-        rip,
+        rip: pc,
         rflags: emu.reg_read(RegisterX86::RFLAGS).unwrap_or(0),
-    }
+    })
+}
+
+/// Create RegisterSnapshot from Unicorn ARM64 emulator state
+#[cfg(target_arch = "aarch64")]
+fn snapshot_from_unicorn<D>(emu: &Unicorn<'_, D>, pc: u64) -> RegisterSnapshot {
+    RegisterSnapshot::Arm64(Arm64RegisterSnapshot {
+        x: [
+            emu.reg_read(RegisterARM64::X0).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X1).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X2).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X3).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X4).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X5).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X6).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X7).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X8).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X9).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X10).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X11).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X12).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X13).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X14).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X15).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X16).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X17).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X18).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X19).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X20).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X21).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X22).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X23).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X24).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X25).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X26).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X27).unwrap_or(0),
+            emu.reg_read(RegisterARM64::X28).unwrap_or(0),
+        ],
+        fp: emu.reg_read(RegisterARM64::X29).unwrap_or(0),
+        lr: emu.reg_read(RegisterARM64::X30).unwrap_or(0),
+        sp: emu.reg_read(RegisterARM64::SP).unwrap_or(0),
+        pc,
+        cpsr: emu.reg_read(RegisterARM64::NZCV).unwrap_or(0),
+    })
 }
 
 /// Shared state for memory hook callbacks
@@ -476,6 +522,7 @@ impl<'a> Emulator<'a> {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn align_size(size: u64) -> u64 {
         // Unicorn requires page-aligned sizes (4KB)
         const PAGE_SIZE: u64 = 0x1000;
@@ -911,21 +958,37 @@ impl<'a> Emulator<'a> {
 
             EmulationMode::Syscall => {
                 // Use Unicorn's instruction-level syscall hook (no per-instruction overhead)
-                if self.architecture != Architecture::X64 {
-                    return Err(EmulatorError::UnicornError("Syscall mode not yet supported for ARM64".into()));
-                }
                 let shared = self.shared_state.clone();
-                let hook = self.emu.add_insn_sys_hook(
-                    X86Insn::SYSCALL,
-                    0, u64::MAX,
-                    move |emu| {
-                        // Get RIP at syscall instruction
-                        let rip = emu.reg_read(RegisterX86::RIP).unwrap_or(0);
-                        let mut state = shared.write().unwrap();
-                        state.syscall_address = Some(rip);
-                        state.stop_requested = true;
+                let hook = match self.architecture {
+                    Architecture::X64 => {
+                        self.emu.add_insn_sys_hook(
+                            X86Insn::SYSCALL,
+                            0, u64::MAX,
+                            move |emu| {
+                                // Get RIP at syscall instruction
+                                let rip = emu.reg_read(RegisterX86::RIP).unwrap_or(0);
+                                let mut state = shared.write().unwrap();
+                                state.syscall_address = Some(rip);
+                                state.stop_requested = true;
+                            }
+                        ).map_err(|e| EmulatorError::UnicornError(format!("syscall hook failed: {:?}", e)))?
                     }
-                ).map_err(|e| EmulatorError::UnicornError(format!("syscall hook failed: {:?}", e)))?;
+                    Architecture::Arm64 => {
+                        // ARM64 uses SVC instruction which triggers EXCP_SWI (interrupt 2)
+                        const EXCP_SWI: u32 = 2;
+                        self.emu.add_intr_hook(
+                            move |emu, intno| {
+                                if intno == EXCP_SWI {
+                                    // Get PC at SVC instruction
+                                    let pc = emu.reg_read(RegisterARM64::PC).unwrap_or(0);
+                                    let mut state = shared.write().unwrap();
+                                    state.syscall_address = Some(pc);
+                                    state.stop_requested = true;
+                                }
+                            }
+                        ).map_err(|e| EmulatorError::UnicornError(format!("intr hook failed: {:?}", e)))?
+                    }
+                };
                 Some(hook)
             }
         };

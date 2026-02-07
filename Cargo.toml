@@ -47,7 +47,7 @@ dirs = "5.0"
 capstone = "0.12"
 regex = "1.10"
 bincode = { version = "2.0.0-rc.3", features = ["serde"] }
-unicorn-engine = "2.1"
+unicorn-engine = { git = "https://github.com/expend20/unicorn", branch = "win-arm64-build" }
 
 [build-dependencies]
 cc = "1.0"
