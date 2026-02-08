@@ -410,17 +410,21 @@ pub(super) fn handle_exception_event(
         }
 
         // Unexpected SS
-        let _ctx_for_log = match super::thread_context::get_thread_context(process, pid, tid) {
-            Ok(crate::protocol::ThreadContext::Win32RawContext(c)) => Some(c),
-            _ => None,
-        };
         #[cfg(target_arch = "x86_64")]
         {
+            let ctx_for_log = match super::thread_context::get_thread_context(process, pid, tid) {
+                Ok(crate::protocol::ThreadContext::Win32RawContext(c)) => Some(c),
+                _ => None,
+            };
             if let Some(ref ctx) = ctx_for_log {
                 trace!(pid = pid, tid = tid, rip = %format!("0x{:X}", ctx.Rip), eflags = %format!("0x{:X}", ctx.EFlags), "Unexpected single-step event (no active step record)");
             } else {
                 trace!(pid = pid, tid = tid, "Unexpected single-step event (no active step record) - failed to fetch context for log");
             }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            trace!(pid = pid, tid = tid, "Unexpected single-step event (no active step record)");
         }
         return Ok(Some(crate::protocol::DebugEvent::Exception { pid, tid, code: ex_record.ExceptionCode as u32, address: ex_record.ExceptionAddress as u64, first_chance: ex_info.dwFirstChance == 1, parameters: vec![] }));
     }

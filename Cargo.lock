@@ -1897,7 +1897,7 @@ checksum = "5a5f39404a5da50712a4c1eecf25e90dd62b613502b7e925fd4e4d19b5c96512"
 [[package]]
 name = "unicorn-engine"
 version = "2.1.5"
-source = "git+https://github.com/expend20/unicorn?branch=win-arm64-build#9639f077dede871f6b6eb016ed1f6216899c2883"
+source = "git+https://github.com/expend20/unicorn?branch=win-arm64-build#4792132aa72bdb8b2a1df7587734882d828de073"
 dependencies = [
  "bindgen",
  "cc",
@@ -1909,7 +1909,7 @@ dependencies = [
 [[package]]
 name = "unicorn-engine-sys"
 version = "2.1.5"
-source = "git+https://github.com/expend20/unicorn?branch=win-arm64-build#9639f077dede871f6b6eb016ed1f6216899c2883"
+source = "git+https://github.com/expend20/unicorn?branch=win-arm64-build#4792132aa72bdb8b2a1df7587734882d828de073"
 dependencies = [
  "bindgen",
  "cc",

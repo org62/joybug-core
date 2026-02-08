@@ -20,10 +20,13 @@ use windows_sys::Win32::System::Memory::{
 };
 
 use crate::interfaces::{Architecture, PlatformAPI};
-use crate::protocol::{ThreadContext, EmulationMode, RegisterSnapshot, Arm64RegisterSnapshot, MemoryAccess};
+use crate::protocol::{ThreadContext, EmulationMode, RegisterSnapshot, MemoryAccess};
 
 #[cfg(target_arch = "x86_64")]
 use crate::protocol::X64RegisterSnapshot;
+
+#[cfg(target_arch = "aarch64")]
+use crate::protocol::Arm64RegisterSnapshot;
 
 mod error;
 mod registers;
