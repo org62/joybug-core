@@ -162,6 +162,30 @@ impl<S> DebugSession<S> {
         Ok(())
     }
 
+    /// Set a single-shot breakpoint at a raw address with a dedicated handler
+    /// Callback receives: (session, pid, tid, address)
+    pub fn set_single_shot_breakpoint_at<F>(
+        &mut self,
+        pid: u32,
+        address: u64,
+        handler: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<()> + Send + 'static,
+    {
+        match self.send_and_receive(&DebuggerRequest::SetSingleShotBreakpoint { pid, addr: address })? {
+            DebuggerResponse::Ack => {}
+            DebuggerResponse::Error { message } => {
+                return Err(anyhow::anyhow!("Failed to set single-shot breakpoint at 0x{:x}: {}", address, message));
+            }
+            other => {
+                return Err(anyhow::anyhow!("Unexpected response to SetSingleShotBreakpoint: {:?}", other));
+            }
+        }
+        self.single_shot_handlers.insert(address, Box::new(handler));
+        Ok(())
+    }
+
     pub fn step<F>(
         &mut self,
         pid: u32,

@@ -24,6 +24,20 @@ For tests:
 export LIBCLANG_PATH='C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\Llvm\ARM64\bin' && powershell -Command "& 'C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\Launch-VsDevShell.ps1' -Arch arm64 -SkipAutomaticLocation; cargo test 2>&1"
 ```
 
+### One-liner for Claude Code (x64)
+
+**IMPORTANT:** On x64 hosts, use x64 LLVM and `-Arch amd64`. Using ARM64 libclang on an x64 host fails with "invalid DLL (ARM64)".
+
+```bash
+export LIBCLANG_PATH='C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin' && powershell -Command "& 'C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1' -Arch amd64 -SkipAutomaticLocation; cargo build 2>&1"
+```
+
+For tests:
+
+```bash
+export LIBCLANG_PATH='C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin' && powershell -Command "& 'C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1' -Arch amd64 -SkipAutomaticLocation; cargo test 2>&1"
+```
+
 ### Common Commands
 
 ```bash
