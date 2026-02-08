@@ -6,6 +6,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{trace, warn, error};
 use crate::windows_platform::symbol_provider::WindowsSymbolProvider;
+use pelite::pe64::{Pe, PeFile};
+use pelite::image::{RUNTIME_FUNCTION, UNWIND_INFO, UNW_FLAG_CHAININFO};
 
 /// Cached symbols for a single module with RVA-based storage
 #[derive(Debug, Clone)]
@@ -14,25 +16,34 @@ pub struct ModuleSymbols {
     pub symbols: Vec<ModuleSymbol>, // All symbols stored as RVAs
 }
 
+/// Cached PE exception data for chain resolution
+struct PdataCache {
+    /// Parsed .pdata entries (sorted by BeginAddress)
+    pdata: Vec<RUNTIME_FUNCTION>,
+    /// Precomputed map: fragment BeginAddress → primary function BeginAddress
+    /// Only entries with UNW_FLAG_CHAININFO are included.
+    chain_map: HashMap<u32, u32>,
+}
+
 /// Manages symbol loading for modules in the Windows platform
 /// Uses RVA-based storage for efficient sharing across processes
 pub struct SymbolManager {
     /// Store loaded symbols for fast access (module_path -> ModuleSymbols)
     symbol_cache: Arc<Mutex<HashMap<String, ModuleSymbols>>>,
-    
+
+    /// Cached .pdata + PE bytes per module for chain resolution
+    pdata_cache: Mutex<HashMap<String, Option<PdataCache>>>,
+
     /// Set of modules currently being loaded
     pending_loads: Arc<Mutex<HashSet<String>>>,
     /// Condvar to notify waiters when a module finishes loading
     pending_cv: Arc<Condvar>,
-    
+
     /// Channel to send load requests to the worker thread
     worker_tx: mpsc::Sender<ModuleInfo>,
-    
+
     /// Maximum time to wait for a symbol loading task before giving up
     wait_timeout: Duration,
-    
-    // worker_handle: Option<JoinHandle<()>>, // We can't easily join on Drop if we can't close the channel easily from here without taking self by value or something, but we can just let it detach.
-    // Actually, if we drop the sender, the receiver will error and the thread will exit.
 }
 
 impl SymbolManager {
@@ -121,6 +132,7 @@ impl SymbolManager {
 
         Ok(Self {
             symbol_cache,
+            pdata_cache: Mutex::new(HashMap::new()),
             pending_loads,
             pending_cv,
             worker_tx,
@@ -373,28 +385,34 @@ impl SymbolManager {
         }
     }
 
-    /// Resolve an absolute address to a symbol by finding the appropriate module
-    /// This is the new implementation that properly uses RVA-based symbol storage
+    /// Resolve an absolute address to a symbol by finding the appropriate module.
+    /// Follows RUNTIME_FUNCTION unwind chains for PGO-split function fragments,
+    /// then falls back to nearest-below symbol search.
     pub fn resolve_address_to_symbol(&self, modules: &[ModuleInfo], address: u64) -> Result<Option<(String, ResolvedSymbol, u64)>, SymbolError> {
-        // Use binary search to find the module containing this address
-        // Assumes modules are sorted by base address (they typically are from the OS)
         let containing_module = Self::find_module_binary_search(modules, address);
 
         if let Some(module) = containing_module {
-            // Calculate the RVA (Relative Virtual Address) from the module base
             let rva = (address - module.base) as u32;
 
-            // Use the RVA-based symbol resolution
+            // Try chain resolution: if this RVA is inside a PGO fragment,
+            // resolve the symbol at the primary function entry instead.
+            if let Some(primary_rva) = self.lookup_chain_target(&module.name, rva) {
+                if let Ok(Some(symbol)) = self.resolve_rva_to_symbol(&module.name, primary_rva) {
+                    let offset = rva as u64 - symbol.rva as u64;
+                    let module_name = extract_module_name(&module.name);
+                    return Ok(Some((
+                        module_name,
+                        symbol,
+                        offset,
+                    )));
+                }
+            }
+
+            // Normal nearest-below symbol resolution
             match self.resolve_rva_to_symbol(&module.name, rva)? {
                 Some(symbol) => {
-                    // Calculate offset from the symbol's RVA
                     let offset_from_symbol = address - (module.base + symbol.rva as u64);
-                    // put only module name, not the full path
-                    let module_name = std::path::Path::new(&module.name)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(&module.name)
-                        .to_string();
+                    let module_name = extract_module_name(&module.name);
                     Ok(Some((module_name, symbol, offset_from_symbol)))
                 }
                 None => Ok(None),
@@ -402,6 +420,21 @@ impl SymbolManager {
         } else {
             Ok(None)
         }
+    }
+
+    /// Check if an RVA falls in a chained RUNTIME_FUNCTION fragment, and if so
+    /// return the primary function's BeginAddress. Returns None if not chained.
+    fn lookup_chain_target(&self, module_path: &str, rva: u32) -> Option<u32> {
+        let mut pdata_cache = self.pdata_cache.lock().unwrap();
+        let cached = pdata_cache.entry(module_path.to_string()).or_insert_with(|| {
+            Self::load_pdata_for_module(module_path)
+        });
+        let cached = cached.as_ref()?;
+        if cached.chain_map.is_empty() {
+            return None;
+        }
+        let rf = Self::find_runtime_function(&cached.pdata, rva)?;
+        cached.chain_map.get(&rf.BeginAddress).copied()
     }
 
     /// Binary search to find the module containing an address
@@ -446,7 +479,7 @@ impl SymbolManager {
     /// Resolve an RVA to a symbol as raw ModuleSymbol (without VA calculation)
     pub fn resolve_rva_to_symbol_raw(&self, module_path: &str, rva: u32) -> Result<Option<ModuleSymbol>, SymbolError> {
         self.wait_for_loading(module_path)?;
-        
+
         let cache = self.symbol_cache.lock().unwrap();
         if let Some(module_symbols) = cache.get(module_path) {
             // Find the symbol with the highest RVA that is still <= the target RVA
@@ -456,7 +489,7 @@ impl SymbolManager {
                     best_match = Some(symbol);
                 }
             }
-            
+
             match best_match {
                 Some(symbol) => {
                     //trace!(module_path, rva = format!("0x{:X}", rva), symbol_name = %symbol.name, symbol_rva = format!("0x{:X}", symbol.rva), offset = rva - symbol.rva, "RVA resolved to raw symbol");
@@ -505,4 +538,132 @@ impl SymbolManager {
         }
     }
 
-} 
+    /// Resolve an address to a symbol by following RUNTIME_FUNCTION unwind chains.
+    /// This handles PGO-split functions where cold code chunks link back to the
+    /// primary function entry via UNW_FLAG_CHAININFO in the unwind info.
+    /// Used by the PlatformAPI trait implementation.
+    pub fn resolve_address_with_chain(
+        &self,
+        modules: &[ModuleInfo],
+        address: u64,
+    ) -> Result<Option<(String, ModuleSymbol, u64)>, SymbolError> {
+        let module = match Self::find_module_binary_search(modules, address) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let rva = (address - module.base) as u32;
+
+        let primary_begin = match self.lookup_chain_target(&module.name, rva) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        // Resolve the symbol at the primary entry point RVA
+        self.wait_for_loading(&module.name)?;
+        let cache = self.symbol_cache.lock().unwrap();
+        if let Some(module_symbols) = cache.get(&module.name) {
+            let symbols = &module_symbols.symbols;
+            let idx = symbols.partition_point(|s| s.rva <= primary_begin);
+            if idx > 0 {
+                let symbol = &symbols[idx - 1];
+                if primary_begin.wrapping_sub(symbol.rva) < 16 {
+                    let offset = rva as u64 - symbol.rva as u64;
+                    let module_name = extract_module_name(&module.name);
+                    return Ok(Some((
+                        module_name,
+                        ModuleSymbol {
+                            name: symbol.name.clone(),
+                            rva: symbol.rva,
+                        },
+                        offset,
+                    )));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Load .pdata and precompute the chain map for a module.
+    /// The chain map resolves all UNW_FLAG_CHAININFO entries to their primary function.
+    fn load_pdata_for_module(module_path: &str) -> Option<PdataCache> {
+        let pe_bytes = std::fs::read(module_path).ok()?;
+        let pe = PeFile::from_bytes(&pe_bytes).ok()?;
+        let exception = pe.exception().ok()?;
+        let pdata = exception.image().to_vec();
+        if pdata.is_empty() {
+            return None;
+        }
+
+        // Build chain map: for each entry with UNW_FLAG_CHAININFO, follow the chain
+        // to find the primary (non-chained) function entry.
+        let mut chain_map = HashMap::new();
+        for rf in &pdata {
+            if let Ok(primary) = Self::follow_unwind_chain_raw(&pe, rf) {
+                if primary != rf.BeginAddress {
+                    chain_map.insert(rf.BeginAddress, primary);
+                }
+            }
+        }
+
+        Some(PdataCache { pdata, chain_map })
+    }
+
+    /// Find the RUNTIME_FUNCTION entry containing a given RVA.
+    fn find_runtime_function(pdata: &[RUNTIME_FUNCTION], rva: u32) -> Option<&RUNTIME_FUNCTION> {
+        let pos = pdata.partition_point(|rf| rf.BeginAddress <= rva);
+        if pos == 0 {
+            return None;
+        }
+        let rf = &pdata[pos - 1];
+        if rva >= rf.BeginAddress && rva < rf.EndAddress {
+            Some(rf)
+        } else {
+            None
+        }
+    }
+
+    /// Follow RUNTIME_FUNCTION unwind chain from a single entry.
+    /// Used during cache building to precompute all chains.
+    fn follow_unwind_chain_raw<'a>(
+        pe: &PeFile<'a>,
+        rf: &RUNTIME_FUNCTION,
+    ) -> Result<u32, SymbolError> {
+        let unwind_info: &UNWIND_INFO = pe.derva(rf.UnwindData)
+            .map_err(|e| SymbolError::PeParsingFailed(format!("{:?}", e)))?;
+        let flags = unwind_info.VersionFlags >> 3;
+        if (flags & UNW_FLAG_CHAININFO) == 0 {
+            return Ok(rf.BeginAddress); // Not chained
+        }
+
+        // Follow chain
+        let mut current_unwind_data = rf.UnwindData;
+        let mut current_unwind = unwind_info;
+        for _ in 0..32 {
+            let count = current_unwind.CountOfCodes as u32;
+            let aligned = (count + 1) & !1;
+            let chain_rva = current_unwind_data + 4 + aligned * 2;
+            let chained_rf: &RUNTIME_FUNCTION = pe.derva(chain_rva)
+                .map_err(|e| SymbolError::PeParsingFailed(format!("{:?}", e)))?;
+
+            // Read the chained entry's unwind info
+            let next_unwind: &UNWIND_INFO = pe.derva(chained_rf.UnwindData)
+                .map_err(|e| SymbolError::PeParsingFailed(format!("{:?}", e)))?;
+            let next_flags = next_unwind.VersionFlags >> 3;
+            if (next_flags & UNW_FLAG_CHAININFO) == 0 {
+                return Ok(chained_rf.BeginAddress); // Found the primary
+            }
+            current_unwind_data = chained_rf.UnwindData;
+            current_unwind = next_unwind;
+        }
+        Ok(rf.BeginAddress) // Chain too deep, give up
+    }
+}
+
+/// Extract module name (without path or extension) from a full path.
+fn extract_module_name(module_path: &str) -> String {
+    std::path::Path::new(module_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(module_path)
+        .to_string()
+}

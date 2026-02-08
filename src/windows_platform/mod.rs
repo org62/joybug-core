@@ -420,6 +420,13 @@ impl PlatformAPI for WindowsPlatform {
             let modules = self.get_process(pid).map_err(|e| SymbolError::SymbolsNotFound(e.to_string()))?
                 .module_manager()
                 .list_modules();
+
+            // Try chain-aware resolution first (handles PGO-split function fragments)
+            if let Ok(Some(result)) = symbol_manager.resolve_address_with_chain(&modules, address) {
+                return Ok(Some(result));
+            }
+
+            // Fall back to nearest-below symbol resolution
             symbol_manager.resolve_address_to_symbol_raw(&modules, address)
         } else {
             Err(SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()))
