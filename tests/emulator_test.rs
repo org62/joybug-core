@@ -15,6 +15,7 @@ struct EmulatorTestState {
     mode_basic_block_tested: bool,
     mode_module_transition_tested: bool,
     mode_syscall_tested: bool,
+    mode_instruction_trace_syscall_tested: bool,
 }
 
 impl EmulatorTestState {
@@ -25,6 +26,7 @@ impl EmulatorTestState {
             mode_basic_block_tested: false,
             mode_module_transition_tested: false,
             mode_syscall_tested: false,
+            mode_instruction_trace_syscall_tested: false,
         }
     }
 
@@ -34,6 +36,7 @@ impl EmulatorTestState {
             && self.mode_basic_block_tested
             && self.mode_module_transition_tested
             && self.mode_syscall_tested
+            && self.mode_instruction_trace_syscall_tested
     }
 }
 
@@ -197,6 +200,39 @@ fn test_mode_module_transition(
     Ok(())
 }
 
+fn test_mode_instruction_trace_syscall_stop(
+    session: &mut DebugSession<EmulatorTestState>,
+    pid: u32,
+    tid: u32,
+) -> anyhow::Result<()> {
+    println!("\n=== Testing InstructionTrace stops on syscall ===");
+
+    // Use a high limit - we expect it to hit a syscall well before this
+    let result = session.emulate_instructions(pid, tid, 50000, EmulationMode::InstructionTrace, None)?;
+
+    match result {
+        EmulateResult::Trace(trace) => {
+            let line_count = trace.trace_text.lines().count();
+            println!("  Trace lines: {}", line_count);
+            println!("  Stop reason: {}", trace.stop_reason);
+
+            assert!(
+                trace.stop_reason.contains("Syscall"),
+                "Expected InstructionTrace to stop on syscall, but stop_reason was: {}",
+                trace.stop_reason
+            );
+            println!("  [PASS] InstructionTrace correctly stopped on syscall");
+
+            session.state.mode_instruction_trace_syscall_tested = true;
+        }
+        EmulateResult::Emulation(_) => {
+            return Err(anyhow::anyhow!("Expected TenetTrace for InstructionTrace mode"));
+        }
+    }
+
+    Ok(())
+}
+
 fn test_mode_syscall(
     session: &mut DebugSession<EmulatorTestState>,
     pid: u32,
@@ -275,6 +311,7 @@ fn run_emulator_tests(
     test_mode_basic_block(session, pid, tid)?;
     test_mode_module_transition(session, pid, tid)?;
     test_mode_syscall(session, pid, tid)?;
+    test_mode_instruction_trace_syscall_stop(session, pid, tid)?;
 
     println!("\n=== All emulator tests completed ===");
     Ok(())
@@ -344,6 +381,10 @@ fn test_emulator_integration() {
             assert!(
                 session.state.mode_syscall_tested,
                 "Syscall mode was not tested"
+            );
+            assert!(
+                session.state.mode_instruction_trace_syscall_tested,
+                "InstructionTrace syscall stop was not tested"
             );
 
             println!("All emulator modes tested successfully!");

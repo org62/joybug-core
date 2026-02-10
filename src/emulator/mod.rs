@@ -840,8 +840,44 @@ impl<'a> Emulator<'a> {
         let _ = self.load_memory_region(platform, sp);
 
         // Install mode-specific hooks
-        let hook_handle = match mode {
-            EmulationMode::Basic => None,
+        let mut hook_handles: Vec<unicorn_engine::UcHookId> = Vec::new();
+        match mode {
+            EmulationMode::Basic => {
+                // Install syscall hook so Basic mode stops on syscall
+                let shared = self.shared_state.clone();
+                let syscall_hook = match self.architecture {
+                    Architecture::X64 => {
+                        self.emu.add_insn_sys_hook(
+                            X86Insn::SYSCALL,
+                            0, u64::MAX,
+                            move |emu| {
+                                let rip = emu.reg_read(RegisterX86::RIP).unwrap_or(0);
+                                let mut state = shared.write().unwrap();
+                                state.syscall_address = Some(rip);
+                                state.stop_requested = true;
+                                drop(state);
+                                emu.emu_stop().ok();
+                            }
+                        ).map_err(|e| EmulatorError::UnicornError(format!("syscall hook failed: {:?}", e)))?
+                    }
+                    Architecture::Arm64 => {
+                        const EXCP_SWI: u32 = 2;
+                        self.emu.add_intr_hook(
+                            move |emu, intno| {
+                                if intno == EXCP_SWI {
+                                    let pc = emu.reg_read(RegisterARM64::PC).unwrap_or(0);
+                                    let mut state = shared.write().unwrap();
+                                    state.syscall_address = Some(pc);
+                                    state.stop_requested = true;
+                                    drop(state);
+                                    emu.emu_stop().ok();
+                                }
+                            }
+                        ).map_err(|e| EmulatorError::UnicornError(format!("intr hook failed: {:?}", e)))?
+                    }
+                };
+                hook_handles.push(syscall_hook);
+            }
 
             EmulationMode::InstructionTrace => {
                 // CODE hook: fires on every instruction
@@ -852,6 +888,12 @@ impl<'a> Emulator<'a> {
                     use crate::protocol::{MemoryAccess, MemoryAccessType};
 
                     let mut state = shared.write().unwrap();
+
+                    // If a stop was requested (e.g., syscall hit), don't record further instructions
+                    if state.stop_requested {
+                        emu.emu_stop().ok();
+                        return;
+                    }
 
                     // Step 1: Capture pending write data from previous instruction
                     // (previous instruction has now completed execution)
@@ -940,7 +982,42 @@ impl<'a> Emulator<'a> {
                     state.last_instruction_addr = Some(addr);
                     state.last_instruction_size = Some(size);
                 }).map_err(|e| EmulatorError::UnicornError(format!("code hook failed: {:?}", e)))?;
-                Some(hook)
+                hook_handles.push(hook);
+
+                // Also install syscall hook so InstructionTrace stops on syscall
+                let shared2 = self.shared_state.clone();
+                let syscall_hook = match self.architecture {
+                    Architecture::X64 => {
+                        self.emu.add_insn_sys_hook(
+                            X86Insn::SYSCALL,
+                            0, u64::MAX,
+                            move |emu| {
+                                let rip = emu.reg_read(RegisterX86::RIP).unwrap_or(0);
+                                let mut state = shared2.write().unwrap();
+                                state.syscall_address = Some(rip);
+                                state.stop_requested = true;
+                                drop(state);
+                                emu.emu_stop().ok();
+                            }
+                        ).map_err(|e| EmulatorError::UnicornError(format!("syscall hook failed: {:?}", e)))?
+                    }
+                    Architecture::Arm64 => {
+                        const EXCP_SWI: u32 = 2;
+                        self.emu.add_intr_hook(
+                            move |emu, intno| {
+                                if intno == EXCP_SWI {
+                                    let pc = emu.reg_read(RegisterARM64::PC).unwrap_or(0);
+                                    let mut state = shared2.write().unwrap();
+                                    state.syscall_address = Some(pc);
+                                    state.stop_requested = true;
+                                    drop(state);
+                                    emu.emu_stop().ok();
+                                }
+                            }
+                        ).map_err(|e| EmulatorError::UnicornError(format!("intr hook failed: {:?}", e)))?
+                    }
+                };
+                hook_handles.push(syscall_hook);
             }
 
             EmulationMode::BasicBlock => {
@@ -950,13 +1027,47 @@ impl<'a> Emulator<'a> {
                     let mut state = shared.write().unwrap();
                     state.basic_blocks.push(addr);
                 }).map_err(|e| EmulatorError::UnicornError(format!("block hook failed: {:?}", e)))?;
-                Some(hook)
+                hook_handles.push(hook);
+
+                // Also install syscall hook so BasicBlock stops on syscall
+                let shared2 = self.shared_state.clone();
+                let syscall_hook = match self.architecture {
+                    Architecture::X64 => {
+                        self.emu.add_insn_sys_hook(
+                            X86Insn::SYSCALL,
+                            0, u64::MAX,
+                            move |emu| {
+                                let rip = emu.reg_read(RegisterX86::RIP).unwrap_or(0);
+                                let mut state = shared2.write().unwrap();
+                                state.syscall_address = Some(rip);
+                                state.stop_requested = true;
+                                drop(state);
+                                emu.emu_stop().ok();
+                            }
+                        ).map_err(|e| EmulatorError::UnicornError(format!("syscall hook failed: {:?}", e)))?
+                    }
+                    Architecture::Arm64 => {
+                        const EXCP_SWI: u32 = 2;
+                        self.emu.add_intr_hook(
+                            move |emu, intno| {
+                                if intno == EXCP_SWI {
+                                    let pc = emu.reg_read(RegisterARM64::PC).unwrap_or(0);
+                                    let mut state = shared2.write().unwrap();
+                                    state.syscall_address = Some(pc);
+                                    state.stop_requested = true;
+                                    drop(state);
+                                    emu.emu_stop().ok();
+                                }
+                            }
+                        ).map_err(|e| EmulatorError::UnicornError(format!("intr hook failed: {:?}", e)))?
+                    }
+                };
+                hook_handles.push(syscall_hook);
             }
 
             EmulationMode::ModuleTransition => {
                 // For module transition, we detect it via memory fetch faults
                 // when loading new pages - check in the emulation loop
-                None
             }
 
             EmulationMode::Syscall => {
@@ -968,31 +1079,32 @@ impl<'a> Emulator<'a> {
                             X86Insn::SYSCALL,
                             0, u64::MAX,
                             move |emu| {
-                                // Get RIP at syscall instruction
                                 let rip = emu.reg_read(RegisterX86::RIP).unwrap_or(0);
                                 let mut state = shared.write().unwrap();
                                 state.syscall_address = Some(rip);
                                 state.stop_requested = true;
+                                drop(state);
+                                emu.emu_stop().ok();
                             }
                         ).map_err(|e| EmulatorError::UnicornError(format!("syscall hook failed: {:?}", e)))?
                     }
                     Architecture::Arm64 => {
-                        // ARM64 uses SVC instruction which triggers EXCP_SWI (interrupt 2)
                         const EXCP_SWI: u32 = 2;
                         self.emu.add_intr_hook(
                             move |emu, intno| {
                                 if intno == EXCP_SWI {
-                                    // Get PC at SVC instruction
                                     let pc = emu.reg_read(RegisterARM64::PC).unwrap_or(0);
                                     let mut state = shared.write().unwrap();
                                     state.syscall_address = Some(pc);
                                     state.stop_requested = true;
+                                    drop(state);
+                                    emu.emu_stop().ok();
                                 }
                             }
                         ).map_err(|e| EmulatorError::UnicornError(format!("intr hook failed: {:?}", e)))?
                     }
                 };
-                Some(hook)
+                hook_handles.push(hook);
             }
         };
 
@@ -1033,11 +1145,13 @@ impl<'a> Emulator<'a> {
                     instructions_executed += executed;
                     remaining = remaining.saturating_sub(executed);
 
-                    // Check for stop_requested (e.g., exit address reached)
+                    // Check for stop_requested (e.g., exit address reached, syscall)
                     {
                         let state = self.shared_state.read().unwrap();
                         if state.stop_requested {
-                            if let Some(addr) = state.exit_address {
+                            if let Some(addr) = state.syscall_address {
+                                stop_reason = StopReason::Syscall { address: addr };
+                            } else if let Some(addr) = state.exit_address {
                                 stop_reason = StopReason::ReachedAddress(addr);
                             } else {
                                 stop_reason = StopReason::Stopped;
@@ -1265,8 +1379,8 @@ impl<'a> Emulator<'a> {
             }
         }
 
-        // Remove hook if installed
-        if let Some(hook) = hook_handle {
+        // Remove hooks if installed
+        for hook in hook_handles {
             let _ = self.emu.remove_hook(hook);
         }
 
