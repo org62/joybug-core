@@ -11,6 +11,7 @@ pub struct TenetTraceResult {
     pub trace_text: String,
     pub stop_reason: String,
     pub trace_time_us: u64,
+    pub stats_text: String,
 }
 
 /// Result from emulate_instructions()
@@ -29,6 +30,7 @@ pub struct EmulationResultData {
     pub emulation_time_us: u64,
     pub pages_loaded: usize,
     pub basic_blocks: Vec<u64>,
+    pub stats_text: String,
 }
 use std::collections::HashMap;
 pub use std::net::TcpStream;
@@ -991,10 +993,12 @@ impl<S> DebugSession<S> {
                 trace_text,
                 stop_reason,
                 trace_time_us,
+                stats_text,
             } => Ok(TenetTraceResult {
                 trace_text,
                 stop_reason,
                 trace_time_us,
+                stats_text,
             }),
             DebuggerResponse::Error { message } => {
                 Err(anyhow::anyhow!("Failed to trace instructions: {}", message))
@@ -1035,10 +1039,12 @@ impl<S> DebugSession<S> {
                 trace_text,
                 stop_reason,
                 trace_time_us,
+                stats_text,
             } => Ok(EmulateResult::Trace(TenetTraceResult {
                 trace_text,
                 stop_reason,
                 trace_time_us,
+                stats_text,
             })),
             DebuggerResponse::EmulationResult {
                 final_pc,
@@ -1047,6 +1053,7 @@ impl<S> DebugSession<S> {
                 emulation_time_us,
                 pages_loaded,
                 basic_blocks,
+                stats_text,
             } => Ok(EmulateResult::Emulation(EmulationResultData {
                 final_pc,
                 instructions_executed,
@@ -1054,6 +1061,7 @@ impl<S> DebugSession<S> {
                 emulation_time_us,
                 pages_loaded,
                 basic_blocks,
+                stats_text,
             })),
             DebuggerResponse::Error { message } => {
                 Err(anyhow::anyhow!("Failed to emulate instructions: {}", message))

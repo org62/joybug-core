@@ -430,12 +430,16 @@ pub mod request_response {
             /// Number of pages loaded during emulation
             pages_loaded: usize,
             basic_blocks: Vec<u64>,
+            /// Detailed timing breakdown
+            stats_text: String,
         },
         /// Tenet format trace result (for TraceInstructions and EmulateInstructions with InstructionTrace mode)
         TenetTrace {
             trace_text: String,
             stop_reason: String,
             trace_time_us: u64,
+            /// Detailed timing breakdown
+            stats_text: String,
         },
     }
 

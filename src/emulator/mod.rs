@@ -70,6 +70,8 @@ pub struct EmulationResult {
     pub register_trace: Vec<RegisterSnapshot>,
     /// Memory trace: memory accesses at each step (only populated in InstructionTrace mode)
     pub memory_trace: Vec<Vec<MemoryAccess>>,
+    /// Detailed timing breakdown
+    pub stats_text: String,
 }
 
 /// Why emulation stopped
@@ -575,6 +577,7 @@ impl<'a> Emulator<'a> {
         stop_reason: StopReason,
         emulation_time_us: u64,
         pages_before: usize,
+        stats_text: String,
     ) -> Result<EmulationResult, EmulatorError> {
         let final_pc = self.get_pc()?;
         let state = self.shared_state.read().unwrap();
@@ -590,6 +593,7 @@ impl<'a> Emulator<'a> {
             instruction_trace: state.instruction_trace.clone(),
             register_trace: state.register_trace.clone(),
             memory_trace: state.memory_trace.clone(),
+            stats_text,
         })
     }
 
@@ -768,7 +772,7 @@ impl<'a> Emulator<'a> {
         }
 
         let emulation_time_us = start_time.elapsed().as_micros() as u64;
-        self.build_result(instructions_executed, stop_reason, emulation_time_us, pages_before)
+        self.build_result(instructions_executed, stop_reason, emulation_time_us, pages_before, String::new())
     }
 
     /// Emulate with a specific mode that determines which hooks are installed
@@ -833,14 +837,26 @@ impl<'a> Emulator<'a> {
         }
 
         // Pre-load initial code region (loads entire region containing PC)
+        let preload_start = std::time::Instant::now();
         self.load_memory_region(platform, start_pc)?;
 
         // Pre-load stack region (loads entire region containing SP)
         let sp = self.get_sp()?;
         let _ = self.load_memory_region(platform, sp);
+        let preload_us = preload_start.elapsed().as_micros() as u64;
+        let preload_pages = {
+            let state = self.shared_state.read().unwrap();
+            state.mapped_regions.len() - pages_before
+        };
 
         // Install mode-specific hooks
+        let hook_setup_start = std::time::Instant::now();
         let mut hook_handles: Vec<unicorn_engine::UcHookId> = Vec::new();
+        // Timing accumulators
+        let mut exec_time_us: u64 = 0;
+        let mut page_load_time_us: u64 = 0;
+        let mut page_load_count: usize = 0;
+        let mut loop_iterations: usize = 0;
         match mode {
             EmulationMode::Basic => {
                 // Install syscall hook so Basic mode stops on syscall
@@ -1066,8 +1082,42 @@ impl<'a> Emulator<'a> {
             }
 
             EmulationMode::ModuleTransition => {
-                // For module transition, we detect it via memory fetch faults
-                // when loading new pages - check in the emulation loop
+                // Module transition is detected via memory fetch faults in the loop.
+                // Also install syscall hook: if a syscall is reached before any
+                // module transition, the result is meaningless (CPU would trap).
+                let shared = self.shared_state.clone();
+                let syscall_hook = match self.architecture {
+                    Architecture::X64 => {
+                        self.emu.add_insn_sys_hook(
+                            X86Insn::SYSCALL,
+                            0, u64::MAX,
+                            move |emu| {
+                                let rip = emu.reg_read(RegisterX86::RIP).unwrap_or(0);
+                                let mut state = shared.write().unwrap();
+                                state.syscall_address = Some(rip);
+                                state.stop_requested = true;
+                                drop(state);
+                                emu.emu_stop().ok();
+                            }
+                        ).map_err(|e| EmulatorError::UnicornError(format!("syscall hook failed: {:?}", e)))?
+                    }
+                    Architecture::Arm64 => {
+                        const EXCP_SWI: u32 = 2;
+                        self.emu.add_intr_hook(
+                            move |emu, intno| {
+                                if intno == EXCP_SWI {
+                                    let pc = emu.reg_read(RegisterARM64::PC).unwrap_or(0);
+                                    let mut state = shared.write().unwrap();
+                                    state.syscall_address = Some(pc);
+                                    state.stop_requested = true;
+                                    drop(state);
+                                    emu.emu_stop().ok();
+                                }
+                            }
+                        ).map_err(|e| EmulatorError::UnicornError(format!("intr hook failed: {:?}", e)))?
+                    }
+                };
+                hook_handles.push(syscall_hook);
             }
 
             EmulationMode::Syscall => {
@@ -1108,16 +1158,35 @@ impl<'a> Emulator<'a> {
             }
         };
 
-        // Batch size for modes with hooks - run multiple instructions at once
-        // For modes without hooks (Basic, ModuleTransition), we single-step
-        let batch_size = match mode {
-            EmulationMode::Syscall | EmulationMode::InstructionTrace | EmulationMode::BasicBlock => 1000,
-            EmulationMode::Basic | EmulationMode::ModuleTransition => 1,
-        };
+        let hook_setup_us = hook_setup_start.elapsed().as_micros() as u64;
+
+        // All modes use count=0, timeout=0: Unicorn runs at full speed until
+        // a hook fires (syscall, block, code) or a page fault occurs. This avoids
+        // both per-instruction counting overhead (count>0 forces single-instruction
+        // TBs in Unicorn) and timer thread overhead (timeout>0 spawns a thread per
+        // emu_start call, costing ~14ms each on Windows).
+        //
+        // InstructionTrace additionally uses batched counting via its CODE hook.
+        let use_instruction_counting = mode == EmulationMode::InstructionTrace;
+        const TRACE_BATCH_SIZE: usize = 1000;
+
+        // Safety limit: max loop iterations to prevent infinite loops in case
+        // no hook fires and we just keep loading pages forever.
+        const MAX_LOOP_ITERATIONS: usize = 500;
 
         // Main emulation loop
         let mut remaining = max_instructions;
-        while remaining > 0 {
+        loop {
+            if use_instruction_counting && remaining == 0 {
+                break;
+            }
+
+            if loop_iterations >= MAX_LOOP_ITERATIONS {
+                stop_reason = StopReason::InstructionLimit;
+                break;
+            }
+
+            loop_iterations += 1;
             let pc_before = self.get_pc()?;
 
             // Clear pending fault
@@ -1126,24 +1195,23 @@ impl<'a> Emulator<'a> {
                 state.pending_memory_fault = None;
             }
 
-            // Execute instructions - batch for hooked modes, single for others
-            let count = batch_size.min(remaining);
-            match self.emu.emu_start(pc_before, u64::MAX, 0, count) {
+            // Execute instructions: count=0, timeout=0 for all modes.
+            // Hooks and page faults provide natural stopping points.
+            let (count, timeout_us) = if use_instruction_counting {
+                (TRACE_BATCH_SIZE.min(remaining), 0u64)
+            } else {
+                (0, 0u64)
+            };
+            let emu_call_start = std::time::Instant::now();
+            match self.emu.emu_start(pc_before, u64::MAX, timeout_us, count) {
                 Ok(()) => {
-                    // For modes with CODE hooks, get count from instruction_trace
-                    // For other modes, assume 'count' instructions ran (or PC changed = 1)
-                    let executed = if mode == EmulationMode::InstructionTrace {
+                    exec_time_us += emu_call_start.elapsed().as_micros() as u64;
+                    if use_instruction_counting {
                         let state = self.shared_state.read().unwrap();
-                        state.instruction_trace.len().saturating_sub(instructions_executed)
-                    } else if batch_size > 1 {
-                        // For batch modes without per-instruction tracking, estimate from PC delta
-                        // This is imprecise but better than nothing
-                        count
-                    } else {
-                        1
-                    };
-                    instructions_executed += executed;
-                    remaining = remaining.saturating_sub(executed);
+                        let executed = state.instruction_trace.len().saturating_sub(instructions_executed);
+                        instructions_executed += executed;
+                        remaining = remaining.saturating_sub(executed);
+                    }
 
                     // Check for stop_requested (e.g., exit address reached, syscall)
                     {
@@ -1159,14 +1227,23 @@ impl<'a> Emulator<'a> {
                             break;
                         }
                     }
+
+                    // For all modes: if Ok(()) returned without stop_requested,
+                    // just continue the loop. MAX_LOOP_ITERATIONS provides the safety net.
                     continue;
                 }
                 Err(uc_error::READ_UNMAPPED) | Err(uc_error::FETCH_UNMAPPED) | Err(uc_error::WRITE_UNMAPPED) => {
-                    let pc_after = self.get_pc().unwrap_or(pc_before);
-                    if pc_after != pc_before {
-                        instructions_executed += 1;
-                        remaining = remaining.saturating_sub(1);
+                    exec_time_us += emu_call_start.elapsed().as_micros() as u64;
+                    if use_instruction_counting {
+                        // Sync from CODE hook's trace — the hook already recorded all
+                        // instructions that ran before the fault.
+                        let state = self.shared_state.read().unwrap();
+                        let traced = state.instruction_trace.len();
+                        let delta = traced.saturating_sub(instructions_executed);
+                        instructions_executed = traced;
+                        remaining = remaining.saturating_sub(delta);
                     }
+                    let pc_after = self.get_pc().unwrap_or(pc_before);
 
                     let fault_addr = {
                         let state = self.shared_state.read().unwrap();
@@ -1203,26 +1280,40 @@ impl<'a> Emulator<'a> {
                             }
                         }
 
+                        let load_start = std::time::Instant::now();
                         match self.load_memory_region(platform, addr) {
-                            Ok(()) => continue,
+                            Ok(()) => {
+                                page_load_time_us += load_start.elapsed().as_micros() as u64;
+                                page_load_count += 1;
+                                continue;
+                            }
                             Err(_) => {
+                                page_load_time_us += load_start.elapsed().as_micros() as u64;
                                 stop_reason = StopReason::UnmappedMemory(addr);
                                 break;
                             }
                         }
                     } else {
+                        let load_start = std::time::Instant::now();
                         let sp = self.get_sp().unwrap_or(0);
                         let _ = self.load_memory_region(platform, pc_after);
                         if sp > 0 && sp >= 0x1000 {
                             let _ = self.load_memory_region(platform, sp - 0x1000);
                         }
+                        page_load_time_us += load_start.elapsed().as_micros() as u64;
+                        page_load_count += 1;
                         if pc_after != pc_before {
                             continue;
                         }
                         match self.emu.emu_start(pc_before, u64::MAX, 0, 1) {
                             Ok(()) => {
-                                instructions_executed += 1;
-                                remaining = remaining.saturating_sub(1);
+                                if use_instruction_counting {
+                                    let state = self.shared_state.read().unwrap();
+                                    let traced = state.instruction_trace.len();
+                                    let delta = traced.saturating_sub(instructions_executed);
+                                    instructions_executed = traced;
+                                    remaining = remaining.saturating_sub(delta);
+                                }
                             }
                             Err(_) => {
                                 stop_reason = StopReason::UnmappedMemory(pc_before);
@@ -1232,6 +1323,7 @@ impl<'a> Emulator<'a> {
                     }
                 }
                 Err(uc_error::EXCEPTION) => {
+                    exec_time_us += emu_call_start.elapsed().as_micros() as u64;
                     // CPU exception - check if instruction executed before the exception
                     let pc_after = self.get_pc().unwrap_or(pc_before);
 
@@ -1239,8 +1331,13 @@ impl<'a> Emulator<'a> {
                         // Instruction executed successfully, PC moved - continue
                         // Note: Unicorn often returns EXCEPTION when single-stepping
                         // even though the instruction succeeded
-                        instructions_executed += 1;
-                        remaining = remaining.saturating_sub(1);
+                        if use_instruction_counting {
+                            let state = self.shared_state.read().unwrap();
+                            let traced = state.instruction_trace.len();
+                            let delta = traced.saturating_sub(instructions_executed);
+                            instructions_executed = traced;
+                            remaining = remaining.saturating_sub(delta);
+                        }
                         let _ = self.load_memory_region(platform, pc_after);
                         continue;
                     }
@@ -1330,9 +1427,10 @@ impl<'a> Emulator<'a> {
                     break;
                 }
                 Err(e) => {
-                    let pc_after = self.get_pc().unwrap_or(pc_before);
-                    if pc_after != pc_before {
-                        instructions_executed += 1;
+                    exec_time_us += emu_call_start.elapsed().as_micros() as u64;
+                    if use_instruction_counting {
+                        let state = self.shared_state.read().unwrap();
+                        instructions_executed = state.instruction_trace.len();
                     }
                     stop_reason = StopReason::Error(format!("{:?}", e));
                     break;
@@ -1380,6 +1478,7 @@ impl<'a> Emulator<'a> {
         }
 
         // Remove hooks if installed
+        let cleanup_start = std::time::Instant::now();
         for hook in hook_handles {
             let _ = self.emu.remove_hook(hook);
         }
@@ -1403,9 +1502,24 @@ impl<'a> Emulator<'a> {
                 }
             }
         }
+        let cleanup_us = cleanup_start.elapsed().as_micros() as u64;
 
         let emulation_time_us = start_time.elapsed().as_micros() as u64;
-        self.build_result(instructions_executed, stop_reason, emulation_time_us, pages_before)
+        let total_pages = {
+            let state = self.shared_state.read().unwrap();
+            state.mapped_regions.len() - pages_before
+        };
+        let stats_text = format!(
+            "preload: {}us ({}pg) | hooks: {}us | exec: {}us | pgload: {}us ({}pg) | cleanup: {}us | total: {}us | pages: {}",
+            preload_us, preload_pages,
+            hook_setup_us,
+            exec_time_us,
+            page_load_time_us, page_load_count,
+            cleanup_us,
+            emulation_time_us,
+            total_pages,
+        );
+        self.build_result(instructions_executed, stop_reason, emulation_time_us, pages_before, stats_text)
     }
 }
 

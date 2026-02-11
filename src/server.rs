@@ -377,6 +377,7 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                                 trace_text,
                                 stop_reason: format!("{}", result.stop_reason),
                                 trace_time_us: result.emulation_time_us,
+                                stats_text: result.stats_text,
                             }
                         } else {
                             // Other modes return EmulationResult
@@ -387,6 +388,7 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                                 emulation_time_us: result.emulation_time_us,
                                 pages_loaded: result.pages_loaded,
                                 basic_blocks: result.basic_blocks,
+                                stats_text: result.stats_text,
                             }
                         }
                     }
@@ -408,6 +410,7 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                             trace_text,
                             stop_reason,
                             trace_time_us,
+                            stats_text: String::new(),
                         }
                     }
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },

@@ -231,6 +231,7 @@ fn run_trace(
             trace_text,
             stop_reason,
             trace_time_us,
+            ..
         } => {
             let line_count = trace_text.lines().count();
             eprintln!(

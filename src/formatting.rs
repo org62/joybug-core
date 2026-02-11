@@ -99,7 +99,7 @@ impl std::fmt::Debug for DebuggerResponse {
                     .field("function_name", function_name)
                     .finish()
             }
-            DebuggerResponse::EmulationResult { final_pc, instructions_executed, stop_reason, emulation_time_us, pages_loaded, basic_blocks } => {
+            DebuggerResponse::EmulationResult { final_pc, instructions_executed, stop_reason, emulation_time_us, pages_loaded, basic_blocks, .. } => {
                 f.debug_struct("EmulationResult")
                     .field("final_pc", &format_args!("0x{:X}", final_pc))
                     .field("instructions_executed", instructions_executed)
@@ -109,7 +109,7 @@ impl std::fmt::Debug for DebuggerResponse {
                     .field("basic_blocks_count", &basic_blocks.len())
                     .finish()
             }
-            DebuggerResponse::TenetTrace { trace_text, stop_reason, trace_time_us } => {
+            DebuggerResponse::TenetTrace { trace_text, stop_reason, trace_time_us, .. } => {
                 f.debug_struct("TenetTrace")
                     .field("trace_text_len", &trace_text.len())
                     .field("stop_reason", stop_reason)
