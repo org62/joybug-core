@@ -202,7 +202,7 @@ impl WindowsSymbolProvider {
                     match sym_iter.next() {
                         Ok(Some(symbol)) => {
                             if let Ok(SymbolData::Procedure(ProcedureSymbol { name, offset, .. })) = symbol.parse() {
-                                insert_symbol(&name.to_string(), offset, &address_map, &mut symbols_map);
+                                insert_symbol(&name.to_string(), offset, &address_map, &mut symbols_map, true);
                             }
                         }
                         Ok(None) => break,
@@ -226,11 +226,11 @@ impl WindowsSymbolProvider {
             match iter.next() {
                 Ok(Some(symbol)) => {
                     match symbol.parse() {
-                        Ok(SymbolData::Public(PublicSymbol { name, offset, .. })) => {
-                            insert_symbol(&name.to_string(), offset, &address_map, &mut symbols_map);
+                        Ok(SymbolData::Public(PublicSymbol { name, offset, function, .. })) => {
+                            insert_symbol(&name.to_string(), offset, &address_map, &mut symbols_map, function);
                         }
                         Ok(SymbolData::Procedure(ProcedureSymbol { name, offset, .. })) => {
-                            insert_symbol(&name.to_string(), offset, &address_map, &mut symbols_map);
+                            insert_symbol(&name.to_string(), offset, &address_map, &mut symbols_map, true);
                         }
                         Ok(_other_data) => { /* Skip other symbol types */ }
                         Err(pdb_parse_err) => {
@@ -260,6 +260,7 @@ fn insert_symbol(
     offset: PdbInternalSectionOffset,
     address_map: &AddressMap,
     symbols_map: &mut HashMap<String, ModuleSymbol>,
+    is_function: bool,
 ) {
     let demangled_name = if name_str.starts_with('?') {
         msvc_demangler::demangle(name_str, DemangleFlags::COMPLETE)
@@ -273,6 +274,7 @@ fn insert_symbol(
     symbols_map.entry(demangled_name.clone()).or_insert(ModuleSymbol {
         name: demangled_name,
         rva,
+        is_function,
     });
 }
 
@@ -354,6 +356,7 @@ impl SymbolProvider for WindowsSymbolProvider {
                                 module_name: module_name.to_string(),
                                 rva: symbol.rva,
                                 va: module_base + symbol.rva as u64,
+                                is_function: symbol.is_function,
                             };
                             
                             found_symbols.push(resolved_symbol);
@@ -387,6 +390,7 @@ impl SymbolProvider for WindowsSymbolProvider {
                             module_name: module_name.clone(),
                             rva: symbol.rva,
                             va: module_base + symbol.rva as u64,
+                            is_function: symbol.is_function,
                         };
                         
                         found_symbols.push(resolved_symbol);

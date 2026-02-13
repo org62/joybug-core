@@ -35,14 +35,16 @@ pub enum SymbolError {
 pub struct ModuleSymbol {
     pub name: String,
     pub rva: u32, // Relative Virtual Address
+    pub is_function: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ResolvedSymbol {
     pub name: String,
     pub module_name: String,
-    pub rva: u32, // Relative Virtual Address  
+    pub rva: u32, // Relative Virtual Address
     pub va: u64,  // Virtual Address (module_base + rva)
+    pub is_function: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -268,6 +268,7 @@ impl SymbolManager {
                                 module_name: module_name.to_string(),
                                 rva: symbol.rva,
                                 va: module_symbols.module_base + symbol.rva as u64,
+                                is_function: symbol.is_function,
                             });
 
                             if found_symbols.len() >= max_results {
@@ -291,6 +292,7 @@ impl SymbolManager {
                                     module_name: module_name.to_string(),
                                     rva: symbol.rva,
                                     va: module_symbols.module_base + symbol.rva as u64,
+                                    is_function: symbol.is_function,
                                 });
 
                                 if found_symbols.len() >= max_results {
@@ -317,11 +319,12 @@ impl SymbolManager {
                 for symbol in &module_symbols.symbols {
                     if symbol.name.to_lowercase().contains(&symbol_name.to_lowercase()) {
                         let symbol_name_with_module = format!("{}!{}", module_name, symbol.name);
-                        found_symbols.push(ResolvedSymbol { 
-                            name: symbol_name_with_module, 
+                        found_symbols.push(ResolvedSymbol {
+                            name: symbol_name_with_module,
                             module_name: module_name.clone(),
                             rva: symbol.rva,
                             va: module_symbols.module_base + symbol.rva as u64,
+                            is_function: symbol.is_function,
                         });
                         
                         // Stop if we've reached the maximum number of results
@@ -376,6 +379,7 @@ impl SymbolManager {
                 module_name,
                 rva: symbol.rva,
                 va: module_symbols.module_base + symbol.rva as u64,
+                is_function: symbol.is_function,
             };
 
             Ok(Some(symbol_with_va))
@@ -574,6 +578,7 @@ impl SymbolManager {
                         ModuleSymbol {
                             name: symbol.name.clone(),
                             rva: symbol.rva,
+                            is_function: symbol.is_function,
                         },
                         offset,
                     )));
