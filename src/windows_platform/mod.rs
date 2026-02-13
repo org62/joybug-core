@@ -523,9 +523,26 @@ impl PlatformAPI for WindowsPlatform {
             println!("=====================================\n");
         }
 
-        result
+        // Resolve indirect jump/call targets (e.g., `call qword ptr [IAT_slot]`)
+        // by reading the pointer value so clicking navigates to the actual function.
+        let mut instructions = result?;
+        let ptr_size = match arch {
+            Architecture::X64 | Architecture::Arm64 => 8usize,
+        };
+        for instr in &mut instructions {
+            if (instr.is_call || instr.is_jump) && instr.jump_target.is_some() && instr.op_str.contains('[') {
+                let ptr_addr = instr.jump_target.unwrap();
+                if let Ok(data) = memory::read_memory_unlocked(pid, ptr_addr, ptr_size) {
+                    if data.len() >= ptr_size {
+                        let actual_target = u64::from_le_bytes(data[..8].try_into().unwrap());
+                        instr.jump_target = Some(actual_target);
+                    }
+                }
+            }
+        }
+        Ok(instructions)
     }
-    
+
     fn get_call_stack(&self, pid: u32, tid: u32) -> Result<Vec<crate::interfaces::CallFrame>, PlatformError> {
         callstack::get_call_stack(self, pid, tid)
     }

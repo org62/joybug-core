@@ -187,11 +187,25 @@ pub trait DisassemblerProvider: Send + Sync {
                 let mut op_str = instruction.op_str.clone();
                 for addr in &instruction.addresses_to_symbolize {
                     if let Some(symbol) = symbol_resolver(*addr) {
-                        // Replace hex address with symbol name
+                        let symbol_str = symbol.format_symbol();
+                        // Try direct hex replacement first (for absolute addresses)
                         let hex_lower = format!("0x{:x}", addr);
                         let hex_upper = format!("0x{:X}", addr);
-                        op_str = op_str.replace(&hex_lower, &symbol.format_symbol());
-                        op_str = op_str.replace(&hex_upper, &symbol.format_symbol());
+                        let before = op_str.clone();
+                        op_str = op_str.replace(&hex_lower, &symbol_str);
+                        op_str = op_str.replace(&hex_upper, &symbol_str);
+
+                        // Fallback: RIP-relative pattern replacement
+                        // Capstone outputs [rip + 0xNNNN] but the resolved address isn't in the text
+                        if op_str == before {
+                            let disp = (*addr).wrapping_sub(instruction.address + instruction.size as u64) as i64;
+                            let (pattern, replacement) = if disp >= 0 {
+                                (format!("[rip + 0x{:x}]", disp), format!("[{}]", symbol_str))
+                            } else {
+                                (format!("[rip - 0x{:x}]", disp.unsigned_abs()), format!("[{}]", symbol_str))
+                            };
+                            op_str = op_str.replace(&pattern, &replacement);
+                        }
                     }
                 }
                 if op_str != instruction.op_str {
@@ -265,6 +279,10 @@ pub trait PlatformAPI: Send + Sync {
 
 impl SymbolInfo {
     pub fn format_symbol(&self) -> String {
-        format!("{}!{}+0x{:x}", self.module_name, self.symbol_name, self.offset)
+        if self.offset == 0 {
+            format!("{}!{}", self.module_name, self.symbol_name)
+        } else {
+            format!("{}!{}+0x{:x}", self.module_name, self.symbol_name, self.offset)
+        }
     }
 }

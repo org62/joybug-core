@@ -359,10 +359,23 @@ where
         if let Some(resolver) = symbol_resolver {
             for addr in &instr.addresses_to_symbolize {
                 if let Some(symbol) = resolver(*addr) {
+                    let symbol_str = symbol.format_symbol();
                     let hex_lower = format!("0x{:x}", addr);
                     let hex_upper = format!("0x{:X}", addr);
-                    op_str = op_str.replace(&hex_lower, &symbol.format_symbol());
-                    op_str = op_str.replace(&hex_upper, &symbol.format_symbol());
+                    let before = op_str.clone();
+                    op_str = op_str.replace(&hex_lower, &symbol_str);
+                    op_str = op_str.replace(&hex_upper, &symbol_str);
+
+                    // Fallback: RIP-relative pattern replacement
+                    if op_str == before {
+                        let disp = (*addr).wrapping_sub(instr.address + instr.size as u64) as i64;
+                        let (pattern, replacement) = if disp >= 0 {
+                            (format!("[rip + 0x{:x}]", disp), format!("[{}]", symbol_str))
+                        } else {
+                            (format!("[rip - 0x{:x}]", disp.unsigned_abs()), format!("[{}]", symbol_str))
+                        };
+                        op_str = op_str.replace(&pattern, &replacement);
+                    }
                 }
             }
         }

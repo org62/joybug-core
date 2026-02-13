@@ -137,11 +137,12 @@ fn extract_addresses_from_operands(
                                 if target > 0x10000 {
                                     addresses.push(target);
                                 }
-                            }
-                            // Also check displacement for absolute addresses (e.g., mov eax, [0x12345678])
-                            let disp = mem.disp();
-                            if disp > 0x10000 {
-                                addresses.push(disp as u64);
+                            } else {
+                                // Check displacement for absolute addresses (e.g., mov eax, [0x12345678])
+                                let disp = mem.disp();
+                                if disp > 0x10000 {
+                                    addresses.push(disp as u64);
+                                }
                             }
                         }
                         _ => {}
