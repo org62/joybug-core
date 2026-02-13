@@ -455,8 +455,13 @@ impl PlatformAPI for WindowsPlatform {
 
         // Time memory read
         let t0 = Instant::now();
-        let data = memory::read_memory_unlocked(pid, address, count * 16)
+        let mut data = memory::read_memory_unlocked(pid, address, count * 16)
             .map_err(|e| DisassemblerError::InvalidData(format!("Failed to read memory: {}", e)))?;
+
+        // Patch breakpoint bytes with originals so disassembly shows real instructions
+        if let Ok(process) = self.get_process(pid) {
+            process.patch_breakpoint_bytes(address, &mut data);
+        }
         let memory_time = t0.elapsed();
 
         // Time module list fetch

@@ -222,6 +222,9 @@ struct EmulatorSharedState {
     syscall_address: Option<u64>,
     /// Exit address (stop when this address is reached)
     exit_address: Option<u64>,
+    /// Set after a memory fault in InstructionTrace mode; tells the CODE hook
+    /// to pop the stale trace entry that was recorded before the fault.
+    retrying_after_fault: bool,
 }
 
 /// CPU Emulator that initializes from debugger state
@@ -276,6 +279,7 @@ impl<'a> Emulator<'a> {
             last_instruction_size: None,
             syscall_address: None,
             exit_address: None,
+            retrying_after_fault: false,
         }));
 
         // Create Unicorn instance
@@ -630,6 +634,7 @@ impl<'a> Emulator<'a> {
             state.register_trace.clear();
             state.memory_trace.clear();
             state.pending_write_ops.clear();
+            state.retrying_after_fault = false;
         }
 
         // Pre-load initial code region (loads entire region containing PC)
@@ -825,6 +830,7 @@ impl<'a> Emulator<'a> {
             state.register_trace.clear();
             state.memory_trace.clear();
             state.pending_write_ops.clear();
+            state.retrying_after_fault = false;
             state.syscall_address = None;
             state.exit_address = exit_address;
 
@@ -909,6 +915,28 @@ impl<'a> Emulator<'a> {
                     if state.stop_requested {
                         emu.emu_stop().ok();
                         return;
+                    }
+
+                    // If we're retrying after a memory fault, pop the stale trace entry
+                    // that was recorded before the fault caused emulation to stop.
+                    if state.retrying_after_fault {
+                        state.retrying_after_fault = false;
+                        if let Some(&(last_addr, _)) = state.instruction_trace.last() {
+                            if last_addr == addr {
+                                state.instruction_trace.pop();
+                                state.register_trace.pop();
+                                state.memory_trace.pop();
+                                state.pending_write_ops.clear();
+                                // Revert last_instruction tracking to prevent spurious basic block entry
+                                if let Some(&(prev_addr, prev_size)) = state.instruction_trace.last() {
+                                    state.last_instruction_addr = Some(prev_addr);
+                                    state.last_instruction_size = Some(prev_size as u32);
+                                } else {
+                                    state.last_instruction_addr = None;
+                                    state.last_instruction_size = None;
+                                }
+                            }
+                        }
                     }
 
                     // Step 1: Capture pending write data from previous instruction
@@ -1242,6 +1270,10 @@ impl<'a> Emulator<'a> {
                         let delta = traced.saturating_sub(instructions_executed);
                         instructions_executed = traced;
                         remaining = remaining.saturating_sub(delta);
+                        drop(state);
+                        // Tell the CODE hook to pop the stale entry on retry
+                        let mut state = self.shared_state.write().unwrap();
+                        state.retrying_after_fault = true;
                     }
                     let pc_after = self.get_pc().unwrap_or(pc_before);
 
@@ -1546,6 +1578,7 @@ mod tests {
             last_instruction_size: None,
             syscall_address: None,
             exit_address: None,
+            retrying_after_fault: false,
         }));
 
         let emu = Unicorn::new_with_data(Arch::X86, Mode::MODE_64, shared);
@@ -1570,6 +1603,7 @@ mod tests {
             last_instruction_size: None,
             syscall_address: None,
             exit_address: None,
+            retrying_after_fault: false,
         }));
 
         let mut emu = Unicorn::new_with_data(Arch::X86, Mode::MODE_64, shared).unwrap();
@@ -1604,6 +1638,7 @@ mod tests {
             last_instruction_size: None,
             syscall_address: None,
             exit_address: None,
+            retrying_after_fault: false,
         }));
 
         let mut emu = Unicorn::new_with_data(Arch::X86, Mode::MODE_64, shared).unwrap();

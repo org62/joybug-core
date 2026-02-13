@@ -217,6 +217,30 @@ impl DebuggedProcess {
         }
     }
 
+    /// Patch a memory buffer to replace breakpoint instruction bytes with the
+    /// original bytes that were saved when each breakpoint was set.
+    /// This should be used before disassembling memory so the user sees
+    /// original instructions rather than int3/brk.
+    pub(super) fn patch_breakpoint_bytes(&self, base_address: u64, data: &mut [u8]) {
+        let range_end = base_address + data.len() as u64;
+        for (bp_addr, original) in self.persistent_breakpoints.iter()
+            .chain(self.single_shot_breakpoints.iter())
+        {
+            let bp_start = *bp_addr;
+            let bp_end = bp_start + original.len() as u64;
+            // Check for overlap with buffer range
+            if bp_start < range_end && bp_end > base_address {
+                let copy_start = bp_start.max(base_address);
+                let copy_end = bp_end.min(range_end);
+                let buf_offset = (copy_start - base_address) as usize;
+                let src_offset = (copy_start - bp_start) as usize;
+                let len = (copy_end - copy_start) as usize;
+                data[buf_offset..buf_offset + len]
+                    .copy_from_slice(&original[src_offset..src_offset + len]);
+            }
+        }
+    }
+
     pub(super) fn module_manager(&self) -> &super::module_manager::ModuleManager { &self.module_manager }
     pub(super) fn module_manager_mut(&mut self) -> &mut super::module_manager::ModuleManager { &mut self.module_manager }
     pub(super) fn thread_manager(&self) -> &super::thread_manager::ThreadManager { &self.thread_manager }
