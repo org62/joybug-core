@@ -197,13 +197,15 @@ impl WindowsPlatform {
                                 Ok(exp) => {
                                     let name = index_to_name.get(&index).cloned();
                                     let kind = match exp {
+                                        pelite::pe::exports::Export::Symbol(rva) if *rva == 0 => continue, // unused ordinal slot
                                         pelite::pe::exports::Export::Symbol(rva) => ExportKind::Symbol { rva: *rva },
                                         pelite::pe::exports::Export::Forward(fwd) => ExportKind::Forward { target: fwd.to_string() },
                                     };
                                     entries.push(ExportEntry { ordinal, name, kind });
                                 }
-                                Err(e) => {
-                                    entries.push(ExportEntry { ordinal, name: index_to_name.get(&index).cloned(), kind: ExportKind::Error(format!("{}", e)) });
+                                Err(_) => {
+                                    // Unused ordinal slot (null address) — skip
+                                    continue;
                                 }
                             }
                         }
