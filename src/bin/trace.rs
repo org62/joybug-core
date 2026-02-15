@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::process::exit;
 
 use clap::Parser;
+use pelite::pe64::Pe;
 use joybug2::protocol::{
     DebuggerRequest, DebuggerResponse, EmulationMode, TraceExitCondition,
 };
@@ -30,6 +31,10 @@ struct Args {
     #[arg(short = 's', long, value_parser = parse_hex)]
     start: Option<u64>,
 
+    /// Exported function name to trace (resolves address at runtime)
+    #[arg(short = 'n', long)]
+    name: Option<String>,
+
     /// Trace end address (hex, e.g., 0x140001100)
     /// Tracing stops when this address is reached
     #[arg(short = 'e', long, value_parser = parse_hex)]
@@ -42,6 +47,10 @@ struct Args {
     /// Trace backend: "emu" (emulator) or "trap" (trap-flag)
     #[arg(short = 'b', long, default_value = "emu")]
     backend: String,
+
+    /// Trace a single function call (stop when function returns)
+    #[arg(short = 'f', long)]
+    func: bool,
 
     /// Output file (default: stdout)
     #[arg(short = 'o', long)]
@@ -61,6 +70,9 @@ fn parse_hex(s: &str) -> Result<u64, String> {
 struct TraceState {
     start_address: Option<u64>,
     end_address: Option<u64>,
+    start_export_rva: Option<u32>,
+    exe_name: Option<String>,
+    func_mode: bool,
     max_instructions: usize,
     backend: String,
     trace_text: Option<String>,
@@ -70,9 +82,15 @@ struct TraceState {
 
 impl TraceState {
     fn new(args: &Args) -> Self {
+        let exe_name = args.command.split_whitespace().next()
+            .and_then(|p| p.rsplit(['\\', '/']).next())
+            .map(|s| s.to_string());
         Self {
             start_address: args.start,
             end_address: args.end,
+            start_export_rva: None,
+            exe_name,
+            func_mode: args.func,
             max_instructions: args.limit,
             backend: args.backend.clone(),
             trace_text: None,
@@ -90,6 +108,31 @@ fn main() {
         eprintln!("Error: backend must be 'emu' or 'trap'");
         exit(1);
     }
+
+    // Resolve export name to RVA from PE on disk
+    let export_rva: Option<u32> = if let Some(ref name) = args.name {
+        let exe_path = args.command.split_whitespace().next().unwrap();
+        let file_data = std::fs::read(exe_path)
+            .unwrap_or_else(|e| { eprintln!("Failed to read '{}': {}", exe_path, e); exit(1); });
+        let pe = pelite::pe64::PeFile::from_bytes(&file_data)
+            .unwrap_or_else(|e| { eprintln!("Failed to parse PE: {}", e); exit(1); });
+        let exports = pe.exports().unwrap_or_else(|e| { eprintln!("No exports: {}", e); exit(1); });
+        let by = exports.by().unwrap_or_else(|e| { eprintln!("Export parse error: {}", e); exit(1); });
+        let export = by.name(name)
+            .unwrap_or_else(|_| { eprintln!("Export '{}' not found", name); exit(1); });
+        match export {
+            pelite::pe::exports::Export::Symbol(rva) => {
+                eprintln!("Export '{}' -> RVA 0x{:X}", name, rva);
+                Some(*rva)
+            }
+            pelite::pe::exports::Export::Forward(fwd) => {
+                eprintln!("Export '{}' is a forward to {:?}", name, fwd);
+                exit(1);
+            }
+        }
+    } else {
+        None
+    };
 
     // Start server
     let server_addr = args.server.clone().unwrap_or_else(|| {
@@ -127,10 +170,28 @@ fn main() {
     eprintln!();
 
     // Run trace session
-    let final_state = DebugSession::new(TraceState::new(&args), Some(&server_addr))
+    let mut state = TraceState::new(&args);
+    state.start_export_rva = export_rva;
+    let final_state = DebugSession::new(state, Some(&server_addr))
         .expect("Failed to connect to server")
         .on_initial_breakpoint(|session, pid, tid, address| {
             eprintln!("Initial breakpoint at 0x{:016X}", address);
+
+            // Resolve export RVA to VA using module base
+            if let Some(rva) = session.state.start_export_rva.take() {
+                let modules = session.list_modules(pid)?;
+                let exe_name = session.state.exe_name.as_deref().unwrap_or("");
+                let main_module = modules.iter()
+                    .find(|m| {
+                        let mod_name = m.name.rsplit(['\\', '/']).next().unwrap_or(&m.name);
+                        mod_name.eq_ignore_ascii_case(exe_name)
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("Module '{}' not found in loaded modules", exe_name))?;
+                let va = main_module.base + rva as u64;
+                eprintln!("Resolved export RVA 0x{:X} -> VA 0x{:X} (module {} at 0x{:X})",
+                    rva, va, main_module.name, main_module.base);
+                session.state.start_address = Some(va);
+            }
 
             // Determine trace start point
             let trace_start = session.state.start_address.unwrap_or(address);
@@ -196,6 +257,16 @@ fn run_trace(
 ) -> Result<(), anyhow::Error> {
     let exit_condition = if let Some(end_addr) = session.state.end_address {
         TraceExitCondition::ReachAddress(end_addr)
+    } else if session.state.func_mode {
+        // Read return address from top of stack
+        let ctx = session.get_thread_context(pid, tid)?;
+        let rsp = match &ctx {
+            joybug2::protocol::ThreadContext::Win32RawContext(c) => c.Rsp,
+        };
+        let ret_addr_bytes = session.read_memory(pid, rsp, 8)?;
+        let ret_addr = u64::from_le_bytes(ret_addr_bytes.try_into().unwrap());
+        eprintln!("Function mode: RSP=0x{:X}, return address=0x{:X}", rsp, ret_addr);
+        TraceExitCondition::ReachAddress(ret_addr)
     } else {
         TraceExitCondition::InstructionLimit(session.state.max_instructions)
     };
