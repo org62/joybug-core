@@ -636,6 +636,21 @@ pub mod request_response {
                 }
             }
         }
+
+        pub fn get_sp(&self) -> u64 {
+            #[cfg(target_arch = "x86_64")]
+            {
+                match self {
+                    ThreadContext::Win32RawContext(ctx) => ctx.Rsp,
+                }
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                match self {
+                    ThreadContext::Win32RawContext(ctx) => ctx.Sp,
+                }
+            }
+        }
     }
 
     #[cfg(windows)]

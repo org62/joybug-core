@@ -260,12 +260,10 @@ fn run_trace(
     } else if session.state.func_mode {
         // Read return address from top of stack
         let ctx = session.get_thread_context(pid, tid)?;
-        let rsp = match &ctx {
-            joybug2::protocol::ThreadContext::Win32RawContext(c) => c.Rsp,
-        };
-        let ret_addr_bytes = session.read_memory(pid, rsp, 8)?;
+        let sp = ctx.get_sp();
+        let ret_addr_bytes = session.read_memory(pid, sp, 8)?;
         let ret_addr = u64::from_le_bytes(ret_addr_bytes.try_into().unwrap());
-        eprintln!("Function mode: RSP=0x{:X}, return address=0x{:X}", rsp, ret_addr);
+        eprintln!("Function mode: SP=0x{:X}, return address=0x{:X}", sp, ret_addr);
         TraceExitCondition::ReachAddress(ret_addr)
     } else {
         TraceExitCondition::InstructionLimit(session.state.max_instructions)
