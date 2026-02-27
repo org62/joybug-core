@@ -150,30 +150,46 @@ pub fn trace_instructions(
         // Continue execution (will stop on next instruction due to trap flag)
         debug_events::continue_only(pid, tid)?;
 
-        // Wait for the single-step exception
-        let debug_event = debug_events::wait_for_debug_event_blocking()?;
+        // Wait for the single-step exception from our target thread.
+        // Other threads may generate debug events (DLL loads, thread creates, etc.)
+        // that we must auto-continue before our single-step arrives.
+        // ContinueDebugEvent requires the pid/tid FROM the debug event, not arbitrary values.
+        let mut trace_break = false;
+        loop {
+            let debug_event = debug_events::wait_for_debug_event_blocking()?;
+            let event_pid = debug_event.dwProcessId;
+            let event_tid = debug_event.dwThreadId;
+            let event_result = debug_events::handle_debug_event(platform, &debug_event)?;
 
-        // Handle the debug event
-        let event_result = debug_events::handle_debug_event(platform, &debug_event)?;
-
-        // Check if we got an unexpected event (like process exit)
-        if let Some(event) = event_result {
-            match event {
-                crate::protocol::DebugEvent::ProcessExited { exit_code, .. } => {
+            // ProcessExited applies regardless of which thread reported it
+            if let Some(ref event) = event_result {
+                if let crate::protocol::DebugEvent::ProcessExited { exit_code, .. } = event {
                     stop_reason = format!("ProcessExited({})", exit_code);
+                    trace_break = true;
                     break;
                 }
-                crate::protocol::DebugEvent::Exception { code, address, .. } => {
-                    // 0x80000004 is EXCEPTION_SINGLE_STEP - expected
-                    if code != 0x80000004 {
-                        stop_reason = format!("Exception(0x{:08X}@0x{:X})", code, address);
-                        break;
+            }
+
+            if event_tid == tid {
+                // Event from our target thread
+                if let Some(ref event) = event_result {
+                    if let crate::protocol::DebugEvent::Exception { code, address, .. } = event {
+                        if *code != 0x80000004 {
+                            // Unexpected exception - stop tracing
+                            stop_reason = format!("Exception(0x{:08X}@0x{:X})", code, address);
+                            trace_break = true;
+                        }
+                        // 0x80000004 = EXCEPTION_SINGLE_STEP - expected, continue tracing
                     }
                 }
-                _ => {
-                    // Continue tracing for other events
-                }
+                break;
+            } else {
+                // Event from another thread - auto-continue with correct pid/tid and keep waiting
+                debug_events::continue_only(event_pid, event_tid)?;
             }
+        }
+        if trace_break {
+            break;
         }
     }
 
@@ -191,7 +207,8 @@ pub fn trace_instructions(
         }
     }
 
-    // Clear trap flag after tracing
+    // Clear trap flag after tracing (while process is still stopped on the pending event).
+    // The caller (framework) will ContinueDebugEvent for the last pending event.
     if let Ok(thread_context) = platform.get_thread_context(pid, tid) {
         let ThreadContext::Win32RawContext(mut context) = thread_context;
         let _ = clear_single_step_flag_native(&mut context);

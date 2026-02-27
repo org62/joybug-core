@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <windows.h>
 
 /* XTEA block size and rounds */
 #define XTEA_ROUNDS 32
@@ -76,6 +77,16 @@ void xtea_decrypt(uint32_t v[2], const uint32_t key[4]) {
 }
 
 /*
+ * Syscall marker: calls CloseHandle(NULL) which goes through
+ * kernel32 -> ntdll -> NtClose syscall (SVC on ARM64, SYSCALL on x64).
+ * The invalid handle returns STATUS_INVALID_HANDLE but the syscall fires.
+ */
+__declspec(noinline)
+void syscall_marker(void) {
+    CloseHandle(NULL);
+}
+
+/*
  * Marker function to set breakpoint before encryption
  * The actual work happens after this returns
  */
@@ -118,6 +129,9 @@ int main(void) {
 
     printf("Original data: 0x%08X 0x%08X\n", data[0], data[1]);
     printf("Key: 0x%08X 0x%08X 0x%08X 0x%08X\n\n", key[0], key[1], key[2], key[3]);
+
+    /* Syscall test: this will reach NtClose via kernel32 */
+    syscall_marker();
 
     /* === TRACE REGION START === */
     trace_start_marker();

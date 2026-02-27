@@ -280,6 +280,7 @@ impl<'a> Emulator<'a> {
             syscall_address: None,
             exit_address: None,
             retrying_after_fault: false,
+
         }));
 
         // Create Unicorn instance
@@ -1186,30 +1187,48 @@ impl<'a> Emulator<'a> {
             }
         };
 
+        let use_instruction_counting = mode == EmulationMode::InstructionTrace;
+
         let hook_setup_us = hook_setup_start.elapsed().as_micros() as u64;
 
-        // All modes use count=0, timeout=0: Unicorn runs at full speed until
-        // a hook fires (syscall, block, code) or a page fault occurs. This avoids
-        // both per-instruction counting overhead (count>0 forces single-instruction
-        // TBs in Unicorn) and timer thread overhead (timeout>0 spawns a thread per
-        // emu_start call, costing ~14ms each on Windows).
+        // =========================================================================
+        // CRITICAL: count=0 for non-tracing modes (Basic, BasicBlock,
+        //           ModuleTransition, Syscall)
+        // =========================================================================
+        // Passing count=0 to emu_start() is MANDATORY for non-tracing modes.
+        // count=0 lets Unicorn build multi-instruction JIT translation blocks,
+        // giving 10-100x better performance than count>0. Setting count>0 forces
+        // Unicorn to create single-instruction translation blocks, completely
+        // destroying JIT performance. NEVER change this to count>0.
         //
-        // InstructionTrace additionally uses batched counting via its CODE hook.
-        let use_instruction_counting = mode == EmulationMode::InstructionTrace;
+        // Safety mechanism: Non-tracing modes use Unicorn's built-in timeout
+        // parameter, which spawns a background thread that calls emu_stop()
+        // after the time budget expires. This provides a hard safety net without
+        // any instruction-counting overhead. In normal operation, hooks (syscall,
+        // module transition, etc.) stop emulation well before the timeout fires.
+        //
+        // InstructionTrace mode uses count=TRACE_BATCH_SIZE to batch instructions
+        // between the CODE hook and the outer loop.
+        // =========================================================================
         const TRACE_BATCH_SIZE: usize = 1000;
 
-        // Safety limit: max loop iterations to prevent infinite loops in case
-        // no hook fires and we just keep loading pages forever.
-        const MAX_LOOP_ITERATIONS: usize = 500;
+        // Safety timeout for non-tracing modes: 3 seconds total wall-clock time.
+        // Unicorn's timeout parameter spawns a background thread that calls
+        // emu_stop() if the time budget expires within a single emu_start() call.
+        // The wall-clock check at the loop top catches cross-call timeouts.
+        const SAFETY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-        // Main emulation loop
+        // Main emulation loop: iterates on page faults to lazy-load memory.
+        // Non-tracing modes use count=0 (CRITICAL for JIT speed) with a timeout
+        // safety net. InstructionTrace uses batched count for its CODE hook.
         let mut remaining = max_instructions;
         loop {
             if use_instruction_counting && remaining == 0 {
                 break;
             }
 
-            if loop_iterations >= MAX_LOOP_ITERATIONS {
+            // Safety timeout: bound total wall-clock time for non-tracing modes
+            if !use_instruction_counting && start_time.elapsed() > SAFETY_TIMEOUT {
                 stop_reason = StopReason::InstructionLimit;
                 break;
             }
@@ -1223,17 +1242,26 @@ impl<'a> Emulator<'a> {
                 state.pending_memory_fault = None;
             }
 
-            // Execute instructions: count=0, timeout=0 for all modes.
-            // Hooks and page faults provide natural stopping points.
+            // CRITICAL: count=0 for non-tracing modes. See comment block above.
+            // timeout_us provides a per-call safety net: Unicorn spawns a background
+            // thread that calls emu_stop() after the remaining time budget expires.
             let (count, timeout_us) = if use_instruction_counting {
                 (TRACE_BATCH_SIZE.min(remaining), 0u64)
             } else {
-                (0, 0u64)
+                let remaining_us = SAFETY_TIMEOUT
+                    .saturating_sub(start_time.elapsed())
+                    .as_micros() as u64;
+                (0, remaining_us.max(1)) // min 1us; 0 means no timeout
             };
+            tracing::debug!("emu_start: pc=0x{:X}, count={}, iteration={}", pc_before, count, loop_iterations);
             let emu_call_start = std::time::Instant::now();
             match self.emu.emu_start(pc_before, u64::MAX, timeout_us, count) {
                 Ok(()) => {
-                    exec_time_us += emu_call_start.elapsed().as_micros() as u64;
+                    let elapsed = emu_call_start.elapsed().as_micros() as u64;
+                    exec_time_us += elapsed;
+                    let pc_after = self.get_pc().unwrap_or(pc_before);
+                    tracing::debug!("emu_start returned Ok: pc=0x{:X}->0x{:X}, elapsed={}us, iteration={}", pc_before, pc_after, elapsed, loop_iterations);
+
                     if use_instruction_counting {
                         let state = self.shared_state.read().unwrap();
                         let executed = state.instruction_trace.len().saturating_sub(instructions_executed);
@@ -1241,7 +1269,7 @@ impl<'a> Emulator<'a> {
                         remaining = remaining.saturating_sub(executed);
                     }
 
-                    // Check for stop_requested (e.g., exit address reached, syscall)
+                    // Check for stop_requested (set by hooks: syscall, exit address, etc.)
                     {
                         let state = self.shared_state.read().unwrap();
                         if state.stop_requested {
@@ -1256,8 +1284,6 @@ impl<'a> Emulator<'a> {
                         }
                     }
 
-                    // For all modes: if Ok(()) returned without stop_requested,
-                    // just continue the loop. MAX_LOOP_ITERATIONS provides the safety net.
                     continue;
                 }
                 Err(uc_error::READ_UNMAPPED) | Err(uc_error::FETCH_UNMAPPED) | Err(uc_error::WRITE_UNMAPPED) => {
@@ -1346,6 +1372,21 @@ impl<'a> Emulator<'a> {
                                     instructions_executed = traced;
                                     remaining = remaining.saturating_sub(delta);
                                 }
+                                // Check if a hook (syscall, exit address, etc.) fired during retry
+                                {
+                                    let state = self.shared_state.read().unwrap();
+                                    if state.stop_requested {
+                                        if let Some(addr) = state.syscall_address {
+                                            stop_reason = StopReason::Syscall { address: addr };
+                                        } else if let Some(addr) = state.exit_address {
+                                            stop_reason = StopReason::ReachedAddress(addr);
+                                        } else {
+                                            stop_reason = StopReason::Stopped;
+                                        }
+                                        break;
+                                    }
+                                }
+                                continue;
                             }
                             Err(_) => {
                                 stop_reason = StopReason::UnmappedMemory(pc_before);
@@ -1468,45 +1509,6 @@ impl<'a> Emulator<'a> {
                     break;
                 }
             }
-
-            // Check for stop conditions
-            {
-                let state = self.shared_state.read().unwrap();
-
-                // Check for syscall
-                if let Some(addr) = state.syscall_address {
-                    stop_reason = StopReason::Syscall { address: addr };
-                    break;
-                }
-
-                // Check for module transition (from CODE hook path)
-                if let Some((from, to, addr)) = &state.module_transition {
-                    let symbol = platform.resolve_address_to_symbol(self.pid, *addr)
-                        .ok()
-                        .flatten()
-                        .map(|(_, sym, offset)| format_symbol_with_offset(sym, offset));
-                    stop_reason = StopReason::ModuleTransition {
-                        from: from.clone(),
-                        to: to.clone(),
-                        address: *addr,
-                        symbol,
-                    };
-                    break;
-                }
-
-                if state.stop_requested {
-                    // Check if it was a syscall
-                    if let Some(addr) = state.syscall_address {
-                        stop_reason = StopReason::Syscall { address: addr };
-                    } else if let Some(addr) = state.exit_address {
-                        // Reached exit address
-                        stop_reason = StopReason::ReachedAddress(addr);
-                    } else {
-                        stop_reason = StopReason::Stopped;
-                    }
-                    break;
-                }
-            }
         }
 
         // Remove hooks if installed
@@ -1579,6 +1581,7 @@ mod tests {
             syscall_address: None,
             exit_address: None,
             retrying_after_fault: false,
+
         }));
 
         let emu = Unicorn::new_with_data(Arch::X86, Mode::MODE_64, shared);
@@ -1604,6 +1607,7 @@ mod tests {
             syscall_address: None,
             exit_address: None,
             retrying_after_fault: false,
+
         }));
 
         let mut emu = Unicorn::new_with_data(Arch::X86, Mode::MODE_64, shared).unwrap();
@@ -1639,6 +1643,7 @@ mod tests {
             syscall_address: None,
             exit_address: None,
             retrying_after_fault: false,
+
         }));
 
         let mut emu = Unicorn::new_with_data(Arch::X86, Mode::MODE_64, shared).unwrap();
