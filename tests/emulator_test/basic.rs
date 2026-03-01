@@ -11,7 +11,7 @@ pub fn test_basic(
 ) -> anyhow::Result<()> {
     println!("\n=== Test: Basic mode ===");
 
-    let result = session.emulate_instructions(pid, tid, 500, EmulationMode::Basic, None)?;
+    let result = session.emulate_instructions(pid, tid, 500, EmulationMode::Basic, None, vec![])?;
 
     match result {
         EmulateResult::Emulation(data) => {

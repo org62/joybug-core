@@ -10,7 +10,7 @@ pub fn test_module_transition(
 ) -> anyhow::Result<()> {
     println!("\n=== Test: ModuleTransition mode ===");
 
-    let result = session.emulate_instructions(pid, tid, 50000, EmulationMode::ModuleTransition, None)?;
+    let result = session.emulate_instructions(pid, tid, 50000, EmulationMode::ModuleTransition, None, vec![])?;
 
     match result {
         EmulateResult::Emulation(data) => {

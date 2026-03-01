@@ -13,7 +13,7 @@ pub fn test_basic_block(
 ) -> anyhow::Result<()> {
     println!("\n=== Test: BasicBlock mode ===");
 
-    let result = session.emulate_instructions(pid, tid, 500, EmulationMode::BasicBlock, None)?;
+    let result = session.emulate_instructions(pid, tid, 500, EmulationMode::BasicBlock, None, vec![])?;
 
     match result {
         EmulateResult::Emulation(data) => {

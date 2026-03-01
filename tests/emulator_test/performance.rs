@@ -19,7 +19,7 @@ pub fn test_performance(
     // address and tests that trace batching (count=TRACE_BATCH_SIZE) is efficient.
     let result = session.emulate_instructions(
         pid, tid, 50000, EmulationMode::InstructionTrace,
-        Some(TraceExitCondition::ReachAddress(exit_addr)),
+        Some(TraceExitCondition::ReachAddress(exit_addr)), vec![],
     )?;
 
     match result {

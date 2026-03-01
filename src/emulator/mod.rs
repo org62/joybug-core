@@ -202,6 +202,11 @@ impl<'a> Emulator<'a> {
         }
     }
 
+    /// Read memory from the emulator's address space (Unicorn).
+    pub fn read_emulated_memory(&self, address: u64, size: usize) -> Option<Vec<u8>> {
+        self.emu.mem_read_as_vec(address, size).ok()
+    }
+
     /// Build EmulationResult from current state
     fn build_result(
         &self,
@@ -210,10 +215,17 @@ impl<'a> Emulator<'a> {
         emulation_time_us: u64,
         pages_before: usize,
         stats_text: String,
+        memory_reads: &[(u64, usize)],
     ) -> Result<EmulationResult, EmulatorError> {
         let final_pc = self.get_pc()?;
         let state = self.shared_state.read().unwrap();
         let pages_loaded = state.mapped_regions.len() - pages_before;
+
+        let memory_snapshots: Vec<(u64, Vec<u8>)> = memory_reads.iter()
+            .filter_map(|&(addr, size)| {
+                self.emu.mem_read_as_vec(addr, size).ok().map(|data| (addr, data))
+            })
+            .collect();
 
         Ok(EmulationResult {
             final_pc,
@@ -226,6 +238,7 @@ impl<'a> Emulator<'a> {
             register_trace: state.register_trace.clone(),
             memory_trace: state.memory_trace.clone(),
             stats_text,
+            memory_snapshots,
         })
     }
 }

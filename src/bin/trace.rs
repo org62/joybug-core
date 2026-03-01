@@ -282,6 +282,7 @@ fn run_trace(
             max_instructions,
             mode: EmulationMode::InstructionTrace,
             exit_condition: Some(exit_condition.clone()),
+            memory_reads: vec![],
         };
         session.send_and_receive(&req)?
     } else {

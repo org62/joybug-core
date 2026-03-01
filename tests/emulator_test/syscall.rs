@@ -13,7 +13,7 @@ pub fn test_syscall(
     println!("\n=== Test: Syscall mode ===");
 
     // Use a generous limit - CloseHandle → NtClose is a short path
-    let result = session.emulate_instructions(pid, tid, 50000, EmulationMode::Syscall, None)?;
+    let result = session.emulate_instructions(pid, tid, 50000, EmulationMode::Syscall, None, vec![])?;
 
     match result {
         EmulateResult::Emulation(data) => {

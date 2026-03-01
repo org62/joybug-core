@@ -10,7 +10,7 @@ pub fn test_instruction_trace_syscall(
 ) -> anyhow::Result<()> {
     println!("\n=== Test: InstructionTrace stops on syscall ===");
 
-    let result = session.emulate_instructions(pid, tid, 50000, EmulationMode::InstructionTrace, None)?;
+    let result = session.emulate_instructions(pid, tid, 50000, EmulationMode::InstructionTrace, None, vec![])?;
 
     match result {
         EmulateResult::Trace(trace) => {

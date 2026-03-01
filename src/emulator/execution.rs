@@ -172,7 +172,7 @@ impl<'a> Emulator<'a> {
         }
 
         let emulation_time_us = start_time.elapsed().as_micros() as u64;
-        self.build_result(instructions_executed, stop_reason, emulation_time_us, pages_before, String::new())
+        self.build_result(instructions_executed, stop_reason, emulation_time_us, pages_before, String::new(), &[])
     }
 
     /// Emulate with a specific mode that determines which hooks are installed
@@ -189,6 +189,7 @@ impl<'a> Emulator<'a> {
         max_instructions: usize,
         mode: EmulationMode,
         exit_condition: Option<crate::protocol::TraceExitCondition>,
+        memory_reads: &[(u64, usize)],
     ) -> Result<EmulationResult, EmulatorError> {
         use std::time::Instant;
         use crate::protocol::TraceExitCondition;
@@ -225,6 +226,7 @@ impl<'a> Emulator<'a> {
             state.pending_write_ops.clear();
             state.retrying_after_fault = false;
             state.syscall_address = None;
+            state.exception_intno = None;
             state.exit_address = exit_address;
 
             if mode == EmulationMode::ModuleTransition {
@@ -344,7 +346,12 @@ impl<'a> Emulator<'a> {
                     {
                         let state = self.shared_state.read().unwrap();
                         if state.stop_requested {
-                            if let Some(addr) = state.syscall_address {
+                            if let Some(intno) = state.exception_intno {
+                                let pc = self.get_pc().unwrap_or(0);
+                                stop_reason = StopReason::Error(format!(
+                                    "Unhandled exception (intno={}) at PC=0x{:X}", intno, pc
+                                ));
+                            } else if let Some(addr) = state.syscall_address {
                                 stop_reason = StopReason::Syscall { address: addr };
                             } else if let Some(addr) = state.exit_address {
                                 stop_reason = StopReason::ReachedAddress(addr);
@@ -443,7 +450,12 @@ impl<'a> Emulator<'a> {
                                 {
                                     let state = self.shared_state.read().unwrap();
                                     if state.stop_requested {
-                                        if let Some(addr) = state.syscall_address {
+                                        if let Some(intno) = state.exception_intno {
+                                            let pc = self.get_pc().unwrap_or(0);
+                                            stop_reason = StopReason::Error(format!(
+                                                "Unhandled exception (intno={}) at PC=0x{:X}", intno, pc
+                                            ));
+                                        } else if let Some(addr) = state.syscall_address {
                                             stop_reason = StopReason::Syscall { address: addr };
                                         } else if let Some(addr) = state.exit_address {
                                             stop_reason = StopReason::ReachedAddress(addr);
@@ -535,7 +547,7 @@ impl<'a> Emulator<'a> {
             emulation_time_us,
             total_pages,
         );
-        self.build_result(instructions_executed, stop_reason, emulation_time_us, pages_before, stats_text)
+        self.build_result(instructions_executed, stop_reason, emulation_time_us, pages_before, stats_text, memory_reads)
     }
 
     /// Log detailed diagnostics for a CPU exception (PC didn't move).

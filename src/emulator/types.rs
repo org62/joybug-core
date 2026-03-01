@@ -57,6 +57,8 @@ pub struct EmulationResult {
     pub memory_trace: Vec<Vec<MemoryAccess>>,
     /// Detailed timing breakdown
     pub stats_text: String,
+    /// Memory snapshots read from emulator state after execution
+    pub memory_snapshots: Vec<(u64, Vec<u8>)>,
 }
 
 /// Why emulation stopped
@@ -126,6 +128,8 @@ pub(super) struct EmulatorSharedState {
     pub last_instruction_size: Option<u32>,
     /// Syscall address (set by syscall hook)
     pub syscall_address: Option<u64>,
+    /// Unhandled exception interrupt number (set by interrupt hook for non-SVC interrupts)
+    pub exception_intno: Option<u32>,
     /// Exit address (stop when this address is reached)
     pub exit_address: Option<u64>,
     /// Set after a memory fault in InstructionTrace mode; tells the CODE hook
@@ -150,6 +154,7 @@ impl EmulatorSharedState {
             last_instruction_addr: None,
             last_instruction_size: None,
             syscall_address: None,
+            exception_intno: None,
             exit_address: None,
             retrying_after_fault: false,
         }

@@ -20,9 +20,11 @@ mod module_transition;
 mod performance;
 #[path = "emulator_test/syscall.rs"]
 mod syscall;
+#[path = "emulator_test/timeout.rs"]
+mod timeout;
 
 use common::TestServer;
-use helpers::{EmulatorTestState, get_xtea_test_path};
+use helpers::{EmulatorTestState, get_xtea_test_path, get_emulator_test_path};
 use joybug2::interfaces::Architecture;
 use joybug2::protocol_io::{BreakpointDecision, DebugSession};
 
@@ -167,4 +169,78 @@ fn test_emulator_integration() {
         .expect("Debug session failed");
 
     assert!(final_state.all_tested(), "Not all emulator features were tested");
+}
+
+/// Test emulation timeout using an infinite loop program.
+/// Launches emulator_test.exe, breaks on infinite_increment(), sets g_do_infinite_loop
+/// to force an infinite loop, then emulates in Basic mode until the 3s safety timeout fires.
+/// Reads g_counter from emulated memory to verify the loop ran many iterations.
+#[test]
+fn test_emulator_timeout() {
+    joybug2::init_tracing();
+
+    let server = TestServer::spawn();
+    let server_addr = server.address().to_string();
+    let test_exe = get_emulator_test_path();
+
+    println!("=== Emulator Timeout Test ===");
+    println!("Test program: {}", test_exe);
+    println!("Server: {}", server_addr);
+
+    let final_state = DebugSession::new(EmulatorTestState::new(), Some(server_addr.as_str()))
+        .expect("Failed to connect to debug server")
+        .on_initial_breakpoint(|session, pid, _tid, address| {
+            println!("\nInitial breakpoint at 0x{:016X}", address);
+
+            let func_sym = session.find_symbols("infinite_increment", 1)?
+                .into_iter()
+                .find(|s| s.module_name.to_lowercase().contains("emulator_test"))
+                .ok_or_else(|| anyhow::anyhow!("Could not find infinite_increment symbol"))?;
+            println!("  infinite_increment: 0x{:016X}", func_sym.va);
+
+            let loop_flag_sym = session.find_symbols("g_do_infinite_loop", 1)?
+                .into_iter()
+                .find(|s| s.module_name.to_lowercase().contains("emulator_test"))
+                .ok_or_else(|| anyhow::anyhow!("Could not find g_do_infinite_loop symbol"))?;
+            println!("  g_do_infinite_loop: 0x{:016X}", loop_flag_sym.va);
+
+            let counter_sym = session.find_symbols("g_counter", 1)?
+                .into_iter()
+                .find(|s| s.module_name.to_lowercase().contains("emulator_test"))
+                .ok_or_else(|| anyhow::anyhow!("Could not find g_counter symbol"))?;
+            println!("  g_counter: 0x{:016X}", counter_sym.va);
+
+            let func_addr = func_sym.va;
+            let loop_flag_addr = loop_flag_sym.va;
+            let counter_addr = counter_sym.va;
+
+            session.set_breakpoint_at(pid, func_addr, None, move |session, pid, tid, address| {
+                println!("\n=== Hit infinite_increment at 0x{:016X} ===", address);
+                session.remove_breakpoint(pid, address)?;
+
+                // Force infinite loop: set g_do_infinite_loop = 1
+                session.write_memory(pid, loop_flag_addr, 1u64.to_le_bytes().to_vec())?;
+
+                let saved_context = session.get_thread_context(pid, tid)?;
+
+                timeout::test_timeout(session, pid, tid, counter_addr)?;
+                session.set_thread_context(pid, tid, saved_context)?;
+
+                // Restore g_do_infinite_loop = 0 so the real process exits after resuming
+                session.write_memory(pid, loop_flag_addr, 0u64.to_le_bytes().to_vec())?;
+
+                Ok(BreakpointDecision::Remove)
+            })?;
+
+            Ok(())
+        })
+        .on_process_exited(|session, pid, exit_code| {
+            println!("\nProcess {} exited with code {}", pid, exit_code);
+            assert!(session.state.timeout_tested, "Timeout was not tested");
+            Ok(())
+        })
+        .launch(test_exe)
+        .expect("Debug session failed");
+
+    assert!(final_state.timeout_tested, "Timeout test was not completed");
 }

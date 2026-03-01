@@ -146,11 +146,12 @@ impl WindowsPlatform {
         max_instructions: usize,
         mode: crate::protocol::EmulationMode,
         exit_condition: Option<crate::protocol::TraceExitCondition>,
+        memory_reads: &[(u64, usize)],
     ) -> Result<EmulationResult, PlatformError> {
         let mut emulator = Emulator::from_debugger_state(self, pid, tid)
             .map_err(|e| PlatformError::Other(e.to_string()))?;
 
-        emulator.emulate_with_mode(self, max_instructions, mode, exit_condition)
+        emulator.emulate_with_mode(self, max_instructions, mode, exit_condition, memory_reads)
             .map_err(|e| PlatformError::Other(e.to_string()))
     }
 

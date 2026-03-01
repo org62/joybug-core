@@ -49,14 +49,17 @@ impl<'a> Emulator<'a> {
                 const EXCP_SWI: u32 = 2;
                 self.emu.add_intr_hook(
                     move |emu, intno| {
+                        let pc = emu.reg_read(RegisterARM64::PC).unwrap_or(0);
+                        let mut state = shared.write().unwrap();
                         if intno == EXCP_SWI {
-                            let pc = emu.reg_read(RegisterARM64::PC).unwrap_or(0);
-                            let mut state = shared.write().unwrap();
                             state.syscall_address = Some(pc);
-                            state.stop_requested = true;
-                            drop(state);
-                            emu.emu_stop().ok();
+                        } else {
+                            tracing::warn!("Unhandled ARM64 interrupt: intno={} at PC=0x{:X}", intno, pc);
+                            state.exception_intno = Some(intno);
                         }
+                        state.stop_requested = true;
+                        drop(state);
+                        emu.emu_stop().ok();
                     }
                 ).map_err(|e| EmulatorError::UnicornError(format!("intr hook failed: {:?}", e)))
             }

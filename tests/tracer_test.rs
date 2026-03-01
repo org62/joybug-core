@@ -145,6 +145,7 @@ fn run_tracer_comparison(
             trap_line_count,
             EmulationMode::InstructionTrace,
             None,
+            vec![],
         )?;
 
         let emu_line_count = match &emu_result {

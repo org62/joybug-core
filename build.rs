@@ -115,5 +115,6 @@ fn main() {
         let _ = compile_test_program(&manifest_dir, &out_dir, "disassembly_test", None);
         // xtea_test uses fixed base address for predictable symbol addresses in traces
         let _ = compile_test_program(&manifest_dir, &out_dir, "xtea_test", Some(0x140000000));
+        let _ = compile_test_program(&manifest_dir, &out_dir, "emulator_test", None);
     }
 }

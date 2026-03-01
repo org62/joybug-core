@@ -31,6 +31,8 @@ pub struct EmulationResultData {
     pub pages_loaded: usize,
     pub basic_blocks: Vec<u64>,
     pub stats_text: String,
+    /// Memory snapshots read from emulator state after execution
+    pub memory_snapshots: Vec<(u64, Vec<u8>)>,
 }
 use std::collections::HashMap;
 pub use std::net::TcpStream;
@@ -1019,6 +1021,7 @@ impl<S> DebugSession<S> {
     /// * `max_instructions` - Maximum instructions to emulate
     /// * `mode` - Emulation mode (Basic, InstructionTrace, BasicBlock, ModuleTransition, Syscall)
     /// * `exit_condition` - Optional exit condition (stop at address)
+    /// * `memory_reads` - Memory addresses to read from emulator state after execution
     pub fn emulate_instructions(
         &mut self,
         pid: u32,
@@ -1026,6 +1029,7 @@ impl<S> DebugSession<S> {
         max_instructions: usize,
         mode: EmulationMode,
         exit_condition: Option<TraceExitCondition>,
+        memory_reads: Vec<(u64, usize)>,
     ) -> anyhow::Result<EmulateResult> {
         let req = DebuggerRequest::EmulateInstructions {
             pid,
@@ -1033,6 +1037,7 @@ impl<S> DebugSession<S> {
             max_instructions,
             mode,
             exit_condition,
+            memory_reads,
         };
         match self.send_and_receive(&req)? {
             DebuggerResponse::TenetTrace {
@@ -1054,6 +1059,7 @@ impl<S> DebugSession<S> {
                 pages_loaded,
                 basic_blocks,
                 stats_text,
+                memory_snapshots,
             } => Ok(EmulateResult::Emulation(EmulationResultData {
                 final_pc,
                 instructions_executed,
@@ -1062,6 +1068,7 @@ impl<S> DebugSession<S> {
                 pages_loaded,
                 basic_blocks,
                 stats_text,
+                memory_snapshots,
             })),
             DebuggerResponse::Error { message } => {
                 Err(anyhow::anyhow!("Failed to emulate instructions: {}", message))

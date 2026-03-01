@@ -362,10 +362,10 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                 }
             }
             // Emulator handlers (one-shot)
-            DebuggerRequest::EmulateInstructions { pid, tid, max_instructions, mode, exit_condition } => {
+            DebuggerRequest::EmulateInstructions { pid, tid, max_instructions, mode, exit_condition, memory_reads } => {
                 use crate::protocol::EmulationMode;
                 let p = platform.read().unwrap();
-                match p.emulate_with_mode(pid, tid, max_instructions, mode, exit_condition) {
+                match p.emulate_with_mode(pid, tid, max_instructions, mode, exit_condition, &memory_reads) {
                     Ok(result) => {
                         if mode == EmulationMode::InstructionTrace {
                             // InstructionTrace mode returns Tenet format
@@ -389,6 +389,7 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                                 pages_loaded: result.pages_loaded,
                                 basic_blocks: result.basic_blocks,
                                 stats_text: result.stats_text,
+                                memory_snapshots: result.memory_snapshots,
                             }
                         }
                     }

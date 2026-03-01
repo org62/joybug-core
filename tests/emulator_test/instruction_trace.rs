@@ -12,7 +12,7 @@ pub fn test_instruction_trace(
     println!("\n=== Test: InstructionTrace mode ===");
 
     let limit = 300;
-    let result = session.emulate_instructions(pid, tid, limit, EmulationMode::InstructionTrace, None)?;
+    let result = session.emulate_instructions(pid, tid, limit, EmulationMode::InstructionTrace, None, vec![])?;
 
     match result {
         EmulateResult::Trace(trace) => {

@@ -369,6 +369,10 @@ pub mod request_response {
             /// Optional exit condition (stop at address)
             #[serde(default)]
             exit_condition: Option<TraceExitCondition>,
+            /// Memory addresses to read from emulator state after execution.
+            /// Each entry is (address, size). Results returned in memory_snapshots.
+            #[serde(default)]
+            memory_reads: Vec<(u64, usize)>,
         },
         /// Trace instructions using trap flag, capturing register state at each step
         /// Returns TenetTrace with delta-encoded register/memory state
@@ -432,6 +436,10 @@ pub mod request_response {
             basic_blocks: Vec<u64>,
             /// Detailed timing breakdown
             stats_text: String,
+            /// Memory snapshots read from emulator state after execution.
+            /// Each entry is (address, data).
+            #[serde(default)]
+            memory_snapshots: Vec<(u64, Vec<u8>)>,
         },
         /// Tenet format trace result (for TraceInstructions and EmulateInstructions with InstructionTrace mode)
         TenetTrace {

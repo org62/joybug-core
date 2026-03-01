@@ -14,7 +14,7 @@ pub fn test_instruction_trace_exit_condition(
 
     let result = session.emulate_instructions(
         pid, tid, 50000, EmulationMode::InstructionTrace,
-        Some(TraceExitCondition::ReachAddress(exit_addr)),
+        Some(TraceExitCondition::ReachAddress(exit_addr)), vec![],
     )?;
 
     match result {
