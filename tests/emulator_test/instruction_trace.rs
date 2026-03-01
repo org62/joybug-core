@@ -34,8 +34,10 @@ pub fn test_instruction_trace(
             );
 
             // First line should contain the start address (it's the full register snapshot)
+            // On x64, the PC register is called "rip"; on ARM64, it's "pc"
             let first_line = trace.trace_text.lines().next().unwrap();
-            let expected_pc = format!("pc=0x{:x}", start_pc);
+            let pc_reg_name = if cfg!(target_arch = "x86_64") { "rip" } else { "pc" };
+            let expected_pc = format!("{}=0x{:x}", pc_reg_name, start_pc);
             assert!(
                 first_line.contains(&expected_pc),
                 "InstructionTrace: first line should contain start PC {}, got: {}",
@@ -43,16 +45,17 @@ pub fn test_instruction_trace(
                 if first_line.len() > 100 { &first_line[..100] } else { first_line }
             );
 
-            // Subsequent lines should have delta-encoded pc= values
+            // Subsequent lines should have delta-encoded pc register values
+            let pc_prefix = format!("{}=", pc_reg_name);
             let mut lines_with_pc = 0;
             for line in trace.trace_text.lines() {
-                if line.contains("pc=") {
+                if line.contains(&pc_prefix) {
                     lines_with_pc += 1;
                 }
             }
             assert_eq!(
                 lines_with_pc, line_count,
-                "InstructionTrace: every line should contain a pc= value"
+                "InstructionTrace: every line should contain a {}= value", pc_reg_name
             );
 
             // Show first few lines

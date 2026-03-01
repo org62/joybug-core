@@ -33,8 +33,10 @@ pub fn test_instruction_trace_exit_condition(
             );
 
             // The last trace line should contain the exit address
+            // On x64, the PC register is called "rip"; on ARM64, it's "pc"
             if let Some(last_line) = trace.trace_text.lines().last() {
-                let expected_pc = format!("pc=0x{:x}", exit_addr);
+                let pc_reg_name = if cfg!(target_arch = "x86_64") { "rip" } else { "pc" };
+                let expected_pc = format!("{}=0x{:x}", pc_reg_name, exit_addr);
                 assert!(
                     last_line.contains(&expected_pc),
                     "InstructionTrace exit: last line should contain exit PC {}, got: {}",

@@ -130,7 +130,6 @@ impl<'a> Emulator<'a> {
         pid: u32,
         tid: u32,
     ) -> Result<(), EmulatorError> {
-        use unicorn_engine::unicorn_const::Prot;
         use windows_sys::Win32::System::Memory::MEM_COMMIT;
 
         match platform.get_teb_address(pid, tid) {
