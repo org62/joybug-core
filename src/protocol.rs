@@ -251,6 +251,8 @@ pub mod request_response {
         Continue {
             pid: u32,
             tid: u32,
+            #[serde(default)]
+            pass_exception: bool,
         },
         BreakInto {
             pid: u32,

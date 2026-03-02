@@ -2,7 +2,7 @@ use super::{utils, WindowsPlatform, stepper};
 use crate::interfaces::PlatformError;
 use crate::protocol::ModuleInfo;
 use tracing::{error, trace, warn};
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, FALSE, DBG_CONTINUE, DUPLICATE_SAME_ACCESS, HANDLE, DuplicateHandle, STATUS_SINGLE_STEP, MAX_PATH};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, FALSE, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, DUPLICATE_SAME_ACCESS, HANDLE, DuplicateHandle, STATUS_SINGLE_STEP, MAX_PATH};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, INFINITE};
 use windows_sys::Win32::System::Diagnostics::Debug::{
     ContinueDebugEvent, WaitForDebugEvent, DEBUG_EVENT, EXCEPTION_DEBUG_EVENT,
@@ -15,9 +15,14 @@ use std::ptr;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 
 // Non-locking helpers to minimize lock holding in server
-pub fn continue_only(pid: u32, tid: u32) -> Result<(), PlatformError> {
-    trace!(pid, tid, "ContinueDebugEvent only");
-    let cont_res = unsafe { ContinueDebugEvent(pid, tid, DBG_CONTINUE) };
+pub fn continue_debug_event(pid: u32, tid: u32, pass_exception: bool) -> Result<(), PlatformError> {
+    let status = if pass_exception {
+        DBG_EXCEPTION_NOT_HANDLED
+    } else {
+        DBG_CONTINUE
+    };
+    trace!(pid, tid, pass_exception, "ContinueDebugEvent");
+    let cont_res = unsafe { ContinueDebugEvent(pid, tid, status) };
     if cont_res == FALSE {
         let error = unsafe { GetLastError() };
         let error_str = utils::error_message(error);
@@ -28,6 +33,11 @@ pub fn continue_only(pid: u32, tid: u32) -> Result<(), PlatformError> {
         )));
     }
     Ok(())
+}
+
+/// Convenience wrapper that always uses DBG_CONTINUE
+pub fn continue_only(pid: u32, tid: u32) -> Result<(), PlatformError> {
+    continue_debug_event(pid, tid, false)
 }
 
 pub fn wait_for_debug_event_blocking() -> Result<DEBUG_EVENT, PlatformError> {

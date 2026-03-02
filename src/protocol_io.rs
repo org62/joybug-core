@@ -40,6 +40,58 @@ use std::sync::Mutex;
 use crate::framed_json_stream::FramedJsonStream;
 use tracing::{debug, error, info, warn};
 
+/// What the debugger should do when encountering an exception
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExceptionAction {
+    /// Pass to application (DBG_EXCEPTION_NOT_HANDLED) and auto-continue
+    PassToApplication,
+    /// Handle by debugger (DBG_CONTINUE) and auto-continue
+    HandledByDebugger,
+    /// Stop execution and let the user decide
+    Stop,
+}
+
+/// Per-exception-code configuration
+#[derive(Debug, Clone)]
+pub struct ExceptionCodeConfig {
+    pub first_chance: ExceptionAction,
+    pub second_chance: ExceptionAction,
+}
+
+/// Exception handling configuration
+#[derive(Debug, Clone)]
+pub struct ExceptionConfig {
+    /// Default for first-chance exceptions not in per_code map
+    pub default_first_chance: ExceptionAction,
+    /// Default for second-chance exceptions
+    pub default_second_chance: ExceptionAction,
+    /// Per-exception-code overrides
+    pub per_code: HashMap<u32, ExceptionCodeConfig>,
+}
+
+impl Default for ExceptionConfig {
+    fn default() -> Self {
+        Self {
+            default_first_chance: ExceptionAction::Stop,
+            default_second_chance: ExceptionAction::Stop,
+            per_code: HashMap::new(),
+        }
+    }
+}
+
+impl ExceptionConfig {
+    /// Look up the action for a given exception code and chance
+    pub fn action_for(&self, code: u32, first_chance: bool) -> ExceptionAction {
+        if let Some(config) = self.per_code.get(&code) {
+            if first_chance { config.first_chance } else { config.second_chance }
+        } else if first_chance {
+            self.default_first_chance
+        } else {
+            self.default_second_chance
+        }
+    }
+}
+
 pub fn send_request(stream: &mut FramedJsonStream, req: &DebuggerRequest) -> anyhow::Result<()> {
     debug!("Sending request: {:?}", req);
     stream.send(req)
@@ -117,6 +169,11 @@ pub struct DebugSession<S> {
     on_process_created:
         Option<Box<dyn FnMut(&mut Self, u32, u32, &str, u64) -> anyhow::Result<()> + Send + 'static>>,
     on_event: Option<Box<dyn FnMut(&mut Self, &DebugEvent) -> anyhow::Result<bool> + Send + 'static>>,
+    /// Exception handling configuration
+    exception_config: ExceptionConfig,
+    /// Handler called on exception events; overrides exception_config if set.
+    /// Receives (session, pid, tid, code, address, first_chance, parameters) and returns the desired action.
+    on_exception: Option<Box<dyn FnMut(&mut Self, u32, u32, u32, u64, bool, &[u64]) -> anyhow::Result<ExceptionAction> + Send + 'static>>,
 }
 
 impl<S> DebugSession<S> {
@@ -138,6 +195,8 @@ impl<S> DebugSession<S> {
             on_thread_exited: None,
             on_process_created: None,
             on_event: None,
+            exception_config: ExceptionConfig::default(),
+            on_exception: None,
         })
     }
     /// Handle the initial process breakpoint
@@ -302,6 +361,32 @@ impl<S> DebugSession<S> {
         self
     }
 
+    /// Set exception handling configuration
+    pub fn exception_config(mut self, config: ExceptionConfig) -> Self {
+        self.exception_config = config;
+        self
+    }
+
+    /// Set a per-exception-code action
+    pub fn set_exception_action(mut self, code: u32, first_chance: ExceptionAction, second_chance: ExceptionAction) -> Self {
+        self.exception_config.per_code.insert(code, ExceptionCodeConfig {
+            first_chance,
+            second_chance,
+        });
+        self
+    }
+
+    /// Set a handler called on exception events that overrides the exception_config.
+    /// Handler receives (session, pid, tid, code, address, first_chance, parameters)
+    /// and returns the desired ExceptionAction.
+    pub fn on_exception<F>(mut self, handler: F) -> Self
+    where
+        F: FnMut(&mut Self, u32, u32, u32, u64, bool, &[u64]) -> anyhow::Result<ExceptionAction> + Send + 'static,
+    {
+        self.on_exception = Some(Box::new(handler));
+        self
+    }
+
     /// Launch a process and run the debug session with the configured callbacks
     /// Returns the final state after the session completes
     pub fn launch(mut self, command: String) -> anyhow::Result<S> {
@@ -356,9 +441,12 @@ impl<S> DebugSession<S> {
         let mut on_process_exited = self.on_process_exited.take();
         let mut on_thread_exited = self.on_thread_exited.take();
         let mut on_event = self.on_event.take();
+        let mut on_exception = self.on_exception.take();
 
         // Check if on_event handler wants to stop the session
         let mut should_continue = true;
+        // For exceptions: whether to pass exception to application on auto-continue
+        let mut pass_exception = false;
         if let Some(ref mut handler) = on_event {
             // The handler returns Result<bool> where false means stop the session
             should_continue = handler(self, event)?;
@@ -476,8 +564,25 @@ impl<S> DebugSession<S> {
                 };
 
             }
-            DebugEvent::Exception { .. } => {
-                // No-op. Auto-continue will handle it below.
+            DebugEvent::Exception { pid, tid, code, address, first_chance, parameters } => {
+                // Determine what to do with this exception
+                let action = if let Some(ref mut handler) = on_exception {
+                    handler(self, *pid, *tid, *code, *address, *first_chance, parameters)?
+                } else {
+                    self.exception_config.action_for(*code, *first_chance)
+                };
+
+                match action {
+                    ExceptionAction::Stop => {
+                        should_continue = false;
+                    }
+                    ExceptionAction::PassToApplication => {
+                        pass_exception = true;
+                    }
+                    ExceptionAction::HandledByDebugger => {
+                        // pass_exception stays false (DBG_CONTINUE)
+                    }
+                }
             }
             _ => {
                 panic!("Unhandled event in handle_session_event: {}", event);
@@ -493,6 +598,7 @@ impl<S> DebugSession<S> {
         self.on_process_created = on_process_created;
         self.on_dll_unloaded = on_dll_unloaded;
         self.on_event = on_event;
+        self.on_exception = on_exception;
 
         // If the on_event handler wants to stop, respect that
         if !should_continue {
@@ -503,6 +609,17 @@ impl<S> DebugSession<S> {
         match event {
             DebugEvent::ProcessExited { .. } => return Ok(false),
 
+            DebugEvent::Exception { pid, tid, .. } => {
+                let cont = DebuggerRequest::Continue {
+                    pid: *pid,
+                    tid: *tid,
+                    pass_exception,
+                };
+                let mut stream = self.stream.lock().unwrap();
+                debug!("Auto-continue on exception (pass_exception={}): {}", pass_exception, event);
+                send_request(&mut stream, &cont)?;
+            }
+
             DebugEvent::ProcessCreated { pid, tid, .. }
             | DebugEvent::DllLoaded { pid, tid, .. }
             | DebugEvent::DllUnloaded { pid, tid, .. }
@@ -511,13 +628,13 @@ impl<S> DebugSession<S> {
             | DebugEvent::Breakpoint { pid, tid, .. }
             | DebugEvent::InitialBreakpoint { pid, tid, .. }
             | DebugEvent::Output { pid, tid, .. }
-            | DebugEvent::Exception { pid, tid, .. }
             | DebugEvent::StepComplete { pid, tid, .. }
             | DebugEvent::SingleShotBreakpoint { pid, tid, .. }
             | DebugEvent::RipEvent { pid, tid, .. } => {
                 let cont = DebuggerRequest::Continue {
                     pid: *pid,
                     tid: *tid,
+                    pass_exception: false,
                 };
                 let mut stream = self.stream.lock().unwrap();
                 debug!("Auto-continue on event: {}", event);

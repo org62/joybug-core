@@ -79,11 +79,11 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
         }
 
         // Handle Continue without holding the platform lock across the blocking wait
-        if let DebuggerRequest::Continue { pid, tid } = req {
+        if let DebuggerRequest::Continue { pid, tid, pass_exception } = req {
             #[cfg(windows)]
             {
                 // 1) Continue without lock
-                match crate::windows_platform::debug_events::continue_only(pid, tid) {
+                match crate::windows_platform::debug_events::continue_debug_event(pid, tid, pass_exception) {
                     Ok(()) => {}
                     Err(e) => {
                         let resp = DebuggerResponse::Error { message: e.to_string() };
@@ -155,7 +155,7 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
-            DebuggerRequest::Continue { pid: _, tid: _ } => {
+            DebuggerRequest::Continue { pid: _, tid: _, pass_exception: _ } => {
                 // Should have been handled by the unlocked fast-path above
                 DebuggerResponse::Ack
             }
