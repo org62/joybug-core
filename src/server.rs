@@ -82,32 +82,41 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
         if let DebuggerRequest::Continue { pid, tid, pass_exception } = req {
             #[cfg(windows)]
             {
-                // 1) Continue without lock
-                match crate::windows_platform::debug_events::continue_debug_event(pid, tid, pass_exception) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        let resp = DebuggerResponse::Error { message: e.to_string() };
-                        if let Err(e) = framed_stream.send(&resp) { error!(?e, "Failed to write response to socket"); break; }
-                        continue;
+                // Continue + wait loop: auto-continues when handle_debug_event
+                // returns None (internal events like BP rearm that the client
+                // should not see).
+                let mut cont_pid = pid;
+                let mut cont_tid = tid;
+                let mut cont_pass = pass_exception;
+                let resp = loop {
+                    // 1) Continue without lock
+                    match crate::windows_platform::debug_events::continue_debug_event(cont_pid, cont_tid, cont_pass) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            break DebuggerResponse::Error { message: e.to_string() };
+                        }
                     }
-                }
 
-                // 2) Wait for next debug event without lock
-                let debug_event = match crate::windows_platform::debug_events::wait_for_debug_event_blocking() {
-                    Ok(ev) => ev,
-                    Err(e) => {
-                        let resp = DebuggerResponse::Error { message: e.to_string() };
-                        if let Err(e) = framed_stream.send(&resp) { error!(?e, "Failed to write response to socket"); break; }
-                        continue;
+                    // 2) Wait for next debug event without lock
+                    let debug_event = match crate::windows_platform::debug_events::wait_for_debug_event_blocking() {
+                        Ok(ev) => ev,
+                        Err(e) => {
+                            break DebuggerResponse::Error { message: e.to_string() };
+                        }
+                    };
+
+                    // 3) Reacquire lock only to handle the event and mutate state
+                    let mut platform_guard = platform.write().unwrap();
+                    match crate::windows_platform::debug_events::handle_debug_event(&mut *platform_guard, &debug_event) {
+                        Ok(Some(event)) => break DebuggerResponse::Event { event },
+                        Ok(None) => {
+                            // Internal event (e.g., breakpoint rearm) — auto-continue
+                            cont_pid = debug_event.dwProcessId;
+                            cont_tid = debug_event.dwThreadId;
+                            cont_pass = false;
+                        }
+                        Err(e) => break DebuggerResponse::Error { message: e.to_string() },
                     }
-                };
-
-                // 3) Reacquire lock only to handle the event and mutate state
-                let mut platform_guard = platform.write().unwrap();
-                let resp = match crate::windows_platform::debug_events::handle_debug_event(&mut *platform_guard, &debug_event) {
-                    Ok(Some(event)) => DebuggerResponse::Event { event },
-                    Ok(None) => DebuggerResponse::Ack,
-                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 };
                 if let Err(e) = framed_stream.send(&resp) { error!(?e, "Failed to write response to socket"); break; }
                 continue;
@@ -180,6 +189,20 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
             DebuggerRequest::RemoveBreakpoint { pid, addr } => {
                 let mut p = platform.write().unwrap();
                 match p.remove_breakpoint(pid, addr) {
+                    Ok(_) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::SetHardwareBreakpoint { pid, addr, bp_type, size } => {
+                let mut p = platform.write().unwrap();
+                match p.set_hardware_breakpoint(pid, addr, bp_type, size) {
+                    Ok(dr_index) => DebuggerResponse::HardwareBreakpointSet { dr_index },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::RemoveHardwareBreakpoint { pid, addr } => {
+                let mut p = platform.write().unwrap();
+                match p.remove_hardware_breakpoint(pid, addr) {
                     Ok(_) => DebuggerResponse::Ack,
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }

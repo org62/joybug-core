@@ -58,6 +58,7 @@ impl std::fmt::Debug for DebuggerResponse {
                 ds.finish()
             }
             // Add other variants here, using a default debug format
+            DebuggerResponse::HardwareBreakpointSet { dr_index } => f.debug_struct("HardwareBreakpointSet").field("dr_index", dr_index).finish(),
             DebuggerResponse::Ack => write!(f, "Ack"),
             DebuggerResponse::Error { message } => f.debug_struct("Error").field("message", message).finish(),
             DebuggerResponse::Event { event } => f.debug_struct("Event").field("event", &format_args!("{}", event)).finish(),
@@ -233,6 +234,9 @@ impl std::fmt::Display for DebugEvent {
             }
             DebugEvent::Breakpoint { pid, tid, address } => {
                 write!(f, "Breakpoint(pid={}, tid={}, address=0x{:X})", pid, tid, address)
+            }
+            DebugEvent::HardwareBreakpoint { pid, tid, address, dr_index, bp_type } => {
+                write!(f, "HardwareBreakpoint(pid={}, tid={}, address=0x{:X}, dr={}, type={:?})", pid, tid, address, dr_index, bp_type)
             }
             DebugEvent::InitialBreakpoint { pid, tid, address } => {
                 write!(f, "InitialBreakpoint(pid={}, tid={}, address=0x{:X})", pid, tid, address)

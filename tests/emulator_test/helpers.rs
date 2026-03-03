@@ -1,34 +1,6 @@
 /// Shared helpers for emulator integration tests.
 
-/// Get the path to a compiled test program exe
-fn get_test_program_path(name: &str) -> String {
-    let out_dir = std::env::var("OUT_DIR").unwrap_or_else(|_| {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        format!("{}\\target\\debug\\build", manifest_dir)
-    });
-
-    let expected_path = format!("{}\\{}.exe", out_dir, name);
-    if std::path::Path::new(&expected_path).exists() {
-        return expected_path;
-    }
-
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    for profile in &["debug", "release"] {
-        let search_dir = format!("{}\\target\\{}\\build", manifest_dir, profile);
-        if let Ok(entries) = std::fs::read_dir(&search_dir) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    let candidate = entry.path().join("out").join(format!("{}.exe", name));
-                    if candidate.exists() {
-                        return candidate.to_string_lossy().to_string();
-                    }
-                }
-            }
-        }
-    }
-
-    panic!("Could not find {}.exe. Make sure to build the project first.", name);
-}
+use crate::common::get_test_program_path;
 
 /// Get the path to the compiled xtea_test.exe
 pub fn get_xtea_test_path() -> String {

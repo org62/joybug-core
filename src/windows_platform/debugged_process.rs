@@ -1,7 +1,17 @@
 use crate::interfaces::{Architecture, PlatformError};
+use crate::protocol::{HardwareBreakpointType, HardwareBreakpointSize};
 use tracing::{error, warn};
 use windows_sys::Win32::Foundation::{FALSE, GetLastError, HANDLE};
 use windows_sys::Win32::System::Diagnostics::Debug::{SymCleanup, SymInitialize};
+
+#[derive(Debug, Clone)]
+pub(crate) struct InternalHardwareBreakpoint {
+    pub address: u64,
+    pub bp_type: HardwareBreakpointType,
+    pub size: HardwareBreakpointSize,
+    pub dr_index: u8,
+    pub is_active: bool,
+}
 
 /// Represents a single debugged process with its associated state
 #[derive(Debug)]
@@ -23,6 +33,10 @@ pub(crate) struct DebuggedProcess {
     step_out_breakpoints: std::collections::HashMap<u64, (u32, u64)>, // (tid, original_return_address)
     /// Track threads that need re-arming after a single-step: tid -> (address, is_single_shot)
     pending_rearm_breakpoints: std::collections::HashMap<u32, (u64, bool)>,
+    /// Hardware breakpoints (DR0-DR3, max 4)
+    hardware_breakpoints: Vec<InternalHardwareBreakpoint>,
+    /// Pending HW BP re-arm after single-step: tid -> dr_index
+    pending_hw_bp_rearm: std::collections::HashMap<u32, u8>,
 }
 
 impl DebuggedProcess {
@@ -52,6 +66,8 @@ impl DebuggedProcess {
             step_over_breakpoints: std::collections::HashMap::new(),
             step_out_breakpoints: std::collections::HashMap::new(),
             pending_rearm_breakpoints: std::collections::HashMap::new(),
+            hardware_breakpoints: Vec::new(),
+            pending_hw_bp_rearm: std::collections::HashMap::new(),
         })
     }
 }
@@ -245,6 +261,53 @@ impl DebuggedProcess {
     pub(super) fn module_manager_mut(&mut self) -> &mut super::module_manager::ModuleManager { &mut self.module_manager }
     pub(super) fn thread_manager(&self) -> &super::thread_manager::ThreadManager { &self.thread_manager }
     pub(super) fn thread_manager_mut(&mut self) -> &mut super::thread_manager::ThreadManager { &mut self.thread_manager }
+
+    // Hardware breakpoint methods
+
+    /// Find a free debug register (DR0-DR3). Returns None if all 4 are in use.
+    pub(super) fn find_free_debug_register(&self) -> Option<u8> {
+        let used: std::collections::HashSet<u8> = self.hardware_breakpoints.iter().map(|bp| bp.dr_index).collect();
+        (0..4u8).find(|i| !used.contains(i))
+    }
+
+    /// Add a hardware breakpoint to the internal tracking.
+    pub(super) fn add_hardware_breakpoint(&mut self, bp: InternalHardwareBreakpoint) {
+        self.hardware_breakpoints.push(bp);
+    }
+
+    /// Remove a hardware breakpoint by address. Returns the removed BP if found.
+    pub(super) fn remove_hardware_breakpoint_by_addr(&mut self, addr: u64) -> Option<InternalHardwareBreakpoint> {
+        if let Some(pos) = self.hardware_breakpoints.iter().position(|bp| bp.address == addr) {
+            Some(self.hardware_breakpoints.remove(pos))
+        } else {
+            None
+        }
+    }
+
+    /// Find a hardware breakpoint by DR index.
+    pub(super) fn find_hardware_breakpoint_by_dr_index(&self, dr_index: u8) -> Option<&InternalHardwareBreakpoint> {
+        self.hardware_breakpoints.iter().find(|bp| bp.dr_index == dr_index)
+    }
+
+    /// Check if a hardware breakpoint exists at the given address.
+    pub(super) fn has_hardware_breakpoint_at(&self, addr: u64) -> bool {
+        self.hardware_breakpoints.iter().any(|bp| bp.address == addr)
+    }
+
+    /// Return all active hardware breakpoints.
+    pub(super) fn active_hardware_breakpoints(&self) -> Vec<InternalHardwareBreakpoint> {
+        self.hardware_breakpoints.iter().filter(|bp| bp.is_active).cloned().collect()
+    }
+
+    /// Schedule a HW BP re-arm after a single-step for the given thread.
+    pub(super) fn schedule_hw_bp_rearm(&mut self, tid: u32, dr_index: u8) {
+        self.pending_hw_bp_rearm.insert(tid, dr_index);
+    }
+
+    /// Take and remove a pending HW BP re-arm for a thread.
+    pub(super) fn take_pending_hw_bp_rearm(&mut self, tid: u32) -> Option<u8> {
+        self.pending_hw_bp_rearm.remove(&tid)
+    }
 }
 
 impl Drop for DebuggedProcess {

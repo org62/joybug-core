@@ -194,6 +194,13 @@ pub(super) fn handle_create_process_event(
             start_address,
             thread_handle,
         );
+        // Apply active hardware breakpoints to the initial thread
+        let active_hw_bps = process.active_hardware_breakpoints();
+        if !active_hw_bps.is_empty() {
+            if let Err(e) = super::hardware_breakpoints::apply_all_hw_bps_to_thread(thread_handle, &active_hw_bps) {
+                warn!(tid = debug_event.dwThreadId, error = %e, "Failed to apply HW breakpoints to initial thread");
+            }
+        }
     }
 
     trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, base_of_image = %format!("0x{:X}", info.lpBaseOfImage as u64), image_file_name = ?image_file_name, size_of_image = %format!("{:X?}", size_of_image), "ProcessCreated event");
@@ -396,7 +403,8 @@ pub(super) fn handle_exception_event(
             "Single-step event"
         );
 
-        // Handle re-arming first
+        // Handle SW breakpoint re-arming first
+        // Return None so the server auto-continues without exposing this internal event to the client
         if let Some((rearm_addr, _is_single_shot)) = process.take_pending_rearm_for_tid(tid) {
             trace!(pid = pid, tid = tid, rearm_addr = %format!("0x{:X}", rearm_addr), "SS used for persistent breakpoint re-arm");
             if let Err(e) = stepper::clear_single_step_flag_native2(platform, pid, tid) { error!("Failed to clear single-step flag: {}", e); }
@@ -404,7 +412,61 @@ pub(super) fn handle_exception_event(
                 let process = platform.get_process(pid)?;
                 let _ = process.rearm_persistent_breakpoint_if_matches_original(rearm_addr);
             }
-            return Ok(Some(crate::protocol::DebugEvent::Exception { pid, tid, code: ex_record.ExceptionCode as u32, address: ex_record.ExceptionAddress as u64, first_chance: ex_info.dwFirstChance == 1, parameters: vec![] }));
+            return Ok(None);
+        }
+
+        // Handle HW breakpoint re-arming (after stepping past a HW BP)
+        // Return None so the server auto-continues without exposing this internal event to the client
+        if let Some(rearm_dr_index) = process.take_pending_hw_bp_rearm(tid) {
+            trace!(pid, tid, rearm_dr_index, "SS used for hardware breakpoint re-arm");
+            // Re-enable the HW BP and clear the trap flag
+            #[cfg(target_arch = "x86_64")]
+            {
+                let thread_handle = process.thread_manager().get_thread_handle(tid)
+                    .ok_or_else(|| PlatformError::OsError(format!("No handle for thread {}", tid)))?;
+                let mut aligned = super::AlignedContext { context: unsafe { std::mem::zeroed() } };
+                aligned.context.ContextFlags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_DEBUG_REGISTERS_AMD64
+                    | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64;
+                if unsafe { windows_sys::Win32::System::Diagnostics::Debug::GetThreadContext(thread_handle, &mut aligned.context) } != 0 {
+                    super::hardware_breakpoints::enable_hw_bp_enable(&mut aligned.context, rearm_dr_index);
+                    // Clear trap flag
+                    aligned.context.EFlags &= !(0x100u32);
+                    let _ = unsafe { windows_sys::Win32::System::Diagnostics::Debug::SetThreadContext(thread_handle, &aligned.context) };
+                }
+            }
+            return Ok(None);
+        }
+
+        // Check for hardware breakpoint hit via DR6
+        #[cfg(target_arch = "x86_64")]
+        {
+            let thread_handle = process.thread_manager().get_thread_handle(tid)
+                .ok_or_else(|| PlatformError::OsError(format!("No handle for thread {}", tid)))?;
+            let mut aligned = super::AlignedContext { context: unsafe { std::mem::zeroed() } };
+            aligned.context.ContextFlags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_DEBUG_REGISTERS_AMD64
+                | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64;
+            if unsafe { windows_sys::Win32::System::Diagnostics::Debug::GetThreadContext(thread_handle, &mut aligned.context) } != 0 {
+                if let Some(dr_index) = super::hardware_breakpoints::check_dr6_for_hw_bp(&mut aligned.context) {
+                    if let Some(bp) = process.find_hardware_breakpoint_by_dr_index(dr_index) {
+                        let bp_address = bp.address;
+                        let bp_type = bp.bp_type;
+                        trace!(pid, tid, dr_index, address = %format!("0x{:X}", bp_address), "Hardware breakpoint hit");
+
+                        // Disable the HW BP enable bit so we can step past
+                        super::hardware_breakpoints::disable_hw_bp_enable(&mut aligned.context, dr_index);
+                        // Set trap flag to single-step one instruction
+                        aligned.context.EFlags |= 0x100u32;
+                        let _ = unsafe { windows_sys::Win32::System::Diagnostics::Debug::SetThreadContext(thread_handle, &aligned.context) };
+
+                        // Schedule re-arm after the single step completes
+                        process.schedule_hw_bp_rearm(tid, dr_index);
+
+                        return Ok(Some(crate::protocol::DebugEvent::HardwareBreakpoint {
+                            pid, tid, address: bp_address, dr_index, bp_type,
+                        }));
+                    }
+                }
+            }
         }
 
         // Active stepper completion
@@ -515,6 +577,13 @@ pub fn handle_debug_event(
                     start_address,
                     thread_handle,
                 );
+                // Apply active hardware breakpoints to the new thread
+                let active_hw_bps = process.active_hardware_breakpoints();
+                if !active_hw_bps.is_empty() {
+                    if let Err(e) = super::hardware_breakpoints::apply_all_hw_bps_to_thread(thread_handle, &active_hw_bps) {
+                        warn!(tid = debug_event.dwThreadId, error = %e, "Failed to apply HW breakpoints to new thread");
+                    }
+                }
             }
 
             trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, start_address = %format!("0x{:X}", info.lpStartAddress.map_or(0, |addr| addr as usize as u64)), "ThreadCreated event");
@@ -694,5 +763,29 @@ pub fn handle_debug_event(
             Some(crate::protocol::DebugEvent::Unknown)
         }
     };
+
+    // Ensure hardware breakpoint DR registers are applied to ALL threads before returning.
+    // This is critical because:
+    // 1. ntdll initialization code may clear DR registers after the initial breakpoint
+    // 2. Other SetThreadContext calls (SW BP handling, stepper) use CONTEXT_ALL which
+    //    reads back potentially-zeroed DRs and writes them back, clobbering our values
+    // By applying DR-only context at the end of every event, we ensure DRs are correct
+    // when ContinueDebugEvent is called next.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let pid = debug_event.dwProcessId;
+        if let Ok(process) = platform.get_process(pid) {
+            let active_bps = process.active_hardware_breakpoints();
+            if !active_bps.is_empty() {
+                let thread_handles = process.thread_manager().all_thread_handles();
+                for (tid, handle) in &thread_handles {
+                    if let Err(e) = super::hardware_breakpoints::apply_hw_bps_dr_only(*handle, &active_bps) {
+                        trace!(tid, error = %e, "Failed to ensure HW BPs on thread (may have exited)");
+                    }
+                }
+            }
+        }
+    }
+
     Ok(event)
 }

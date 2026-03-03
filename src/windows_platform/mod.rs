@@ -15,6 +15,7 @@ mod module_extra;
 mod dbghelp;
 mod dereference;
 mod tracer;
+mod hardware_breakpoints;
 
 use crate::interfaces::{PlatformAPI, PlatformError, ModuleSymbol, ResolvedSymbol, SymbolError, Architecture, DisassemblerError, Instruction, DisassemblerProvider, Stepper};
 // no-op
@@ -79,7 +80,7 @@ impl WindowsPlatform {
     pub fn process_handle(&self, pid: u32) -> Result<HANDLE, PlatformError> {
         Ok(self.get_process(pid)?.handle())
     }
-    
+
     /// Get a reference to a debugged process by PID
     fn get_process(&self, pid: u32) -> Result<&DebuggedProcess, PlatformError> {
         self.processes.get(&pid)
@@ -295,6 +296,67 @@ impl PlatformAPI for WindowsPlatform {
         trace!(pid, addr, "WindowsPlatform::remove_breakpoint called");
         let process = self.get_process_mut(pid)?;
         process.remove_breakpoint(addr)
+    }
+
+    fn set_hardware_breakpoint(
+        &mut self,
+        pid: u32,
+        addr: u64,
+        bp_type: crate::protocol::HardwareBreakpointType,
+        size: crate::protocol::HardwareBreakpointSize,
+    ) -> Result<u8, PlatformError> {
+        trace!(pid, addr, ?bp_type, ?size, "WindowsPlatform::set_hardware_breakpoint called");
+        let process = self.get_process_mut(pid)?;
+
+        // Check for duplicate
+        if process.has_hardware_breakpoint_at(addr) {
+            return Err(PlatformError::Other(format!(
+                "Hardware breakpoint already exists at 0x{:X}", addr
+            )));
+        }
+
+        // Allocate a free debug register
+        let dr_index = process.find_free_debug_register()
+            .ok_or_else(|| PlatformError::Other(
+                "All 4 hardware debug registers are in use".to_string()
+            ))?;
+
+        // Apply to all threads
+        let thread_handles = process.thread_manager().all_thread_handles();
+        for (_tid, handle) in &thread_handles {
+            hardware_breakpoints::apply_single_hw_bp_to_thread(*handle, dr_index, addr, bp_type, size)?;
+        }
+
+        // Store in process state
+        process.add_hardware_breakpoint(debugged_process::InternalHardwareBreakpoint {
+            address: addr,
+            bp_type,
+            size,
+            dr_index,
+            is_active: true,
+        });
+
+        info!(pid, addr, dr_index, "Hardware breakpoint set");
+        Ok(dr_index)
+    }
+
+    fn remove_hardware_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError> {
+        trace!(pid, addr, "WindowsPlatform::remove_hardware_breakpoint called");
+        let process = self.get_process_mut(pid)?;
+
+        let bp = process.remove_hardware_breakpoint_by_addr(addr)
+            .ok_or_else(|| PlatformError::Other(format!(
+                "No hardware breakpoint at 0x{:X}", addr
+            )))?;
+
+        // Clear from all threads
+        let thread_handles = process.thread_manager().all_thread_handles();
+        for (_tid, handle) in &thread_handles {
+            let _ = hardware_breakpoints::clear_hw_bp_from_thread(*handle, bp.dr_index);
+        }
+
+        info!(pid, addr, dr_index = bp.dr_index, "Hardware breakpoint removed");
+        Ok(())
     }
 
     fn launch(&mut self, command: &str) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {

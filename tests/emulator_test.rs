@@ -23,7 +23,7 @@ mod syscall;
 #[path = "emulator_test/timeout.rs"]
 mod timeout;
 
-use common::TestServer;
+use common::{TestServer, find_symbol, find_module};
 use helpers::{EmulatorTestState, get_xtea_test_path, get_emulator_test_path};
 use joybug2::interfaces::Architecture;
 use joybug2::protocol_io::{BreakpointDecision, DebugSession};
@@ -46,30 +46,18 @@ fn test_emulator_integration() {
             println!("\n=== Initial breakpoint at 0x{:016X} ===", address);
 
             // Find the main module
-            let modules = session.list_modules(pid)?;
-            let main_module = modules.iter()
-                .find(|m| m.name.to_lowercase().contains("xtea_test"))
-                .ok_or_else(|| anyhow::anyhow!("Could not find xtea_test module"))?;
+            let main_module = find_module(session, pid, "xtea_test")?;
             println!("  Module: {} at 0x{:016X} (size: 0x{:X})",
                 main_module.name, main_module.base, main_module.size.unwrap_or(0));
 
             // Find key symbols
-            let encrypt_sym = session.find_symbols("xtea_encrypt", 1)?
-                .into_iter()
-                .find(|s| s.module_name.to_lowercase().contains("xtea_test"))
-                .ok_or_else(|| anyhow::anyhow!("Could not find xtea_encrypt symbol"))?;
+            let encrypt_sym = find_symbol(session, "xtea_encrypt", "xtea_test")?;
             println!("  xtea_encrypt: 0x{:016X}", encrypt_sym.va);
 
-            let end_marker_sym = session.find_symbols("trace_end_marker", 1)?
-                .into_iter()
-                .find(|s| s.module_name.to_lowercase().contains("xtea_test"))
-                .ok_or_else(|| anyhow::anyhow!("Could not find trace_end_marker symbol"))?;
+            let end_marker_sym = find_symbol(session, "trace_end_marker", "xtea_test")?;
             println!("  trace_end_marker: 0x{:016X}", end_marker_sym.va);
 
-            let syscall_marker_sym = session.find_symbols("syscall_marker", 1)?
-                .into_iter()
-                .find(|s| s.module_name.to_lowercase().contains("xtea_test"))
-                .ok_or_else(|| anyhow::anyhow!("Could not find syscall_marker symbol"))?;
+            let syscall_marker_sym = find_symbol(session, "syscall_marker", "xtea_test")?;
             println!("  syscall_marker: 0x{:016X}", syscall_marker_sym.va);
 
             let entry_info = session.get_module_extra_info(pid, main_module.base)?;
@@ -192,22 +180,13 @@ fn test_emulator_timeout() {
         .on_initial_breakpoint(|session, pid, _tid, address| {
             println!("\nInitial breakpoint at 0x{:016X}", address);
 
-            let func_sym = session.find_symbols("infinite_increment", 1)?
-                .into_iter()
-                .find(|s| s.module_name.to_lowercase().contains("emulator_test"))
-                .ok_or_else(|| anyhow::anyhow!("Could not find infinite_increment symbol"))?;
+            let func_sym = find_symbol(session, "infinite_increment", "emulator_test")?;
             println!("  infinite_increment: 0x{:016X}", func_sym.va);
 
-            let loop_flag_sym = session.find_symbols("g_do_infinite_loop", 1)?
-                .into_iter()
-                .find(|s| s.module_name.to_lowercase().contains("emulator_test"))
-                .ok_or_else(|| anyhow::anyhow!("Could not find g_do_infinite_loop symbol"))?;
+            let loop_flag_sym = find_symbol(session, "g_do_infinite_loop", "emulator_test")?;
             println!("  g_do_infinite_loop: 0x{:016X}", loop_flag_sym.va);
 
-            let counter_sym = session.find_symbols("g_counter", 1)?
-                .into_iter()
-                .find(|s| s.module_name.to_lowercase().contains("emulator_test"))
-                .ok_or_else(|| anyhow::anyhow!("Could not find g_counter symbol"))?;
+            let counter_sym = find_symbol(session, "g_counter", "emulator_test")?;
             println!("  g_counter: 0x{:016X}", counter_sym.va);
 
             let func_addr = func_sym.va;

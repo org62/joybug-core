@@ -2,11 +2,10 @@
 
 mod common;
 
-use common::TestServer;
+use common::{TestServer, get_test_program_path, find_symbol, find_module};
 use joybug2::interfaces::Architecture;
 use joybug2::protocol_io::DebugSession;
 use std::io::Write;
-use std::path::Path;
 use std::time::Instant;
 
 #[test]
@@ -14,13 +13,7 @@ fn test_disassembly_basic() {
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();
 
-    // Test exe must exist - fail if not compiled
-    let test_exe_path = format!("{}/disassembly_test.exe", env!("OUT_DIR"));
-    assert!(
-        Path::new(&test_exe_path).exists(),
-        "disassembly_test.exe not found at {}. Ensure cl.exe is available (run from VS Developer Command Prompt).",
-        test_exe_path
-    );
+    let test_exe_path = get_test_program_path("disassembly_test");
 
     struct TestState {
         disassembly_tested: bool,
@@ -45,12 +38,7 @@ fn test_disassembly_basic() {
             // =============================================
             println!("\n----- TEST 1: Find test_control_flow function -----\n");
 
-            let symbols = session.find_symbols("disassembly_test!test_control_flow", 10)?;
-            assert!(!symbols.is_empty(), "test_control_flow symbol must be found");
-
-            let test_fn_sym = symbols.iter()
-                .find(|s| s.name.contains("test_control_flow"))
-                .expect("test_control_flow symbol not found");
+            let test_fn_sym = find_symbol(session, "disassembly_test!test_control_flow", "disassembly_test")?;
 
             println!("test_control_flow @ {:#x}", test_fn_sym.va);
 
@@ -59,10 +47,7 @@ fn test_disassembly_basic() {
             // =============================================
             println!("\n----- TEST 2: Disassemble function -----\n");
 
-            #[cfg(target_arch = "x86_64")]
-            let arch = Architecture::X64;
-            #[cfg(target_arch = "aarch64")]
-            let arch = Architecture::Arm64;
+            let arch = Architecture::from_native();
 
             let (instructions, fn_start, fn_end, fn_name) = session
                 .disassemble_function(pid, test_fn_sym.va, 200, arch)?;
@@ -207,8 +192,7 @@ fn test_disassembly_basic() {
             // =============================================
             println!("\n----- TEST 7: Disassemble helper_add -----\n");
 
-            let helper_symbols = session.find_symbols("disassembly_test!helper_add", 10)?;
-            if let Some(helper_sym) = helper_symbols.iter().find(|s| s.name.contains("helper_add")) {
+            if let Ok(helper_sym) = find_symbol(session, "disassembly_test!helper_add", "disassembly_test") {
                 let (helper_instrs, helper_start, helper_end, helper_name) = session
                     .disassemble_function(pid, helper_sym.va, 50, arch)?;
 
@@ -256,12 +240,7 @@ fn test_instruction_flags_detection() {
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();
 
-    let test_exe_path = format!("{}/disassembly_test.exe", env!("OUT_DIR"));
-    assert!(
-        Path::new(&test_exe_path).exists(),
-        "disassembly_test.exe not found at {}",
-        test_exe_path
-    );
+    let test_exe_path = get_test_program_path("disassembly_test");
 
     struct TestState {
         flags_tested: bool,
@@ -278,15 +257,9 @@ fn test_instruction_flags_detection() {
         session.set_single_shot_breakpoint(pid, "disassembly_test!breakpoint_here", |session, pid, _tid, _addr| {
             println!("\n----- Testing instruction flag mutual exclusivity -----\n");
 
-            let symbols = session.find_symbols("disassembly_test!test_control_flow", 10)?;
-            let test_fn_sym = symbols.iter()
-                .find(|s| s.name.contains("test_control_flow"))
-                .expect("test_control_flow symbol not found");
+            let test_fn_sym = find_symbol(session, "disassembly_test!test_control_flow", "disassembly_test")?;
 
-            #[cfg(target_arch = "x86_64")]
-            let arch = Architecture::X64;
-            #[cfg(target_arch = "aarch64")]
-            let arch = Architecture::Arm64;
+            let arch = Architecture::from_native();
 
             let (instructions, _, _, _) = session
                 .disassemble_function(pid, test_fn_sym.va, 200, arch)?;
@@ -335,12 +308,7 @@ fn test_disassemble_non_module_memory() {
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();
 
-    let test_exe_path = format!("{}/disassembly_test.exe", env!("OUT_DIR"));
-    assert!(
-        Path::new(&test_exe_path).exists(),
-        "disassembly_test.exe not found at {}",
-        test_exe_path
-    );
+    let test_exe_path = get_test_program_path("disassembly_test");
 
     struct TestState {
         non_module_tested: bool,
@@ -359,10 +327,7 @@ fn test_disassemble_non_module_memory() {
 
             // Read the global pointer to dynamically allocated code
             // The C program allocated RWX memory and stored the pointer in g_dynamic_code_ptr
-            let ptr_symbols = session.find_symbols("disassembly_test!g_dynamic_code_ptr", 10)?;
-            let ptr_sym = ptr_symbols.iter()
-                .find(|s| s.name.contains("g_dynamic_code_ptr"))
-                .expect("g_dynamic_code_ptr symbol not found");
+            let ptr_sym = find_symbol(session, "disassembly_test!g_dynamic_code_ptr", "disassembly_test")?;
 
             println!("g_dynamic_code_ptr symbol @ {:#x}", ptr_sym.va);
 
@@ -397,10 +362,7 @@ fn test_disassemble_non_module_memory() {
             );
 
             // Disassemble the dynamic code
-            #[cfg(target_arch = "x86_64")]
-            let arch = Architecture::X64;
-            #[cfg(target_arch = "aarch64")]
-            let arch = Architecture::Arm64;
+            let arch = Architecture::from_native();
 
             let (instructions, fn_start, fn_end, fn_name) = session
                 .disassemble_function(pid, dynamic_code_addr, 20, arch)?;
@@ -533,12 +495,7 @@ fn test_disassembly_speed_kernelbase() {
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();
 
-    let test_exe_path = format!("{}/disassembly_test.exe", env!("OUT_DIR"));
-    assert!(
-        Path::new(&test_exe_path).exists(),
-        "disassembly_test.exe not found at {}",
-        test_exe_path
-    );
+    let test_exe_path = get_test_program_path("disassembly_test");
 
     struct TestState {
         speed_tested: bool,
@@ -561,9 +518,7 @@ fn test_disassembly_speed_kernelbase() {
         println!("\n========== DISASSEMBLY SPEED TEST ==========\n");
 
         // Find kernelbase.dll
-        let modules = session.list_modules(pid)?;
-        let kernelbase = modules.iter()
-            .find(|m| m.name.to_lowercase().contains("kernelbase"))
+        let kernelbase = find_module(session, pid, "kernelbase")
             .expect("kernelbase.dll should be loaded");
 
         println!("Found kernelbase.dll:");
@@ -580,10 +535,7 @@ fn test_disassembly_speed_kernelbase() {
 
         println!("  Runtime functions: {}", runtime_functions.len());
 
-        #[cfg(target_arch = "x86_64")]
-        let arch = Architecture::X64;
-        #[cfg(target_arch = "aarch64")]
-        let arch = Architecture::Arm64;
+        let arch = Architecture::from_native();
 
         // Disassemble first 1000 functions and measure time
         const MAX_FUNCTIONS: usize = 1000;

@@ -2,10 +2,9 @@
 
 mod common;
 
-use common::TestServer;
+use common::{TestServer, get_test_program_path, find_symbol};
 use joybug2::protocol::{DereferenceEntry, DereferenceValue};
 use joybug2::protocol_io::DebugSession;
-use std::path::Path;
 
 /// Format a dereference entry in GEF-style output
 fn format_entry(entry: &DereferenceEntry) -> String {
@@ -52,13 +51,7 @@ fn test_dereference_basic() {
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();
 
-    // Test exe must exist - fail if not compiled
-    let test_exe_path = format!("{}/dereference_test.exe", env!("OUT_DIR"));
-    assert!(
-        Path::new(&test_exe_path).exists(),
-        "dereference_test.exe not found at {}. Ensure cl.exe is available (run from VS Developer Command Prompt).",
-        test_exe_path
-    );
+    let test_exe_path = get_test_program_path("dereference_test");
 
     struct TestState {
         dereference_tested: bool,
@@ -105,9 +98,7 @@ fn test_dereference_basic() {
             // =============================================
             println!("\n----- TEST 1: g_string_ptr -----\n");
 
-            let string_symbols = session.find_symbols("dereference_test!g_string_ptr", 10)?;
-            let string_sym = string_symbols.iter().find(|s| s.name.contains("g_string_ptr"))
-                .expect("g_string_ptr symbol must be found");
+            let string_sym = find_symbol(session, "dereference_test!g_string_ptr", "dereference_test")?;
             println!("g_string_ptr symbol at 0x{:x}", string_sym.va);
 
             let entries = session.dereference(pid, string_sym.va, 1, None)?;
@@ -140,9 +131,7 @@ fn test_dereference_basic() {
             // =============================================
             println!("\n----- TEST 1b: g_wide_string_ptr (UTF-16) -----\n");
 
-            let wide_string_symbols = session.find_symbols("dereference_test!g_wide_string_ptr", 10)?;
-            let wide_string_sym = wide_string_symbols.iter().find(|s| s.name.contains("g_wide_string_ptr"))
-                .expect("g_wide_string_ptr symbol must be found");
+            let wide_string_sym = find_symbol(session, "dereference_test!g_wide_string_ptr", "dereference_test")?;
             println!("g_wide_string_ptr symbol at 0x{:x}", wide_string_sym.va);
 
             let entries = session.dereference(pid, wide_string_sym.va, 1, None)?;
@@ -177,9 +166,7 @@ fn test_dereference_basic() {
             // =============================================
             println!("\n----- TEST 2: g_loop_ptr1 (loop detection with chain) -----\n");
 
-            let loop_symbols = session.find_symbols("dereference_test!g_loop_ptr1", 10)?;
-            let loop_sym = loop_symbols.iter().find(|s| s.name.contains("g_loop_ptr1"))
-                .expect("g_loop_ptr1 symbol must be found");
+            let loop_sym = find_symbol(session, "dereference_test!g_loop_ptr1", "dereference_test")?;
             println!("g_loop_ptr1 symbol at 0x{:x}", loop_sym.va);
 
             let entries = session.dereference(pid, loop_sym.va, 1, None)?;
@@ -240,9 +227,7 @@ fn test_dereference_basic() {
             // =============================================
             println!("\n----- TEST 3: g_list_head (heap pointer) -----\n");
 
-            let list_symbols = session.find_symbols("dereference_test!g_list_head", 10)?;
-            let list_sym = list_symbols.iter().find(|s| s.name.contains("g_list_head"))
-                .expect("g_list_head symbol must be found");
+            let list_sym = find_symbol(session, "dereference_test!g_list_head", "dereference_test")?;
             println!("g_list_head symbol at 0x{:x}", list_sym.va);
 
             let entries = session.dereference(pid, list_sym.va, 1, None)?;
@@ -269,9 +254,7 @@ fn test_dereference_basic() {
             // =============================================
             println!("\n----- TEST 4: g_main_ptr (function pointer) -----\n");
 
-            let main_ptr_symbols = session.find_symbols("dereference_test!g_main_ptr", 10)?;
-            let main_ptr_sym = main_ptr_symbols.iter().find(|s| s.name.contains("g_main_ptr"))
-                .expect("g_main_ptr symbol must be found");
+            let main_ptr_sym = find_symbol(session, "dereference_test!g_main_ptr", "dereference_test")?;
             println!("g_main_ptr symbol at 0x{:x}", main_ptr_sym.va);
 
             let entries = session.dereference(pid, main_ptr_sym.va, 1, None)?;
@@ -301,9 +284,7 @@ fn test_dereference_basic() {
             // =============================================
             println!("\n----- TEST 5: g_null_ptr (NULL pointer) -----\n");
 
-            let null_ptr_symbols = session.find_symbols("dereference_test!g_null_ptr", 10)?;
-            let null_ptr_sym = null_ptr_symbols.iter().find(|s| s.name.contains("g_null_ptr"))
-                .expect("g_null_ptr symbol must be found");
+            let null_ptr_sym = find_symbol(session, "dereference_test!g_null_ptr", "dereference_test")?;
             println!("g_null_ptr symbol at 0x{:x}", null_ptr_sym.va);
 
             let entries = session.dereference(pid, null_ptr_sym.va, 1, None)?;
@@ -328,9 +309,7 @@ fn test_dereference_basic() {
             // =============================================
             println!("\n----- TEST 6: g_ptr_to_small_int (pointer to small int) -----\n");
 
-            let small_int_ptr_symbols = session.find_symbols("dereference_test!g_ptr_to_small_int", 10)?;
-            let small_int_ptr_sym = small_int_ptr_symbols.iter().find(|s| s.name.contains("g_ptr_to_small_int"))
-                .expect("g_ptr_to_small_int symbol must be found");
+            let small_int_ptr_sym = find_symbol(session, "dereference_test!g_ptr_to_small_int", "dereference_test")?;
             println!("g_ptr_to_small_int symbol at 0x{:x}", small_int_ptr_sym.va);
 
             let entries = session.dereference(pid, small_int_ptr_sym.va, 1, None)?;
@@ -374,9 +353,7 @@ fn test_dereference_basic() {
             // =============================================
             println!("\n----- TEST 7: g_invalid_ptr (non-dereferenceable value) -----\n");
 
-            let invalid_ptr_symbols = session.find_symbols("dereference_test!g_invalid_ptr", 10)?;
-            let invalid_ptr_sym = invalid_ptr_symbols.iter().find(|s| s.name.contains("g_invalid_ptr"))
-                .expect("g_invalid_ptr symbol must be found");
+            let invalid_ptr_sym = find_symbol(session, "dereference_test!g_invalid_ptr", "dereference_test")?;
             println!("g_invalid_ptr symbol at 0x{:x}", invalid_ptr_sym.va);
 
             let entries = session.dereference(pid, invalid_ptr_sym.va, 1, None)?;
@@ -466,9 +443,7 @@ fn test_dereference_basic() {
             println!("\n----- TEST 10: Direct string address dereference -----\n");
 
             // First, get the string address from g_string_ptr
-            let string_symbols = session.find_symbols("dereference_test!g_string_ptr", 10)?;
-            let string_sym = string_symbols.iter().find(|s| s.name.contains("g_string_ptr"))
-                .expect("g_string_ptr symbol must be found");
+            let string_sym = find_symbol(session, "dereference_test!g_string_ptr", "dereference_test")?;
 
             let ptr_entries = session.dereference(pid, string_sym.va, 1, None)?;
             let string_addr = match &ptr_entries[0].chain[0] {

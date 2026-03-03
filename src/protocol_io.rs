@@ -1,8 +1,9 @@
 use crate::interfaces::{Architecture, Instruction, ModuleSymbol};
 use crate::pe_types::ModuleExtraInfo;
 pub use crate::protocol::{
-    DebuggerRequest, DebuggerResponse, DebugEvent, EmulationMode, ModuleInfo, ProcessInfo,
-    StepAction, StepKind, ThreadContext, ThreadInfo, TraceExitCondition,
+    DebuggerRequest, DebuggerResponse, DebugEvent, EmulationMode, HardwareBreakpointSize,
+    HardwareBreakpointType, ModuleInfo, ProcessInfo, StepAction, StepKind, ThreadContext,
+    ThreadInfo, TraceExitCondition,
 };
 
 /// Result from trace_instructions()
@@ -104,6 +105,7 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::Instructions { instructions } => {
             format!("Instructions ({} instructions)", instructions.len())
         }
+        DebuggerResponse::HardwareBreakpointSet { dr_index } => format!("HardwareBreakpointSet(dr={})", dr_index),
         DebuggerResponse::Ack => "Ack".to_string(),
         DebuggerResponse::Error { .. } => "Error".to_string(),
         DebuggerResponse::Event { .. } => "Event".to_string(),
@@ -487,6 +489,23 @@ impl<S> DebugSession<S> {
                     self.breakpoint_handlers.insert(*address, kept);
                 }
             }
+            DebugEvent::HardwareBreakpoint { pid, tid, address, .. } => {
+                // Dispatch to breakpoint_handlers, same as software breakpoints
+                if let Some(handlers_vec) = self.breakpoint_handlers.remove(address) {
+                    let mut kept: Vec<Box<dyn FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<BreakpointDecision> + Send + 'static>> = Vec::with_capacity(handlers_vec.len());
+                    for mut handler in handlers_vec.into_iter() {
+                        let decision = handler(self, *pid, *tid, *address)?;
+                        if decision == BreakpointDecision::Keep {
+                            kept.push(handler);
+                        } else {
+                            // Remove the hardware breakpoint on server
+                            let _ = self.send_and_receive(&DebuggerRequest::RemoveHardwareBreakpoint { pid: *pid, addr: *address });
+                        }
+                    }
+                    // Put handlers back
+                    self.breakpoint_handlers.insert(*address, kept);
+                }
+            }
             DebugEvent::DllLoaded {
                 pid,
                 tid,
@@ -626,6 +645,7 @@ impl<S> DebugSession<S> {
             | DebugEvent::ThreadCreated { pid, tid, .. }
             | DebugEvent::ThreadExited { pid, tid, .. }
             | DebugEvent::Breakpoint { pid, tid, .. }
+            | DebugEvent::HardwareBreakpoint { pid, tid, .. }
             | DebugEvent::InitialBreakpoint { pid, tid, .. }
             | DebugEvent::Output { pid, tid, .. }
             | DebugEvent::StepComplete { pid, tid, .. }
@@ -1081,6 +1101,91 @@ impl<S> DebugSession<S> {
             }
             other => Err(anyhow::anyhow!(
                 "Unexpected response to RemoveBreakpoint: {:?}",
+                other
+            )),
+        }
+    }
+
+    /// Set a hardware breakpoint. Returns the debug register index (0-3).
+    pub fn set_hardware_breakpoint(
+        &mut self,
+        pid: u32,
+        addr: u64,
+        bp_type: crate::protocol::HardwareBreakpointType,
+        size: crate::protocol::HardwareBreakpointSize,
+    ) -> anyhow::Result<u8> {
+        let req = DebuggerRequest::SetHardwareBreakpoint { pid, addr, bp_type, size };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::HardwareBreakpointSet { dr_index } => Ok(dr_index),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to set hardware breakpoint: {}", message))
+            }
+            other => Err(anyhow::anyhow!(
+                "Unexpected response to SetHardwareBreakpoint: {:?}",
+                other
+            )),
+        }
+    }
+
+    /// Set a hardware breakpoint by symbol name with a handler.
+    /// Returns the resolved address.
+    pub fn set_hardware_breakpoint_by_symbol<F>(
+        &mut self,
+        pid: u32,
+        symbol_name: &str,
+        bp_type: crate::protocol::HardwareBreakpointType,
+        size: crate::protocol::HardwareBreakpointSize,
+        handler: F,
+    ) -> anyhow::Result<u64>
+    where
+        F: FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<BreakpointDecision> + Send + 'static,
+    {
+        let symbols = self.find_symbols(symbol_name, 1)?;
+        if symbols.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Could not find symbol '{}' for hardware breakpoint",
+                symbol_name
+            ));
+        }
+        let address = symbols[0].va;
+        self.set_hardware_breakpoint(pid, address, bp_type, size)?;
+        self.breakpoint_handlers
+            .entry(address)
+            .or_default()
+            .push(Box::new(handler));
+        Ok(address)
+    }
+
+    /// Set a hardware breakpoint at an address with a handler.
+    pub fn set_hardware_breakpoint_at<F>(
+        &mut self,
+        pid: u32,
+        addr: u64,
+        bp_type: crate::protocol::HardwareBreakpointType,
+        size: crate::protocol::HardwareBreakpointSize,
+        handler: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<BreakpointDecision> + Send + 'static,
+    {
+        self.set_hardware_breakpoint(pid, addr, bp_type, size)?;
+        self.breakpoint_handlers
+            .entry(addr)
+            .or_default()
+            .push(Box::new(handler));
+        Ok(())
+    }
+
+    /// Remove a hardware breakpoint at the specified address.
+    pub fn remove_hardware_breakpoint(&mut self, pid: u32, addr: u64) -> anyhow::Result<()> {
+        let req = DebuggerRequest::RemoveHardwareBreakpoint { pid, addr };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to remove hardware breakpoint: {}", message))
+            }
+            other => Err(anyhow::anyhow!(
+                "Unexpected response to RemoveHardwareBreakpoint: {:?}",
                 other
             )),
         }

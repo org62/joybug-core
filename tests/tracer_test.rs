@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::TestServer;
+use common::{TestServer, get_test_program_path, find_symbol, find_module};
 use joybug2::protocol_io::{
     BreakpointDecision, DebugSession, EmulateResult, EmulationMode, TraceExitCondition,
 };
@@ -30,74 +30,21 @@ impl TracerTestState {
     }
 }
 
-/// Get the path to the compiled xtea_test.exe
-fn get_xtea_test_path() -> String {
-    let out_dir = std::env::var("OUT_DIR").unwrap_or_else(|_| {
-        // Fallback for test environment
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        format!("{}\\target\\debug\\build", manifest_dir)
-    });
-
-    // Try to find it in the expected location
-    let expected_path = format!("{}\\xtea_test.exe", out_dir);
-    if std::path::Path::new(&expected_path).exists() {
-        return expected_path;
-    }
-
-    // Search in common build directories
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    for profile in &["debug", "release"] {
-        let search_dir = format!("{}\\target\\{}\\build", manifest_dir, profile);
-        if let Ok(entries) = std::fs::read_dir(&search_dir) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    let candidate = entry.path().join("out").join("xtea_test.exe");
-                    if candidate.exists() {
-                        return candidate.to_string_lossy().to_string();
-                    }
-                }
-            }
-        }
-    }
-
-    panic!("Could not find xtea_test.exe. Make sure to build the project first.");
-}
-
 fn run_tracer_comparison(
     session: &mut DebugSession<TracerTestState>,
     pid: u32,
-    tid: u32,
+    _tid: u32,
     _address: u64,
 ) -> anyhow::Result<()> {
     println!("\n=== Running Tracer Comparison Test ===\n");
 
     // Find xtea_encrypt function
-    let modules = session.list_modules(pid)?;
-    let main_module = modules
-        .iter()
-        .find(|m| m.name.to_lowercase().contains("xtea_test"))
-        .ok_or_else(|| anyhow::anyhow!("Could not find xtea_test module"))?;
-
+    let main_module = find_module(session, pid, "xtea_test")?;
     println!("Found main module: {} at 0x{:016X}", main_module.name, main_module.base);
 
-    // Get symbols to find xtea_encrypt
-    let encrypt_symbol = session
-        .find_symbols("xtea_encrypt", 1)?
-        .into_iter()
-        .find(|s| s.module_name.to_lowercase().contains("xtea_test"));
-
-    let encrypt_addr = match encrypt_symbol {
-        Some(sym) => {
-            println!("Found xtea_encrypt at 0x{:016X}", sym.va);
-            sym.va
-        }
-        None => {
-            println!("Could not find xtea_encrypt symbol, using entry point + offset");
-            // Fallback: just trace from current position
-            let ctx = session.get_thread_context(pid, tid)?;
-            ctx.get_pc()
-        }
-    };
+    let encrypt_sym = find_symbol(session, "xtea_encrypt", "xtea_test")?;
+    let encrypt_addr = encrypt_sym.va;
+    println!("Found xtea_encrypt at 0x{:016X}", encrypt_addr);
 
     // Set breakpoint at xtea_encrypt
     session.set_breakpoint_at(pid, encrypt_addr, None, |session, pid, tid, address| {
@@ -208,7 +155,7 @@ fn test_tracer_vs_emulator() {
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();
 
-    let xtea_path = get_xtea_test_path();
+    let xtea_path = get_test_program_path("xtea_test");
     println!("Using test program: {}", xtea_path);
 
     let final_state = DebugSession::new(TracerTestState::new(), Some(server_addr.as_str()))

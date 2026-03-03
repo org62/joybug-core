@@ -2,18 +2,11 @@
 
 mod common;
 
-use common::TestServer;
+use common::{TestServer, get_test_program_path};
 use joybug2::protocol_io::{DebugSession, ExceptionAction};
-use std::path::Path;
 
 fn test_exe_path() -> String {
-    let path = format!("{}/exception_test.exe", env!("OUT_DIR"));
-    assert!(
-        Path::new(&path).exists(),
-        "exception_test.exe not found at {}. Ensure cl.exe is available.",
-        path
-    );
-    path
+    get_test_program_path("exception_test")
 }
 
 /// Confirms the existing bug: with default behavior (DBG_CONTINUE),

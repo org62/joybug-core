@@ -12,6 +12,21 @@ pub mod request_response {
         Out,
     }
 
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+    pub enum HardwareBreakpointType {
+        Execute,
+        Write,
+        ReadWrite,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+    pub enum HardwareBreakpointSize {
+        Byte1,
+        Byte2,
+        Byte4,
+        Byte8,
+    }
+
     /// Memory access type for tracing
     #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
     pub enum MemoryAccessType {
@@ -270,6 +285,16 @@ pub mod request_response {
             pid: u32,
             addr: u64,
         },
+        SetHardwareBreakpoint {
+            pid: u32,
+            addr: u64,
+            bp_type: HardwareBreakpointType,
+            size: HardwareBreakpointSize,
+        },
+        RemoveHardwareBreakpoint {
+            pid: u32,
+            addr: u64,
+        },
         ReadMemory {
             pid: u32,
             address: u64,
@@ -390,6 +415,7 @@ pub mod request_response {
     pub enum DebuggerResponse {
         Ack,
         Error { message: String },
+        HardwareBreakpointSet { dr_index: u8 },
         Event { event: DebugEvent },
         MemoryData { data: Vec<u8> },
         WriteAck,
@@ -471,6 +497,13 @@ pub mod request_response {
             tid: u32,
             address: u64,
         },
+        HardwareBreakpoint {
+            pid: u32,
+            tid: u32,
+            address: u64,
+            dr_index: u8,
+            bp_type: HardwareBreakpointType,
+        },
         InitialBreakpoint {
             pid: u32,
             tid: u32,
@@ -538,6 +571,7 @@ pub mod request_response {
                 DebugEvent::Output { pid, .. } => *pid,
                 DebugEvent::Exception { pid, .. } => *pid,
                 DebugEvent::Breakpoint { pid, .. } => *pid,
+                DebugEvent::HardwareBreakpoint { pid, .. } => *pid,
                 DebugEvent::InitialBreakpoint { pid, .. } => *pid,
                 DebugEvent::SingleShotBreakpoint { pid, .. } => *pid,
                 DebugEvent::ProcessCreated { pid, .. } => *pid,
@@ -557,6 +591,7 @@ pub mod request_response {
                 DebugEvent::Output { tid, .. } => *tid,
                 DebugEvent::Exception { tid, .. } => *tid,
                 DebugEvent::Breakpoint { tid, .. } => *tid,
+                DebugEvent::HardwareBreakpoint { tid, .. } => *tid,
                 DebugEvent::InitialBreakpoint { tid, .. } => *tid,
                 DebugEvent::SingleShotBreakpoint { tid, .. } => *tid,
                 DebugEvent::ProcessCreated { tid, .. } => *tid,
