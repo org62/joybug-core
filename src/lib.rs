@@ -10,6 +10,7 @@ pub mod emulator;
 pub mod memory_operand;
 pub mod tenet_format;
 pub mod local_server;
+pub mod assembler;
 
 #[cfg(windows)]
 pub type PlatformImpl = windows_platform::WindowsPlatform;

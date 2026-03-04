@@ -48,6 +48,7 @@ capstone = "0.12"
 regex = "1.10"
 bincode = { version = "2.0.0-rc.3", features = ["serde"] }
 unicorn-engine = { git = "https://github.com/expend20/unicorn", branch = "AVX2-port" }
+keystone-engine = "0.1"
 
 [build-dependencies]
 cc = "1.0"
