@@ -357,6 +357,13 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::SearchMemory { pid, pattern, max_results } => {
+                let p = platform.read().unwrap();
+                match p.search_memory(pid, &pattern, max_results) {
+                    Ok((addresses, capped)) => DebuggerResponse::MemorySearchResult { addresses, capped },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::DisassembleFunction { pid, address, max_instructions, arch } => {
                 let p = platform.read().unwrap();
                 match p.disassemble_function(pid, address, max_instructions, arch) {
@@ -470,6 +477,9 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
             DebuggerResponse::DereferenceResult { entries } => format!(
                 "DereferenceResult {{ entries: [..{} entries] }}",
                 entries.len()
+            ),
+            DebuggerResponse::MemorySearchResult { addresses, capped } => format!(
+                "MemorySearchResult ({} matches, capped={})", addresses.len(), capped
             ),
             _ => format!("{:?}", resp),
         }, "Sending response");

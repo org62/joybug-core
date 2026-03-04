@@ -409,6 +409,11 @@ pub mod request_response {
             exit_condition: TraceExitCondition,
             max_instructions: usize,
         },
+        SearchMemory {
+            pid: u32,
+            pattern: Vec<u8>,
+            max_results: usize,
+        },
     }
 
     #[derive(Serialize, Deserialize, Clone)]
@@ -468,6 +473,10 @@ pub mod request_response {
             /// Each entry is (address, data).
             #[serde(default)]
             memory_snapshots: Vec<(u64, Vec<u8>)>,
+        },
+        MemorySearchResult {
+            addresses: Vec<u64>,
+            capped: bool,
         },
         /// Tenet format trace result (for TraceInstructions and EmulateInstructions with InstructionTrace mode)
         TenetTrace {

@@ -130,6 +130,7 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::FunctionDisassembly { instructions, .. } => format!("FunctionDisassembly ({} instructions)", instructions.len()),
         DebuggerResponse::EmulationResult { instructions_executed, .. } => format!("EmulationResult ({} instructions)", instructions_executed),
         DebuggerResponse::TenetTrace { trace_text, .. } => format!("TenetTrace ({} bytes)", trace_text.len()),
+        DebuggerResponse::MemorySearchResult { addresses, capped } => format!("MemorySearchResult ({} matches, capped={})", addresses.len(), capped),
     };
     debug!("Received response: {}", summary);
     Ok(resp)
@@ -1062,6 +1063,20 @@ impl<S> DebugSession<S> {
             DebuggerResponse::MemoryRegionList { regions } => Ok(regions),
             DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to enumerate memory regions: {}", message)),
             other => Err(anyhow::anyhow!("Unexpected response to EnumerateMemoryRegions: {:?}", other)),
+        }
+    }
+
+    pub fn search_memory(
+        &mut self,
+        pid: u32,
+        pattern: Vec<u8>,
+        max_results: usize,
+    ) -> anyhow::Result<(Vec<u64>, bool)> {
+        let req = DebuggerRequest::SearchMemory { pid, pattern, max_results };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::MemorySearchResult { addresses, capped } => Ok((addresses, capped)),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to search memory: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to SearchMemory: {:?}", other)),
         }
     }
 

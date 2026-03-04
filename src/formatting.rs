@@ -92,6 +92,10 @@ impl std::fmt::Debug for DebuggerResponse {
             DebuggerResponse::DereferenceResult { entries } => f.debug_struct("DereferenceResult")
                 .field("count", &entries.len())
                 .finish(),
+            DebuggerResponse::MemorySearchResult { addresses, capped } => f.debug_struct("MemorySearchResult")
+                .field("matches", &addresses.len())
+                .field("capped", capped)
+                .finish(),
             DebuggerResponse::FunctionDisassembly { instructions, function_start, function_end, function_name } => {
                 f.debug_struct("FunctionDisassembly")
                     .field("instructions_count", &instructions.len())

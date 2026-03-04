@@ -279,6 +279,71 @@ pub trait PlatformAPI: Send + Sync {
     fn get_teb_address(&self, _pid: u32, _tid: u32) -> Result<u64, PlatformError> {
         Err(PlatformError::NotImplemented)
     }
+
+    /// Search process memory for a byte pattern, returning matching addresses.
+    /// Scans all committed, readable memory regions in 1MB chunks with overlap
+    /// for cross-boundary matches. Returns early if max_results is reached.
+    fn search_memory(&self, pid: u32, pattern: &[u8], max_results: usize) -> Result<(Vec<u64>, bool), PlatformError> {
+        if pattern.is_empty() {
+            return Err(PlatformError::Other("Search pattern must not be empty".into()));
+        }
+
+        let regions = self.enumerate_memory_regions(pid)?;
+        let mut addresses = Vec::new();
+        let chunk_size: usize = 1024 * 1024; // 1MB
+
+        const PAGE_NOACCESS: u32 = 0x01;
+        const PAGE_GUARD: u32 = 0x100;
+        const MEM_COMMIT: u32 = 0x1000;
+
+        for region in &regions {
+            if region.state != MEM_COMMIT {
+                continue;
+            }
+            if region.protect == 0 || (region.protect & PAGE_NOACCESS) != 0 || (region.protect & PAGE_GUARD) != 0 {
+                continue;
+            }
+
+            let region_base = region.base_address;
+            let region_size = region.region_size as usize;
+            let overlap = if pattern.len() > 1 { pattern.len() - 1 } else { 0 };
+            let mut offset: usize = 0;
+
+            while offset < region_size {
+                let read_size = (chunk_size + overlap).min(region_size - offset);
+                let read_addr = region_base + offset as u64;
+
+                match self.read_memory(pid, read_addr, read_size) {
+                    Ok(data) => {
+                        if data.len() >= pattern.len() {
+                            let mut i = 0;
+                            while i <= data.len() - pattern.len() {
+                                if data[i..i + pattern.len()] == *pattern {
+                                    addresses.push(read_addr + i as u64);
+                                    if addresses.len() >= max_results {
+                                        return Ok((addresses, true));
+                                    }
+                                    i += 1;
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        // Skip unreadable chunks silently
+                    }
+                }
+
+                if read_size <= overlap {
+                    break;
+                }
+                offset += read_size - overlap;
+            }
+        }
+
+        Ok((addresses, false))
+    }
 }
 
 impl SymbolInfo {
