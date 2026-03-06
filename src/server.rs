@@ -39,6 +39,7 @@ const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9000";
 
 fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformImpl>>) {
     let mut framed_stream = FramedJsonStream::new(stream);
+    let mut scanner = crate::memory_scanner::MemoryScanner::new();
     loop {
         let recv_start = Instant::now();
         let req: DebuggerRequest = match framed_stream.receive() {
@@ -424,6 +425,33 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                         }
                     }
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::ScanMemoryStart { pid, value_type, compare_type, value, value2, alignment, float_tolerance, writable_only } => {
+                let p = platform.read().unwrap();
+                match scanner.start_scan(&*p, pid, value_type, compare_type, value, value2, alignment, float_tolerance, writable_only.unwrap_or(true)) {
+                    Ok((scan_id, match_count, scan_time_us)) => DebuggerResponse::ScanMemoryResult { scan_id, match_count, scan_time_us },
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::ScanMemoryNext { scan_id, compare_type, value, value2 } => {
+                let p = platform.read().unwrap();
+                match scanner.next_scan(&*p, scan_id, compare_type, value, value2) {
+                    Ok((match_count, scan_time_us)) => DebuggerResponse::ScanMemoryResult { scan_id, match_count, scan_time_us },
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::ScanMemoryGetResults { scan_id, offset, count } => {
+                let p = platform.read().unwrap();
+                match scanner.get_results(&*p, scan_id, offset, count) {
+                    Ok((addresses, values, total_count)) => DebuggerResponse::ScanMemoryResults { addresses, values, total_count },
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::ScanMemoryReset { scan_id } => {
+                match scanner.reset_scan(scan_id) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e },
                 }
             }
             // Trap-flag based instruction tracer - always returns Tenet format

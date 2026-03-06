@@ -245,6 +245,47 @@ pub mod request_response {
         Syscall,
     }
 
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+    pub enum ScanValueType {
+        U8, U16, U32, U64, F32, F64,
+    }
+
+    impl ScanValueType {
+        pub fn size(&self) -> usize {
+            match self {
+                ScanValueType::U8 => 1,
+                ScanValueType::U16 => 2,
+                ScanValueType::U32 | ScanValueType::F32 => 4,
+                ScanValueType::U64 | ScanValueType::F64 => 8,
+            }
+        }
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+    pub enum ScanCompareType {
+        ExactValue,
+        UnknownInitialValue,
+        BiggerThan,
+        SmallerThan,
+        ValueBetween,
+        IncreasedValue,
+        DecreasedValue,
+        IncreasedValueBy,
+        DecreasedValueBy,
+        Changed,
+        Unchanged,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+    pub enum ScanValue {
+        U8(u8),
+        U16(u16),
+        U32(u32),
+        U64(u64),
+        F32(f32),
+        F64(f64),
+    }
+
     #[derive(Serialize, Deserialize, Debug, Clone)]
     pub enum DebuggerRequest {
         ListProcesses,
@@ -414,6 +455,32 @@ pub mod request_response {
             pattern: Vec<u8>,
             max_results: usize,
         },
+        ScanMemoryStart {
+            pid: u32,
+            value_type: ScanValueType,
+            compare_type: ScanCompareType,
+            value: Option<ScanValue>,
+            value2: Option<ScanValue>,
+            alignment: Option<usize>,
+            float_tolerance: Option<f64>,
+            /// If true (default), only scan writable memory regions.
+            #[serde(default)]
+            writable_only: Option<bool>,
+        },
+        ScanMemoryNext {
+            scan_id: u64,
+            compare_type: ScanCompareType,
+            value: Option<ScanValue>,
+            value2: Option<ScanValue>,
+        },
+        ScanMemoryGetResults {
+            scan_id: u64,
+            offset: u64,
+            count: u64,
+        },
+        ScanMemoryReset {
+            scan_id: u64,
+        },
     }
 
     #[derive(Serialize, Deserialize, Clone)]
@@ -477,6 +544,16 @@ pub mod request_response {
         MemorySearchResult {
             addresses: Vec<u64>,
             capped: bool,
+        },
+        ScanMemoryResult {
+            scan_id: u64,
+            match_count: u64,
+            scan_time_us: u64,
+        },
+        ScanMemoryResults {
+            addresses: Vec<u64>,
+            values: Vec<ScanValue>,
+            total_count: u64,
         },
         /// Tenet format trace result (for TraceInstructions and EmulateInstructions with InstructionTrace mode)
         TenetTrace {

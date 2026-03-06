@@ -2,8 +2,8 @@ use crate::interfaces::{Architecture, Instruction, ModuleSymbol};
 use crate::pe_types::ModuleExtraInfo;
 pub use crate::protocol::{
     DebuggerRequest, DebuggerResponse, DebugEvent, EmulationMode, HardwareBreakpointSize,
-    HardwareBreakpointType, ModuleInfo, ProcessInfo, StepAction, StepKind, ThreadContext,
-    ThreadInfo, TraceExitCondition,
+    HardwareBreakpointType, ModuleInfo, ProcessInfo, ScanCompareType, ScanValue, ScanValueType,
+    StepAction, StepKind, ThreadContext, ThreadInfo, TraceExitCondition,
 };
 
 /// Result from trace_instructions()
@@ -131,6 +131,8 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::EmulationResult { instructions_executed, .. } => format!("EmulationResult ({} instructions)", instructions_executed),
         DebuggerResponse::TenetTrace { trace_text, .. } => format!("TenetTrace ({} bytes)", trace_text.len()),
         DebuggerResponse::MemorySearchResult { addresses, capped } => format!("MemorySearchResult ({} matches, capped={})", addresses.len(), capped),
+        DebuggerResponse::ScanMemoryResult { match_count, .. } => format!("ScanMemoryResult ({} matches)", match_count),
+        DebuggerResponse::ScanMemoryResults { addresses, total_count, .. } => format!("ScanMemoryResults ({}/{} returned)", addresses.len(), total_count),
     };
     debug!("Received response: {}", summary);
     Ok(resp)
@@ -422,12 +424,18 @@ impl<S> DebugSession<S> {
             let mut stream = self.stream.lock().unwrap();
             let resp = receive_response(&mut stream)?;
             drop(stream);
-            if let DebuggerResponse::Event { event } = resp {
-                if !self.handle_session_event(&event)? {
-                    break;
+            match resp {
+                DebuggerResponse::Event { event } => {
+                    if !self.handle_session_event(&event)? {
+                        break;
+                    }
                 }
-            } else {
-                info!("Received non-event response: {:?}, ignoring.", resp);
+                DebuggerResponse::Error { message } => {
+                    return Err(anyhow::anyhow!("Server error: {}", message));
+                }
+                other => {
+                    info!("Received non-event response: {:?}, ignoring.", other);
+                }
             }
         }
         Ok(())
@@ -1077,6 +1085,63 @@ impl<S> DebugSession<S> {
             DebuggerResponse::MemorySearchResult { addresses, capped } => Ok((addresses, capped)),
             DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to search memory: {}", message)),
             other => Err(anyhow::anyhow!("Unexpected response to SearchMemory: {:?}", other)),
+        }
+    }
+
+    pub fn scan_memory_start(
+        &mut self,
+        pid: u32,
+        value_type: ScanValueType,
+        compare_type: ScanCompareType,
+        value: Option<ScanValue>,
+        value2: Option<ScanValue>,
+        alignment: Option<usize>,
+        float_tolerance: Option<f64>,
+        writable_only: bool,
+    ) -> anyhow::Result<(u64, u64, u64)> {
+        let req = DebuggerRequest::ScanMemoryStart { pid, value_type, compare_type, value, value2, alignment, float_tolerance, writable_only: Some(writable_only) };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::ScanMemoryResult { scan_id, match_count, scan_time_us } => Ok((scan_id, match_count, scan_time_us)),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to start scan: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to ScanMemoryStart: {:?}", other)),
+        }
+    }
+
+    pub fn scan_memory_next(
+        &mut self,
+        scan_id: u64,
+        compare_type: ScanCompareType,
+        value: Option<ScanValue>,
+        value2: Option<ScanValue>,
+    ) -> anyhow::Result<(u64, u64)> {
+        let req = DebuggerRequest::ScanMemoryNext { scan_id, compare_type, value, value2 };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::ScanMemoryResult { scan_id: _, match_count, scan_time_us } => Ok((match_count, scan_time_us)),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to next scan: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to ScanMemoryNext: {:?}", other)),
+        }
+    }
+
+    pub fn scan_memory_get_results(
+        &mut self,
+        scan_id: u64,
+        offset: u64,
+        count: u64,
+    ) -> anyhow::Result<(Vec<u64>, Vec<ScanValue>, u64)> {
+        let req = DebuggerRequest::ScanMemoryGetResults { scan_id, offset, count };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::ScanMemoryResults { addresses, values, total_count } => Ok((addresses, values, total_count)),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to get scan results: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to ScanMemoryGetResults: {:?}", other)),
+        }
+    }
+
+    pub fn scan_memory_reset(&mut self, scan_id: u64) -> anyhow::Result<()> {
+        let req = DebuggerRequest::ScanMemoryReset { scan_id };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to reset scan: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to ScanMemoryReset: {:?}", other)),
         }
     }
 

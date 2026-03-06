@@ -11,6 +11,7 @@ pub mod memory_operand;
 pub mod tenet_format;
 pub mod local_server;
 pub mod assembler;
+pub mod memory_scanner;
 
 #[cfg(windows)]
 pub type PlatformImpl = windows_platform::WindowsPlatform;

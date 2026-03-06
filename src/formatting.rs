@@ -121,6 +121,19 @@ impl std::fmt::Debug for DebuggerResponse {
                     .field("trace_time_us", trace_time_us)
                     .finish()
             }
+            DebuggerResponse::ScanMemoryResult { scan_id, match_count, scan_time_us } => {
+                f.debug_struct("ScanMemoryResult")
+                    .field("scan_id", scan_id)
+                    .field("match_count", match_count)
+                    .field("scan_time_us", scan_time_us)
+                    .finish()
+            }
+            DebuggerResponse::ScanMemoryResults { addresses, total_count, .. } => {
+                f.debug_struct("ScanMemoryResults")
+                    .field("returned", &addresses.len())
+                    .field("total_count", total_count)
+                    .finish()
+            }
         }
     }
 }

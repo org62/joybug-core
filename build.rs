@@ -120,5 +120,6 @@ fn main() {
         let _ = compile_test_program(&manifest_dir, &out_dir, "hardware_bp_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "memory_search_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "assembler_test", None);
+        let _ = compile_test_program(&manifest_dir, &out_dir, "memory_scan_test", None);
     }
 }
