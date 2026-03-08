@@ -1,4 +1,6 @@
 use thiserror::Error;
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::protocol::{ModuleInfo, ProcessInfo, ThreadInfo};
 
 pub type Address = u64;
@@ -282,67 +284,96 @@ pub trait PlatformAPI: Send + Sync {
 
     /// Search process memory for a byte pattern, returning matching addresses.
     /// Scans all committed, readable memory regions in 1MB chunks with overlap
-    /// for cross-boundary matches. Returns early if max_results is reached.
-    fn search_memory(&self, pid: u32, pattern: &[u8], max_results: usize) -> Result<(Vec<u64>, bool), PlatformError> {
+    /// for cross-boundary matches. Uses rayon to parallelize across regions.
+    /// Returns up to `max_results` addresses sorted by address.
+    fn search_memory(&self, pid: u32, pattern: &[u8], max_results: usize) -> Result<(Vec<u64>, bool), PlatformError>
+    where
+        Self: Sync,
+    {
         if pattern.is_empty() {
             return Err(PlatformError::Other("Search pattern must not be empty".into()));
         }
 
         let regions = self.enumerate_memory_regions(pid)?;
-        let mut addresses = Vec::new();
         let chunk_size: usize = 1024 * 1024; // 1MB
 
         const PAGE_NOACCESS: u32 = 0x01;
         const PAGE_GUARD: u32 = 0x100;
         const MEM_COMMIT: u32 = 0x1000;
 
-        for region in &regions {
-            if region.state != MEM_COMMIT {
-                continue;
-            }
-            if region.protect == 0 || (region.protect & PAGE_NOACCESS) != 0 || (region.protect & PAGE_GUARD) != 0 {
-                continue;
-            }
+        // Filter to searchable regions
+        let searchable_regions: Vec<_> = regions
+            .iter()
+            .filter(|r| {
+                r.state == MEM_COMMIT
+                    && r.protect != 0
+                    && (r.protect & PAGE_NOACCESS) == 0
+                    && (r.protect & PAGE_GUARD) == 0
+            })
+            .collect();
 
-            let region_base = region.base_address;
-            let region_size = region.region_size as usize;
-            let overlap = if pattern.len() > 1 { pattern.len() - 1 } else { 0 };
-            let mut offset: usize = 0;
+        let total_found = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
 
-            while offset < region_size {
-                let read_size = (chunk_size + overlap).min(region_size - offset);
-                let read_addr = region_base + offset as u64;
+        let all_results: Vec<Vec<u64>> = searchable_regions
+            .par_iter()
+            .map(|region| {
+                if stop.load(Ordering::Relaxed) {
+                    return Vec::new();
+                }
 
-                match self.read_memory(pid, read_addr, read_size) {
-                    Ok(data) => {
-                        if data.len() >= pattern.len() {
-                            let mut i = 0;
-                            while i <= data.len() - pattern.len() {
-                                if data[i..i + pattern.len()] == *pattern {
-                                    addresses.push(read_addr + i as u64);
-                                    if addresses.len() >= max_results {
-                                        return Ok((addresses, true));
+                let region_base = region.base_address;
+                let region_size = region.region_size as usize;
+                let overlap = if pattern.len() > 1 { pattern.len() - 1 } else { 0 };
+                let mut offset: usize = 0;
+                let mut local_results = Vec::new();
+
+                while offset < region_size {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let read_size = (chunk_size + overlap).min(region_size - offset);
+                    let read_addr = region_base + offset as u64;
+
+                    match self.read_memory(pid, read_addr, read_size) {
+                        Ok(data) => {
+                            if data.len() >= pattern.len() {
+                                let mut i = 0;
+                                while i <= data.len() - pattern.len() {
+                                    if data[i..i + pattern.len()] == *pattern {
+                                        local_results.push(read_addr + i as u64);
+                                        let prev = total_found.fetch_add(1, Ordering::Relaxed);
+                                        if prev + 1 >= max_results * 2 {
+                                            stop.store(true, Ordering::Relaxed);
+                                            return local_results;
+                                        }
                                     }
-                                    i += 1;
-                                } else {
                                     i += 1;
                                 }
                             }
                         }
+                        Err(_) => {
+                            // Skip unreadable chunks silently
+                        }
                     }
-                    Err(_) => {
-                        // Skip unreadable chunks silently
+
+                    if read_size <= overlap {
+                        break;
                     }
+                    offset += read_size - overlap;
                 }
 
-                if read_size <= overlap {
-                    break;
-                }
-                offset += read_size - overlap;
-            }
-        }
+                local_results
+            })
+            .collect();
 
-        Ok((addresses, false))
+        let mut addresses: Vec<u64> = all_results.into_iter().flatten().collect();
+        addresses.sort_unstable();
+        let capped = addresses.len() > max_results;
+        addresses.truncate(max_results);
+
+        Ok((addresses, capped))
     }
 }
 
