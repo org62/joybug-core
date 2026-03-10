@@ -345,7 +345,23 @@ impl SymbolManager {
     /// This method works directly with RVAs since symbols are stored as RVAs
     pub fn resolve_rva_to_symbol(&self, module_path: &str, rva: u32) -> Result<Option<ResolvedSymbol>, SymbolError> {
         self.wait_for_loading(module_path)?;
+        self.resolve_rva_to_symbol_from_cache(module_path, rva)
+    }
 
+    /// Resolve an RVA to a symbol without waiting for loading to complete.
+    /// Returns None immediately if the module's symbols are still loading.
+    pub fn try_resolve_rva_to_symbol(&self, module_path: &str, rva: u32) -> Result<Option<ResolvedSymbol>, SymbolError> {
+        {
+            let pending = self.pending_loads.lock().unwrap();
+            if pending.contains(module_path) {
+                return Ok(None);
+            }
+        }
+        self.resolve_rva_to_symbol_from_cache(module_path, rva)
+    }
+
+    /// Shared implementation: look up an RVA in the already-loaded symbol cache.
+    fn resolve_rva_to_symbol_from_cache(&self, module_path: &str, rva: u32) -> Result<Option<ResolvedSymbol>, SymbolError> {
         let cache = self.symbol_cache.lock().unwrap();
         if let Some(module_symbols) = cache.get(module_path) {
             // Binary search: find the rightmost symbol with rva <= target rva
@@ -393,6 +409,26 @@ impl SymbolManager {
     /// Follows RUNTIME_FUNCTION unwind chains for PGO-split function fragments,
     /// then falls back to nearest-below symbol search.
     pub fn resolve_address_to_symbol(&self, modules: &[ModuleInfo], address: u64) -> Result<Option<(String, ResolvedSymbol, u64)>, SymbolError> {
+        self.resolve_address_impl(modules, address, |module_path, rva| {
+            self.resolve_rva_to_symbol(module_path, rva)
+        })
+    }
+
+    /// Non-blocking variant of `resolve_address_to_symbol`.
+    /// Returns None immediately if the module's symbols are still loading,
+    /// instead of waiting up to the timeout duration.
+    pub fn try_resolve_address_to_symbol(&self, modules: &[ModuleInfo], address: u64) -> Result<Option<(String, ResolvedSymbol, u64)>, SymbolError> {
+        self.resolve_address_impl(modules, address, |module_path, rva| {
+            self.try_resolve_rva_to_symbol(module_path, rva)
+        })
+    }
+
+    /// Shared implementation for address-to-symbol resolution.
+    /// The `resolve_rva` closure controls whether resolution blocks on pending loads.
+    fn resolve_address_impl<F>(&self, modules: &[ModuleInfo], address: u64, resolve_rva: F) -> Result<Option<(String, ResolvedSymbol, u64)>, SymbolError>
+    where
+        F: Fn(&str, u32) -> Result<Option<ResolvedSymbol>, SymbolError>,
+    {
         let containing_module = Self::find_module_binary_search(modules, address);
 
         if let Some(module) = containing_module {
@@ -401,7 +437,7 @@ impl SymbolManager {
             // Try chain resolution: if this RVA is inside a PGO fragment,
             // resolve the symbol at the primary function entry instead.
             if let Some(primary_rva) = self.lookup_chain_target(&module.name, rva) {
-                if let Ok(Some(symbol)) = self.resolve_rva_to_symbol(&module.name, primary_rva) {
+                if let Ok(Some(symbol)) = resolve_rva(&module.name, primary_rva) {
                     let offset = rva as u64 - symbol.rva as u64;
                     let module_name = extract_module_name(&module.name);
                     return Ok(Some((
@@ -413,7 +449,7 @@ impl SymbolManager {
             }
 
             // Normal nearest-below symbol resolution
-            match self.resolve_rva_to_symbol(&module.name, rva)? {
+            match resolve_rva(&module.name, rva)? {
                 Some(symbol) => {
                     let offset_from_symbol = address - (module.base + symbol.rva as u64);
                     let module_name = extract_module_name(&module.name);

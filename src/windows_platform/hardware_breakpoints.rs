@@ -6,7 +6,7 @@ use tracing::trace;
 #[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::System::Diagnostics::Debug::{
     CONTEXT, GetThreadContext, SetThreadContext,
-    CONTEXT_DEBUG_REGISTERS_AMD64, CONTEXT_ALL_AMD64,
+    CONTEXT_DEBUG_REGISTERS_AMD64,
 };
 #[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
@@ -144,7 +144,9 @@ pub(super) fn enable_hw_bp_enable(ctx: &mut CONTEXT, dr_index: u8) {
 }
 
 /// Apply a single hardware breakpoint to a thread by getting/setting its context.
-/// Uses CONTEXT_ALL to ensure DR register changes persist across ContinueDebugEvent.
+/// Uses CONTEXT_DEBUG_REGISTERS only — we only need DR0-DR7, and CONTEXT_ALL
+/// can fail on threads in certain states (kernel transitions, uninitialized, etc.)
+/// with ERROR_GEN_FAILURE ("A device attached to the system is not functioning").
 #[cfg(target_arch = "x86_64")]
 pub(super) fn apply_single_hw_bp_to_thread(
     thread_handle: HANDLE,
@@ -156,12 +158,12 @@ pub(super) fn apply_single_hw_bp_to_thread(
     let mut aligned = AlignedContext {
         context: unsafe { std::mem::zeroed() },
     };
-    aligned.context.ContextFlags = CONTEXT_ALL_AMD64;
+    aligned.context.ContextFlags = CONTEXT_DEBUG_REGISTERS_AMD64;
 
     if unsafe { GetThreadContext(thread_handle, &mut aligned.context) } == 0 {
         let err = unsafe { GetLastError() };
         return Err(PlatformError::OsError(format!(
-            "GetThreadContext(ALL) failed: {}",
+            "GetThreadContext(DR) failed: {}",
             utils::error_message(err)
         )));
     }
@@ -172,7 +174,7 @@ pub(super) fn apply_single_hw_bp_to_thread(
     if unsafe { SetThreadContext(thread_handle, &aligned.context) } == 0 {
         let err = unsafe { GetLastError() };
         return Err(PlatformError::OsError(format!(
-            "SetThreadContext(ALL) failed: {}",
+            "SetThreadContext(DR) failed: {}",
             utils::error_message(err)
         )));
     }
@@ -189,12 +191,12 @@ pub(super) fn clear_hw_bp_from_thread(
     let mut aligned = AlignedContext {
         context: unsafe { std::mem::zeroed() },
     };
-    aligned.context.ContextFlags = CONTEXT_ALL_AMD64;
+    aligned.context.ContextFlags = CONTEXT_DEBUG_REGISTERS_AMD64;
 
     if unsafe { GetThreadContext(thread_handle, &mut aligned.context) } == 0 {
         let err = unsafe { GetLastError() };
         return Err(PlatformError::OsError(format!(
-            "GetThreadContext(ALL) failed: {}",
+            "GetThreadContext(DR) failed: {}",
             utils::error_message(err)
         )));
     }
@@ -204,7 +206,7 @@ pub(super) fn clear_hw_bp_from_thread(
     if unsafe { SetThreadContext(thread_handle, &aligned.context) } == 0 {
         let err = unsafe { GetLastError() };
         return Err(PlatformError::OsError(format!(
-            "SetThreadContext(ALL) failed: {}",
+            "SetThreadContext(DR) failed: {}",
             utils::error_message(err)
         )));
     }
@@ -225,12 +227,12 @@ pub(super) fn apply_all_hw_bps_to_thread(
     let mut aligned = AlignedContext {
         context: unsafe { std::mem::zeroed() },
     };
-    aligned.context.ContextFlags = CONTEXT_ALL_AMD64;
+    aligned.context.ContextFlags = CONTEXT_DEBUG_REGISTERS_AMD64;
 
     if unsafe { GetThreadContext(thread_handle, &mut aligned.context) } == 0 {
         let err = unsafe { GetLastError() };
         return Err(PlatformError::OsError(format!(
-            "GetThreadContext(ALL) failed: {}",
+            "GetThreadContext(DR) failed: {}",
             utils::error_message(err)
         )));
     }
@@ -242,7 +244,7 @@ pub(super) fn apply_all_hw_bps_to_thread(
     if unsafe { SetThreadContext(thread_handle, &aligned.context) } == 0 {
         let err = unsafe { GetLastError() };
         return Err(PlatformError::OsError(format!(
-            "SetThreadContext(ALL) failed: {}",
+            "SetThreadContext(DR) failed: {}",
             utils::error_message(err)
         )));
     }

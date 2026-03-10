@@ -666,7 +666,10 @@ impl PlatformAPI for WindowsPlatform {
         let symbol_manager = self.symbol_manager.as_ref();
         let symbol_resolver = move |addr: u64| -> Option<crate::interfaces::SymbolInfo> {
             if let Some(sm) = symbol_manager {
-                if let Ok(Some((module_path, symbol, offset))) = sm.resolve_address_to_symbol(&modules, addr) {
+                // Use non-blocking variant: return None immediately if symbols are still loading
+                // rather than waiting up to 5 seconds for PDB parsing to complete.
+                // This makes dereference responses instant even for large PDBs.
+                if let Ok(Some((module_path, symbol, offset))) = sm.try_resolve_address_to_symbol(&modules, addr) {
                     let module_name = std::path::Path::new(&module_path)
                         .file_stem()
                         .and_then(|s| s.to_str())
