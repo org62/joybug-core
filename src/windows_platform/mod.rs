@@ -25,7 +25,7 @@ use symbol_manager::SymbolManager;
 use disassembler::CapstoneDisassembler;
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-use tracing::{trace, info, error};
+use tracing::{trace, info, warn, error};
 use std::collections::HashMap;
 
 // Safe wrapper for HANDLE that automatically closes it
@@ -321,10 +321,22 @@ impl PlatformAPI for WindowsPlatform {
                 "All 4 hardware debug registers are in use".to_string()
             ))?;
 
-        // Apply to all threads
+        // Apply to all threads (skip threads that fail — they may be exiting or
+        // in a kernel transition where GetThreadContext returns ERROR_GEN_FAILURE)
         let thread_handles = process.thread_manager().all_thread_handles();
-        for (_tid, handle) in &thread_handles {
-            hardware_breakpoints::apply_single_hw_bp_to_thread(*handle, dr_index, addr, bp_type, size)?;
+        let mut applied_count = 0u32;
+        for (tid, handle) in &thread_handles {
+            match hardware_breakpoints::apply_single_hw_bp_to_thread(*handle, dr_index, addr, bp_type, size) {
+                Ok(()) => applied_count += 1,
+                Err(e) => {
+                    warn!(tid, addr, error = %e, "Failed to apply HW BP to thread (may have exited or be in kernel transition)");
+                }
+            }
+        }
+        if applied_count == 0 && !thread_handles.is_empty() {
+            return Err(PlatformError::Other(format!(
+                "Failed to set hardware breakpoint: could not apply to any of {} threads", thread_handles.len()
+            )));
         }
 
         // Store in process state
