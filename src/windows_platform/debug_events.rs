@@ -66,6 +66,26 @@ pub(super) fn handle_create_process_event(
     let image_file_name =
         utils::get_path_from_handle(info.hFile).unwrap_or_else(|| image_path_fallback.unwrap_or("<unknown>").to_string());
 
+    // If this PID is unknown, it's a child process — register it
+    if platform.get_process(pid).is_err() {
+        let mut dup_handle: HANDLE = std::ptr::null_mut();
+        let current = unsafe { GetCurrentProcess() };
+        if unsafe { DuplicateHandle(current, info.hProcess, current, &mut dup_handle, 0, FALSE, DUPLICATE_SAME_ACCESS) } == 0 {
+            return Err(PlatformError::OsError("DuplicateHandle for child process failed".into()));
+        }
+        let architecture = match super::process::determine_process_architecture(dup_handle) {
+            Ok(arch) => arch,
+            Err(e) => {
+                unsafe { CloseHandle(dup_handle); }
+                return Err(e);
+            }
+        };
+        if let Err(e) = platform.add_process(pid, dup_handle, architecture) {
+            unsafe { CloseHandle(dup_handle); }
+            return Err(e);
+        }
+    }
+
     // Get the process for this PID to use its handle and clear its managers
     let process = platform.get_process_mut(pid)?;
     let h_process = process.handle();
@@ -518,7 +538,12 @@ pub fn handle_debug_event(
             Ok(ev) => ev,
             Err(e) => {
                 error!("Failed to handle exception event: {}", e);
-                Some(crate::protocol::DebugEvent::Unknown)
+                Some(crate::protocol::DebugEvent::Unknown {
+                    pid: debug_event.dwProcessId,
+                    tid: debug_event.dwThreadId,
+                    debug_event_code: EXCEPTION_DEBUG_EVENT,
+                    error: format!("{}", e),
+                })
             }
         },
         CREATE_PROCESS_DEBUG_EVENT => {
@@ -526,9 +551,12 @@ pub fn handle_debug_event(
                 Ok(event) => Some(event),
                 Err(e) => {
                     error!("Failed to handle create process event: {}", e);
-                    // Decide what to do on an error. Maybe return an error event or just unknown.
-                    // For now, let's stick to the existing pattern of returning an `Option`.
-                    Some(crate::protocol::DebugEvent::Unknown)
+                    Some(crate::protocol::DebugEvent::Unknown {
+                        pid: debug_event.dwProcessId,
+                        tid: debug_event.dwThreadId,
+                        debug_event_code: CREATE_PROCESS_DEBUG_EVENT,
+                        error: format!("{}", e),
+                    })
                 }
             }
         }
@@ -539,9 +567,10 @@ pub fn handle_debug_event(
             // Cleanup any pending step breakpoint state for this process
             let pid = debug_event.dwProcessId;
             platform.cleanup_step_state_for_process(pid);
-            
+
             Some(crate::protocol::DebugEvent::ProcessExited {
                 pid: debug_event.dwProcessId,
+                tid: debug_event.dwThreadId,
                 exit_code: info.dwExitCode,
             })
         }
@@ -758,9 +787,14 @@ pub fn handle_debug_event(
                 event_type: info.dwType,
             })
         }
-        _ => {
-            error!("Unknown debug event");
-            Some(crate::protocol::DebugEvent::Unknown)
+        code => {
+            error!("Unknown debug event code: {}", code);
+            Some(crate::protocol::DebugEvent::Unknown {
+                pid: debug_event.dwProcessId,
+                tid: debug_event.dwThreadId,
+                debug_event_code: code,
+                error: format!("Unrecognized debug event code: {}", code),
+            })
         }
     };
 

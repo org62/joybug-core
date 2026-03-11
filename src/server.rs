@@ -208,9 +208,9 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
-            DebuggerRequest::Launch { command } => {
+            DebuggerRequest::Launch { command, debug_children } => {
                 let mut p = platform.write().unwrap();
-                match p.launch(&command) {
+                match p.launch(&command, debug_children) {
                     Ok(Some(event)) => DebuggerResponse::Event { event },
                     Ok(None) => DebuggerResponse::Ack,
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },

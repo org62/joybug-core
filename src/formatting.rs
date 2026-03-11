@@ -240,8 +240,8 @@ impl std::fmt::Display for ModuleInfo {
 impl std::fmt::Display for DebugEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DebugEvent::ProcessExited { pid, exit_code } => {
-                write!(f, "ProcessExited(pid={}, exit_code=0x{:X})", pid, exit_code)
+            DebugEvent::ProcessExited { pid, tid, exit_code } => {
+                write!(f, "ProcessExited(pid={}, tid={}, exit_code=0x{:X})", pid, tid, exit_code)
             }
             DebugEvent::Output { pid, tid, output } => {
                 write!(f, "Output(pid={}, tid={}, output={})", pid, tid, output)
@@ -287,7 +287,9 @@ impl std::fmt::Display for DebugEvent {
             DebugEvent::StepFailed { pid, tid, kind, message } => {
                 write!(f, "StepFailed(pid={}, tid={}, kind={:?}, message={})", pid, tid, kind, message)
             }
-            DebugEvent::Unknown => write!(f, "Unknown"),
+            DebugEvent::Unknown { pid, tid, debug_event_code, error } => {
+                write!(f, "Unknown(pid={}, tid={}, event_code={}, error={})", pid, tid, debug_event_code, error)
+            }
         }
     }
 }

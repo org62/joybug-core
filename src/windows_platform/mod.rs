@@ -371,8 +371,8 @@ impl PlatformAPI for WindowsPlatform {
         Ok(())
     }
 
-    fn launch(&mut self, command: &str) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
-        process::launch(self, command)
+    fn launch(&mut self, command: &str, debug_children: bool) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
+        process::launch(self, command, debug_children)
     }
 
     fn read_memory(&self, pid: u32, address: u64, size: usize) -> Result<Vec<u8>, PlatformError> {

@@ -303,6 +303,8 @@ pub mod request_response {
         },
         Launch {
             command: String,
+            #[serde(default)]
+            debug_children: bool,
         },
         Continue {
             pid: u32,
@@ -568,7 +570,7 @@ pub mod request_response {
     #[derive(Debug, Serialize, Deserialize, Clone)]
     pub enum DebugEvent {
         //ProcessStarted { pid: u32 },
-        ProcessExited { pid: u32, exit_code: u32 },
+        ProcessExited { pid: u32, tid: u32, exit_code: u32 },
         Output { pid: u32, tid: u32, output: String },
         Exception {
             pid: u32,
@@ -647,7 +649,12 @@ pub mod request_response {
             kind: StepKind,
             message: String,
         },
-        Unknown,
+        Unknown {
+            pid: u32,
+            tid: u32,
+            debug_event_code: u32,
+            error: String,
+        },
     }
 
     impl DebugEvent {
@@ -668,7 +675,7 @@ pub mod request_response {
                 DebugEvent::RipEvent { pid, .. } => *pid,
                 DebugEvent::StepComplete { pid, .. } => *pid,
                 DebugEvent::StepFailed { pid, .. } => *pid,
-                DebugEvent::Unknown => 0, // Or handle as an error
+                DebugEvent::Unknown { pid, .. } => *pid,
             }
         }
 
@@ -688,8 +695,8 @@ pub mod request_response {
                 DebugEvent::RipEvent { tid, .. } => *tid,
                 DebugEvent::StepComplete { tid, .. } => *tid,
                 DebugEvent::StepFailed { tid, .. } => *tid,
-                DebugEvent::ProcessExited { .. } => 0,
-                DebugEvent::Unknown => 0,
+                DebugEvent::ProcessExited { tid, .. } => *tid,
+                DebugEvent::Unknown { tid, .. } => *tid,
             }
         }
     }

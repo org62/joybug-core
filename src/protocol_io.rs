@@ -179,6 +179,9 @@ pub struct DebugSession<S> {
     /// Handler called on exception events; overrides exception_config if set.
     /// Receives (session, pid, tid, code, address, first_chance, parameters) and returns the desired action.
     on_exception: Option<Box<dyn FnMut(&mut Self, u32, u32, u32, u64, bool, &[u64]) -> anyhow::Result<ExceptionAction> + Send + 'static>>,
+    /// PID of the root (first) process. Used in multi-process mode to distinguish
+    /// root process exit (terminates session) from child process exit (auto-continues).
+    root_pid: Option<u32>,
 }
 
 impl<S> DebugSession<S> {
@@ -202,6 +205,7 @@ impl<S> DebugSession<S> {
             on_event: None,
             exception_config: ExceptionConfig::default(),
             on_exception: None,
+            root_pid: None,
         })
     }
     /// Handle the initial process breakpoint
@@ -394,10 +398,18 @@ impl<S> DebugSession<S> {
 
     /// Launch a process and run the debug session with the configured callbacks
     /// Returns the final state after the session completes
-    pub fn launch(mut self, command: String) -> anyhow::Result<S> {
-        let launch = DebuggerRequest::Launch { command };
+    pub fn launch(self, command: String) -> anyhow::Result<S> {
+        self.launch_inner(command, false)
+    }
+
+    /// Launch a process with child-process debugging enabled
+    pub fn launch_with_children(self, command: String) -> anyhow::Result<S> {
+        self.launch_inner(command, true)
+    }
+
+    fn launch_inner(mut self, command: String, debug_children: bool) -> anyhow::Result<S> {
+        let launch = DebuggerRequest::Launch { command, debug_children };
         self.send(&launch)?;
-        // Don't wait for a response here, run_session_loop will handle it
         self.run_session_loop(None)?;
         Ok(self.state)
     }
@@ -548,6 +560,9 @@ impl<S> DebugSession<S> {
                 base_of_image,
                 ..
             } => {
+                if self.root_pid.is_none() {
+                    self.root_pid = Some(*pid);
+                }
                 if let Some(ref mut handler) = on_process_created {
                     let name = image_file_name.as_deref().unwrap_or("<unknown>");
                     handler(self, *pid, *tid, name, *base_of_image)?;
@@ -558,7 +573,7 @@ impl<S> DebugSession<S> {
                     handler(self, *pid, *tid, *exit_code)?;
                 }
             }
-            DebugEvent::ProcessExited { pid, exit_code } => {
+            DebugEvent::ProcessExited { pid, exit_code, .. } => {
                 if let Some(ref mut handler) = on_process_exited {
                     handler(self, *pid, *exit_code)?;
                 }
@@ -635,7 +650,22 @@ impl<S> DebugSession<S> {
 
         // Handle automatic continuation for most events
         match event {
-            DebugEvent::ProcessExited { .. } => return Ok(false),
+            DebugEvent::ProcessExited { pid, tid, .. } => {
+                // If this is a child process exit (not root), auto-continue
+                let is_root = self.root_pid.is_none_or(|root| root == *pid);
+                if is_root {
+                    return Ok(false);
+                } else {
+                    let cont = DebuggerRequest::Continue {
+                        pid: *pid,
+                        tid: *tid,
+                        pass_exception: false,
+                    };
+                    let mut stream = self.stream.lock().unwrap();
+                    debug!("Auto-continue on child process exit: {}", event);
+                    send_request(&mut stream, &cont)?;
+                }
+            }
 
             DebugEvent::Exception { pid, tid, .. } => {
                 let cont = DebuggerRequest::Continue {
@@ -673,7 +703,7 @@ impl<S> DebugSession<S> {
                 // Do not auto-continue on step failure; let UI control flow
                 debug!("Not auto-continuing on StepFailed: {}", event);
             }
-            DebugEvent::Unknown => {}
+            DebugEvent::Unknown { .. } => {}
         }
 
         Ok(true)

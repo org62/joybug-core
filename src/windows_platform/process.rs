@@ -20,7 +20,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, IsWow64Process2,
-    DEBUG_PROCESS, INFINITE, PROCESS_INFORMATION, STARTUPINFOW, OpenProcess, TerminateProcess, PROCESS_TERMINATE, PROCESS_ALL_ACCESS,
+    DEBUG_PROCESS, DEBUG_ONLY_THIS_PROCESS, INFINITE, PROCESS_INFORMATION, STARTUPINFOW, OpenProcess, TerminateProcess, PROCESS_TERMINATE, PROCESS_ALL_ACCESS,
 };
 use windows_sys::Win32::System::SystemInformation::{
     IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_UNKNOWN
@@ -32,7 +32,7 @@ fn to_wide(s: &str) -> Vec<u16> {
 }
 
 /// Determine the architecture of a process by checking if it's running under WoW64
-fn determine_process_architecture(process_handle: windows_sys::Win32::Foundation::HANDLE) -> Result<Architecture, PlatformError> {
+pub(super) fn determine_process_architecture(process_handle: windows_sys::Win32::Foundation::HANDLE) -> Result<Architecture, PlatformError> {
     let mut process_machine: u16 = IMAGE_FILE_MACHINE_UNKNOWN;
     let mut native_machine: u16 = IMAGE_FILE_MACHINE_UNKNOWN;
 
@@ -71,13 +71,14 @@ fn determine_process_architecture(process_handle: windows_sys::Win32::Foundation
     }
 }
 
-pub(super) fn launch(platform: &mut WindowsPlatform, command: &str) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
+pub(super) fn launch(platform: &mut WindowsPlatform, command: &str, debug_children: bool) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
     println!("[windows_platform] launch thread id: {:?}", std::thread::current().id());
     trace!(command, "WindowsPlatform::launch called");
     let cmd_line_wide = to_wide(command);
     let mut startup_info: STARTUPINFOW = unsafe { std::mem::zeroed() };
     startup_info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut process_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let debug_flags = if debug_children { DEBUG_PROCESS } else { DEBUG_ONLY_THIS_PROCESS };
     let success = unsafe {
         CreateProcessW(
             ptr::null(),
@@ -85,7 +86,7 @@ pub(super) fn launch(platform: &mut WindowsPlatform, command: &str) -> Result<Op
             ptr::null_mut(),
             ptr::null_mut(),
             FALSE,
-            DEBUG_PROCESS,
+            debug_flags,
             ptr::null_mut(),
             ptr::null(),
             &mut startup_info,
