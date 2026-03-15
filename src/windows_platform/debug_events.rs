@@ -457,6 +457,43 @@ pub(super) fn handle_exception_event(
             return Ok(None);
         }
 
+        // Active stepper completion — check BEFORE DR6 so that a user-initiated step
+        // from a HW BP isn't misinterpreted as a new HW BP hit (stale DR6 bits).
+        if let Some(step_state) = process.take_active_single_step(tid) {
+            trace!(pid = pid, tid = tid, kind = ?step_state.kind, address = %format!("0x{:X}", ex_record.ExceptionAddress as u64), "Single-step from active stepper");
+            let rearm_addr = ex_record.ExceptionAddress as u64;
+            // Clear single-step flag, and if there's a deferred HW BP rearm, combine both
+            // into one context operation to avoid a redundant GetThreadContext/SetThreadContext.
+            #[cfg(target_arch = "x86_64")]
+            if let Some(rearm_dr_index) = step_state.deferred_hw_bp_rearm {
+                trace!(pid, tid, rearm_dr_index, "Re-arming deferred hardware breakpoint after step completion");
+                let process = platform.get_process(pid)?;
+                let thread_handle = process.thread_manager().get_thread_handle(tid)
+                    .ok_or_else(|| PlatformError::OsError(format!("No handle for thread {}", tid)))?;
+                let mut aligned = super::AlignedContext { context: unsafe { std::mem::zeroed() } };
+                aligned.context.ContextFlags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_DEBUG_REGISTERS_AMD64
+                    | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64;
+                if unsafe { windows_sys::Win32::System::Diagnostics::Debug::GetThreadContext(thread_handle, &mut aligned.context) } != 0 {
+                    // Clear trap flag
+                    aligned.context.EFlags &= !(0x100u32);
+                    super::hardware_breakpoints::enable_hw_bp_enable(&mut aligned.context, rearm_dr_index);
+                    aligned.context.Dr6 = 0;
+                    let _ = unsafe { windows_sys::Win32::System::Diagnostics::Debug::SetThreadContext(thread_handle, &aligned.context) };
+                }
+            } else {
+                if let Err(e) = stepper::clear_single_step_flag_native2(platform, pid, tid) { error!("Failed to clear single-step flag: {}", e); }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                if let Err(e) = stepper::clear_single_step_flag_native2(platform, pid, tid) { error!("Failed to clear single-step flag: {}", e); }
+            }
+            {
+                let process = platform.get_process(pid)?;
+                let _ = process.rearm_persistent_breakpoint_if_matches_original(rearm_addr);
+            }
+            return Ok(Some(crate::protocol::DebugEvent::StepComplete { pid, tid, kind: step_state.kind, address: ex_record.ExceptionAddress as u64 }));
+        }
+
         // Check for hardware breakpoint hit via DR6
         #[cfg(target_arch = "x86_64")]
         {
@@ -487,18 +524,6 @@ pub(super) fn handle_exception_event(
                     }
                 }
             }
-        }
-
-        // Active stepper completion
-        if let Some(step_state) = process.take_active_single_step(tid) {
-            trace!(pid = pid, tid = tid, kind = ?step_state.kind, address = %format!("0x{:X}", ex_record.ExceptionAddress as u64), "Single-step from active stepper");
-            if let Err(e) = stepper::clear_single_step_flag_native2(platform, pid, tid) { error!("Failed to clear single-step flag: {}", e); }
-            let rearm_addr = ex_record.ExceptionAddress as u64;
-            {
-                let process = platform.get_process(pid)?;
-                let _ = process.rearm_persistent_breakpoint_if_matches_original(rearm_addr);
-            }
-            return Ok(Some(crate::protocol::DebugEvent::StepComplete { pid, tid, kind: step_state.kind, address: ex_record.ExceptionAddress as u64 }));
         }
 
         // Unexpected SS

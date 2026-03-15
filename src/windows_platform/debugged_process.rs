@@ -178,9 +178,9 @@ impl DebuggedProcess {
 
     /// Record that a thread is in an active single-step operation. Returns true if an existing
     /// record for this thread was replaced.
-    pub(super) fn record_active_single_step(&mut self, tid: u32, kind: crate::protocol::StepKind) -> bool {
+    pub(super) fn record_active_single_step(&mut self, tid: u32, kind: crate::protocol::StepKind, deferred_hw_bp_rearm: Option<u8>) -> bool {
         self.active_single_steps
-            .insert(tid, super::StepState { kind })
+            .insert(tid, super::StepState { kind, deferred_hw_bp_rearm })
             .is_some()
     }
 
@@ -308,6 +308,7 @@ impl DebuggedProcess {
     pub(super) fn take_pending_hw_bp_rearm(&mut self, tid: u32) -> Option<u8> {
         self.pending_hw_bp_rearm.remove(&tid)
     }
+
 }
 
 impl Drop for DebuggedProcess {

@@ -52,6 +52,8 @@ struct AlignedContext {
 #[derive(Debug, Clone)]
 pub(crate) struct StepState {
     pub(crate) kind: StepKind,
+    /// If set, a hardware breakpoint DR index that needs re-arming after the step completes.
+    pub(crate) deferred_hw_bp_rearm: Option<u8>,
 }
 
 pub(crate) use debugged_process::DebuggedProcess;
