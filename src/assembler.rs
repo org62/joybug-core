@@ -45,6 +45,9 @@ pub fn assemble(arch: Architecture, code: &str, address: u64) -> Result<Assemble
 /// `[0xADDR]` memory operands, we compute the correct RIP-relative
 /// displacement via a two-pass approach (first pass to get instruction
 /// length, second pass with the computed displacement).
+///
+/// Input may use Intel syntax (e.g. `qword ptr [rsp+8]` from Capstone
+/// disassembly). We automatically strip `ptr` since NASM doesn't use it.
 fn assemble_x64(code: &str, address: u64) -> Result<AssembleOutput, AssembleError> {
     let map_err = |e: keystone_engine::KeystoneError| AssembleError {
         message: format!("{}", e),
@@ -64,6 +67,10 @@ fn assemble_x64(code: &str, address: u64) -> Result<AssembleOutput, AssembleErro
         if trimmed.is_empty() {
             continue;
         }
+
+        // Strip Intel-style "ptr" keyword (NASM doesn't use it).
+        // "qword ptr [rsp+8]" → "qword [rsp+8]"
+        let trimmed = &strip_intel_ptr(trimmed);
 
         let current_addr = address + output_bytes.len() as u64;
 
@@ -102,10 +109,48 @@ fn assemble_x64(code: &str, address: u64) -> Result<AssembleOutput, AssembleErro
         }
     }
 
+    if output_bytes.is_empty() {
+        return Err(AssembleError {
+            message: "Assembly produced no output".to_string(),
+        });
+    }
+
     Ok(AssembleOutput {
         bytes: output_bytes,
         stat_count,
     })
+}
+
+/// Strip Intel-syntax `ptr` keyword from assembly text.
+/// Converts e.g. `qword ptr [rsp+8]` → `qword [rsp+8]`.
+fn strip_intel_ptr(s: &str) -> String {
+    let lower = s.to_lowercase();
+    let mut result = String::with_capacity(s.len());
+    let mut i = 0;
+    let chars: Vec<char> = s.chars().collect();
+    let lower_chars: Vec<char> = lower.chars().collect();
+
+    while i < chars.len() {
+        // Look for " ptr" followed by space or '['
+        if i + 4 <= chars.len()
+            && lower_chars[i] == ' '
+            && lower_chars[i + 1] == 'p'
+            && lower_chars[i + 2] == 't'
+            && lower_chars[i + 3] == 'r'
+        {
+            let after = if i + 4 < chars.len() { lower_chars[i + 4] } else { '\0' };
+            if after == ' ' || after == '[' || after == '\0' {
+                // Skip " ptr" but keep the leading space
+                result.push(' ');
+                // Also skip trailing space after ptr to avoid double spaces
+                i += if after == ' ' { 5 } else { 4 };
+                continue;
+            }
+        }
+        result.push(chars[i]);
+        i += 1;
+    }
+    result
 }
 
 /// Split assembly code into individual statements by newlines and semicolons.
@@ -240,6 +285,37 @@ mod tests {
         ]);
         let expected_disp = (target as i64 - (base + 6) as i64) as i32;
         assert_eq!(disp, expected_disp);
+    }
+
+    #[test]
+    fn test_assemble_x64_invalid_register() {
+        // rbxxxx is not a valid register - must be rejected
+        let result = assemble(Architecture::X64, "mov qword [rsp + 8], rbxxxx", 0x1000);
+        assert!(result.is_err(), "Expected error for invalid register 'rbxxxx', got {:?}", result.as_ref().map(|r| &r.bytes));
+
+        // Also test with Intel "ptr" syntax (what Capstone outputs)
+        let result_ptr = assemble(Architecture::X64, "mov qword ptr [rsp + 8], rbxxxx", 0x1000);
+        assert!(result_ptr.is_err(), "Expected error for invalid register 'rbxxxx' with ptr syntax, got {:?}", result_ptr.as_ref().map(|r| &r.bytes));
+    }
+
+    #[test]
+    fn test_assemble_x64_intel_ptr_syntax() {
+        // Intel "ptr" syntax (from Capstone) must work after automatic stripping
+        let result = assemble(Architecture::X64, "mov qword ptr [rsp + 8], rbx", 0x1000).unwrap();
+        assert!(!result.bytes.is_empty());
+
+        let nasm_result = assemble(Architecture::X64, "mov qword [rsp + 8], rbx", 0x1000).unwrap();
+        assert_eq!(result.bytes, nasm_result.bytes, "ptr syntax should produce same bytes as NASM syntax");
+    }
+
+    #[test]
+    fn test_strip_intel_ptr() {
+        assert_eq!(strip_intel_ptr("mov qword ptr [rsp + 8], rbx"), "mov qword [rsp + 8], rbx");
+        assert_eq!(strip_intel_ptr("mov DWORD PTR [rax], 1"), "mov DWORD [rax], 1");
+        assert_eq!(strip_intel_ptr("mov byte ptr[rcx], 0"), "mov byte [rcx], 0");
+        // No ptr — unchanged
+        assert_eq!(strip_intel_ptr("mov qword [rsp + 8], rbx"), "mov qword [rsp + 8], rbx");
+        assert_eq!(strip_intel_ptr("nop"), "nop");
     }
 
     #[test]

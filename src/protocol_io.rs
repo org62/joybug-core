@@ -1197,6 +1197,18 @@ impl<S> DebugSession<S> {
         }
     }
 
+    /// Re-arm a persistent breakpoint at the given address.
+    ///
+    /// Sends SetBreakpoint to the server to update stored original bytes and
+    /// write the breakpoint instruction. Does NOT register a new callback handler —
+    /// existing handlers are preserved.
+    ///
+    /// Use this after temporarily removing a breakpoint (e.g. to read original
+    /// bytes or apply a patch) when the handler is still registered.
+    pub fn rearm_breakpoint(&mut self, pid: u32, addr: u64) -> anyhow::Result<()> {
+        self.setup_persistent_breakpoint(pid, addr, None)
+    }
+
     /// Remove a breakpoint at the specified address.
     ///
     /// # Arguments
