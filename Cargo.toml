@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "trace"
 path = "src/bin/trace.rs"
 
+[[bin]]
+name = "jlua"
+path = "src/bin/jlua.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1.37", features = ["full", "rt"] }
@@ -50,6 +54,8 @@ rayon = "1.10"
 bincode = { version = "2.0.0-rc.3", features = ["serde"] }
 unicorn-engine = { git = "https://github.com/expend20/unicorn", branch = "AVX2-port" }
 keystone-engine = "0.1"
+mlua = { version = "0.10", features = ["lua54", "send", "vendored"] }
+rustyline = "15"
 
 [build-dependencies]
 cc = "1.0"

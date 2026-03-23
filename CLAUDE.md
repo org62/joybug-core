@@ -99,6 +99,23 @@ Integration tests in `tests/` use compiled C programs from `tests/test_programs/
 - `emulator/mod.rs` - Unicorn CPU emulator for forward execution
 - `callstack_proposal.md` - Design doc for call stack feature
 - `docs/stepping/` - Stepping algorithm analysis
+- [docs/jlua-guide.md](docs/jlua-guide.md) - Lua scripting API reference (jlua REPL + `dbg` API)
+
+## Lua Scripting (`src/scripting/`)
+
+Every debugger feature must be accessible from Lua. When adding a new feature:
+
+1. Add the Lua binding method in `src/scripting/bindings.rs`
+2. Add a Lua integration test in `tests/lua/` (grouped by topic: basics, breakpoints, disassembly, memory, stepping, modules, emulation)
+3. Register the test in `tests/scripting_test.rs` (use `run_lua_test_file()` helper)
+4. Update [docs/jlua-guide.md](docs/jlua-guide.md) with the new API
+
+Key files:
+- `src/scripting/bindings.rs` - All `dbg:*` method bindings (LuaDebugClient)
+- `src/scripting/debug_client.rs` - DebugClient, event loop, helper converters (instruction_to_lua_table, etc.)
+- `src/scripting/lua_helpers.lua` - Built-in Lua helpers (hex, hexdump, regs, disasm, etc.)
+- `src/scripting/repl.rs` - Interactive REPL with tab completion
+- `tests/lua/` - Lua test scripts organized by topic
 
 ## Feature Documentation
 
