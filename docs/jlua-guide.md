@@ -469,3 +469,73 @@ end)
 dbg:launch("server.exe")
 dbg:run()
 ```
+
+### In-Process Inline Hooks
+
+Hook functions in the current process with Lua callbacks. The hook uses inline code patching (no INT3/exceptions) for fast interception.
+
+```lua
+-- Hook a function at a known address.
+-- The callback receives a context table with all x64 registers.
+local info = dbg:hook(address, function(ctx)
+    -- Read arguments (Windows x64 fastcall: rcx, rdx, r8, r9)
+    print("arg1:", hex(ctx.rcx))
+    print("arg2:", hex(ctx.rdx))
+
+    -- Modify arguments before the original function runs
+    ctx.rcx = ctx.rcx * 2
+end)
+-- info.id         = hook ID
+-- info.trampoline = address of the original function trampoline
+-- info.address    = hooked address
+
+-- Remove the hook, restoring the original function
+dbg:unhook(address)
+```
+
+**Context fields:** `rax`, `rcx`, `rdx`, `rbx`, `rbp`, `rsi`, `rdi`, `r8`–`r15`, `rflags`
+
+The original function always executes after the callback returns (via trampoline). To skip the original, modify `ctx` to adjust control flow.
+
+### In-Process Memory Access (`mem`)
+
+The `mem` table provides direct memory read/write for the current process. Available everywhere (hooks, scripts, REPL).
+
+```lua
+-- Read typed values
+local val  = mem.read_u8(addr)
+local val  = mem.read_u16(addr)
+local val  = mem.read_u32(addr)
+local ptr  = mem.read_u64(addr)
+
+-- Read raw bytes (returns Lua string)
+local data = mem.read(addr, 64)
+
+-- Read strings
+local s  = mem.read_str(addr)            -- null-terminated ASCII/UTF-8
+local ws = mem.read_wstr(addr)           -- null-terminated UTF-16 (Windows wide string)
+local s  = mem.read_str(addr, 256)       -- with max length
+
+-- Write typed values
+mem.write_u8(addr, 0x90)
+mem.write_u16(addr, val)
+mem.write_u32(addr, val)
+mem.write_u64(addr, val)
+
+-- Write raw bytes
+mem.write(addr, "\x90\x90\x90")
+mem.write(addr, data)
+```
+
+#### Hook + Memory Example: Logging CreateFileW
+
+```lua
+dbg:hook(CreateFileW_addr, function(ctx)
+    -- RCX = LPCWSTR lpFileName (first arg, wide string pointer)
+    local filename = mem.read_wstr(ctx.rcx)
+    print("CreateFileW:", filename)
+
+    -- Read the second argument (dwDesiredAccess) from RDX
+    print("  access:", hex(ctx.rdx))
+end)
+```

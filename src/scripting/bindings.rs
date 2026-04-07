@@ -1205,7 +1205,122 @@ impl LuaUserData for LuaDebugClient {
             table.set("size", result.bytes.len())?;
             Ok(table)
         });
+
+        // ---- Inline hooks ----
+
+        methods.add_method("hook", |lua, _this, (addr, callback): (u64, LuaFunction)| {
+            let mut engine = HOOK_ENGINE.lock().unwrap();
+            let (hook_id, trampoline) = engine.hook(addr as *const u8, lua, callback)
+                .map_err(|e| mlua::Error::external(anyhow::anyhow!("hook failed: {}", e)))?;
+            let table = lua.create_table()?;
+            table.set("id", hook_id)?;
+            table.set("trampoline", trampoline as u64)?;
+            table.set("address", addr)?;
+            Ok(table)
+        });
+
+        methods.add_method("unhook", |_lua, _this, addr: u64| {
+            let mut engine = HOOK_ENGINE.lock().unwrap();
+            engine.unhook(addr)
+                .map_err(|e| mlua::Error::external(anyhow::anyhow!("unhook failed: {}", e)))?;
+            Ok(())
+        });
+
+        // (In-process memory access is registered as globals via register_mem_functions)
     }
+}
+
+#[cfg(windows)]
+use std::sync::{LazyLock, Mutex};
+
+#[cfg(windows)]
+static HOOK_ENGINE: LazyLock<Mutex<crate::inline_hook::LuaHookEngine>> =
+    LazyLock::new(|| Mutex::new(crate::inline_hook::LuaHookEngine::new()));
+
+/// Register in-process memory access functions as a `mem` global table.
+pub fn register_mem_functions(lua: &Lua) -> mlua::Result<()> {
+    let mem = lua.create_table()?;
+
+    mem.set("read", lua.create_function(|lua, (addr, size): (u64, usize)| {
+        if size == 0 || size > 1024 * 1024 {
+            return Err(mlua::Error::external(anyhow::anyhow!("invalid size")));
+        }
+        let data = unsafe { std::slice::from_raw_parts(addr as *const u8, size) };
+        lua.create_string(data)
+    })?)?;
+
+    mem.set("write", lua.create_function(|_lua, (addr, data): (u64, mlua::String)| {
+        let bytes = data.as_bytes();
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len());
+        }
+        Ok(())
+    })?)?;
+
+    mem.set("read_u8", lua.create_function(|_lua, addr: u64| {
+        Ok(unsafe { *(addr as *const u8) } as u64)
+    })?)?;
+
+    mem.set("read_u16", lua.create_function(|_lua, addr: u64| {
+        Ok(unsafe { std::ptr::read_unaligned(addr as *const u16) } as u64)
+    })?)?;
+
+    mem.set("read_u32", lua.create_function(|_lua, addr: u64| {
+        Ok(unsafe { std::ptr::read_unaligned(addr as *const u32) } as u64)
+    })?)?;
+
+    mem.set("read_u64", lua.create_function(|_lua, addr: u64| {
+        Ok(unsafe { std::ptr::read_unaligned(addr as *const u64) })
+    })?)?;
+
+    mem.set("write_u8", lua.create_function(|_lua, (addr, val): (u64, u64)| {
+        unsafe { *(addr as *mut u8) = val as u8; }
+        Ok(())
+    })?)?;
+
+    mem.set("write_u16", lua.create_function(|_lua, (addr, val): (u64, u64)| {
+        unsafe { std::ptr::write_unaligned(addr as *mut u16, val as u16); }
+        Ok(())
+    })?)?;
+
+    mem.set("write_u32", lua.create_function(|_lua, (addr, val): (u64, u64)| {
+        unsafe { std::ptr::write_unaligned(addr as *mut u32, val as u32); }
+        Ok(())
+    })?)?;
+
+    mem.set("write_u64", lua.create_function(|_lua, (addr, val): (u64, u64)| {
+        unsafe { std::ptr::write_unaligned(addr as *mut u64, val); }
+        Ok(())
+    })?)?;
+
+    mem.set("read_str", lua.create_function(|lua, (addr, max_len): (u64, Option<usize>)| {
+        let max = max_len.unwrap_or(4096);
+        let ptr = addr as *const u8;
+        let mut len = 0;
+        while len < max {
+            if unsafe { *ptr.add(len) } == 0 { break; }
+            len += 1;
+        }
+        let data = unsafe { std::slice::from_raw_parts(ptr, len) };
+        lua.create_string(data)
+    })?)?;
+
+    mem.set("read_wstr", lua.create_function(|_lua, (addr, max_len): (u64, Option<usize>)| {
+        let max = max_len.unwrap_or(4096);
+        let ptr = addr as *const u16;
+        let mut len = 0;
+        while len < max {
+            if unsafe { std::ptr::read_unaligned(ptr.add(len)) } == 0 { break; }
+            len += 1;
+        }
+        let wchars: Vec<u16> = (0..len)
+            .map(|i| unsafe { std::ptr::read_unaligned(ptr.add(i)) })
+            .collect();
+        Ok(String::from_utf16_lossy(&wchars))
+    })?)?;
+
+    lua.globals().set("mem", mem)?;
+    Ok(())
 }
 
 // ---- Memory formatting helpers (exposed as Lua globals) ----

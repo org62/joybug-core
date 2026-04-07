@@ -29,5 +29,8 @@ pub fn create_lua() -> mlua::Result<Lua> {
     // Register memory formatting globals
     bindings::register_memory_formatters(&lua)?;
 
+    // Register in-process memory access (mem.read, mem.write, etc.)
+    bindings::register_mem_functions(&lua)?;
+
     Ok(lua)
 }
