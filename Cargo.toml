@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "veh_shared", "veh_dll"]
+
 [package]
 name = "joybug2"
 version = "0.1.0"
@@ -56,6 +59,7 @@ unicorn-engine = { git = "https://github.com/expend20/unicorn", branch = "AVX2-p
 keystone-engine = "0.1"
 mlua = { version = "0.10", features = ["lua54", "send", "vendored"] }
 rustyline = "15"
+joybug2-veh-shared = { path = "veh_shared" }
 
 [build-dependencies]
 cc = "1.0"

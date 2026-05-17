@@ -14,6 +14,7 @@ pub mod assembler;
 pub mod memory_scanner;
 pub mod scripting;
 pub mod inline_hook;
+pub mod veh_platform;
 
 #[cfg(windows)]
 pub type PlatformImpl = windows_platform::WindowsPlatform;

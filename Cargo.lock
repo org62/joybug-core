@@ -913,6 +913,7 @@ dependencies = [
  "cc",
  "clap",
  "dirs 5.0.1",
+ "joybug2-veh-shared",
  "keystone-engine",
  "mlua",
  "msvc-demangler",
@@ -931,6 +932,18 @@ dependencies = [
  "uuid",
  "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "joybug2-veh-dll"
+version = "0.1.0"
+dependencies = [
+ "joybug2-veh-shared",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "joybug2-veh-shared"
+version = "0.1.0"
 
 [[package]]
 name = "js-sys"

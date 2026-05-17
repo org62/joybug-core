@@ -1,5 +1,6 @@
 //! Local debug server that runs in a separate thread with its own tokio runtime.
 
+use crate::interfaces::{PlatformAPI, Stepper};
 use std::net::TcpListener as StdTcpListener;
 use std::thread::JoinHandle;
 use tokio::sync::oneshot;
@@ -16,18 +17,36 @@ pub struct LocalServer {
 }
 
 impl LocalServer {
-    /// Start a local debug server on a dynamically allocated port.
-    /// Panics on failure. For a non-panicking version, use `start()`.
+    /// Start a local debug server with the default `WindowsPlatform` backend.
+    /// Panics on failure; use `start()` for a non-panicking variant.
     pub fn spawn() -> Self {
         Self::start().expect("Failed to start local debug server")
     }
 
-    /// Start a local debug server on a dynamically allocated port.
+    /// Start a local debug server with the default `WindowsPlatform` backend.
     pub fn start() -> Result<Self, String> {
+        Self::start_with(crate::PlatformImpl::new())
+    }
+
+    /// Start a local debug server with a custom platform implementation
+    /// (e.g., `VEHPlatform`). Panics on failure.
+    pub fn spawn_with<P>(platform: P) -> Self
+    where
+        P: PlatformAPI + Stepper + Send + Sync + 'static,
+    {
+        Self::start_with(platform).expect("Failed to start local debug server")
+    }
+
+    /// Start a local debug server with a custom platform implementation.
+    pub fn start_with<P>(platform: P) -> Result<Self, String>
+    where
+        P: PlatformAPI + Stepper + Send + Sync + 'static,
+    {
         let listener = StdTcpListener::bind(DEFAULT_BIND_ADDR)
             .map_err(|e| format!("Failed to bind listener: {}", e))?;
 
-        let local_addr = listener.local_addr()
+        let local_addr = listener
+            .local_addr()
             .map_err(|e| format!("Failed to get local address: {}", e))?;
         let port = local_addr.port();
         let address = local_addr.to_string();
@@ -41,8 +60,9 @@ impl LocalServer {
                 .expect("Failed to create tokio runtime");
             rt.block_on(async move {
                 let shutdown_future = async { let _ = shutdown_rx.await; };
-                if let Err(e) = crate::server::run_server_with_std_listener(
+                if let Err(e) = crate::server::run_server_with_platform(
                     listener,
+                    platform,
                     shutdown_future,
                 ).await {
                     error!("Local server error: {}", e);

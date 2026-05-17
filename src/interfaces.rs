@@ -375,6 +375,95 @@ pub trait PlatformAPI: Send + Sync {
 
         Ok((addresses, capped))
     }
+
+    // -----------------------------------------------------------------
+    // Server-side dispatch hooks
+    //
+    // These three methods let the connection handler delegate Continue,
+    // TerminateProcess, and BreakInto requests to the platform with its
+    // own locking discipline. The default impls take the platform lock
+    // and call through the regular trait methods — correct for any
+    // backend that does its work inside continue_exec / terminate_process
+    // / break_into. WindowsPlatform overrides them so the long-running
+    // OS calls (WaitForDebugEvent, etc.) happen outside the lock and
+    // don't starve concurrent read-only requests.
+    //
+    // `Self: Sized` is required so the method can take `&Arc<RwLock<Self>>`;
+    // these aren't callable via `&dyn PlatformAPI`, which is fine — they
+    // run from the generic connection handler.
+    // -----------------------------------------------------------------
+
+    fn server_continue(
+        platform: &std::sync::Arc<std::sync::RwLock<Self>>,
+        pid: u32,
+        tid: u32,
+        pass_exception: bool,
+    ) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>
+    where
+        Self: Sized,
+    {
+        let _ = pass_exception;
+        platform.write().unwrap().continue_exec(pid, tid)
+    }
+
+    fn server_terminate(
+        platform: &std::sync::Arc<std::sync::RwLock<Self>>,
+        pid: u32,
+    ) -> Result<(), PlatformError>
+    where
+        Self: Sized,
+    {
+        platform.read().unwrap().terminate_process(pid)
+    }
+
+    fn server_break_into(
+        platform: &std::sync::Arc<std::sync::RwLock<Self>>,
+        pid: u32,
+    ) -> Result<(), PlatformError>
+    where
+        Self: Sized,
+    {
+        platform.read().unwrap().break_into(pid)
+    }
+
+    // -----------------------------------------------------------------
+    // Optional backend-specific features. Default impls return
+    // NotImplemented; WindowsPlatform overrides them.
+    // -----------------------------------------------------------------
+
+    fn emulate_with_mode(
+        &self,
+        _pid: u32,
+        _tid: u32,
+        _max_instructions: usize,
+        _mode: crate::protocol::EmulationMode,
+        _exit_condition: Option<crate::protocol::TraceExitCondition>,
+        _memory_reads: &[(u64, usize)],
+    ) -> Result<crate::emulator::EmulationResult, PlatformError> {
+        Err(PlatformError::NotImplemented)
+    }
+
+    fn trace_instructions(
+        &mut self,
+        _pid: u32,
+        _tid: u32,
+        _exit_condition: crate::protocol::TraceExitCondition,
+        _max_instructions: usize,
+    ) -> Result<(Vec<crate::protocol::TraceEntry>, String, u64), PlatformError> {
+        Err(PlatformError::NotImplemented)
+    }
+
+    fn disassemble_function(
+        &self,
+        _pid: u32,
+        _address: u64,
+        _max_instructions: usize,
+        _arch: Architecture,
+    ) -> Result<(Vec<Instruction>, Option<u64>, Option<u64>, Option<String>), DisassemblerError> {
+        Err(DisassemblerError::CapstoneError(
+            "disassemble_function not supported by this platform".into(),
+        ))
+    }
 }
 
 impl SymbolInfo {

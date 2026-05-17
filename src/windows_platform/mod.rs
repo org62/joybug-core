@@ -702,6 +702,99 @@ impl PlatformAPI for WindowsPlatform {
         // Call the method we defined on WindowsPlatform
         WindowsPlatform::get_teb_address(self, pid, tid)
     }
+
+    // ---------------------- Server-side fast paths ----------------------
+    //
+    // These bypass the platform lock for OS calls that don't need shared
+    // state, so concurrent read-only requests aren't starved while a
+    // Continue is parked in WaitForDebugEvent.
+
+    fn server_continue(
+        platform: &std::sync::Arc<std::sync::RwLock<Self>>,
+        pid: u32,
+        tid: u32,
+        pass_exception: bool,
+    ) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
+        let mut cont_pid = pid;
+        let mut cont_tid = tid;
+        let mut cont_pass = pass_exception;
+        loop {
+            crate::windows_platform::debug_events::continue_debug_event(
+                cont_pid, cont_tid, cont_pass,
+            )?;
+
+            let debug_event =
+                crate::windows_platform::debug_events::wait_for_debug_event_blocking()?;
+
+            let mut p = platform.write().unwrap();
+            match crate::windows_platform::debug_events::handle_debug_event(&mut *p, &debug_event)?
+            {
+                Some(event) => return Ok(Some(event)),
+                None => {
+                    // Internal event (e.g., breakpoint rearm) — auto-continue.
+                    cont_pid = debug_event.dwProcessId;
+                    cont_tid = debug_event.dwThreadId;
+                    cont_pass = false;
+                }
+            }
+        }
+    }
+
+    fn server_terminate(
+        _platform: &std::sync::Arc<std::sync::RwLock<Self>>,
+        pid: u32,
+    ) -> Result<(), PlatformError> {
+        crate::windows_platform::process::terminate_process_unlocked(pid)
+    }
+
+    fn server_break_into(
+        _platform: &std::sync::Arc<std::sync::RwLock<Self>>,
+        pid: u32,
+    ) -> Result<(), PlatformError> {
+        crate::windows_platform::process::debug_break_process_unlocked(pid)
+    }
+
+    // ------------------ Optional features (forwarders) ------------------
+
+    fn emulate_with_mode(
+        &self,
+        pid: u32,
+        tid: u32,
+        max_instructions: usize,
+        mode: crate::protocol::EmulationMode,
+        exit_condition: Option<crate::protocol::TraceExitCondition>,
+        memory_reads: &[(u64, usize)],
+    ) -> Result<crate::emulator::EmulationResult, PlatformError> {
+        WindowsPlatform::emulate_with_mode(
+            self,
+            pid,
+            tid,
+            max_instructions,
+            mode,
+            exit_condition,
+            memory_reads,
+        )
+    }
+
+    fn trace_instructions(
+        &mut self,
+        pid: u32,
+        tid: u32,
+        exit_condition: crate::protocol::TraceExitCondition,
+        max_instructions: usize,
+    ) -> Result<(Vec<crate::protocol::TraceEntry>, String, u64), PlatformError> {
+        WindowsPlatform::trace_instructions(self, pid, tid, exit_condition, max_instructions)
+    }
+
+    fn disassemble_function(
+        &self,
+        pid: u32,
+        address: u64,
+        max_instructions: usize,
+        arch: Architecture,
+    ) -> Result<(Vec<Instruction>, Option<u64>, Option<u64>, Option<String>), DisassemblerError> {
+        WindowsPlatform::disassemble_function(self, pid, address, max_instructions, arch)
+    }
 }
 
 impl Stepper for WindowsPlatform {
