@@ -133,9 +133,9 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
-            DebuggerRequest::Launch { command, debug_children } => {
+            DebuggerRequest::Launch { command, debug_children, working_directory } => {
                 let mut p = platform.write().unwrap();
-                match p.launch(&command, debug_children) {
+                match p.launch(&command, debug_children, working_directory.as_deref()) {
                     Ok(Some(event)) => DebuggerResponse::Event { event },
                     Ok(None) => DebuggerResponse::Ack,
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
@@ -391,6 +391,13 @@ where
                             stats_text: String::new(),
                         }
                     }
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::HidePeb { pid, options } => {
+                let p = platform.read().unwrap();
+                match crate::anti_anti_debug::peb::hide_peb(&*p, pid, &options) {
+                    Ok(report) => DebuggerResponse::PebHideResult { report },
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }

@@ -133,6 +133,10 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::MemorySearchResult { addresses, capped } => format!("MemorySearchResult ({} matches, capped={})", addresses.len(), capped),
         DebuggerResponse::ScanMemoryResult { match_count, .. } => format!("ScanMemoryResult ({} matches)", match_count),
         DebuggerResponse::ScanMemoryResults { addresses, total_count, .. } => format!("ScanMemoryResults ({}/{} returned)", addresses.len(), total_count),
+        DebuggerResponse::PebHideResult { report } => format!(
+            "PebHideResult (peb=0x{:X}, applied={}, failed={}, wow64_skipped={})",
+            report.peb_address, report.applied.len(), report.failures.len(), report.wow64_skipped,
+        ),
     };
     debug!("Received response: {}", summary);
     Ok(resp)
@@ -399,16 +403,22 @@ impl<S> DebugSession<S> {
     /// Launch a process and run the debug session with the configured callbacks
     /// Returns the final state after the session completes
     pub fn launch(self, command: String) -> anyhow::Result<S> {
-        self.launch_inner(command, false)
+        self.launch_inner(command, false, None)
     }
 
     /// Launch a process with child-process debugging enabled
     pub fn launch_with_children(self, command: String) -> anyhow::Result<S> {
-        self.launch_inner(command, true)
+        self.launch_inner(command, true, None)
     }
 
-    fn launch_inner(mut self, command: String, debug_children: bool) -> anyhow::Result<S> {
-        let launch = DebuggerRequest::Launch { command, debug_children };
+    /// Launch a process in a specific working directory and run the debug session.
+    /// Pass `None` to inherit the debugger's current working directory.
+    pub fn launch_in_dir(self, command: String, working_directory: Option<String>) -> anyhow::Result<S> {
+        self.launch_inner(command, false, working_directory)
+    }
+
+    fn launch_inner(mut self, command: String, debug_children: bool, working_directory: Option<String>) -> anyhow::Result<S> {
+        let launch = DebuggerRequest::Launch { command, debug_children, working_directory };
         self.send(&launch)?;
         self.run_session_loop(None)?;
         Ok(self.state)
@@ -1074,6 +1084,23 @@ impl<S> DebugSession<S> {
             other => {
                 Err(anyhow::anyhow!("Unexpected response to WriteMemory: {:?}", other))
             }
+        }
+    }
+
+    /// Apply anti-anti-debug PEB patches to the target process. See
+    /// [`crate::anti_anti_debug::peb::hide_peb`] for the field-by-field semantics.
+    pub fn hide_peb(
+        &mut self,
+        pid: u32,
+        options: crate::anti_anti_debug::PebHideOptions,
+    ) -> anyhow::Result<crate::anti_anti_debug::PebHideReport> {
+        let req = DebuggerRequest::HidePeb { pid, options };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::PebHideResult { report } => Ok(report),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to hide PEB: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to HidePeb: {:?}", other)),
         }
     }
 

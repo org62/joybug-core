@@ -305,6 +305,8 @@ pub mod request_response {
             command: String,
             #[serde(default)]
             debug_children: bool,
+            #[serde(default)]
+            working_directory: Option<String>,
         },
         Continue {
             pid: u32,
@@ -483,6 +485,11 @@ pub mod request_response {
         ScanMemoryReset {
             scan_id: u64,
         },
+        // Anti-anti-debug
+        HidePeb {
+            pid: u32,
+            options: crate::anti_anti_debug::PebHideOptions,
+        },
     }
 
     #[derive(Serialize, Deserialize, Clone)]
@@ -564,6 +571,10 @@ pub mod request_response {
             trace_time_us: u64,
             /// Detailed timing breakdown
             stats_text: String,
+        },
+        // Anti-anti-debug
+        PebHideResult {
+            report: crate::anti_anti_debug::PebHideReport,
         },
     }
 

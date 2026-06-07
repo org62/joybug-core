@@ -61,6 +61,7 @@ break 1234:5678 0x7FF8CDCACBC4> go
 ```lua
 dbg:launch("program.exe arg1 arg2")   -- Launch a process
 dbg:launch("program.exe", true)        -- Launch with child-process debugging
+dbg:launch("program.exe", false, "C:\\work")  -- Launch in a specific working directory
 dbg:attach(pid)                        -- Attach to a running process
 dbg:run()                              -- Enter the event loop (processes events until exit)
 dbg:terminate(pid)                     -- Terminate the debuggee
@@ -340,6 +341,38 @@ end
 -- Reset to start over
 dbg:scan_reset(scan.scan_id)
 ```
+
+### Anti-Anti-Debug
+
+Defeat common anti-debug probes by patching well-known fields in the target's PEB.
+Apply once on the initial breakpoint — the kernel doesn't re-write these fields, so
+a single hide is enough for static checks.
+
+```lua
+-- Enable every technique (BeingDebugged, NtGlobalFlag, primary HEAP flags,
+-- RTL_USER_PROCESS_PARAMETERS window fields, spoof OSBuildNumber=19045).
+local report = dbg:hide_peb(pid)                    -- nil opts ≡ { all = true }
+local report = dbg:hide_peb(pid, { all = true })
+
+-- Or pick specific techniques (missing keys = false).
+local report = dbg:hide_peb(pid, {
+    being_debugged  = true,
+    nt_global_flag  = true,
+    heap_flags      = true,
+    startup_info    = false,
+    os_build_number = false,
+})
+
+-- Report shape:
+--   report.peb_address    -- u64, target's PEB base (0 if WOW64 was skipped)
+--   report.applied        -- list of technique names that were written
+--   report.failures       -- list of { technique = "...", error = "..." }
+--   report.wow64_skipped  -- true if the target is a 32-bit WOW64 process
+```
+
+WOW64 (32-bit on 64-bit Windows) targets are detected and skipped — the offsets in
+this module target the 64-bit native PEB layout. Returns `wow64_skipped = true`
+with no writes performed.
 
 ### Drop into REPL
 

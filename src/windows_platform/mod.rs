@@ -221,6 +221,96 @@ impl WindowsPlatform {
             Err(PlatformError::Other(format!("NtQueryInformationThread failed: 0x{:08X}", status)))
         }
     }
+
+    /// Get the PEB (Process Environment Block) base address for a process.
+    pub fn get_peb_address(&self, pid: u32) -> Result<u64, PlatformError> {
+        let process_handle = self.get_process(pid)?.handle();
+
+        // PROCESS_BASIC_INFORMATION layout — see `winternl.h`.
+        #[repr(C)]
+        struct ProcessBasicInformation {
+            exit_status: i32,
+            peb_base_address: *mut std::ffi::c_void,
+            affinity_mask: usize,
+            base_priority: i32,
+            unique_process_id: usize,
+            inherited_from_unique_process_id: usize,
+        }
+
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtQueryInformationProcess(
+                process_handle: HANDLE,
+                process_information_class: u32,
+                process_information: *mut std::ffi::c_void,
+                process_information_length: u32,
+                return_length: *mut u32,
+            ) -> i32;
+        }
+
+        const PROCESS_BASIC_INFORMATION_CLASS: u32 = 0;
+
+        let mut info: ProcessBasicInformation = unsafe { std::mem::zeroed() };
+        let mut return_length: u32 = 0;
+        let status = unsafe {
+            NtQueryInformationProcess(
+                process_handle,
+                PROCESS_BASIC_INFORMATION_CLASS,
+                &mut info as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of::<ProcessBasicInformation>() as u32,
+                &mut return_length,
+            )
+        };
+
+        if status >= 0 {
+            Ok(info.peb_base_address as u64)
+        } else {
+            Err(PlatformError::Other(format!(
+                "NtQueryInformationProcess(ProcessBasicInformation) failed: 0x{:08X}",
+                status
+            )))
+        }
+    }
+
+    /// True if the target process is WOW64 (32-bit on 64-bit Windows).
+    pub fn is_wow64_process(&self, pid: u32) -> Result<bool, PlatformError> {
+        let process_handle = self.get_process(pid)?.handle();
+
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtQueryInformationProcess(
+                process_handle: HANDLE,
+                process_information_class: u32,
+                process_information: *mut std::ffi::c_void,
+                process_information_length: u32,
+                return_length: *mut u32,
+            ) -> i32;
+        }
+
+        // ProcessWow64Information returns the WOW64 PEB pointer; non-NULL = WOW64.
+        const PROCESS_WOW64_INFORMATION_CLASS: u32 = 26;
+
+        let mut wow64_peb: usize = 0;
+        let mut return_length: u32 = 0;
+        let status = unsafe {
+            NtQueryInformationProcess(
+                process_handle,
+                PROCESS_WOW64_INFORMATION_CLASS,
+                &mut wow64_peb as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of::<usize>() as u32,
+                &mut return_length,
+            )
+        };
+
+        if status >= 0 {
+            Ok(wow64_peb != 0)
+        } else {
+            Err(PlatformError::Other(format!(
+                "NtQueryInformationProcess(ProcessWow64Information) failed: 0x{:08X}",
+                status
+            )))
+        }
+    }
 }
 
 impl PlatformAPI for WindowsPlatform {
@@ -373,8 +463,8 @@ impl PlatformAPI for WindowsPlatform {
         Ok(())
     }
 
-    fn launch(&mut self, command: &str, debug_children: bool) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
-        process::launch(self, command, debug_children)
+    fn launch(&mut self, command: &str, debug_children: bool, working_directory: Option<&str>) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
+        process::launch(self, command, debug_children, working_directory)
     }
 
     fn read_memory(&self, pid: u32, address: u64, size: usize) -> Result<Vec<u8>, PlatformError> {
@@ -701,6 +791,14 @@ impl PlatformAPI for WindowsPlatform {
     fn get_teb_address(&self, pid: u32, tid: u32) -> Result<u64, PlatformError> {
         // Call the method we defined on WindowsPlatform
         WindowsPlatform::get_teb_address(self, pid, tid)
+    }
+
+    fn get_peb_address(&self, pid: u32) -> Result<u64, PlatformError> {
+        WindowsPlatform::get_peb_address(self, pid)
+    }
+
+    fn is_wow64(&self, pid: u32) -> Result<bool, PlatformError> {
+        WindowsPlatform::is_wow64_process(self, pid)
     }
 
     // ---------------------- Server-side fast paths ----------------------

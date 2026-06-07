@@ -32,13 +32,14 @@ impl LuaUserData for LuaDebugClient {
     fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
         // ---- Process lifecycle ----
 
-        methods.add_method("launch", |_lua, this, (command, debug_children): (String, Option<bool>)| {
+        methods.add_method("launch", |_lua, this, (command, debug_children, working_directory): (String, Option<bool>, Option<String>)| {
             let mut client = this.inner.borrow_mut();
             // Launch just sends the request. Events start flowing through the stream.
             // Call dbg:run() to enter the event loop.
             client.send_request_only(&DebuggerRequest::Launch {
                 command,
                 debug_children: debug_children.unwrap_or(false),
+                working_directory,
             }).map_err(|e| mlua::Error::external(e))?;
             Ok(())
         });
@@ -1204,6 +1205,56 @@ impl LuaUserData for LuaDebugClient {
             table.set("bytes", lua.create_string(&result.bytes)?)?;
             table.set("size", result.bytes.len())?;
             Ok(table)
+        });
+
+        // ---- Anti-anti-debug ----
+
+        methods.add_method("hide_peb", |lua, this, (pid, opts_tbl): (u32, Option<LuaTable>)| {
+            // Parse opts table: missing keys = false; `{ all = true }` = enable all.
+            let mut options = crate::anti_anti_debug::PebHideOptions::default();
+            if let Some(tbl) = opts_tbl {
+                let all: bool = tbl.get("all").unwrap_or(false);
+                if all {
+                    options = crate::anti_anti_debug::PebHideOptions::all();
+                } else {
+                    options.being_debugged  = tbl.get("being_debugged").unwrap_or(false);
+                    options.heap_flags      = tbl.get("heap_flags").unwrap_or(false);
+                    options.nt_global_flag  = tbl.get("nt_global_flag").unwrap_or(false);
+                    options.startup_info    = tbl.get("startup_info").unwrap_or(false);
+                    options.os_build_number = tbl.get("os_build_number").unwrap_or(false);
+                }
+            } else {
+                options = crate::anti_anti_debug::PebHideOptions::all();
+            }
+
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::HidePeb { pid, options })
+                .map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::PebHideResult { report } => {
+                    let t = lua.create_table()?;
+                    t.set("peb_address", report.peb_address)?;
+                    t.set("wow64_skipped", report.wow64_skipped)?;
+                    let applied = lua.create_table()?;
+                    for (i, name) in report.applied.iter().enumerate() {
+                        applied.set(i + 1, name.clone())?;
+                    }
+                    t.set("applied", applied)?;
+                    let failures = lua.create_table()?;
+                    for (i, (name, msg)) in report.failures.iter().enumerate() {
+                        let row = lua.create_table()?;
+                        row.set("technique", name.clone())?;
+                        row.set("error", msg.clone())?;
+                        failures.set(i + 1, row)?;
+                    }
+                    t.set("failures", failures)?;
+                    Ok(t)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("HidePeb failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
         });
 
         // ---- Inline hooks ----

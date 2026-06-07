@@ -71,10 +71,15 @@ pub(super) fn determine_process_architecture(process_handle: windows_sys::Win32:
     }
 }
 
-pub(super) fn launch(platform: &mut WindowsPlatform, command: &str, debug_children: bool) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
+pub(super) fn launch(platform: &mut WindowsPlatform, command: &str, debug_children: bool, working_directory: Option<&str>) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
     println!("[windows_platform] launch thread id: {:?}", std::thread::current().id());
-    trace!(command, "WindowsPlatform::launch called");
+    trace!(command, working_directory, "WindowsPlatform::launch called");
     let cmd_line_wide = to_wide(command);
+    // Wide buffer must outlive the CreateProcessW call; null pointer => inherit debugger CWD.
+    let working_dir_wide = working_directory.map(to_wide);
+    let working_dir_ptr = working_dir_wide
+        .as_ref()
+        .map_or(ptr::null(), |w| w.as_ptr());
     let mut startup_info: STARTUPINFOW = unsafe { std::mem::zeroed() };
     startup_info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut process_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
@@ -88,7 +93,7 @@ pub(super) fn launch(platform: &mut WindowsPlatform, command: &str, debug_childr
             FALSE,
             debug_flags,
             ptr::null_mut(),
-            ptr::null(),
+            working_dir_ptr,
             &mut startup_info,
             &mut process_info,
         )

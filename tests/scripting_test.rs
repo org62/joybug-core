@@ -597,6 +597,11 @@ fn test_lua_file_debug_client_events() {
 }
 
 #[test]
+fn test_lua_file_launch_working_directory() {
+    run_lua_test_file("basics/launch_working_directory.lua", None);
+}
+
+#[test]
 fn test_lua_file_parent_child() {
     let test_exe = common::get_test_program_path("parent_child_test");
     run_lua_test_file("basics/parent_child.lua", Some(&test_exe));
@@ -751,4 +756,11 @@ fn test_lua_file_exception_passed() {
 #[test]
 fn test_lua_file_mass_breakpoints() {
     run_lua_test_file("breakpoints/mass_breakpoints.lua", None);
+}
+
+// --- anti-anti-debug ---
+
+#[test]
+fn test_lua_file_hide_peb() {
+    run_lua_test_file("anti_anti_debug/hide_peb.lua", None);
 }

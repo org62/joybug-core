@@ -234,7 +234,7 @@ pub trait PlatformAPI: Send + Sync {
     fn set_single_shot_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError>;
     fn set_hardware_breakpoint(&mut self, pid: u32, addr: u64, bp_type: crate::protocol::HardwareBreakpointType, size: crate::protocol::HardwareBreakpointSize) -> Result<u8, PlatformError>;
     fn remove_hardware_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError>;
-    fn launch(&mut self, command: &str, debug_children: bool) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>;
+    fn launch(&mut self, command: &str, debug_children: bool, working_directory: Option<&str>) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>;
     fn read_memory(&self, pid: u32, address: u64, size: usize) -> Result<Vec<u8>, PlatformError>;
     fn write_memory(&self, pid: u32, address: u64, data: &[u8]) -> Result<(), PlatformError>;
     fn read_wide_string(&self, pid: u32, address: u64, max_len: Option<usize>) -> Result<String, PlatformError>;
@@ -279,6 +279,18 @@ pub trait PlatformAPI: Send + Sync {
 
     // Thread Environment Block (TEB) address - used for emulator GS segment setup
     fn get_teb_address(&self, _pid: u32, _tid: u32) -> Result<u64, PlatformError> {
+        Err(PlatformError::NotImplemented)
+    }
+
+    /// Process Environment Block (PEB) base address — used by the
+    /// anti-anti-debug subsystem for PEB hiding.
+    fn get_peb_address(&self, _pid: u32) -> Result<u64, PlatformError> {
+        Err(PlatformError::NotImplemented)
+    }
+
+    /// True if the target is a 32-bit (WOW64) process on 64-bit Windows.
+    /// Used to bail out of features that assume the 64-bit PEB layout.
+    fn is_wow64(&self, _pid: u32) -> Result<bool, PlatformError> {
         Err(PlatformError::NotImplemented)
     }
 
