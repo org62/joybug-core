@@ -13,7 +13,7 @@ jobs:
   build_github_actions:
     strategy:
       matrix:
-        arch: [ARM64, X64-native]
+        arch: [ARM64, X64]
     runs-on:
       - self-hosted
       - Windows

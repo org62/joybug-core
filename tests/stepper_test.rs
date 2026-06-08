@@ -1,12 +1,12 @@
 #![cfg(windows)]
 
-use joybug2::interfaces::{Architecture};
+mod common;
+
+use common::{TestServer, print_disassembly_and_callstack};
+use joybug2::interfaces::Architecture;
 use std::collections::VecDeque;
 use joybug2::protocol::{StepKind, StepAction};
 use joybug2::protocol_io::DebugSession;
-use std::thread;
-use tokio;
-use joybug2::interfaces::InstructionFormatter;
 
 /// Clean, simple test state for tracking events
 struct TestState {
@@ -24,22 +24,6 @@ impl TestState {
             ]),
         }
     }
-}
-
-fn print_disassembly(session: &mut DebugSession<TestState>, pid: u32, tid: u32, address: u64) -> anyhow::Result<()> {
-    let arch = Architecture::from_native();
-    let disassembly = session.disassemble_memory(pid, address, 10, arch)?;
-    println!("{}", disassembly.format_disassembly());
-    let call_stack = session.get_call_stack(pid, tid)?;
-    println!("Call stack:");
-    for frame in call_stack {
-        if let Some(symbol) = &frame.symbol {
-            println!("  {}", symbol.format_symbol());
-        } else {
-            panic!("  Symbol: <unknown>");
-        }
-    }
-    Ok(())
 }
 
 fn assert_disasm_symbol_prefix(session: &mut DebugSession<TestState>, pid: u32, address: u64, expected_prefix: &str) {
@@ -65,23 +49,20 @@ fn assert_disasm_symbol_prefix(session: &mut DebugSession<TestState>, pid: u32, 
 fn test_stepper_test() {
     joybug2::init_tracing();
     
-    // Start the debug server
-    thread::spawn(|| {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(joybug2::server::run_server()).unwrap();
-    });
+    let server = TestServer::spawn();
+    let server_addr = server.address().to_string();
     
     // Launch process with clean stateful callback-based interface
-    let _final_state = DebugSession::new(TestState::new(), None)
+    let _final_state = DebugSession::new(TestState::new(), Some(server_addr.as_str()))
         .expect("Failed to connect to debug server")
         .on_initial_breakpoint(|session, pid, tid, address| {
             println!("Initial breakpoint hit at 0x{:016x}", address);
-            print_disassembly(session, pid, tid, address)?;
+            print_disassembly_and_callstack(session, pid, tid, address)?;
             // Init the stepper
             let first_step = session.state.step_sequence.remove(0);
             session.step(pid, tid, first_step, |session, pid, tid, address, kind| {
                 println!("Step completed ({:?}) at 0x{:016x}, pid: {}, tid: {}, steps left: {}", kind, address, pid, tid, session.state.step_sequence.len());
-                let _ = print_disassembly(session, pid, tid, address);
+                let _ = print_disassembly_and_callstack(session, pid, tid, address);
                 if kind == StepKind::Out {
                     if let Some(prefix) = session.state.expected_out_prefixes.pop_front() {
                         assert_disasm_symbol_prefix(session, pid, address, prefix);

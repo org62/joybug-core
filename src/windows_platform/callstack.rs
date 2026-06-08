@@ -64,6 +64,9 @@ pub fn get_call_stack(
         Architecture::Arm64 => IMAGE_FILE_MACHINE_ARM64 as u32,
     };
     
+    // Acquire global DbgHelp lock for the duration of the stack walk
+    let _lock = super::dbghelp::DBGHELP_LOCK.lock().unwrap();
+
     for i in 0..MAX_STACK_FRAMES {
         let result = unsafe {
             StackWalk64(
@@ -103,7 +106,7 @@ pub fn get_call_stack(
         // Validate that the instruction pointer is within a loaded module
         // Don't issue a warning if there is less than 2 modules (main executable is only loaded when process is started, but address is in ntdll)
         if modules.len() > 1 && !is_valid_instruction_pointer(instruction_pointer, &modules) {
-            panic!("Instruction pointer 0x{:016x} not in any loaded module. Including frame without symbols.", instruction_pointer);
+            trace!("Instruction pointer 0x{:016x} not in any loaded module. Including frame without symbols.", instruction_pointer);
         }
         
         // Resolve symbol information

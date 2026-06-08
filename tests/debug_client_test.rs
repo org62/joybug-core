@@ -1,12 +1,11 @@
 #![cfg(windows)]
 
+mod common;
+
+use common::{TestServer, print_disassembly_and_callstack};
 use joybug2::interfaces::CallFrame;
 use joybug2::protocol::{StepKind, StepAction};
 use joybug2::protocol_io::DebugSession;
-use std::thread;
-use tokio;
-use joybug2::interfaces::InstructionFormatter;
-use joybug2::interfaces::Architecture;
 
 /// Clean, simple test state for tracking events
 struct TestState {
@@ -33,22 +32,6 @@ impl TestState {
             ntclose_bp_hits: 0,
         }
     }
-}
-
-fn print_disassembly(session: &mut DebugSession<TestState>, pid: u32, tid: u32, address: u64) -> anyhow::Result<()> {
-    let arch = Architecture::from_native();
-    let disassembly = session.disassemble_memory(pid, address, 10, arch)?;
-    println!("{}", disassembly.format_disassembly());
-    let call_stack = session.get_call_stack(pid, tid)?;
-    println!("Call stack:");
-    for frame in call_stack {
-        if let Some(symbol) = &frame.symbol {
-            println!("  {}", symbol.format_symbol());
-        } else {
-            panic!("  Symbol: <unknown>");
-        }
-    }
-    Ok(())
 }
 
 /// Test symbol search functionality
@@ -85,14 +68,11 @@ fn test_symbol_search(session: &mut DebugSession<TestState>) {
 fn test_debug_client_event_collection() {
     joybug2::init_tracing();
     
-    // Start the debug server
-    thread::spawn(|| {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(joybug2::server::run_server()).unwrap();
-    });
+    let server = TestServer::spawn();
+    let server_addr = server.address().to_string();
     
     // Launch process with clean stateful callback-based interface
-    let final_state = DebugSession::new(TestState::new(), None)
+    let final_state = DebugSession::new(TestState::new(), Some(server_addr.as_str()))
         .expect("Failed to connect to debug server")
         .on_initial_breakpoint(|session, pid, _tid, address| {
             println!("=== Hit Initial Breakpoint at 0x{:x} ===", address);
@@ -178,7 +158,7 @@ fn test_debug_client_event_collection() {
         })
         .on_thread_created(|session, pid, tid, address| {
             println!("=== Thread created at 0x{:016x} ===", address);
-            print_disassembly(session, pid, tid, address)?;
+            print_disassembly_and_callstack(session, pid, tid, address)?;
             Ok(())
         })
         .on_thread_exited(|session, pid, _tid, exit_code| {

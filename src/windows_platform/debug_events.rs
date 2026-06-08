@@ -2,7 +2,7 @@ use super::{utils, WindowsPlatform, stepper};
 use crate::interfaces::PlatformError;
 use crate::protocol::ModuleInfo;
 use tracing::{error, trace, warn};
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, FALSE, DBG_CONTINUE, DUPLICATE_SAME_ACCESS, HANDLE, DuplicateHandle, STATUS_SINGLE_STEP, MAX_PATH};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, FALSE, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, DUPLICATE_SAME_ACCESS, HANDLE, DuplicateHandle, STATUS_SINGLE_STEP, MAX_PATH};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, INFINITE};
 use windows_sys::Win32::System::Diagnostics::Debug::{
     ContinueDebugEvent, WaitForDebugEvent, DEBUG_EVENT, EXCEPTION_DEBUG_EVENT,
@@ -15,9 +15,14 @@ use std::ptr;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 
 // Non-locking helpers to minimize lock holding in server
-pub fn continue_only(pid: u32, tid: u32) -> Result<(), PlatformError> {
-    trace!(pid, tid, "ContinueDebugEvent only");
-    let cont_res = unsafe { ContinueDebugEvent(pid, tid, DBG_CONTINUE) };
+pub fn continue_debug_event(pid: u32, tid: u32, pass_exception: bool) -> Result<(), PlatformError> {
+    let status = if pass_exception {
+        DBG_EXCEPTION_NOT_HANDLED
+    } else {
+        DBG_CONTINUE
+    };
+    trace!(pid, tid, pass_exception, "ContinueDebugEvent");
+    let cont_res = unsafe { ContinueDebugEvent(pid, tid, status) };
     if cont_res == FALSE {
         let error = unsafe { GetLastError() };
         let error_str = utils::error_message(error);
@@ -28,6 +33,11 @@ pub fn continue_only(pid: u32, tid: u32) -> Result<(), PlatformError> {
         )));
     }
     Ok(())
+}
+
+/// Convenience wrapper that always uses DBG_CONTINUE
+pub fn continue_only(pid: u32, tid: u32) -> Result<(), PlatformError> {
+    continue_debug_event(pid, tid, false)
 }
 
 pub fn wait_for_debug_event_blocking() -> Result<DEBUG_EVENT, PlatformError> {
@@ -56,6 +66,26 @@ pub(super) fn handle_create_process_event(
     let image_file_name =
         utils::get_path_from_handle(info.hFile).unwrap_or_else(|| image_path_fallback.unwrap_or("<unknown>").to_string());
 
+    // If this PID is unknown, it's a child process — register it
+    if platform.get_process(pid).is_err() {
+        let mut dup_handle: HANDLE = std::ptr::null_mut();
+        let current = unsafe { GetCurrentProcess() };
+        if unsafe { DuplicateHandle(current, info.hProcess, current, &mut dup_handle, 0, FALSE, DUPLICATE_SAME_ACCESS) } == 0 {
+            return Err(PlatformError::OsError("DuplicateHandle for child process failed".into()));
+        }
+        let architecture = match super::process::determine_process_architecture(dup_handle) {
+            Ok(arch) => arch,
+            Err(e) => {
+                unsafe { CloseHandle(dup_handle); }
+                return Err(e);
+            }
+        };
+        if let Err(e) = platform.add_process(pid, dup_handle, architecture) {
+            unsafe { CloseHandle(dup_handle); }
+            return Err(e);
+        }
+    }
+
     // Get the process for this PID to use its handle and clear its managers
     let process = platform.get_process_mut(pid)?;
     let h_process = process.handle();
@@ -67,9 +97,12 @@ pub(super) fn handle_create_process_event(
             
     // Load the module into the symbol handler
     let c_name = CString::new(image_file_name.as_str()).unwrap();
-    if unsafe { SymLoadModule64(h_process, info.hFile, c_name.as_ptr() as *const u8, ptr::null(), info.lpBaseOfImage as u64, size_of_image.unwrap_or(0) as u32) } == 0 {
-        let error = unsafe { GetLastError() };
-        warn!(pid, "SymLoadModule64 failed in create_process for {}: 0x{:x}", image_file_name, error);
+    {
+        let _lock = super::dbghelp::DBGHELP_LOCK.lock().unwrap();
+        if unsafe { SymLoadModule64(h_process, info.hFile, c_name.as_ptr() as *const u8, ptr::null(), info.lpBaseOfImage as u64, size_of_image.unwrap_or(0) as u32) } == 0 {
+            let error = unsafe { GetLastError() };
+            warn!(pid, "SymLoadModule64 failed in create_process for {}: 0x{:x}", image_file_name, error);
+        }
     }
     
     // Now that we're done with hFile, close it.
@@ -87,7 +120,17 @@ pub(super) fn handle_create_process_event(
         size: size_of_image,
     };
     
-    process.module_manager_mut().add_module(main_module.clone());
+    {
+        let process = platform.get_process_mut(pid)?;
+        process.module_manager_mut().add_module(main_module.clone());
+    }
+
+    // Parse and cache extra module info for main module
+    if let Ok(extra) = platform.parse_module_extra_info(pid, main_module.base) {
+        if let Ok(process) = platform.get_process_mut(pid) {
+            process.module_manager_mut().set_extra_info(main_module.base, extra);
+        }
+    }
 
     // Start loading symbols for the main executable in the background
     if let Some(ref symbol_manager) = platform.symbol_manager {
@@ -120,8 +163,17 @@ pub(super) fn handle_create_process_event(
     if let Some(ntdll_module) = try_build_ntdll_moduleinfo_from_self() {
         // Add to the target process' module list so address-to-module checks can succeed early.
         let ntdll_module_cloned = ntdll_module.clone();
-        let process = platform.get_process_mut(pid)?;
-        process.module_manager_mut().add_module(ntdll_module_cloned);
+        {
+            let process = platform.get_process_mut(pid)?;
+            process.module_manager_mut().add_module(ntdll_module_cloned.clone());
+        }
+
+        // Parse and cache extra info for synthetic ntdll entry as well
+        if let Ok(extra) = platform.parse_module_extra_info(pid, ntdll_module_cloned.base) {
+            if let Ok(process) = platform.get_process_mut(pid) {
+                process.module_manager_mut().set_extra_info(ntdll_module_cloned.base, extra);
+            }
+        }
 
         // Start background symbol load for ntdll so RVA -> name mapping is available quickly.
         if let Some(ref symbol_manager) = platform.symbol_manager {
@@ -162,6 +214,13 @@ pub(super) fn handle_create_process_event(
             start_address,
             thread_handle,
         );
+        // Apply active hardware breakpoints to the initial thread
+        let active_hw_bps = process.active_hardware_breakpoints();
+        if !active_hw_bps.is_empty() {
+            if let Err(e) = super::hardware_breakpoints::apply_all_hw_bps_to_thread(thread_handle, &active_hw_bps) {
+                warn!(tid = debug_event.dwThreadId, error = %e, "Failed to apply HW breakpoints to initial thread");
+            }
+        }
     }
 
     trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, base_of_image = %format!("0x{:X}", info.lpBaseOfImage as u64), image_file_name = ?image_file_name, size_of_image = %format!("{:X?}", size_of_image), "ProcessCreated event");
@@ -364,7 +423,8 @@ pub(super) fn handle_exception_event(
             "Single-step event"
         );
 
-        // Handle re-arming first
+        // Handle SW breakpoint re-arming first
+        // Return None so the server auto-continues without exposing this internal event to the client
         if let Some((rearm_addr, _is_single_shot)) = process.take_pending_rearm_for_tid(tid) {
             trace!(pid = pid, tid = tid, rearm_addr = %format!("0x{:X}", rearm_addr), "SS used for persistent breakpoint re-arm");
             if let Err(e) = stepper::clear_single_step_flag_native2(platform, pid, tid) { error!("Failed to clear single-step flag: {}", e); }
@@ -372,14 +432,61 @@ pub(super) fn handle_exception_event(
                 let process = platform.get_process(pid)?;
                 let _ = process.rearm_persistent_breakpoint_if_matches_original(rearm_addr);
             }
-            return Ok(Some(crate::protocol::DebugEvent::Exception { pid, tid, code: ex_record.ExceptionCode as u32, address: ex_record.ExceptionAddress as u64, first_chance: ex_info.dwFirstChance == 1, parameters: vec![] }));
+            return Ok(None);
         }
 
-        // Active stepper completion
+        // Handle HW breakpoint re-arming (after stepping past a HW BP)
+        // Return None so the server auto-continues without exposing this internal event to the client
+        if let Some(rearm_dr_index) = process.take_pending_hw_bp_rearm(tid) {
+            trace!(pid, tid, rearm_dr_index, "SS used for hardware breakpoint re-arm");
+            // Re-enable the HW BP and clear the trap flag
+            #[cfg(target_arch = "x86_64")]
+            {
+                let thread_handle = process.thread_manager().get_thread_handle(tid)
+                    .ok_or_else(|| PlatformError::OsError(format!("No handle for thread {}", tid)))?;
+                let mut aligned = super::AlignedContext { context: unsafe { std::mem::zeroed() } };
+                aligned.context.ContextFlags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_DEBUG_REGISTERS_AMD64
+                    | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64;
+                if unsafe { windows_sys::Win32::System::Diagnostics::Debug::GetThreadContext(thread_handle, &mut aligned.context) } != 0 {
+                    super::hardware_breakpoints::enable_hw_bp_enable(&mut aligned.context, rearm_dr_index);
+                    // Clear trap flag
+                    aligned.context.EFlags &= !(0x100u32);
+                    let _ = unsafe { windows_sys::Win32::System::Diagnostics::Debug::SetThreadContext(thread_handle, &aligned.context) };
+                }
+            }
+            return Ok(None);
+        }
+
+        // Active stepper completion — check BEFORE DR6 so that a user-initiated step
+        // from a HW BP isn't misinterpreted as a new HW BP hit (stale DR6 bits).
         if let Some(step_state) = process.take_active_single_step(tid) {
             trace!(pid = pid, tid = tid, kind = ?step_state.kind, address = %format!("0x{:X}", ex_record.ExceptionAddress as u64), "Single-step from active stepper");
-            if let Err(e) = stepper::clear_single_step_flag_native2(platform, pid, tid) { error!("Failed to clear single-step flag: {}", e); }
             let rearm_addr = ex_record.ExceptionAddress as u64;
+            // Clear single-step flag, and if there's a deferred HW BP rearm, combine both
+            // into one context operation to avoid a redundant GetThreadContext/SetThreadContext.
+            #[cfg(target_arch = "x86_64")]
+            if let Some(rearm_dr_index) = step_state.deferred_hw_bp_rearm {
+                trace!(pid, tid, rearm_dr_index, "Re-arming deferred hardware breakpoint after step completion");
+                let process = platform.get_process(pid)?;
+                let thread_handle = process.thread_manager().get_thread_handle(tid)
+                    .ok_or_else(|| PlatformError::OsError(format!("No handle for thread {}", tid)))?;
+                let mut aligned = super::AlignedContext { context: unsafe { std::mem::zeroed() } };
+                aligned.context.ContextFlags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_DEBUG_REGISTERS_AMD64
+                    | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64;
+                if unsafe { windows_sys::Win32::System::Diagnostics::Debug::GetThreadContext(thread_handle, &mut aligned.context) } != 0 {
+                    // Clear trap flag
+                    aligned.context.EFlags &= !(0x100u32);
+                    super::hardware_breakpoints::enable_hw_bp_enable(&mut aligned.context, rearm_dr_index);
+                    aligned.context.Dr6 = 0;
+                    let _ = unsafe { windows_sys::Win32::System::Diagnostics::Debug::SetThreadContext(thread_handle, &aligned.context) };
+                }
+            } else {
+                if let Err(e) = stepper::clear_single_step_flag_native2(platform, pid, tid) { error!("Failed to clear single-step flag: {}", e); }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                if let Err(e) = stepper::clear_single_step_flag_native2(platform, pid, tid) { error!("Failed to clear single-step flag: {}", e); }
+            }
             {
                 let process = platform.get_process(pid)?;
                 let _ = process.rearm_persistent_breakpoint_if_matches_original(rearm_addr);
@@ -387,18 +494,54 @@ pub(super) fn handle_exception_event(
             return Ok(Some(crate::protocol::DebugEvent::StepComplete { pid, tid, kind: step_state.kind, address: ex_record.ExceptionAddress as u64 }));
         }
 
-        // Unexpected SS
-        let ctx_for_log = match super::thread_context::get_thread_context(process, pid, tid) {
-            Ok(crate::protocol::ThreadContext::Win32RawContext(c)) => Some(c),
-            _ => None,
-        };
+        // Check for hardware breakpoint hit via DR6
         #[cfg(target_arch = "x86_64")]
         {
+            let thread_handle = process.thread_manager().get_thread_handle(tid)
+                .ok_or_else(|| PlatformError::OsError(format!("No handle for thread {}", tid)))?;
+            let mut aligned = super::AlignedContext { context: unsafe { std::mem::zeroed() } };
+            aligned.context.ContextFlags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_DEBUG_REGISTERS_AMD64
+                | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64;
+            if unsafe { windows_sys::Win32::System::Diagnostics::Debug::GetThreadContext(thread_handle, &mut aligned.context) } != 0 {
+                if let Some(dr_index) = super::hardware_breakpoints::check_dr6_for_hw_bp(&mut aligned.context) {
+                    if let Some(bp) = process.find_hardware_breakpoint_by_dr_index(dr_index) {
+                        let bp_address = bp.address;
+                        let bp_type = bp.bp_type;
+                        trace!(pid, tid, dr_index, address = %format!("0x{:X}", bp_address), "Hardware breakpoint hit");
+
+                        // Disable the HW BP enable bit so we can step past
+                        super::hardware_breakpoints::disable_hw_bp_enable(&mut aligned.context, dr_index);
+                        // Set trap flag to single-step one instruction
+                        aligned.context.EFlags |= 0x100u32;
+                        let _ = unsafe { windows_sys::Win32::System::Diagnostics::Debug::SetThreadContext(thread_handle, &aligned.context) };
+
+                        // Schedule re-arm after the single step completes
+                        process.schedule_hw_bp_rearm(tid, dr_index);
+
+                        return Ok(Some(crate::protocol::DebugEvent::HardwareBreakpoint {
+                            pid, tid, address: bp_address, dr_index, bp_type,
+                        }));
+                    }
+                }
+            }
+        }
+
+        // Unexpected SS
+        #[cfg(target_arch = "x86_64")]
+        {
+            let ctx_for_log = match super::thread_context::get_thread_context(process, pid, tid) {
+                Ok(crate::protocol::ThreadContext::Win32RawContext(c)) => Some(c),
+                _ => None,
+            };
             if let Some(ref ctx) = ctx_for_log {
                 trace!(pid = pid, tid = tid, rip = %format!("0x{:X}", ctx.Rip), eflags = %format!("0x{:X}", ctx.EFlags), "Unexpected single-step event (no active step record)");
             } else {
                 trace!(pid = pid, tid = tid, "Unexpected single-step event (no active step record) - failed to fetch context for log");
             }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            trace!(pid = pid, tid = tid, "Unexpected single-step event (no active step record)");
         }
         return Ok(Some(crate::protocol::DebugEvent::Exception { pid, tid, code: ex_record.ExceptionCode as u32, address: ex_record.ExceptionAddress as u64, first_chance: ex_info.dwFirstChance == 1, parameters: vec![] }));
     }
@@ -420,7 +563,12 @@ pub fn handle_debug_event(
             Ok(ev) => ev,
             Err(e) => {
                 error!("Failed to handle exception event: {}", e);
-                Some(crate::protocol::DebugEvent::Unknown)
+                Some(crate::protocol::DebugEvent::Unknown {
+                    pid: debug_event.dwProcessId,
+                    tid: debug_event.dwThreadId,
+                    debug_event_code: EXCEPTION_DEBUG_EVENT,
+                    error: format!("{}", e),
+                })
             }
         },
         CREATE_PROCESS_DEBUG_EVENT => {
@@ -428,9 +576,12 @@ pub fn handle_debug_event(
                 Ok(event) => Some(event),
                 Err(e) => {
                     error!("Failed to handle create process event: {}", e);
-                    // Decide what to do on an error. Maybe return an error event or just unknown.
-                    // For now, let's stick to the existing pattern of returning an `Option`.
-                    Some(crate::protocol::DebugEvent::Unknown)
+                    Some(crate::protocol::DebugEvent::Unknown {
+                        pid: debug_event.dwProcessId,
+                        tid: debug_event.dwThreadId,
+                        debug_event_code: CREATE_PROCESS_DEBUG_EVENT,
+                        error: format!("{}", e),
+                    })
                 }
             }
         }
@@ -441,9 +592,10 @@ pub fn handle_debug_event(
             // Cleanup any pending step breakpoint state for this process
             let pid = debug_event.dwProcessId;
             platform.cleanup_step_state_for_process(pid);
-            
+
             Some(crate::protocol::DebugEvent::ProcessExited {
                 pid: debug_event.dwProcessId,
+                tid: debug_event.dwThreadId,
                 exit_code: info.dwExitCode,
             })
         }
@@ -479,6 +631,13 @@ pub fn handle_debug_event(
                     start_address,
                     thread_handle,
                 );
+                // Apply active hardware breakpoints to the new thread
+                let active_hw_bps = process.active_hardware_breakpoints();
+                if !active_hw_bps.is_empty() {
+                    if let Err(e) = super::hardware_breakpoints::apply_all_hw_bps_to_thread(thread_handle, &active_hw_bps) {
+                        warn!(tid = debug_event.dwThreadId, error = %e, "Failed to apply HW breakpoints to new thread");
+                    }
+                }
             }
 
             trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, start_address = %format!("0x{:X}", info.lpStartAddress.map_or(0, |addr| addr as usize as u64)), "ThreadCreated event");
@@ -521,9 +680,12 @@ pub fn handle_debug_event(
 
             // Load module into symbol handler
             let c_name = CString::new(dll_name.as_str()).unwrap();
-            if unsafe { SymLoadModule64(h_process, info.hFile, c_name.as_ptr() as *const u8, ptr::null(), info.lpBaseOfDll as u64, size_of_dll.unwrap_or(0) as u32) } == 0 {
-                 let error = unsafe { GetLastError() };
-                 warn!(pid = debug_event.dwProcessId, "SymLoadModule64 failed on DLL load for {}: 0x{:x}", dll_name, error);
+            {
+                let _lock = super::dbghelp::DBGHELP_LOCK.lock().unwrap();
+                if unsafe { SymLoadModule64(h_process, info.hFile, c_name.as_ptr() as *const u8, ptr::null(), info.lpBaseOfDll as u64, size_of_dll.unwrap_or(0) as u32) } == 0 {
+                     let error = unsafe { GetLastError() };
+                     warn!(pid = debug_event.dwProcessId, "SymLoadModule64 failed on DLL load for {}: 0x{:x}", dll_name, error);
+                }
             }
 
             // now close handle
@@ -537,8 +699,17 @@ pub fn handle_debug_event(
                 size: size_of_dll,
             };
             
-            let process = platform.get_process_mut(debug_event.dwProcessId)?;
-            process.module_manager_mut().add_module(module_info.clone());
+            {
+                let process = platform.get_process_mut(debug_event.dwProcessId)?;
+                process.module_manager_mut().add_module(module_info.clone());
+            }
+
+            // Parse and cache extra info for the loaded DLL
+            if let Ok(extra) = platform.parse_module_extra_info(debug_event.dwProcessId, module_info.base) {
+                if let Ok(process) = platform.get_process_mut(debug_event.dwProcessId) {
+                    process.module_manager_mut().set_extra_info(module_info.base, extra);
+                }
+            }
 
             // Refresh the module list for the symbol handler
             // This is no longer needed as SymLoadModule64 handles incremental updates
@@ -569,9 +740,12 @@ pub fn handle_debug_event(
                 // Unload from our manager
                 process.module_manager_mut().remove_module(info.lpBaseOfDll as u64);
                 // Unload from symbol handler
-                if unsafe { SymUnloadModule64(process.handle(), info.lpBaseOfDll as u64) } == FALSE {
-                    let error = unsafe { GetLastError() };
-                    warn!(pid = debug_event.dwProcessId, "SymUnloadModule64 failed: 0x{:x}", error);
+                {
+                    let _lock = super::dbghelp::DBGHELP_LOCK.lock().unwrap();
+                    if unsafe { SymUnloadModule64(process.handle(), info.lpBaseOfDll as u64) } == FALSE {
+                        let error = unsafe { GetLastError() };
+                        warn!(pid = debug_event.dwProcessId, "SymUnloadModule64 failed: 0x{:x}", error);
+                    }
                 }
             }
             
@@ -638,10 +812,39 @@ pub fn handle_debug_event(
                 event_type: info.dwType,
             })
         }
-        _ => {
-            error!("Unknown debug event");
-            Some(crate::protocol::DebugEvent::Unknown)
+        code => {
+            error!("Unknown debug event code: {}", code);
+            Some(crate::protocol::DebugEvent::Unknown {
+                pid: debug_event.dwProcessId,
+                tid: debug_event.dwThreadId,
+                debug_event_code: code,
+                error: format!("Unrecognized debug event code: {}", code),
+            })
         }
     };
+
+    // Ensure hardware breakpoint DR registers are applied to ALL threads before returning.
+    // This is critical because:
+    // 1. ntdll initialization code may clear DR registers after the initial breakpoint
+    // 2. Other SetThreadContext calls (SW BP handling, stepper) use CONTEXT_ALL which
+    //    reads back potentially-zeroed DRs and writes them back, clobbering our values
+    // By applying DR-only context at the end of every event, we ensure DRs are correct
+    // when ContinueDebugEvent is called next.
+    #[cfg(target_arch = "x86_64")]
+    {
+        let pid = debug_event.dwProcessId;
+        if let Ok(process) = platform.get_process(pid) {
+            let active_bps = process.active_hardware_breakpoints();
+            if !active_bps.is_empty() {
+                let thread_handles = process.thread_manager().all_thread_handles();
+                for (tid, handle) in &thread_handles {
+                    if let Err(e) = super::hardware_breakpoints::apply_hw_bps_dr_only(*handle, &active_bps) {
+                        trace!(tid, error = %e, "Failed to ensure HW BPs on thread (may have exited)");
+                    }
+                }
+            }
+        }
+    }
+
     Ok(event)
 }

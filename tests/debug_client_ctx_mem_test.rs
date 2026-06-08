@@ -1,10 +1,11 @@
 #![cfg(windows)]
 
+mod common;
+
+use common::TestServer;
 use joybug2::protocol::ThreadContext;
 use joybug2::protocol_io::DebugSession;
 use joybug2::interfaces::{Architecture, InstructionFormatter};
-use std::thread;
-use tokio;
 
 /// Clean, simple test state for tracking events
 struct TestState {
@@ -22,12 +23,10 @@ impl TestState {
 #[test]
 fn test_debug_client_ctx_mem_test() {
     joybug2::init_tracing();
-    thread::spawn(|| {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(joybug2::server::run_server()).unwrap();
-    });
+    let server = TestServer::spawn();
+    let server_addr = server.address().to_string();
 
-    let final_state = DebugSession::new(TestState::new(), None)
+    let final_state = DebugSession::new(TestState::new(), Some(server_addr.as_str()))
         .expect("connect")
         .on_initial_breakpoint(|session, pid, tid, address| {
             session.state.initial_breakpoint_hit = true;

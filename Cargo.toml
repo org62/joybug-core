@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "veh_shared", "veh_dll"]
+
 [package]
 name = "joybug2"
 version = "0.1.0"
@@ -11,10 +14,18 @@ path = "src/lib.rs"
 name = "joybug2"
 path = "src/main.rs"
 
+[[bin]]
+name = "trace"
+path = "src/bin/trace.rs"
+
+[[bin]]
+name = "jlua"
+path = "src/bin/jlua.rs"
+
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 tokio = { version = "1.37", features = ["full", "rt"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 thiserror = "1.0"
 anyhow = "1.0"
 windows-sys = { version = "0.59.0", features = [
@@ -34,11 +45,21 @@ windows-sys = { version = "0.59.0", features = [
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Symbol processing dependencies
-pelite = "0.10"
+pelite = { git = "https://github.com/expend20/pelite", branch = "eh_patching" }
 pdb = "0.8"
 symsrv = "0.5"
-msvc-demangler = "0.9"
+msvc-demangler = "0.11"
 uuid = { version = "1.6", features = ["v4"] }
 dirs = "5.0"
 capstone = "0.12"
 regex = "1.10"
+rayon = "1.10"
+bincode = { version = "2.0.0-rc.3", features = ["serde"] }
+unicorn-engine = { git = "https://github.com/expend20/unicorn", branch = "AVX2-port" }
+keystone-engine = "0.1"
+mlua = { version = "0.10", features = ["lua54", "send", "vendored"] }
+rustyline = "15"
+joybug2-veh-shared = { path = "veh_shared" }
+
+[build-dependencies]
+cc = "1.0"

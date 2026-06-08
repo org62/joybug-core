@@ -1,9 +1,10 @@
 use super::{utils, WindowsPlatform};
 use crate::interfaces::{PlatformAPI, PlatformError};
-use tracing::{error, trace, warn};
+use tracing::{error, trace, warn, debug};
 use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE, HANDLE};
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
-use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_VM_READ};
+use windows_sys::Win32::System::Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION};
+use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_VM_READ, PROCESS_QUERY_INFORMATION};
 
 pub(super) fn read_memory_internal(
     handle: HANDLE,
@@ -30,7 +31,88 @@ pub(super) fn read_memory_internal(
         if ok == 0 {
             let error = GetLastError();
             let error_str = utils::error_message(error);
-            error!(error, error_str, "ReadProcessMemory failed");
+
+            // If we got partial data, return it with a warning instead of failing
+            if bytes_read > 0 {
+                debug!(
+                    address = %format!("0x{:X}", address),
+                    requested_size = size,
+                    bytes_read,
+                    error,
+                    error_str,
+                    "ReadProcessMemory partial read"
+                );
+                buffer.truncate(bytes_read);
+                return Ok(buffer);
+            }
+
+            // If error 299 (ERROR_PARTIAL_COPY) with bytes_read == 0,
+            // query region and retry with clamped size
+            const ERROR_PARTIAL_COPY: u32 = 299;
+            if error == ERROR_PARTIAL_COPY {
+                warn!(address = %format!("0x{:X}", address), "ERROR_PARTIAL_COPY fallback triggered");
+                let mut mem_info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                let query_result = VirtualQueryEx(
+                    handle,
+                    address as *const std::ffi::c_void,
+                    &mut mem_info,
+                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+                );
+
+                if query_result != 0 {
+                    const MEM_COMMIT: u32 = 0x1000;
+                    let region_base = mem_info.BaseAddress as u64;
+                    let region_end = region_base + (mem_info.RegionSize as u64);
+                    warn!(
+                        region_base = %format!("0x{:X}", region_base),
+                        region_end = %format!("0x{:X}", region_end),
+                        region_size = %format!("0x{:X}", mem_info.RegionSize),
+                        state = %format!("0x{:X}", mem_info.State),
+                        "VirtualQueryEx succeeded"
+                    );
+                    if mem_info.State == MEM_COMMIT {
+                        if address < region_end {
+                            let available = (region_end - address) as usize;
+                            warn!(available, size, "Checking available vs requested size");
+                            if available > 0 && available < size {
+                                // Retry with clamped size
+                                let mut retry_buffer = vec![0u8; available];
+                                let mut retry_bytes_read = 0;
+                                let retry_ok = ReadProcessMemory(
+                                    handle,
+                                    address as *const std::ffi::c_void,
+                                    retry_buffer.as_mut_ptr() as *mut std::ffi::c_void,
+                                    available,
+                                    &mut retry_bytes_read,
+                                );
+                                warn!(retry_ok, retry_bytes_read, "Retry read result");
+                                if retry_ok != 0 || retry_bytes_read > 0 {
+                                    retry_buffer.truncate(retry_bytes_read);
+                                    warn!(
+                                        address = %format!("0x{:X}", address),
+                                        requested_size = size,
+                                        available_in_region = available,
+                                        bytes_read = retry_bytes_read,
+                                        "ReadProcessMemory partial read (region-clamped retry)"
+                                    );
+                                    return Ok(retry_buffer);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let query_error = GetLastError();
+                    warn!(query_error, "VirtualQueryEx failed");
+                }
+            }
+
+            error!(
+                address = %format!("0x{:X}", address),
+                size,
+                error,
+                error_str,
+                "ReadProcessMemory failed"
+            );
             return Err(PlatformError::OsError(format!(
                 "ReadProcessMemory failed: {} ({})",
                 error, error_str
@@ -61,18 +143,18 @@ pub(super) fn read_memory_unlocked(
 ) -> Result<Vec<u8>, PlatformError> {
     trace!(pid, address = %format!("0x{:X}", address), size, "read_memory_unlocked called");
     unsafe {
-        let handle = OpenProcess(PROCESS_VM_READ, 0, pid);
+        // Include PROCESS_QUERY_INFORMATION for VirtualQueryEx fallback on partial reads
+        let handle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, 0, pid);
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             let error = GetLastError();
             let error_str = utils::error_message(error);
-            error!(error, error_str, "OpenProcess(PROCESS_VM_READ) failed");
+            error!(error, error_str, "OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION) failed");
             return Err(PlatformError::OsError(format!(
-                "OpenProcess(PROCESS_VM_READ) failed: {} ({})",
+                "OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION) failed: {} ({})",
                 error, error_str
             )));
         }
         let res = read_memory_internal(handle, address, size);
-        // Intentionally do not CloseHandle here: for PROCESS_VM_READ OpenProcess returns a handle we own; we should close it.
         windows_sys::Win32::Foundation::CloseHandle(handle);
         res
     }
@@ -169,7 +251,117 @@ pub(super) fn read_wide_string(
     let wide_chars: Vec<u16> = buffer.chunks_exact(2)
         .map(|a| u16::from_le_bytes([a[0], a[1]]))
         .collect();
-    
+
     let result = String::from_utf16_lossy(&wide_chars);
     Ok(result.trim().to_string())
+}
+
+pub(super) fn query_memory_region_unlocked(
+    pid: u32,
+    address: u64,
+) -> Result<crate::protocol::MemoryRegionInfo, PlatformError> {
+    trace!(pid, address = %format!("0x{:X}", address), "query_memory_region_unlocked");
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            let error = GetLastError();
+            let error_str = utils::error_message(error);
+            error!(error, error_str, "OpenProcess(PROCESS_QUERY_INFORMATION) failed");
+            return Err(PlatformError::OsError(format!(
+                "OpenProcess failed: {} ({})", error, error_str
+            )));
+        }
+
+        let mut mem_info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        let result = VirtualQueryEx(
+            handle,
+            address as *const std::ffi::c_void,
+            &mut mem_info,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        );
+        windows_sys::Win32::Foundation::CloseHandle(handle);
+
+        if result == 0 {
+            let error = GetLastError();
+            let error_str = utils::error_message(error);
+            error!(address = %format!("0x{:X}", address), error, error_str, "VirtualQueryEx failed");
+            return Err(PlatformError::OsError(format!(
+                "VirtualQueryEx failed: {} ({})", error, error_str
+            )));
+        }
+
+        trace!(
+            base_address = %format!("0x{:X}", mem_info.BaseAddress as u64),
+            region_size = %format!("0x{:X}", mem_info.RegionSize),
+            state = %format!("0x{:X}", mem_info.State),
+            "query_memory_region_unlocked succeeded"
+        );
+
+        Ok(crate::protocol::MemoryRegionInfo {
+            base_address: mem_info.BaseAddress as u64,
+            allocation_base: mem_info.AllocationBase as u64,
+            allocation_protect: mem_info.AllocationProtect,
+            region_size: mem_info.RegionSize as u64,
+            state: mem_info.State,
+            protect: mem_info.Protect,
+            region_type: mem_info.Type,
+        })
+    }
+}
+
+pub(super) fn enumerate_memory_regions_unlocked(
+    pid: u32,
+) -> Result<Vec<crate::protocol::MemoryRegionInfo>, PlatformError> {
+    trace!(pid, "enumerate_memory_regions_unlocked");
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            let error = GetLastError();
+            let error_str = utils::error_message(error);
+            error!(error, error_str, "OpenProcess(PROCESS_QUERY_INFORMATION) failed");
+            return Err(PlatformError::OsError(format!(
+                "OpenProcess failed: {} ({})", error, error_str
+            )));
+        }
+
+        let mut regions = Vec::new();
+        let mut address: u64 = 0;
+
+        loop {
+            let mut mem_info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let result = VirtualQueryEx(
+                handle,
+                address as *const std::ffi::c_void,
+                &mut mem_info,
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            );
+
+            if result == 0 {
+                // End of address space or error - stop enumeration
+                break;
+            }
+
+            regions.push(crate::protocol::MemoryRegionInfo {
+                base_address: mem_info.BaseAddress as u64,
+                allocation_base: mem_info.AllocationBase as u64,
+                allocation_protect: mem_info.AllocationProtect,
+                region_size: mem_info.RegionSize as u64,
+                state: mem_info.State,
+                protect: mem_info.Protect,
+                region_type: mem_info.Type,
+            });
+
+            // Move to next region
+            let next_address = (mem_info.BaseAddress as u64).wrapping_add(mem_info.RegionSize as u64);
+            if next_address <= address {
+                // Overflow or no progress - stop
+                break;
+            }
+            address = next_address;
+        }
+
+        windows_sys::Win32::Foundation::CloseHandle(handle);
+        trace!(region_count = regions.len(), "enumerate_memory_regions complete");
+        Ok(regions)
+    }
 } 

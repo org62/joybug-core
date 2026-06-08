@@ -1,6 +1,53 @@
 use crate::protocol::*;
 use crate::interfaces::*;
 
+// Memory region formatting utilities
+#[cfg(windows)]
+pub mod memory {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE,
+        PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
+        PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+    };
+
+    /// Convert memory state to string representation
+    pub fn state_to_str(state: u32) -> &'static str {
+        match state {
+            MEM_COMMIT => "MEM_COMMIT",
+            MEM_RESERVE => "MEM_RESERVE",
+            MEM_FREE => "MEM_FREE",
+            _ => "UNKNOWN",
+        }
+    }
+
+    /// Convert memory type to string representation
+    pub fn type_to_str(region_type: u32) -> &'static str {
+        match region_type {
+            MEM_PRIVATE => "MEM_PRIVATE",
+            MEM_MAPPED => "MEM_MAPPED",
+            MEM_IMAGE => "MEM_IMAGE",
+            0 => "NONE",
+            _ => "UNKNOWN",
+        }
+    }
+
+    /// Convert memory protection flags to string representation
+    pub fn protect_to_str(protect: u32) -> &'static str {
+        match protect & 0xFF {
+            PAGE_NOACCESS => "PAGE_NOACCESS",
+            PAGE_READONLY => "PAGE_READONLY",
+            PAGE_READWRITE => "PAGE_READWRITE",
+            PAGE_WRITECOPY => "PAGE_WRITECOPY",
+            PAGE_EXECUTE => "PAGE_EXECUTE",
+            PAGE_EXECUTE_READ => "PAGE_EXECUTE_READ",
+            PAGE_EXECUTE_READWRITE => "PAGE_EXECUTE_READWRITE",
+            PAGE_EXECUTE_WRITECOPY => "PAGE_EXECUTE_WRITECOPY",
+            0 => "NONE",
+            _ => "OTHER",
+        }
+    }
+}
+
 // Protocol Display and Debug implementations
 impl std::fmt::Debug for DebuggerResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -11,6 +58,7 @@ impl std::fmt::Debug for DebuggerResponse {
                 ds.finish()
             }
             // Add other variants here, using a default debug format
+            DebuggerResponse::HardwareBreakpointSet { dr_index } => f.debug_struct("HardwareBreakpointSet").field("dr_index", dr_index).finish(),
             DebuggerResponse::Ack => write!(f, "Ack"),
             DebuggerResponse::Error { message } => f.debug_struct("Error").field("message", message).finish(),
             DebuggerResponse::Event { event } => f.debug_struct("Event").field("event", &format_args!("{}", event)).finish(),
@@ -28,6 +76,72 @@ impl std::fmt::Debug for DebuggerResponse {
             DebuggerResponse::Instructions { instructions } => f.debug_struct("Instructions").field("instructions", instructions).finish(),
             DebuggerResponse::FunctionArguments { arguments } => f.debug_struct("FunctionArguments").field("arguments", arguments).finish(),
             DebuggerResponse::WideStringData { data } => f.debug_struct("WideStringData").field("data", data).finish(),
+            DebuggerResponse::ModuleExtraInfo { info } => f.debug_struct("ModuleExtraInfo")
+                .field("dos_header", &info.dos_header)
+                .field("nt_headers", &info.nt_headers)
+                .finish(),
+            DebuggerResponse::MemoryRegionInfo { info } => f.debug_struct("MemoryRegionInfo")
+                .field("base_address", &format_args!("0x{:X}", info.base_address))
+                .field("region_size", &format_args!("0x{:X}", info.region_size))
+                .field("state", &format_args!("0x{:X}", info.state))
+                .field("protect", &format_args!("0x{:X}", info.protect))
+                .finish(),
+            DebuggerResponse::MemoryRegionList { regions } => f.debug_struct("MemoryRegionList")
+                .field("count", &regions.len())
+                .finish(),
+            DebuggerResponse::DereferenceResult { entries } => f.debug_struct("DereferenceResult")
+                .field("count", &entries.len())
+                .finish(),
+            DebuggerResponse::MemorySearchResult { addresses, capped } => f.debug_struct("MemorySearchResult")
+                .field("matches", &addresses.len())
+                .field("capped", capped)
+                .finish(),
+            DebuggerResponse::FunctionDisassembly { instructions, function_start, function_end, function_name } => {
+                f.debug_struct("FunctionDisassembly")
+                    .field("instructions_count", &instructions.len())
+                    .field("function_start", &function_start.map(|a| format!("0x{:X}", a)))
+                    .field("function_end", &function_end.map(|a| format!("0x{:X}", a)))
+                    .field("function_name", function_name)
+                    .finish()
+            }
+            DebuggerResponse::EmulationResult { final_pc, instructions_executed, stop_reason, emulation_time_us, pages_loaded, basic_blocks, .. } => {
+                f.debug_struct("EmulationResult")
+                    .field("final_pc", &format_args!("0x{:X}", final_pc))
+                    .field("instructions_executed", instructions_executed)
+                    .field("stop_reason", stop_reason)
+                    .field("emulation_time_us", emulation_time_us)
+                    .field("pages_loaded", pages_loaded)
+                    .field("basic_blocks_count", &basic_blocks.len())
+                    .finish()
+            }
+            DebuggerResponse::TenetTrace { trace_text, stop_reason, trace_time_us, .. } => {
+                f.debug_struct("TenetTrace")
+                    .field("trace_text_len", &trace_text.len())
+                    .field("stop_reason", stop_reason)
+                    .field("trace_time_us", trace_time_us)
+                    .finish()
+            }
+            DebuggerResponse::ScanMemoryResult { scan_id, match_count, scan_time_us } => {
+                f.debug_struct("ScanMemoryResult")
+                    .field("scan_id", scan_id)
+                    .field("match_count", match_count)
+                    .field("scan_time_us", scan_time_us)
+                    .finish()
+            }
+            DebuggerResponse::ScanMemoryResults { addresses, total_count, .. } => {
+                f.debug_struct("ScanMemoryResults")
+                    .field("returned", &addresses.len())
+                    .field("total_count", total_count)
+                    .finish()
+            }
+            DebuggerResponse::PebHideResult { report } => {
+                f.debug_struct("PebHideResult")
+                    .field("peb_address", &format_args!("0x{:X}", report.peb_address))
+                    .field("applied", &report.applied)
+                    .field("failures", &report.failures)
+                    .field("wow64_skipped", &report.wow64_skipped)
+                    .finish()
+            }
         }
     }
 }
@@ -134,8 +248,8 @@ impl std::fmt::Display for ModuleInfo {
 impl std::fmt::Display for DebugEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DebugEvent::ProcessExited { pid, exit_code } => {
-                write!(f, "ProcessExited(pid={}, exit_code=0x{:X})", pid, exit_code)
+            DebugEvent::ProcessExited { pid, tid, exit_code } => {
+                write!(f, "ProcessExited(pid={}, tid={}, exit_code=0x{:X})", pid, tid, exit_code)
             }
             DebugEvent::Output { pid, tid, output } => {
                 write!(f, "Output(pid={}, tid={}, output={})", pid, tid, output)
@@ -145,6 +259,9 @@ impl std::fmt::Display for DebugEvent {
             }
             DebugEvent::Breakpoint { pid, tid, address } => {
                 write!(f, "Breakpoint(pid={}, tid={}, address=0x{:X})", pid, tid, address)
+            }
+            DebugEvent::HardwareBreakpoint { pid, tid, address, dr_index, bp_type } => {
+                write!(f, "HardwareBreakpoint(pid={}, tid={}, address=0x{:X}, dr={}, type={:?})", pid, tid, address, dr_index, bp_type)
             }
             DebugEvent::InitialBreakpoint { pid, tid, address } => {
                 write!(f, "InitialBreakpoint(pid={}, tid={}, address=0x{:X})", pid, tid, address)
@@ -178,7 +295,9 @@ impl std::fmt::Display for DebugEvent {
             DebugEvent::StepFailed { pid, tid, kind, message } => {
                 write!(f, "StepFailed(pid={}, tid={}, kind={:?}, message={})", pid, tid, kind, message)
             }
-            DebugEvent::Unknown => write!(f, "Unknown"),
+            DebugEvent::Unknown { pid, tid, debug_event_code, error } => {
+                write!(f, "Unknown(pid={}, tid={}, event_code={}, error={})", pid, tid, debug_event_code, error)
+            }
         }
     }
 }
@@ -199,14 +318,8 @@ impl std::fmt::Display for ThreadContext {
         #[cfg(all(windows, target_arch = "aarch64"))]
         {
             let ThreadContext::Win32RawContext(ctx) = self;
-            
-            // TODO: Replace with actual register access once CONTEXT_0 layout is confirmed
-            // The Anonymous union should contain X0-X30 registers, possibly as:
-            // - ctx.Anonymous.X[0] through ctx.Anonymous.X[30], or
-            // - ctx.Anonymous.X0 through ctx.Anonymous.X30
-            
-            // For now, using placeholder values but with the correct format
-            return write!(f,
+
+            return unsafe { write!(f,
                 "X0:   {:016X}   X1:   {:016X}   X2:   {:016X}   \n\
                  X3:   {:016X}   X4:   {:016X}   X5:   {:016X}   \n\
                  X6:   {:016X}   X7:   {:016X}   X8:   {:016X}   \n\
@@ -218,36 +331,32 @@ impl std::fmt::Display for ThreadContext {
                  X24:  {:016X}   X25:  {:016X}   X26:  {:016X}   \n\
                  X27:  {:016X}   X28:  {:016X}   FP:   {:016X}   \n\
                  LR:   {:016X}   SP:   {:016X}   PC:   {:016X}   \n\
-                 CPSR: {:08X}   ELR:  {:016X}   SPSR: {:016X}   \n\
-                 LastErrorValue: 0x{:08X}\n\
-                 LastStatusValue: 0x{:08X}",
+                 CPSR: {:08X}",
                 // X0-X2
-                0, 0, 0,
-                // X3-X5  
-                0, 0, 0,
+                ctx.Anonymous.X[0], ctx.Anonymous.X[1], ctx.Anonymous.X[2],
+                // X3-X5
+                ctx.Anonymous.X[3], ctx.Anonymous.X[4], ctx.Anonymous.X[5],
                 // X6-X8
-                0, 0, 0,
+                ctx.Anonymous.X[6], ctx.Anonymous.X[7], ctx.Anonymous.X[8],
                 // X9-X11
-                0, 0, 0,
+                ctx.Anonymous.X[9], ctx.Anonymous.X[10], ctx.Anonymous.X[11],
                 // X12-X14
-                0, 0, 0,
+                ctx.Anonymous.X[12], ctx.Anonymous.X[13], ctx.Anonymous.X[14],
                 // X15-X17
-                0, 0, 0,
+                ctx.Anonymous.X[15], ctx.Anonymous.X[16], ctx.Anonymous.X[17],
                 // X18-X20
-                0, 0, 0,
+                ctx.Anonymous.X[18], ctx.Anonymous.X[19], ctx.Anonymous.X[20],
                 // X21-X23
-                0, 0, 0,
+                ctx.Anonymous.X[21], ctx.Anonymous.X[22], ctx.Anonymous.X[23],
                 // X24-X26
-                0, 0, 0,
+                ctx.Anonymous.X[24], ctx.Anonymous.X[25], ctx.Anonymous.X[26],
                 // X27-X28, FP (X29)
-                0, 0, 0,
+                ctx.Anonymous.X[27], ctx.Anonymous.X[28], ctx.Anonymous.X[29],
                 // LR (X30), SP, PC
-                0, ctx.Sp, ctx.Pc,
-                // CPSR, ELR, SPSR (placeholder values for ELR and SPSR)
-                ctx.Cpsr, 0u64, 0u64,
-                // LastErrorValue, LastStatusValue (placeholder values)
-                0u32, 0u32
-            );
+                ctx.Anonymous.X[30], ctx.Sp, ctx.Pc,
+                // CPSR
+                ctx.Cpsr,
+            ) };
         }
         
         #[cfg(not(any(all(windows, target_arch = "x86_64"), all(windows, target_arch = "aarch64"))))]

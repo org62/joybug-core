@@ -7,11 +7,14 @@ use msvc_demangler::DemangleFlags;
 use pelite::pe64::{Pe, PeFile};
 use pelite::image::IMAGE_DEBUG_TYPE_CODEVIEW;
 use pelite::Error as PeliteError;
-use pdb::{PDB, PublicSymbol, SymbolData, FallibleIterator};
+use pdb::{
+    AddressMap, FallibleIterator, PdbInternalSectionOffset, ProcedureSymbol, PublicSymbol,
+    SymbolData, PDB,
+};
 use symsrv::{SymsrvDownloader, parse_nt_symbol_path, get_symbol_path_from_environment, get_home_sym_dir};
 use tracing::{trace, debug};
 use uuid::Uuid;
-use tokio::runtime::Runtime;
+use tokio::runtime::{Runtime, Builder};
 
 use crate::interfaces::{Address, ModuleSymbol, ResolvedSymbol, SymbolError, SymbolProvider};
 
@@ -111,8 +114,11 @@ pub struct WindowsSymbolProvider {
 
 impl WindowsSymbolProvider {
     pub fn new() -> Result<Self, SymbolError> {
-        // Create tokio runtime for async operations
-        let runtime = Runtime::new()
+        // Create a single-threaded tokio runtime for async operations
+        // Using current_thread ensures we don't spawn extra threads that might linger
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
             .map_err(|e| SymbolError::SymSrvError(format!("Failed to create async runtime: {}", e)))?;
 
         // Parse the _NT_SYMBOL_PATH environment variable using symsrv
@@ -153,37 +159,81 @@ impl WindowsSymbolProvider {
         let mut pdb_parser = PDB::open(file)
             .map_err(|e| SymbolError::PdbParsingFailed(format!("PDB::open for {}: {}", pdb_path.display(), e)))?;
 
-        let mut symbols_vec = Vec::new();
+        // Use a HashMap to deduplicate symbols by name.
+        // Procedure symbols from DBI modules are inserted first (Phase 1),
+        // then public/global symbols (Phase 2). Using or_insert() means
+        // procedure symbols take priority over public symbols with the same name,
+        // matching WinDbg's resolution behavior for private functions.
+        let mut symbols_map: HashMap<String, ModuleSymbol> = HashMap::new();
 
-        let global_symbols = pdb_parser.global_symbols()
-            .map_err(|e| SymbolError::PdbParsingFailed(format!("PDB global_symbols from {}: {}", pdb_path.display(), e)))?;
-        
         let address_map = pdb_parser.address_map()
             .map_err(|e| SymbolError::PdbParsingFailed(format!("PDB address_map from {}: {}", pdb_path.display(), e)))?;
-        
+
+        // Phase 1: Parse procedure symbols from DBI module streams.
+        // These contain private function symbols (e.g., _LdrpInitialize) that
+        // are not present in the global symbol stream.
+        // Scoped so DebugInformation is dropped before Phase 2 calls global_symbols().
+        {
+            let dbi = pdb_parser.debug_information()
+                .map_err(|e| SymbolError::PdbParsingFailed(format!("PDB debug_information from {}: {}", pdb_path.display(), e)))?;
+            let mut modules = dbi.modules()
+                .map_err(|e| SymbolError::PdbParsingFailed(format!("PDB modules from {}: {}", pdb_path.display(), e)))?;
+
+            while let Ok(Some(module)) = modules.next() {
+                let module_info = match pdb_parser.module_info(&module) {
+                    Ok(Some(info)) => info,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        trace!(error = %e, module = %module.module_name(), "Failed to get module info, skipping");
+                        continue;
+                    }
+                };
+
+                let symbols = match module_info.symbols() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        trace!(error = %e, module = %module.module_name(), "Failed to get module symbols, skipping");
+                        continue;
+                    }
+                };
+
+                let mut sym_iter = symbols;
+                loop {
+                    match sym_iter.next() {
+                        Ok(Some(symbol)) => {
+                            if let Ok(SymbolData::Procedure(ProcedureSymbol { name, offset, .. })) = symbol.parse() {
+                                insert_symbol(&name.to_string(), offset, &address_map, &mut symbols_map, true);
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            trace!(error = %e, module = %module.module_name(), "Failed to iterate module symbols, skipping rest");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Parse public and procedure symbols from the global symbol stream.
+        // Public symbols provide exported function names. Using or_insert() ensures
+        // procedure symbols from Phase 1 are not overwritten.
+        let global_symbols = pdb_parser.global_symbols()
+            .map_err(|e| SymbolError::PdbParsingFailed(format!("PDB global_symbols from {}: {}", pdb_path.display(), e)))?;
+
         let mut iter = global_symbols.iter();
         loop {
             match iter.next() {
                 Ok(Some(symbol)) => {
                     match symbol.parse() {
-                        Ok(SymbolData::Public(PublicSymbol { name, offset, .. })) => {
-                            let symbol_name_str = name.to_string();
-                            let demangled_name = if symbol_name_str.starts_with('?') {
-                                msvc_demangler::demangle(&symbol_name_str, DemangleFlags::COMPLETE)
-                                    .unwrap_or_else(|_| symbol_name_str.clone().into_owned())
-                            } else {
-                                symbol_name_str.into_owned()
-                            };
-                            
-                            let rva = offset.to_rva(&address_map).unwrap_or_default().0;
-                            
-                            symbols_vec.push(ModuleSymbol {
-                                name: demangled_name,
-                                rva,
-                            });
+                        Ok(SymbolData::Public(PublicSymbol { name, offset, function, .. })) => {
+                            insert_symbol(&name.to_string(), offset, &address_map, &mut symbols_map, function);
                         }
-                        Ok(_other_data) => { /* Optionally handle other symbol types or log them */ }
-                        Err(pdb_parse_err) => { 
+                        Ok(SymbolData::Procedure(ProcedureSymbol { name, offset, .. })) => {
+                            insert_symbol(&name.to_string(), offset, &address_map, &mut symbols_map, true);
+                        }
+                        Ok(_other_data) => { /* Skip other symbol types */ }
+                        Err(pdb_parse_err) => {
                             trace!(error = %pdb_parse_err, "Failed to parse some PDB symbol, skipping");
                         }
                     }
@@ -196,9 +246,36 @@ impl WindowsSymbolProvider {
             }
         }
 
+        let symbols_vec: Vec<ModuleSymbol> = symbols_map.into_values().collect();
         trace!(count = symbols_vec.len(), "Successfully parsed symbols from PDB");
         Ok(symbols_vec)
     }
+}
+
+/// Helper to demangle a symbol name and insert it into the symbols map.
+/// Uses `or_insert` so the first occurrence wins (procedure symbols from DBI
+/// modules take priority over later public symbols with the same name).
+fn insert_symbol(
+    name_str: &str,
+    offset: PdbInternalSectionOffset,
+    address_map: &AddressMap,
+    symbols_map: &mut HashMap<String, ModuleSymbol>,
+    is_function: bool,
+) {
+    let demangled_name = if name_str.starts_with('?') {
+        msvc_demangler::demangle(name_str, DemangleFlags::COMPLETE)
+            .unwrap_or_else(|_| name_str.to_string())
+    } else {
+        name_str.to_string()
+    };
+
+    let rva = offset.to_rva(address_map).unwrap_or_default().0;
+
+    symbols_map.entry(demangled_name.clone()).or_insert(ModuleSymbol {
+        name: demangled_name,
+        rva,
+        is_function,
+    });
 }
 
 impl SymbolProvider for WindowsSymbolProvider {
@@ -209,29 +286,41 @@ impl SymbolProvider for WindowsSymbolProvider {
         module_size: Option<usize>,
     ) -> Result<(), SymbolError> {
         trace!(module_path = module_path_str, module_base = format!("0x{:X}", module_base), "Loading symbols for module");
-        
+
         if self.loaded_modules.contains_key(module_path_str) {
             trace!(module_path = module_path_str, "Symbols already loaded for module");
             return Ok(());
         }
-        
+
         let module_path = Path::new(module_path_str);
-        
+
         // Extract PDB identifier from the PE file
         let pdb_identifier = extract_pdb_identifier_from_file(module_path)?;
         let symsrv_id = pdb_identifier.to_symsrv_identifier();
-        
+
         trace!(pdb_name = %pdb_identifier.name, pdb_guid = %pdb_identifier.guid, pdb_age = pdb_identifier.age, symsrv_id = %symsrv_id, "Extracted PDB identifier");
-        
-        // Fetch the PDB file
-        let downloaded_pdb_path = self.internal_fetch_pdb(&pdb_identifier.name, &symsrv_id)?;
-        
+
+        // First, check if PDB exists in the same directory as the executable
+        let pdb_path = if let Some(parent_dir) = module_path.parent() {
+            let local_pdb_path = parent_dir.join(&pdb_identifier.name);
+            if local_pdb_path.exists() {
+                trace!(path = %local_pdb_path.display(), "Found PDB in same directory as executable");
+                local_pdb_path
+            } else {
+                // Fall back to symsrv download
+                self.internal_fetch_pdb(&pdb_identifier.name, &symsrv_id)?
+            }
+        } else {
+            // No parent directory, fall back to symsrv download
+            self.internal_fetch_pdb(&pdb_identifier.name, &symsrv_id)?
+        };
+
         // Parse the PDB file
-        let symbols = self.internal_parse_pdb_to_symbols(&downloaded_pdb_path)?;
-        
+        let symbols = self.internal_parse_pdb_to_symbols(&pdb_path)?;
+
         // Store the symbols
         self.loaded_modules.insert(module_path_str.to_string(), (module_base, module_size, symbols));
-        
+
         trace!(module_path = module_path_str, symbol_count = self.loaded_modules.get(module_path_str).unwrap().2.len(), "Successfully loaded symbols for module");
         Ok(())
     }
@@ -267,6 +356,7 @@ impl SymbolProvider for WindowsSymbolProvider {
                                 module_name: module_name.to_string(),
                                 rva: symbol.rva,
                                 va: module_base + symbol.rva as u64,
+                                is_function: symbol.is_function,
                             };
                             
                             found_symbols.push(resolved_symbol);
@@ -300,6 +390,7 @@ impl SymbolProvider for WindowsSymbolProvider {
                             module_name: module_name.clone(),
                             rva: symbol.rva,
                             va: module_base + symbol.rva as u64,
+                            is_function: symbol.is_function,
                         };
                         
                         found_symbols.push(resolved_symbol);

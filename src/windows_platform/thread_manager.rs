@@ -33,6 +33,10 @@ impl ThreadManager {
         self.threads.values().map(|(info, _)| info.clone()).collect()
     }
 
+    pub fn all_thread_handles(&self) -> Vec<(u32, HANDLE)> {
+        self.threads.iter().map(|(tid, (_, handle))| (*tid, handle.0)).collect()
+    }
+
     pub fn clear(&mut self) {
         self.threads.clear();
     }

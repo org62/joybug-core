@@ -11,14 +11,21 @@ pub mod disassembler;
 mod callstack;
 mod stepper;
 mod debugged_process;
+mod module_extra;
+mod dbghelp;
+mod dereference;
+mod tracer;
+mod hardware_breakpoints;
 
 use crate::interfaces::{PlatformAPI, PlatformError, ModuleSymbol, ResolvedSymbol, SymbolError, Architecture, DisassemblerError, Instruction, DisassemblerProvider, Stepper};
+// no-op
 use crate::protocol::{ModuleInfo, ProcessInfo, ThreadInfo, StepKind};
+use crate::emulator::{Emulator, EmulationResult};
 use symbol_manager::SymbolManager;
 use disassembler::CapstoneDisassembler;
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-use tracing::{trace, info};
+use tracing::{trace, info, warn, error};
 use std::collections::HashMap;
 
 // Safe wrapper for HANDLE that automatically closes it
@@ -45,6 +52,8 @@ struct AlignedContext {
 #[derive(Debug, Clone)]
 pub(crate) struct StepState {
     pub(crate) kind: StepKind,
+    /// If set, a hardware breakpoint DR index that needs re-arming after the step completes.
+    pub(crate) deferred_hw_bp_rearm: Option<u8>,
 }
 
 pub(crate) use debugged_process::DebuggedProcess;
@@ -62,7 +71,7 @@ impl WindowsPlatform {
     pub fn new() -> Self {
         let symbol_manager = SymbolManager::new().ok(); // Log error but don't fail initialization
         let disassembler = CapstoneDisassembler::new().ok(); // Log error but don't fail initialization
-        Self { 
+        Self {
             processes: HashMap::new(),
             symbol_manager,
             disassembler,
@@ -73,7 +82,7 @@ impl WindowsPlatform {
     pub fn process_handle(&self, pid: u32) -> Result<HANDLE, PlatformError> {
         Ok(self.get_process(pid)?.handle())
     }
-    
+
     /// Get a reference to a debugged process by PID
     fn get_process(&self, pid: u32) -> Result<&DebuggedProcess, PlatformError> {
         self.processes.get(&pid)
@@ -125,6 +134,181 @@ impl WindowsPlatform {
             (removed_over, removed_out)
         } else {
             (0, 0)
+        }
+    }
+
+    // ==================== Emulator Methods (One-Shot) ====================
+    // Note: Emulators are created, used, and destroyed in a single call
+    // because Unicorn is not Send+Sync and can't be stored across threads.
+
+    /// Emulate with a specific mode (one-shot)
+    pub fn emulate_with_mode(
+        &self,
+        pid: u32,
+        tid: u32,
+        max_instructions: usize,
+        mode: crate::protocol::EmulationMode,
+        exit_condition: Option<crate::protocol::TraceExitCondition>,
+        memory_reads: &[(u64, usize)],
+    ) -> Result<EmulationResult, PlatformError> {
+        let mut emulator = Emulator::from_debugger_state(self, pid, tid)
+            .map_err(|e| PlatformError::Other(e.to_string()))?;
+
+        emulator.emulate_with_mode(self, max_instructions, mode, exit_condition, memory_reads)
+            .map_err(|e| PlatformError::Other(e.to_string()))
+    }
+
+    /// Trace instructions using trap flag, capturing register state at each step
+    pub fn trace_instructions(
+        &mut self,
+        pid: u32,
+        tid: u32,
+        exit_condition: crate::protocol::TraceExitCondition,
+        max_instructions: usize,
+    ) -> Result<(Vec<crate::protocol::TraceEntry>, String, u64), PlatformError> {
+        let result = tracer::trace_instructions(self, pid, tid, exit_condition, max_instructions)?;
+        Ok((result.entries, result.stop_reason, result.trace_time_us))
+    }
+
+    /// Get the TEB (Thread Environment Block) address for a thread
+    pub fn get_teb_address(&self, pid: u32, tid: u32) -> Result<u64, PlatformError> {
+        let process = self.get_process(pid)?;
+        let thread_handle = process.thread_manager().get_thread_handle(tid)
+            .ok_or_else(|| PlatformError::Other(format!("Thread {} not found", tid)))?;
+
+        // Use NtQueryInformationThread to get THREAD_BASIC_INFORMATION
+        #[repr(C)]
+        struct ThreadBasicInformation {
+            exit_status: i32,
+            teb_base_address: *mut std::ffi::c_void,
+            client_id_unique_process: usize,
+            client_id_unique_thread: usize,
+            affinity_mask: usize,
+            priority: i32,
+            base_priority: i32,
+        }
+
+        // Link to ntdll
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtQueryInformationThread(
+                thread_handle: HANDLE,
+                thread_information_class: u32,
+                thread_information: *mut std::ffi::c_void,
+                thread_information_length: u32,
+                return_length: *mut u32,
+            ) -> i32;
+        }
+
+        const THREAD_BASIC_INFORMATION: u32 = 0;
+
+        let mut info: ThreadBasicInformation = unsafe { std::mem::zeroed() };
+        let mut return_length: u32 = 0;
+
+        let status = unsafe {
+            NtQueryInformationThread(
+                thread_handle,
+                THREAD_BASIC_INFORMATION,
+                &mut info as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of::<ThreadBasicInformation>() as u32,
+                &mut return_length,
+            )
+        };
+
+        if status >= 0 {
+            Ok(info.teb_base_address as u64)
+        } else {
+            Err(PlatformError::Other(format!("NtQueryInformationThread failed: 0x{:08X}", status)))
+        }
+    }
+
+    /// Get the PEB (Process Environment Block) base address for a process.
+    pub fn get_peb_address(&self, pid: u32) -> Result<u64, PlatformError> {
+        let process_handle = self.get_process(pid)?.handle();
+
+        // PROCESS_BASIC_INFORMATION layout — see `winternl.h`.
+        #[repr(C)]
+        struct ProcessBasicInformation {
+            exit_status: i32,
+            peb_base_address: *mut std::ffi::c_void,
+            affinity_mask: usize,
+            base_priority: i32,
+            unique_process_id: usize,
+            inherited_from_unique_process_id: usize,
+        }
+
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtQueryInformationProcess(
+                process_handle: HANDLE,
+                process_information_class: u32,
+                process_information: *mut std::ffi::c_void,
+                process_information_length: u32,
+                return_length: *mut u32,
+            ) -> i32;
+        }
+
+        const PROCESS_BASIC_INFORMATION_CLASS: u32 = 0;
+
+        let mut info: ProcessBasicInformation = unsafe { std::mem::zeroed() };
+        let mut return_length: u32 = 0;
+        let status = unsafe {
+            NtQueryInformationProcess(
+                process_handle,
+                PROCESS_BASIC_INFORMATION_CLASS,
+                &mut info as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of::<ProcessBasicInformation>() as u32,
+                &mut return_length,
+            )
+        };
+
+        if status >= 0 {
+            Ok(info.peb_base_address as u64)
+        } else {
+            Err(PlatformError::Other(format!(
+                "NtQueryInformationProcess(ProcessBasicInformation) failed: 0x{:08X}",
+                status
+            )))
+        }
+    }
+
+    /// True if the target process is WOW64 (32-bit on 64-bit Windows).
+    pub fn is_wow64_process(&self, pid: u32) -> Result<bool, PlatformError> {
+        let process_handle = self.get_process(pid)?.handle();
+
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtQueryInformationProcess(
+                process_handle: HANDLE,
+                process_information_class: u32,
+                process_information: *mut std::ffi::c_void,
+                process_information_length: u32,
+                return_length: *mut u32,
+            ) -> i32;
+        }
+
+        // ProcessWow64Information returns the WOW64 PEB pointer; non-NULL = WOW64.
+        const PROCESS_WOW64_INFORMATION_CLASS: u32 = 26;
+
+        let mut wow64_peb: usize = 0;
+        let mut return_length: u32 = 0;
+        let status = unsafe {
+            NtQueryInformationProcess(
+                process_handle,
+                PROCESS_WOW64_INFORMATION_CLASS,
+                &mut wow64_peb as *mut _ as *mut std::ffi::c_void,
+                std::mem::size_of::<usize>() as u32,
+                &mut return_length,
+            )
+        };
+
+        if status >= 0 {
+            Ok(wow64_peb != 0)
+        } else {
+            Err(PlatformError::Other(format!(
+                "NtQueryInformationProcess(ProcessWow64Information) failed: 0x{:08X}",
+                status
+            )))
         }
     }
 }
@@ -206,8 +390,81 @@ impl PlatformAPI for WindowsPlatform {
         process.remove_breakpoint(addr)
     }
 
-    fn launch(&mut self, command: &str) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
-        process::launch(self, command)
+    fn set_hardware_breakpoint(
+        &mut self,
+        pid: u32,
+        addr: u64,
+        bp_type: crate::protocol::HardwareBreakpointType,
+        size: crate::protocol::HardwareBreakpointSize,
+    ) -> Result<u8, PlatformError> {
+        trace!(pid, addr, ?bp_type, ?size, "WindowsPlatform::set_hardware_breakpoint called");
+        let process = self.get_process_mut(pid)?;
+
+        // Check for duplicate
+        if process.has_hardware_breakpoint_at(addr) {
+            return Err(PlatformError::Other(format!(
+                "Hardware breakpoint already exists at 0x{:X}", addr
+            )));
+        }
+
+        // Allocate a free debug register
+        let dr_index = process.find_free_debug_register()
+            .ok_or_else(|| PlatformError::Other(
+                "All 4 hardware debug registers are in use".to_string()
+            ))?;
+
+        // Apply to all threads (skip threads that fail — they may be exiting or
+        // in a kernel transition where GetThreadContext returns ERROR_GEN_FAILURE)
+        let thread_handles = process.thread_manager().all_thread_handles();
+        let mut applied_count = 0u32;
+        for (tid, handle) in &thread_handles {
+            match hardware_breakpoints::apply_single_hw_bp_to_thread(*handle, dr_index, addr, bp_type, size) {
+                Ok(()) => applied_count += 1,
+                Err(e) => {
+                    warn!(tid, addr, error = %e, "Failed to apply HW BP to thread (may have exited or be in kernel transition)");
+                }
+            }
+        }
+        if applied_count == 0 && !thread_handles.is_empty() {
+            return Err(PlatformError::Other(format!(
+                "Failed to set hardware breakpoint: could not apply to any of {} threads", thread_handles.len()
+            )));
+        }
+
+        // Store in process state
+        process.add_hardware_breakpoint(debugged_process::InternalHardwareBreakpoint {
+            address: addr,
+            bp_type,
+            size,
+            dr_index,
+            is_active: true,
+        });
+
+        info!(pid, addr, dr_index, "Hardware breakpoint set");
+        Ok(dr_index)
+    }
+
+    fn remove_hardware_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError> {
+        trace!(pid, addr, "WindowsPlatform::remove_hardware_breakpoint called");
+        let process = self.get_process_mut(pid)?;
+
+        let bp = process.remove_hardware_breakpoint_by_addr(addr)
+            .ok_or_else(|| PlatformError::Other(format!(
+                "No hardware breakpoint at 0x{:X}", addr
+            )))?;
+
+        // Clear from all threads
+        let thread_handles = process.thread_manager().all_thread_handles();
+        for (_tid, handle) in &thread_handles {
+            let _ = hardware_breakpoints::clear_hw_bp_from_thread(*handle, bp.dr_index);
+        }
+
+        info!(pid, addr, dr_index = bp.dr_index, "Hardware breakpoint removed");
+        Ok(())
+    }
+
+    fn launch(&mut self, command: &str, debug_children: bool, working_directory: Option<&str>) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
+        process::launch(self, command, debug_children, working_directory)
     }
 
     fn read_memory(&self, pid: u32, address: u64, size: usize) -> Result<Vec<u8>, PlatformError> {
@@ -330,6 +587,13 @@ impl PlatformAPI for WindowsPlatform {
             let modules = self.get_process(pid).map_err(|e| SymbolError::SymbolsNotFound(e.to_string()))?
                 .module_manager()
                 .list_modules();
+
+            // Try chain-aware resolution first (handles PGO-split function fragments)
+            if let Ok(Some(result)) = symbol_manager.resolve_address_with_chain(&modules, address) {
+                return Ok(Some(result));
+            }
+
+            // Fall back to nearest-below symbol resolution
             symbol_manager.resolve_address_to_symbol_raw(&modules, address)
         } else {
             Err(SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()))
@@ -338,21 +602,56 @@ impl PlatformAPI for WindowsPlatform {
     
     // Symbolized disassembly methods
     fn disassemble_memory(&self, pid: u32, address: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
+        use std::time::Instant;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::cell::Cell;
+
+        // Thread-local timing accumulators
+        thread_local! {
+            static MEMORY_READ_US: Cell<u64> = const { Cell::new(0) };
+            static MODULE_LIST_US: Cell<u64> = const { Cell::new(0) };
+            static DISASM_US: Cell<u64> = const { Cell::new(0) };
+            static SYMBOL_US: Cell<u64> = const { Cell::new(0) };
+            static CALL_COUNT: Cell<u64> = const { Cell::new(0) };
+            static SYMBOL_CALLS: Cell<u64> = const { Cell::new(0) };
+        }
+
         if self.disassembler.is_none() {
             return Err(DisassemblerError::CapstoneError("Disassembler not initialized".to_string()));
         }
 
-        let data = memory::read_memory_unlocked(pid, address, count * 16)
+        // Time memory read
+        let t0 = Instant::now();
+        let mut data = memory::read_memory_unlocked(pid, address, count * 16)
             .map_err(|e| DisassemblerError::InvalidData(format!("Failed to read memory: {}", e)))?;
 
-        let modules = self.get_process(pid)
+        // Patch breakpoint bytes with originals so disassembly shows real instructions
+        if let Ok(process) = self.get_process(pid) {
+            process.patch_breakpoint_bytes(address, &mut data);
+        }
+        let memory_time = t0.elapsed();
+
+        // Time module list fetch
+        let t1 = Instant::now();
+        let mut modules = self.get_process(pid)
             .map_err(|e| DisassemblerError::InvalidData(format!("Process not found: {}", e)))?
             .module_manager()
             .list_modules();
+        // Sort modules by base address for binary search
+        modules.sort_by_key(|m| m.base);
+        let module_time = t1.elapsed();
 
         let symbol_manager = self.symbol_manager.as_ref();
+
+        // Track symbol resolution time
+        let symbol_time_us = std::sync::Arc::new(AtomicU64::new(0));
+        let symbol_call_count = std::sync::Arc::new(AtomicU64::new(0));
+        let symbol_time_clone = symbol_time_us.clone();
+        let symbol_count_clone = symbol_call_count.clone();
+
         let symbol_resolver = move |addr: u64| -> Option<crate::interfaces::SymbolInfo> {
-            if let Some(symbol_manager) = symbol_manager {
+            let t = Instant::now();
+            let result = if let Some(symbol_manager) = symbol_manager {
                 if let Ok(Some((module_path, symbol, offset))) = symbol_manager.resolve_address_to_symbol(&modules, addr) {
                     let module_name = std::path::Path::new(&module_path)
                         .file_stem()
@@ -361,12 +660,61 @@ impl PlatformAPI for WindowsPlatform {
                         .to_string();
                     Some(crate::interfaces::SymbolInfo { module_name, symbol_name: symbol.name, offset })
                 } else { None }
-            } else { None }
+            } else { None };
+            symbol_time_clone.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+            symbol_count_clone.fetch_add(1, Ordering::Relaxed);
+            result
         };
 
-        self.disassembler.as_ref().unwrap().disassemble_with_symbols(arch, &data, address, count, symbol_resolver)
+        // Time disassembly
+        let t2 = Instant::now();
+        let result = self.disassembler.as_ref().unwrap().disassemble_with_symbols(arch, &data, address, count, symbol_resolver);
+        let disasm_time = t2.elapsed();
+
+        // Accumulate timing stats
+        MEMORY_READ_US.with(|c| c.set(c.get() + memory_time.as_micros() as u64));
+        MODULE_LIST_US.with(|c| c.set(c.get() + module_time.as_micros() as u64));
+        DISASM_US.with(|c| c.set(c.get() + disasm_time.as_micros() as u64));
+        SYMBOL_US.with(|c| c.set(c.get() + symbol_time_us.load(Ordering::Relaxed)));
+        SYMBOL_CALLS.with(|c| c.set(c.get() + symbol_call_count.load(Ordering::Relaxed)));
+        let call_count = CALL_COUNT.with(|c| { c.set(c.get() + 1); c.get() });
+
+        // Print stats every 1000 calls
+        if call_count % 1000 == 0 {
+            let mem_ms = MEMORY_READ_US.with(|c| c.get()) as f64 / 1000.0;
+            let mod_ms = MODULE_LIST_US.with(|c| c.get()) as f64 / 1000.0;
+            let dis_ms = DISASM_US.with(|c| c.get()) as f64 / 1000.0;
+            let sym_ms = SYMBOL_US.with(|c| c.get()) as f64 / 1000.0;
+            let sym_calls = SYMBOL_CALLS.with(|c| c.get());
+            println!("\n=== TIMING STATS after {} calls ===", call_count);
+            println!("  Memory read:    {:8.2} ms", mem_ms);
+            println!("  Module list:    {:8.2} ms", mod_ms);
+            println!("  Disassembly:    {:8.2} ms (includes symbol resolution)", dis_ms);
+            println!("  Symbol resolve: {:8.2} ms ({} calls, {:.3} ms/call avg)",
+                sym_ms, sym_calls, if sym_calls > 0 { sym_ms / sym_calls as f64 } else { 0.0 });
+            println!("=====================================\n");
+        }
+
+        // Resolve indirect jump/call targets (e.g., `call qword ptr [IAT_slot]`)
+        // by reading the pointer value so clicking navigates to the actual function.
+        let mut instructions = result?;
+        let ptr_size = match arch {
+            Architecture::X64 | Architecture::Arm64 => 8usize,
+        };
+        for instr in &mut instructions {
+            if (instr.is_call || instr.is_jump) && instr.jump_target.is_some() && instr.op_str.contains('[') {
+                let ptr_addr = instr.jump_target.unwrap();
+                if let Ok(data) = memory::read_memory_unlocked(pid, ptr_addr, ptr_size) {
+                    if data.len() >= ptr_size {
+                        let actual_target = u64::from_le_bytes(data[..8].try_into().unwrap());
+                        instr.jump_target = Some(actual_target);
+                    }
+                }
+            }
+        }
+        Ok(instructions)
     }
-    
+
     fn get_call_stack(&self, pid: u32, tid: u32) -> Result<Vec<crate::interfaces::CallFrame>, PlatformError> {
         callstack::get_call_stack(self, pid, tid)
     }
@@ -384,10 +732,291 @@ impl PlatformAPI for WindowsPlatform {
         process::debug_break_process_unlocked(pid)
     }
 
+    fn get_module_extra_info(&self, pid: u32, module_base: u64) -> Result<crate::pe_types::ModuleExtraInfo, PlatformError> {
+        // Try cached info first
+        if let Ok(process) = self.get_process(pid) {
+            if let Some(info) = process.module_manager().get_extra_info(module_base) {
+                return Ok(info);
+            }
+        }
+        // Fallback: parse from file
+        error!(pid, module_base, "Parsing module extra info from file");
+        self.parse_module_extra_info(pid, module_base)
+    }
+
+    fn query_memory_region(&self, pid: u32, address: u64) -> Result<crate::protocol::MemoryRegionInfo, PlatformError> {
+        memory::query_memory_region_unlocked(pid, address)
+    }
+
+    fn enumerate_memory_regions(&self, pid: u32) -> Result<Vec<crate::protocol::MemoryRegionInfo>, PlatformError> {
+        memory::enumerate_memory_regions_unlocked(pid)
+    }
+
+    fn dereference(
+        &self,
+        pid: u32,
+        address: u64,
+        count: usize,
+        reference_base: Option<u64>,
+    ) -> Result<Vec<crate::protocol::DereferenceEntry>, PlatformError> {
+        // Get process - required for module list and architecture
+        let process = self.get_process(pid)?;
+        let arch = process.architecture();
+
+        // Build symbol resolver for instruction operand symbolization
+        let mut modules = process.module_manager().list_modules();
+        // Sort modules by base address for binary search in symbol resolution
+        modules.sort_by_key(|m| m.base);
+        let symbol_manager = self.symbol_manager.as_ref();
+        let symbol_resolver = move |addr: u64| -> Option<crate::interfaces::SymbolInfo> {
+            if let Some(sm) = symbol_manager {
+                // Use non-blocking variant: return None immediately if symbols are still loading
+                // rather than waiting up to 5 seconds for PDB parsing to complete.
+                // This makes dereference responses instant even for large PDBs.
+                if let Ok(Some((module_path, symbol, offset))) = sm.try_resolve_address_to_symbol(&modules, addr) {
+                    let module_name = std::path::Path::new(&module_path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&module_path)
+                        .to_string();
+                    return Some(crate::interfaces::SymbolInfo { module_name, symbol_name: symbol.name, offset });
+                }
+            }
+            None
+        };
+
+        dereference::dereference(pid, address, count, reference_base, arch, Some(symbol_resolver))
+    }
+
+    fn get_teb_address(&self, pid: u32, tid: u32) -> Result<u64, PlatformError> {
+        // Call the method we defined on WindowsPlatform
+        WindowsPlatform::get_teb_address(self, pid, tid)
+    }
+
+    fn get_peb_address(&self, pid: u32) -> Result<u64, PlatformError> {
+        WindowsPlatform::get_peb_address(self, pid)
+    }
+
+    fn is_wow64(&self, pid: u32) -> Result<bool, PlatformError> {
+        WindowsPlatform::is_wow64_process(self, pid)
+    }
+
+    // ---------------------- Server-side fast paths ----------------------
+    //
+    // These bypass the platform lock for OS calls that don't need shared
+    // state, so concurrent read-only requests aren't starved while a
+    // Continue is parked in WaitForDebugEvent.
+
+    fn server_continue(
+        platform: &std::sync::Arc<std::sync::RwLock<Self>>,
+        pid: u32,
+        tid: u32,
+        pass_exception: bool,
+    ) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
+        let mut cont_pid = pid;
+        let mut cont_tid = tid;
+        let mut cont_pass = pass_exception;
+        loop {
+            crate::windows_platform::debug_events::continue_debug_event(
+                cont_pid, cont_tid, cont_pass,
+            )?;
+
+            let debug_event =
+                crate::windows_platform::debug_events::wait_for_debug_event_blocking()?;
+
+            let mut p = platform.write().unwrap();
+            match crate::windows_platform::debug_events::handle_debug_event(&mut *p, &debug_event)?
+            {
+                Some(event) => return Ok(Some(event)),
+                None => {
+                    // Internal event (e.g., breakpoint rearm) — auto-continue.
+                    cont_pid = debug_event.dwProcessId;
+                    cont_tid = debug_event.dwThreadId;
+                    cont_pass = false;
+                }
+            }
+        }
+    }
+
+    fn server_terminate(
+        _platform: &std::sync::Arc<std::sync::RwLock<Self>>,
+        pid: u32,
+    ) -> Result<(), PlatformError> {
+        crate::windows_platform::process::terminate_process_unlocked(pid)
+    }
+
+    fn server_break_into(
+        _platform: &std::sync::Arc<std::sync::RwLock<Self>>,
+        pid: u32,
+    ) -> Result<(), PlatformError> {
+        crate::windows_platform::process::debug_break_process_unlocked(pid)
+    }
+
+    // ------------------ Optional features (forwarders) ------------------
+
+    fn emulate_with_mode(
+        &self,
+        pid: u32,
+        tid: u32,
+        max_instructions: usize,
+        mode: crate::protocol::EmulationMode,
+        exit_condition: Option<crate::protocol::TraceExitCondition>,
+        memory_reads: &[(u64, usize)],
+    ) -> Result<crate::emulator::EmulationResult, PlatformError> {
+        WindowsPlatform::emulate_with_mode(
+            self,
+            pid,
+            tid,
+            max_instructions,
+            mode,
+            exit_condition,
+            memory_reads,
+        )
+    }
+
+    fn trace_instructions(
+        &mut self,
+        pid: u32,
+        tid: u32,
+        exit_condition: crate::protocol::TraceExitCondition,
+        max_instructions: usize,
+    ) -> Result<(Vec<crate::protocol::TraceEntry>, String, u64), PlatformError> {
+        WindowsPlatform::trace_instructions(self, pid, tid, exit_condition, max_instructions)
+    }
+
+    fn disassemble_function(
+        &self,
+        pid: u32,
+        address: u64,
+        max_instructions: usize,
+        arch: Architecture,
+    ) -> Result<(Vec<Instruction>, Option<u64>, Option<u64>, Option<String>), DisassemblerError> {
+        WindowsPlatform::disassemble_function(self, pid, address, max_instructions, arch)
+    }
 }
 
 impl Stepper for WindowsPlatform {
     fn step(&mut self, pid: u32, tid: u32, kind: StepKind) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
         stepper::step(self, pid, tid, kind)
     }
-} 
+}
+
+impl WindowsPlatform {
+    /// Find function boundaries for an address using the exception directory (RuntimeFunction).
+    /// Returns (function_start_va, function_end_va, function_name) if found.
+    pub fn find_function_bounds(&self, pid: u32, address: u64) -> Result<Option<(u64, u64, Option<String>)>, PlatformError> {
+        let process = self.get_process(pid)?;
+        let modules = process.module_manager().list_modules();
+
+        // Find which module contains this address
+        let containing_module = modules.iter().find(|m| {
+            let end = m.base + m.size.unwrap_or(0);
+            address >= m.base && address < end
+        });
+
+        let module = match containing_module {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+
+        // Get module extra info (which contains runtime_functions)
+        let extra_info = match self.get_module_extra_info(pid, module.base) {
+            Ok(info) => info,
+            Err(_) => return Ok(None),
+        };
+
+        let runtime_functions = match &extra_info.runtime_functions {
+            Some(funcs) if !funcs.is_empty() => funcs,
+            _ => return Ok(None),
+        };
+
+        // Convert address to RVA
+        let rva = (address - module.base) as u32;
+
+        // Binary search for the function containing this RVA
+        let result = runtime_functions.binary_search_by(|rf| {
+            if rva < rf.BeginAddress {
+                std::cmp::Ordering::Greater
+            } else if rva >= rf.EndAddress {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+
+        match result {
+            Ok(idx) => {
+                let rf = &runtime_functions[idx];
+                let func_start = module.base + rf.BeginAddress as u64;
+                let func_end = module.base + rf.EndAddress as u64;
+
+                // Try to get function name from symbol
+                let func_name = if let Some(ref symbol_manager) = self.symbol_manager {
+                    symbol_manager
+                        .resolve_address_to_symbol_raw(&modules, func_start)
+                        .ok()
+                        .flatten()
+                        .map(|(module_path, symbol, _offset)| {
+                            let module_name = std::path::Path::new(&module_path)
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or(&module_path)
+                                .to_string();
+                            format!("{}!{}", module_name, symbol.name)
+                        })
+                } else {
+                    None
+                };
+
+                Ok(Some((func_start, func_end, func_name)))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Disassemble a function with bounds detection.
+    /// Returns (instructions, function_start, function_end, function_name).
+    pub fn disassemble_function(
+        &self,
+        pid: u32,
+        address: u64,
+        max_instructions: usize,
+        arch: Architecture,
+    ) -> Result<(Vec<Instruction>, Option<u64>, Option<u64>, Option<String>), crate::interfaces::DisassemblerError> {
+        // Try to find function bounds
+        let bounds = self.find_function_bounds(pid, address)
+            .ok()
+            .flatten();
+
+        let (disasm_start, disasm_count, func_start, func_end, func_name) = match bounds {
+            Some((start, end, name)) => {
+                // Calculate how many instructions we might need based on function size
+                // Assume average instruction size of ~2 bytes for a conservative estimate
+                // Don't cap by max_instructions here - we want the full function
+                let func_size = (end - start) as usize;
+                let estimated_count = (func_size / 2).max(1);
+                (start, estimated_count, Some(start), Some(end), name)
+            }
+            None => {
+                // No bounds found, just disassemble from the address with limit
+                (address, max_instructions, None, None, None)
+            }
+        };
+
+        // Disassemble the function
+        let instructions = self.disassemble_memory(pid, disasm_start, disasm_count, arch)?;
+
+        // If we have bounds, filter to only instructions within the function (no cap)
+        // If no bounds, use max_instructions as a safety limit
+        let filtered_instructions = if let (Some(start), Some(end)) = (func_start, func_end) {
+            instructions
+                .into_iter()
+                .filter(|i| i.address >= start && i.address < end)
+                .collect()
+        } else {
+            instructions.into_iter().take(max_instructions).collect()
+        };
+
+        Ok((filtered_instructions, func_start, func_end, func_name))
+    }
+}

@@ -1,6 +1,7 @@
 use thiserror::Error;
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::protocol::{ModuleInfo, ProcessInfo, ThreadInfo};
-use regex;
 
 pub type Address = u64;
 
@@ -36,14 +37,16 @@ pub enum SymbolError {
 pub struct ModuleSymbol {
     pub name: String,
     pub rva: u32, // Relative Virtual Address
+    pub is_function: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ResolvedSymbol {
     pub name: String,
     pub module_name: String,
-    pub rva: u32, // Relative Virtual Address  
+    pub rva: u32, // Relative Virtual Address
     pub va: u64,  // Virtual Address (module_base + rva)
+    pub is_function: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -67,6 +70,11 @@ pub struct Instruction {
     pub size: usize,
     pub symbol_info: Option<SymbolInfo>,
     pub symbolized_op_str: Option<String>, // Operands with symbolized addresses
+    pub is_jump: bool,           // jmp, jcc instructions (conditional/unconditional jumps)
+    pub is_call: bool,           // call instruction
+    pub is_ret: bool,            // ret instruction
+    pub jump_target: Option<u64>, // Target address if resolvable (for jumps/calls)
+    pub addresses_to_symbolize: Vec<u64>, // Addresses extracted from operands for symbolization
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -177,12 +185,35 @@ pub trait DisassemblerProvider: Send + Sync {
         let mut instructions = self.disassemble(arch, data, address, count)?;
         for instruction in &mut instructions {
             instruction.symbol_info = symbol_resolver(instruction.address);
-            
-            // Also symbolize operands
-            if !instruction.op_str.is_empty() {
-                let symbolized_ops = symbolize_operands(&instruction.op_str, &symbol_resolver);
-                if symbolized_ops != instruction.op_str {
-                    instruction.symbolized_op_str = Some(symbolized_ops);
+
+            // Symbolize operand addresses using pre-extracted address list (no regex)
+            if !instruction.addresses_to_symbolize.is_empty() {
+                let mut op_str = instruction.op_str.clone();
+                for addr in &instruction.addresses_to_symbolize {
+                    if let Some(symbol) = symbol_resolver(*addr) {
+                        let symbol_str = symbol.format_symbol();
+                        // Try direct hex replacement first (for absolute addresses)
+                        let hex_lower = format!("0x{:x}", addr);
+                        let hex_upper = format!("0x{:X}", addr);
+                        let before = op_str.clone();
+                        op_str = op_str.replace(&hex_lower, &symbol_str);
+                        op_str = op_str.replace(&hex_upper, &symbol_str);
+
+                        // Fallback: RIP-relative pattern replacement
+                        // Capstone outputs [rip + 0xNNNN] but the resolved address isn't in the text
+                        if op_str == before {
+                            let disp = (*addr).wrapping_sub(instruction.address + instruction.size as u64) as i64;
+                            let (pattern, replacement) = if disp >= 0 {
+                                (format!("[rip + 0x{:x}]", disp), format!("[{}]", symbol_str))
+                            } else {
+                                (format!("[rip - 0x{:x}]", disp.unsigned_abs()), format!("[{}]", symbol_str))
+                            };
+                            op_str = op_str.replace(&pattern, &replacement);
+                        }
+                    }
+                }
+                if op_str != instruction.op_str {
+                    instruction.symbolized_op_str = Some(op_str);
                 }
             }
         }
@@ -201,7 +232,9 @@ pub trait PlatformAPI: Send + Sync {
     fn set_breakpoint(&mut self, pid: u32, addr: u64, tid: Option<u32>) -> Result<(), PlatformError>;
     fn remove_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError>;
     fn set_single_shot_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError>;
-    fn launch(&mut self, command: &str) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>;
+    fn set_hardware_breakpoint(&mut self, pid: u32, addr: u64, bp_type: crate::protocol::HardwareBreakpointType, size: crate::protocol::HardwareBreakpointSize) -> Result<u8, PlatformError>;
+    fn remove_hardware_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError>;
+    fn launch(&mut self, command: &str, debug_children: bool, working_directory: Option<&str>) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>;
     fn read_memory(&self, pid: u32, address: u64, size: usize) -> Result<Vec<u8>, PlatformError>;
     fn write_memory(&self, pid: u32, address: u64, data: &[u8]) -> Result<(), PlatformError>;
     fn read_wide_string(&self, pid: u32, address: u64, max_len: Option<usize>) -> Result<String, PlatformError>;
@@ -228,37 +261,229 @@ pub trait PlatformAPI: Send + Sync {
     // Break into a running, debugged process (fire-and-forget)
     fn break_into(&self, pid: u32) -> Result<(), PlatformError>;
     
-    // ... add more as needed
+    // Module extra info
+    fn get_module_extra_info(&self, pid: u32, module_base: u64) -> Result<crate::pe_types::ModuleExtraInfo, PlatformError>;
+
+    // Memory region queries
+    fn query_memory_region(&self, pid: u32, address: u64) -> Result<crate::protocol::MemoryRegionInfo, PlatformError>;
+    fn enumerate_memory_regions(&self, pid: u32) -> Result<Vec<crate::protocol::MemoryRegionInfo>, PlatformError>;
+
+    // Dereference/telescope
+    fn dereference(
+        &self,
+        pid: u32,
+        address: u64,
+        count: usize,
+        reference_base: Option<u64>,
+    ) -> Result<Vec<crate::protocol::DereferenceEntry>, PlatformError>;
+
+    // Thread Environment Block (TEB) address - used for emulator GS segment setup
+    fn get_teb_address(&self, _pid: u32, _tid: u32) -> Result<u64, PlatformError> {
+        Err(PlatformError::NotImplemented)
+    }
+
+    /// Process Environment Block (PEB) base address — used by the
+    /// anti-anti-debug subsystem for PEB hiding.
+    fn get_peb_address(&self, _pid: u32) -> Result<u64, PlatformError> {
+        Err(PlatformError::NotImplemented)
+    }
+
+    /// True if the target is a 32-bit (WOW64) process on 64-bit Windows.
+    /// Used to bail out of features that assume the 64-bit PEB layout.
+    fn is_wow64(&self, _pid: u32) -> Result<bool, PlatformError> {
+        Err(PlatformError::NotImplemented)
+    }
+
+    /// Search process memory for a byte pattern, returning matching addresses.
+    /// Scans all committed, readable memory regions in 1MB chunks with overlap
+    /// for cross-boundary matches. Uses rayon to parallelize across regions.
+    /// Returns up to `max_results` addresses sorted by address.
+    fn search_memory(&self, pid: u32, pattern: &[u8], max_results: usize) -> Result<(Vec<u64>, bool), PlatformError>
+    where
+        Self: Sync,
+    {
+        if pattern.is_empty() {
+            return Err(PlatformError::Other("Search pattern must not be empty".into()));
+        }
+
+        let regions = self.enumerate_memory_regions(pid)?;
+        let chunk_size: usize = 1024 * 1024; // 1MB
+
+        const PAGE_NOACCESS: u32 = 0x01;
+        const PAGE_GUARD: u32 = 0x100;
+        const MEM_COMMIT: u32 = 0x1000;
+
+        // Filter to searchable regions
+        let searchable_regions: Vec<_> = regions
+            .iter()
+            .filter(|r| {
+                r.state == MEM_COMMIT
+                    && r.protect != 0
+                    && (r.protect & PAGE_NOACCESS) == 0
+                    && (r.protect & PAGE_GUARD) == 0
+            })
+            .collect();
+
+        let total_found = AtomicUsize::new(0);
+        let stop = AtomicBool::new(false);
+
+        let all_results: Vec<Vec<u64>> = searchable_regions
+            .par_iter()
+            .map(|region| {
+                if stop.load(Ordering::Relaxed) {
+                    return Vec::new();
+                }
+
+                let region_base = region.base_address;
+                let region_size = region.region_size as usize;
+                let overlap = if pattern.len() > 1 { pattern.len() - 1 } else { 0 };
+                let mut offset: usize = 0;
+                let mut local_results = Vec::new();
+
+                while offset < region_size {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let read_size = (chunk_size + overlap).min(region_size - offset);
+                    let read_addr = region_base + offset as u64;
+
+                    match self.read_memory(pid, read_addr, read_size) {
+                        Ok(data) => {
+                            if data.len() >= pattern.len() {
+                                let mut i = 0;
+                                while i <= data.len() - pattern.len() {
+                                    if data[i..i + pattern.len()] == *pattern {
+                                        local_results.push(read_addr + i as u64);
+                                        let prev = total_found.fetch_add(1, Ordering::Relaxed);
+                                        if prev + 1 >= max_results * 2 {
+                                            stop.store(true, Ordering::Relaxed);
+                                            return local_results;
+                                        }
+                                    }
+                                    i += 1;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // Skip unreadable chunks silently
+                        }
+                    }
+
+                    if read_size <= overlap {
+                        break;
+                    }
+                    offset += read_size - overlap;
+                }
+
+                local_results
+            })
+            .collect();
+
+        let mut addresses: Vec<u64> = all_results.into_iter().flatten().collect();
+        addresses.sort_unstable();
+        let capped = addresses.len() > max_results;
+        addresses.truncate(max_results);
+
+        Ok((addresses, capped))
+    }
+
+    // -----------------------------------------------------------------
+    // Server-side dispatch hooks
+    //
+    // These three methods let the connection handler delegate Continue,
+    // TerminateProcess, and BreakInto requests to the platform with its
+    // own locking discipline. The default impls take the platform lock
+    // and call through the regular trait methods — correct for any
+    // backend that does its work inside continue_exec / terminate_process
+    // / break_into. WindowsPlatform overrides them so the long-running
+    // OS calls (WaitForDebugEvent, etc.) happen outside the lock and
+    // don't starve concurrent read-only requests.
+    //
+    // `Self: Sized` is required so the method can take `&Arc<RwLock<Self>>`;
+    // these aren't callable via `&dyn PlatformAPI`, which is fine — they
+    // run from the generic connection handler.
+    // -----------------------------------------------------------------
+
+    fn server_continue(
+        platform: &std::sync::Arc<std::sync::RwLock<Self>>,
+        pid: u32,
+        tid: u32,
+        pass_exception: bool,
+    ) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>
+    where
+        Self: Sized,
+    {
+        let _ = pass_exception;
+        platform.write().unwrap().continue_exec(pid, tid)
+    }
+
+    fn server_terminate(
+        platform: &std::sync::Arc<std::sync::RwLock<Self>>,
+        pid: u32,
+    ) -> Result<(), PlatformError>
+    where
+        Self: Sized,
+    {
+        platform.read().unwrap().terminate_process(pid)
+    }
+
+    fn server_break_into(
+        platform: &std::sync::Arc<std::sync::RwLock<Self>>,
+        pid: u32,
+    ) -> Result<(), PlatformError>
+    where
+        Self: Sized,
+    {
+        platform.read().unwrap().break_into(pid)
+    }
+
+    // -----------------------------------------------------------------
+    // Optional backend-specific features. Default impls return
+    // NotImplemented; WindowsPlatform overrides them.
+    // -----------------------------------------------------------------
+
+    fn emulate_with_mode(
+        &self,
+        _pid: u32,
+        _tid: u32,
+        _max_instructions: usize,
+        _mode: crate::protocol::EmulationMode,
+        _exit_condition: Option<crate::protocol::TraceExitCondition>,
+        _memory_reads: &[(u64, usize)],
+    ) -> Result<crate::emulator::EmulationResult, PlatformError> {
+        Err(PlatformError::NotImplemented)
+    }
+
+    fn trace_instructions(
+        &mut self,
+        _pid: u32,
+        _tid: u32,
+        _exit_condition: crate::protocol::TraceExitCondition,
+        _max_instructions: usize,
+    ) -> Result<(Vec<crate::protocol::TraceEntry>, String, u64), PlatformError> {
+        Err(PlatformError::NotImplemented)
+    }
+
+    fn disassemble_function(
+        &self,
+        _pid: u32,
+        _address: u64,
+        _max_instructions: usize,
+        _arch: Architecture,
+    ) -> Result<(Vec<Instruction>, Option<u64>, Option<u64>, Option<String>), DisassemblerError> {
+        Err(DisassemblerError::CapstoneError(
+            "disassemble_function not supported by this platform".into(),
+        ))
+    }
 }
 
 impl SymbolInfo {
     pub fn format_symbol(&self) -> String {
-        format!("{}!{}+0x{:x}", self.module_name, self.symbol_name, self.offset)
+        if self.offset == 0 {
+            format!("{}!{}", self.module_name, self.symbol_name)
+        } else {
+            format!("{}!{}+0x{:x}", self.module_name, self.symbol_name, self.offset)
+        }
     }
 }
-
-/// Symbolizes addresses in instruction operands
-pub fn symbolize_operands<F>(op_str: &str, symbol_resolver: F) -> String
-where
-    F: Fn(u64) -> Option<SymbolInfo>,
-{
-    // Regex to find hexadecimal addresses in operands
-    // Matches patterns like 0x1234567890abcdef, 0x1234, etc.
-    let re = regex::Regex::new(r"0x([0-9a-fA-F]+)").unwrap();
-    
-    let result = re.replace_all(op_str, |caps: &regex::Captures| {
-        if let Ok(addr) = u64::from_str_radix(&caps[1], 16) {
-            // Only symbolize addresses that look like code addresses (not small constants)
-            if addr > 0x10000 {
-                if let Some(symbol_info) = symbol_resolver(addr) {
-                    return symbol_info.format_symbol();
-                }
-            }
-        }
-        caps[0].to_string() // Return original if no symbol found
-    });
-    
-    result.to_string()
-}
-
- 

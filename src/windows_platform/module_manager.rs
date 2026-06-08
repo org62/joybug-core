@@ -1,15 +1,18 @@
 use crate::protocol::ModuleInfo;
+use crate::pe_types::ModuleExtraInfo;
 use std::collections::HashMap;
 
 #[derive(Debug, Default)]
 pub struct ModuleManager {
     modules: HashMap<u64, ModuleInfo>, // base_address -> ModuleInfo
+    extra_info: HashMap<u64, ModuleExtraInfo>, // base_address -> cached extra info
 }
 
 impl ModuleManager {
     pub fn new() -> Self {
         Self {
             modules: HashMap::new(),
+            extra_info: HashMap::new(),
         }
     }
 
@@ -19,6 +22,7 @@ impl ModuleManager {
 
     pub fn remove_module(&mut self, base_address: u64) {
         self.modules.remove(&base_address);
+        self.extra_info.remove(&base_address);
     }
 
     pub fn list_modules(&self) -> Vec<ModuleInfo> {
@@ -27,5 +31,14 @@ impl ModuleManager {
 
     pub fn clear(&mut self) {
         self.modules.clear();
+        self.extra_info.clear();
+    }
+
+    pub fn set_extra_info(&mut self, base_address: u64, info: ModuleExtraInfo) {
+        self.extra_info.insert(base_address, info);
+    }
+
+    pub fn get_extra_info(&self, base_address: u64) -> Option<ModuleExtraInfo> {
+        self.extra_info.get(&base_address).cloned()
     }
 } 

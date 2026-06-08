@@ -1,19 +1,47 @@
-use crate::protocol::{DebuggerRequest, DebuggerResponse};
 use crate::interfaces::{PlatformAPI, Stepper};
+use crate::protocol::{DebuggerRequest, DebuggerResponse};
 use tokio::net::TcpListener;
-use tracing::{info, error, debug};
+use tracing::{debug, error, info};
 
+use std::future::{pending, Future};
+use std::net::TcpListener as StdTcpListener;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
-#[cfg(windows)]
-type PlatformImpl = crate::windows_platform::WindowsPlatform;
+// Server-side timing stats
+static SERVER_RECV_US: AtomicU64 = AtomicU64::new(0);
+static SERVER_HANDLE_US: AtomicU64 = AtomicU64::new(0);
+static SERVER_SEND_US: AtomicU64 = AtomicU64::new(0);
+static SERVER_REQ_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn print_server_stats() {
+    let count = SERVER_REQ_COUNT.load(Ordering::Relaxed);
+    if count > 0 && count % 1000 == 0 {
+        let recv = SERVER_RECV_US.load(Ordering::Relaxed) as f64 / 1000.0;
+        let handle = SERVER_HANDLE_US.load(Ordering::Relaxed) as f64 / 1000.0;
+        let send = SERVER_SEND_US.load(Ordering::Relaxed) as f64 / 1000.0;
+        eprintln!("=== SERVER STATS after {} requests ===", count);
+        eprintln!("  Receive:  {:>8.2} ms", recv);
+        eprintln!("  Handle:   {:>8.2} ms", handle);
+        eprintln!("  Send:     {:>8.2} ms", send);
+        eprintln!("  Total:    {:>8.2} ms", recv + handle + send);
+        eprintln!("======================================");
+    }
+}
 
 use crate::framed_json_stream::FramedJsonStream;
 
+const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:9000";
 
-fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformImpl>>) {
+fn handle_connection<P>(stream: std::net::TcpStream, platform: Arc<RwLock<P>>)
+where
+    P: PlatformAPI + Stepper + Send + Sync + 'static,
+{
     let mut framed_stream = FramedJsonStream::new(stream);
+    let mut scanner = crate::memory_scanner::MemoryScanner::new();
     loop {
+        let recv_start = Instant::now();
         let req: DebuggerRequest = match framed_stream.receive() {
             Ok(req) => req,
             Err(e) => {
@@ -27,90 +55,34 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                 break;
             }
         };
+        SERVER_RECV_US.fetch_add(recv_start.elapsed().as_micros() as u64, Ordering::Relaxed);
         debug!(?req, "Received request");
+        let handle_start = Instant::now();
 
-        // Handle termination without taking the platform lock to avoid deadlock with WaitForDebugEvent
-        if let DebuggerRequest::TerminateProcess { pid } = req {
-            #[cfg(windows)]
-            {
-                info!(pid, "TerminateProcess (unlocked) request received");
-                let resp = match crate::windows_platform::process::terminate_process_unlocked(pid) {
-                    Ok(()) => { info!(pid, "TerminateProcess executed successfully"); DebuggerResponse::Ack }
-                    Err(e) => { error!(pid, error = %e, "TerminateProcess failed"); DebuggerResponse::Error { message: e.to_string() } }
-                };
-                if let Err(e) = framed_stream.send(&resp) { error!(?e, "Failed to write response to socket"); break; }
-                continue;
-            }
-            #[cfg(not(windows))]
-            {
-                let resp = DebuggerResponse::Error { message: "TerminateProcess not supported on this platform".to_string() };
-                if let Err(e) = framed_stream.send(&resp) { error!(?e, "Failed to write response to socket"); break; }
-                continue;
-            }
-        }
-
-        // Handle Continue without holding the platform lock across the blocking wait
-        if let DebuggerRequest::Continue { pid, tid } = req {
-            #[cfg(windows)]
-            {
-                // 1) Continue without lock
-                match crate::windows_platform::debug_events::continue_only(pid, tid) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        let resp = DebuggerResponse::Error { message: e.to_string() };
-                        if let Err(e) = framed_stream.send(&resp) { error!(?e, "Failed to write response to socket"); break; }
-                        continue;
-                    }
-                }
-
-                // 2) Wait for next debug event without lock
-                let debug_event = match crate::windows_platform::debug_events::wait_for_debug_event_blocking() {
-                    Ok(ev) => ev,
-                    Err(e) => {
-                        let resp = DebuggerResponse::Error { message: e.to_string() };
-                        if let Err(e) = framed_stream.send(&resp) { error!(?e, "Failed to write response to socket"); break; }
-                        continue;
-                    }
-                };
-
-                // 3) Reacquire lock only to handle the event and mutate state
-                let mut platform_guard = platform.write().unwrap();
-                let resp = match crate::windows_platform::debug_events::handle_debug_event(&mut *platform_guard, &debug_event) {
+        let resp = match req {
+            // ---------- Server-side dispatch hooks (platform-specific locking) ----------
+            DebuggerRequest::Continue { pid, tid, pass_exception } => {
+                match P::server_continue(&platform, pid, tid, pass_exception) {
                     Ok(Some(event)) => DebuggerResponse::Event { event },
                     Ok(None) => DebuggerResponse::Ack,
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
-                };
-                if let Err(e) = framed_stream.send(&resp) { error!(?e, "Failed to write response to socket"); break; }
-                continue;
-            }
-        }
-
-        // Handle BreakInto without holding the platform lock; do not wait
-        if let DebuggerRequest::BreakInto { pid } = req {
-            #[cfg(windows)]
-            {
-                // Trigger debug break without lock and immediately respond
-                match crate::windows_platform::process::debug_break_process_unlocked(pid) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        let resp = DebuggerResponse::Error { message: e.to_string() };
-                        if let Err(e) = framed_stream.send(&resp) { error!(?e, "Failed to write response to socket"); break; }
-                        continue;
-                    }
                 }
-                let resp = DebuggerResponse::Ack;
-                if let Err(e) = framed_stream.send(&resp) { error!(?e, "Failed to write response to socket"); break; }
-                continue;
             }
-            #[cfg(not(windows))]
-            {
-                let resp = DebuggerResponse::Error { message: "BreakInto not supported on this platform".to_string() };
-                if let Err(e) = framed_stream.send(&resp) { error!(?e, "Failed to write response to socket"); break; }
-                continue;
+            DebuggerRequest::TerminateProcess { pid } => {
+                info!(pid, "TerminateProcess request received");
+                match P::server_terminate(&platform, pid) {
+                    Ok(()) => { info!(pid, "TerminateProcess executed successfully"); DebuggerResponse::Ack }
+                    Err(e) => { error!(pid, error = %e, "TerminateProcess failed"); DebuggerResponse::Error { message: e.to_string() } }
+                }
             }
-        }
+            DebuggerRequest::BreakInto { pid } => {
+                match P::server_break_into(&platform, pid) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
 
-        let resp = match req {
+            // ---------- Regular request dispatch ----------
             DebuggerRequest::Attach { pid } => {
                 let mut p = platform.write().unwrap();
                 match p.attach(pid) {
@@ -125,14 +97,6 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                     Ok(_) => DebuggerResponse::Ack,
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
-            }
-            DebuggerRequest::Continue { pid: _, tid: _ } => {
-                // Should have been handled by the unlocked fast-path above
-                DebuggerResponse::Ack
-            }
-            DebuggerRequest::BreakInto { pid: _ } => {
-                // Should have been handled by the unlocked fast-path above
-                DebuggerResponse::Ack
             }
             DebuggerRequest::SetBreakpoint { pid, addr, tid } => {
                 let mut p = platform.write().unwrap();
@@ -155,9 +119,23 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
-            DebuggerRequest::Launch { command } => {
+            DebuggerRequest::SetHardwareBreakpoint { pid, addr, bp_type, size } => {
                 let mut p = platform.write().unwrap();
-                match p.launch(&command) {
+                match p.set_hardware_breakpoint(pid, addr, bp_type, size) {
+                    Ok(dr_index) => DebuggerResponse::HardwareBreakpointSet { dr_index },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::RemoveHardwareBreakpoint { pid, addr } => {
+                let mut p = platform.write().unwrap();
+                match p.remove_hardware_breakpoint(pid, addr) {
+                    Ok(_) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::Launch { command, debug_children, working_directory } => {
+                let mut p = platform.write().unwrap();
+                match p.launch(&command, debug_children, working_directory.as_deref()) {
                     Ok(Some(event)) => DebuggerResponse::Event { event },
                     Ok(None) => DebuggerResponse::Ack,
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
@@ -250,15 +228,15 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
             DebuggerRequest::ResolveAddressToSymbol { pid, address } => {
                 let p = platform.read().unwrap();
                 match p.resolve_address_to_symbol(pid, address) {
-                    Ok(Some((module_path, symbol, offset))) => DebuggerResponse::AddressSymbol { 
-                        module_path: Some(module_path), 
-                        symbol: Some(symbol), 
-                        offset: Some(offset) 
+                    Ok(Some((module_path, symbol, offset))) => DebuggerResponse::AddressSymbol {
+                        module_path: Some(module_path),
+                        symbol: Some(symbol),
+                        offset: Some(offset),
                     },
-                    Ok(None) => DebuggerResponse::AddressSymbol { 
-                        module_path: None, 
-                        symbol: None, 
-                        offset: None 
+                    Ok(None) => DebuggerResponse::AddressSymbol {
+                        module_path: None,
+                        symbol: None,
+                        offset: None,
                     },
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
@@ -277,7 +255,55 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
-            DebuggerRequest::TerminateProcess { pid } => { let _ = pid; unreachable!() }
+            DebuggerRequest::GetModuleExtraInfo { pid, module_base } => {
+                let p = platform.read().unwrap();
+                match p.get_module_extra_info(pid, module_base) {
+                    Ok(info) => DebuggerResponse::ModuleExtraInfo { info },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::QueryMemoryRegion { pid, address } => {
+                let p = platform.read().unwrap();
+                match p.query_memory_region(pid, address) {
+                    Ok(info) => DebuggerResponse::MemoryRegionInfo { info },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::EnumerateMemoryRegions { pid } => {
+                let p = platform.read().unwrap();
+                match p.enumerate_memory_regions(pid) {
+                    Ok(regions) => DebuggerResponse::MemoryRegionList { regions },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::Dereference { pid, address, count, reference_base } => {
+                let p = platform.read().unwrap();
+                match p.dereference(pid, address, count, reference_base) {
+                    Ok(entries) => DebuggerResponse::DereferenceResult { entries },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::SearchMemory { pid, pattern, max_results } => {
+                let p = platform.read().unwrap();
+                match p.search_memory(pid, &pattern, max_results) {
+                    Ok((addresses, capped)) => DebuggerResponse::MemorySearchResult { addresses, capped },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::DisassembleFunction { pid, address, max_instructions, arch } => {
+                let p = platform.read().unwrap();
+                match p.disassemble_function(pid, address, max_instructions, arch) {
+                    Ok((instructions, function_start, function_end, function_name)) => {
+                        DebuggerResponse::FunctionDisassembly {
+                            instructions,
+                            function_start,
+                            function_end,
+                            function_name,
+                        }
+                    }
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::Step { pid, tid, kind } => {
                 let mut p = platform.write().unwrap();
                 match p.step(pid, tid, kind) {
@@ -290,7 +316,93 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                     }},
                 }
             }
+            DebuggerRequest::EmulateInstructions { pid, tid, max_instructions, mode, exit_condition, memory_reads } => {
+                use crate::protocol::EmulationMode;
+                let p = platform.read().unwrap();
+                match p.emulate_with_mode(pid, tid, max_instructions, mode, exit_condition, &memory_reads) {
+                    Ok(result) => {
+                        if mode == EmulationMode::InstructionTrace {
+                            let trace_text = crate::tenet_format::traces_to_tenet(
+                                &result.register_trace,
+                                &result.memory_trace,
+                            );
+                            DebuggerResponse::TenetTrace {
+                                trace_text,
+                                stop_reason: format!("{}", result.stop_reason),
+                                trace_time_us: result.emulation_time_us,
+                                stats_text: result.stats_text,
+                            }
+                        } else {
+                            DebuggerResponse::EmulationResult {
+                                final_pc: result.final_pc,
+                                instructions_executed: result.instructions_executed,
+                                stop_reason: format!("{}", result.stop_reason),
+                                emulation_time_us: result.emulation_time_us,
+                                pages_loaded: result.pages_loaded,
+                                basic_blocks: result.basic_blocks,
+                                stats_text: result.stats_text,
+                                memory_snapshots: result.memory_snapshots,
+                            }
+                        }
+                    }
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::ScanMemoryStart { pid, value_type, compare_type, value, value2, alignment, float_tolerance, writable_only } => {
+                let p = platform.read().unwrap();
+                match scanner.start_scan(&*p, pid, value_type, compare_type, value, value2, alignment, float_tolerance, writable_only.unwrap_or(true)) {
+                    Ok((scan_id, match_count, scan_time_us)) => DebuggerResponse::ScanMemoryResult { scan_id, match_count, scan_time_us },
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::ScanMemoryNext { scan_id, compare_type, value, value2 } => {
+                let p = platform.read().unwrap();
+                match scanner.next_scan(&*p, scan_id, compare_type, value, value2) {
+                    Ok((match_count, scan_time_us)) => DebuggerResponse::ScanMemoryResult { scan_id, match_count, scan_time_us },
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::ScanMemoryGetResults { scan_id, offset, count } => {
+                let p = platform.read().unwrap();
+                match scanner.get_results(&*p, scan_id, offset, count) {
+                    Ok((addresses, values, total_count)) => DebuggerResponse::ScanMemoryResults { addresses, values, total_count },
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::ScanMemoryReset { scan_id } => {
+                match scanner.reset_scan(scan_id) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::TraceInstructions { pid, tid, exit_condition, max_instructions } => {
+                let mut p = platform.write().unwrap();
+                match p.trace_instructions(pid, tid, exit_condition, max_instructions) {
+                    Ok((entries, stop_reason, trace_time_us)) => {
+                        let trace_data: Vec<_> = entries
+                            .iter()
+                            .map(|e| (e.registers.clone(), e.memory_accesses.clone()))
+                            .collect();
+                        let trace_text = crate::tenet_format::trace_to_tenet(&trace_data);
+                        DebuggerResponse::TenetTrace {
+                            trace_text,
+                            stop_reason,
+                            trace_time_us,
+                            stats_text: String::new(),
+                        }
+                    }
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::HidePeb { pid, options } => {
+                let p = platform.read().unwrap();
+                match crate::anti_anti_debug::peb::hide_peb(&*p, pid, &options) {
+                    Ok(report) => DebuggerResponse::PebHideResult { report },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
         };
+        SERVER_HANDLE_US.fetch_add(handle_start.elapsed().as_micros() as u64, Ordering::Relaxed);
         debug!(resp = %match &resp {
             DebuggerResponse::Event { event } => event.to_string(),
             DebuggerResponse::ThreadContext { context } => {
@@ -312,32 +424,105 @@ fn handle_connection(stream: std::net::TcpStream, platform: Arc<RwLock<PlatformI
                 "CallStack {{ frames: [..{} frames] }}",
                 frames.len()
             ),
+            DebuggerResponse::MemoryRegionList { regions } => format!(
+                "MemoryRegionList {{ regions: [..{} regions] }}",
+                regions.len()
+            ),
+            DebuggerResponse::DereferenceResult { entries } => format!(
+                "DereferenceResult {{ entries: [..{} entries] }}",
+                entries.len()
+            ),
+            DebuggerResponse::MemorySearchResult { addresses, capped } => format!(
+                "MemorySearchResult ({} matches, capped={})", addresses.len(), capped
+            ),
             _ => format!("{:?}", resp),
         }, "Sending response");
+        let send_start = Instant::now();
         if let Err(e) = framed_stream.send(&resp) {
             error!(?e, "Failed to write response to socket");
             break;
         }
+        SERVER_SEND_US.fetch_add(send_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+        SERVER_REQ_COUNT.fetch_add(1, Ordering::Relaxed);
+        print_server_stats();
     }
 }
 
 pub async fn run_server() -> anyhow::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:9000").await?;
-    info!("Server listening on 127.0.0.1:9000");
-    
-    // Create a single shared platform instance
-    let shared_platform = Arc::new(RwLock::new(PlatformImpl::new()));
-    
+    let listener = TcpListener::bind(DEFAULT_LISTEN_ADDR).await?;
+    run_server_with_listener(listener, crate::PlatformImpl::new(), pending()).await
+}
+
+pub async fn run_server_with_shutdown<F>(shutdown: F) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send,
+{
+    let listener = TcpListener::bind(DEFAULT_LISTEN_ADDR).await?;
+    run_server_with_listener(listener, crate::PlatformImpl::new(), shutdown).await
+}
+
+pub async fn run_server_with_std_listener<F>(
+    listener: StdTcpListener,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send,
+{
+    listener.set_nonblocking(true)?;
+    let listener = TcpListener::from_std(listener)?;
+    run_server_with_listener(listener, crate::PlatformImpl::new(), shutdown).await
+}
+
+/// Run a server with any PlatformAPI implementation on a pre-bound tokio listener.
+pub async fn run_server_with_listener<P, F>(
+    listener: TcpListener,
+    platform: P,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    P: PlatformAPI + Stepper + Send + Sync + 'static,
+    F: Future<Output = ()> + Send,
+{
+    let local_addr = listener.local_addr()?;
+    info!(%local_addr, "Server listening");
+
+    let shared_platform = Arc::new(RwLock::new(platform));
+    tokio::pin!(shutdown);
+
     loop {
-        let (socket, addr) = listener.accept().await?;
-        info!(%addr, "Accepted connection");
-        let std_stream = socket.into_std()?;
-        std_stream.set_nonblocking(false)?;
-        
-        // Clone the Arc for the new thread
-        let platform = Arc::clone(&shared_platform);
-        std::thread::spawn(move || {
-            handle_connection(std_stream, platform);
-        });
+        tokio::select! {
+            _ = &mut shutdown => {
+                info!("Shutdown signal received; stopping server accept loop");
+                break;
+            }
+            accept_result = listener.accept() => {
+                let (socket, addr) = accept_result?;
+                info!(%addr, "Accepted connection");
+                let std_stream = socket.into_std()?;
+                std_stream.set_nonblocking(false)?;
+
+                let platform = Arc::clone(&shared_platform);
+                std::thread::spawn(move || {
+                    handle_connection(std_stream, platform);
+                });
+            }
+        }
     }
+
+    Ok(())
+}
+
+/// Run a server with any PlatformAPI on a pre-bound std listener (used by LocalServer).
+pub async fn run_server_with_platform<P, F>(
+    listener: StdTcpListener,
+    platform: P,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    P: PlatformAPI + Stepper + Send + Sync + 'static,
+    F: Future<Output = ()> + Send,
+{
+    listener.set_nonblocking(true)?;
+    let listener = TcpListener::from_std(listener)?;
+    run_server_with_listener(listener, platform, shutdown).await
 }
