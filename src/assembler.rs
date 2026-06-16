@@ -1,5 +1,12 @@
 use crate::interfaces::Architecture;
 use keystone_engine::{Keystone, Arch, Mode, OptionType, OptionValue};
+use std::sync::Mutex;
+
+/// Keystone is backed by LLVM's MC layer, which relies on process-global state
+/// that is NOT thread-safe. Creating engines and assembling from multiple threads
+/// concurrently (e.g. parallel `cargo test` threads) corrupts output and yields
+/// wrong/garbage bytes intermittently. Serialize all Keystone usage process-wide.
+static KEYSTONE_LOCK: Mutex<()> = Mutex::new(());
 
 pub struct AssembleOutput {
     pub bytes: Vec<u8>,
@@ -20,6 +27,10 @@ impl std::fmt::Display for AssembleError {
 impl std::error::Error for AssembleError {}
 
 pub fn assemble(arch: Architecture, code: &str, address: u64) -> Result<AssembleOutput, AssembleError> {
+    // Serialize all Keystone usage; the underlying LLVM MC layer is not thread-safe.
+    // Recover from poisoning (a prior panic while assembling) rather than propagating it.
+    let _guard = KEYSTONE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     let map_err = |e: keystone_engine::KeystoneError| AssembleError {
         message: format!("{}", e),
     };
