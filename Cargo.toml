@@ -1,5 +1,9 @@
 [workspace]
 members = [".", "veh_shared", "veh_dll"]
+# Build/test all members by default. Without this, plain `cargo build`/`cargo test`
+# only operate on the root package (joybug2) and skip the `veh_dll` cdylib, so the
+# VEH integration tests can't find joybug2_veh_dll.dll. See VehPlatform::find_veh_dll.
+default-members = [".", "veh_shared", "veh_dll"]
 
 [package]
 name = "joybug2"
