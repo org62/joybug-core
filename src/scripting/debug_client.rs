@@ -333,10 +333,17 @@ impl DebugClient {
             _ => {}
         }
 
-        // 2. Send Continue to resume execution, wait for StepComplete event
+        // 2. Send Continue to resume execution, wait for StepComplete event.
+        // Intermediate events (DLL loads, thread create/exit, etc.) may fire on a
+        // *different* thread than the one we're stepping. ContinueDebugEvent must be
+        // called with the thread that actually reported the event, otherwise the OS
+        // returns ERROR_INVALID_PARAMETER (87). Track the continue target and update
+        // it from each event's own pid/tid.
+        let mut cont_pid = pid;
+        let mut cont_tid = tid;
         loop {
             let resp = self.send_and_receive(&DebuggerRequest::Continue {
-                pid, tid, pass_exception: false,
+                pid: cont_pid, tid: cont_tid, pass_exception: false,
             }).map_err(|e| mlua::Error::external(e))?;
 
             match resp {
@@ -358,8 +365,12 @@ impl DebugClient {
                                 anyhow::anyhow!("Process {} exited (code {}) during step", ep, exit_code),
                             ));
                         }
-                        // Intermediate events (DLL loads, etc.) — continue again
-                        _ => {}
+                        // Intermediate events (DLL loads, etc.) — continue the thread
+                        // that reported this event, not the one we're stepping.
+                        _ => {
+                            cont_pid = event.pid();
+                            cont_tid = event.tid();
+                        }
                     }
                 }
                 DebuggerResponse::Error { message } => {
