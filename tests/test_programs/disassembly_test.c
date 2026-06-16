@@ -114,6 +114,13 @@ int main(int argc, char* argv[]) {
         // Copy known shellcode
         memcpy(rwx_mem, g_add_shellcode, sizeof(g_add_shellcode));
 
+        // On ARM64 the instruction cache is not coherent with the data cache,
+        // so freshly written code must be flushed to the point of unification
+        // before it can be executed. Without this the CPU fetches stale/zero
+        // bytes (0x00000000 = UDF) and faults with an illegal instruction.
+        // Harmless on x64 (coherent I-cache), required on ARM64.
+        FlushInstructionCache(GetCurrentProcess(), rwx_mem, sizeof(g_add_shellcode));
+
         // Execute it to verify it works
         AddFunc dynamic_add = (AddFunc)rwx_mem;
         int dynamic_result = dynamic_add(30, 12);
