@@ -95,6 +95,14 @@ fn compile_test_program(manifest_dir: &str, out_dir: &str, name: &str, fixed_bas
 }
 
 fn main() {
+    // keystone-engine builds with /MTd (static debug CRT) while Rust uses /MD (dynamic CRT).
+    // Suppress the conflicting default lib and link ucrtd to provide _CrtDbgReport symbols.
+    #[cfg(windows)]
+    if env::var("PROFILE").unwrap_or_default() == "debug" {
+        println!("cargo:rustc-link-arg=/NODEFAULTLIB:LIBCMTD");
+        println!("cargo:rustc-link-lib=ucrtd");
+    }
+
     // Require LIBCLANG_PATH to be set (needed for bindgen in dependencies like capstone-sys)
     if env::var("LIBCLANG_PATH").is_err() {
         panic!(
