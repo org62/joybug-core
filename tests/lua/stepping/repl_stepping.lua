@@ -4,7 +4,7 @@
 dbg:on_initial_breakpoint(function(pid, tid, addr)
     -- Simulate REPL stepping
     local ctx1 = dbg:get_context(pid, tid)
-    local rip1 = ctx1.rip
+    local rip1 = ipof(ctx1)
 
     -- Step (same call the REPL si command makes)
     local rip2 = dbg:step_into(pid, tid)
@@ -14,7 +14,7 @@ dbg:on_initial_breakpoint(function(pid, tid, addr)
 
     -- Read context after stepping
     local ctx3 = dbg:get_context(pid, tid)
-    assert(rip3 == ctx3.rip, "rip after step should match context rip")
+    assert(rip3 == ipof(ctx3), "instruction pointer after step should match context")
 
     -- Resolve address (same as format_address)
     local sym = dbg:resolve_address(pid, rip3)

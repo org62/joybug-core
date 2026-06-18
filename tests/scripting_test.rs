@@ -15,7 +15,26 @@ fn setup_lua_with_server(server: &TestServer) -> mlua::Lua {
     lua.globals()
         .set("dbg", lua.create_userdata(lua_client).unwrap())
         .unwrap();
+    set_arch_global(&lua);
     lua
+}
+
+/// Inject an `ARCH` global ("x86_64" or "aarch64") plus `ipof(ctx)`/`spof(ctx)`
+/// helpers so Lua test scripts can stay arch-neutral (the instruction/stack
+/// pointer is rip/rsp on x86 and pc/sp on AArch64).
+fn set_arch_global(lua: &mlua::Lua) {
+    #[cfg(target_arch = "x86_64")]
+    lua.globals().set("ARCH", "x86_64").unwrap();
+    #[cfg(target_arch = "aarch64")]
+    lua.globals().set("ARCH", "aarch64").unwrap();
+    lua.load(
+        r#"
+        function ipof(ctx) if ARCH == 'aarch64' then return ctx.pc else return ctx.rip end end
+        function spof(ctx) if ARCH == 'aarch64' then return ctx.sp else return ctx.rsp end end
+        "#,
+    )
+    .exec()
+    .unwrap();
 }
 
 /// Helper: run a Lua test script from a file path.
@@ -47,6 +66,7 @@ fn run_lua_test_file(lua_path: &str, test_exe: Option<&str>) {
 /// Helper: run a Lua test that only needs the helpers (no server connection).
 fn run_lua_test_file_no_server(lua_path: &str) {
     let lua = scripting::create_lua().expect("create lua");
+    set_arch_global(&lua);
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let full_path = format!("{}\\tests\\lua\\{}", manifest_dir, lua_path);
@@ -117,10 +137,10 @@ fn test_script_launch_and_registers() {
             result.addr = addr
 
             local ctx = dbg:get_context(pid, tid)
-            result.has_rip = (ctx.rip ~= nil)
-            result.has_rsp = (ctx.rsp ~= nil)
-            result.rip = ctx.rip
-            result.rsp = ctx.rsp
+            result.has_rip = (ipof(ctx) ~= nil)
+            result.has_rsp = (spof(ctx) ~= nil)
+            result.rip = ipof(ctx)
+            result.rsp = spof(ctx)
 
             dbg:terminate(pid)
         end)
@@ -236,23 +256,27 @@ fn test_script_memory_operations() {
         local result = {}
 
         dbg:on_initial_breakpoint(function(pid, tid, addr)
-            -- Read the breakpoint instruction (should be int3 = 0xCC on x64)
-            local byte = dbg:read_u8(pid, addr)
-            result.breakpoint_byte = byte
-
-            -- Read 16 bytes of memory
+            -- Read the breakpoint instruction. x86: int3 = 0xCC. AArch64: BRK
+            -- #0xF000 = 0xD43E0000 (little-endian first byte 0x00).
             local data = dbg:read_memory(pid, addr, 16)
             result.memory_size = #data
-            result.first_byte = string.byte(data, 1)
+            if ARCH == 'aarch64' then
+                local b0, b1, b2, b3 = string.byte(data, 1, 4)
+                result.bp_ok = (b0 + b1 * 0x100 + b2 * 0x10000 + b3 * 0x1000000) == 0xD43E0000
+            else
+                local byte = dbg:read_u8(pid, addr)
+                result.bp_ok = (byte == 0xCC) and (string.byte(data, 1) == 0xCC)
+            end
 
             -- Read stack pointer and read 8 bytes from the stack
             local ctx = dbg:get_context(pid, tid)
-            local stack_data = dbg:read_memory(pid, ctx.rsp, 8)
+            local sp = spof(ctx)
+            local stack_data = dbg:read_memory(pid, sp, 8)
             result.stack_read_ok = (#stack_data == 8)
 
             -- Test read_u32 and read_u64
-            local val32 = dbg:read_u32(pid, ctx.rsp)
-            local val64 = dbg:read_u64(pid, ctx.rsp)
+            local val32 = dbg:read_u32(pid, sp)
+            local val64 = dbg:read_u64(pid, sp)
             result.has_u32 = (val32 ~= nil)
             result.has_u64 = (val64 ~= nil)
 
@@ -266,14 +290,11 @@ fn test_script_memory_operations() {
 
     let result: mlua::Table = lua.load(script).eval().unwrap();
 
-    let bp_byte: u64 = result.get("breakpoint_byte").unwrap();
-    assert_eq!(bp_byte, 0xCC, "initial breakpoint should be int3 (0xCC)");
+    let bp_ok: bool = result.get("bp_ok").unwrap();
+    assert!(bp_ok, "initial breakpoint instruction should match the arch's breakpoint encoding");
 
     let mem_size: i64 = result.get("memory_size").unwrap();
     assert_eq!(mem_size, 16, "should read 16 bytes");
-
-    let first_byte: i64 = result.get("first_byte").unwrap();
-    assert_eq!(first_byte, 0xCC, "first byte should also be 0xCC");
 
     let stack_ok: bool = result.get("stack_read_ok").unwrap();
     assert!(stack_ok, "should read 8 bytes from stack");
@@ -325,7 +346,11 @@ fn test_script_disassembly_and_callstack() {
     assert_eq!(instr_count, 5, "should disassemble 5 instructions");
 
     let first_mnemonic: String = result.get("first_mnemonic").unwrap();
+    // Initial breakpoint instruction: int3 on x86, brk on AArch64.
+    #[cfg(target_arch = "x86_64")]
     assert_eq!(first_mnemonic, "int3", "first instruction at initial breakpoint should be int3");
+    #[cfg(target_arch = "aarch64")]
+    assert_eq!(first_mnemonic, "brk", "first instruction at initial breakpoint should be brk");
 
     let first_addr: u64 = result.get("first_addr").unwrap();
     assert!(first_addr > 0, "instruction address should be nonzero");
@@ -372,7 +397,7 @@ fn test_script_breakpoint_handler() {
 
                     -- Read registers at the breakpoint
                     local ctx = dbg:get_context(pid, tid)
-                    result.bp_rip = ctx.rip
+                    result.bp_rip = ipof(ctx)
 
                     -- Get call stack at breakpoint
                     local frames = dbg:get_call_stack(pid, tid)
@@ -483,12 +508,12 @@ fn test_script_stepping() {
 
         dbg:on_initial_breakpoint(function(pid, tid, addr)
             local ctx_before = dbg:get_context(pid, tid)
-            result.rip_before = ctx_before.rip
+            result.rip_before = ipof(ctx_before)
 
             -- Single step into
             local new_addr = dbg:step_into(pid, tid)
             result.step_addr = new_addr
-            result.stepped = (new_addr ~= ctx_before.rip)
+            result.stepped = (new_addr ~= ipof(ctx_before))
 
             dbg:terminate(pid)
         end)
@@ -530,7 +555,7 @@ fn test_repl_stepping_and_register_globals() {
             -- Simulate what the REPL does: step, then read register globals
             -- (the REPL calls step_and_wait, format_address, populate_register_globals)
             local ctx1 = dbg:get_context(pid, tid)
-            result.rip1 = ctx1.rip
+            result.rip1 = ipof(ctx1)
 
             -- Step (same call the REPL si command makes)
             local addr2 = dbg:step_into(pid, tid)
@@ -542,7 +567,7 @@ fn test_repl_stepping_and_register_globals() {
 
             -- Read context after stepping
             local ctx3 = dbg:get_context(pid, tid)
-            result.rip3_ctx = ctx3.rip
+            result.rip3_ctx = ipof(ctx3)
 
             -- Resolve address (same as format_address)
             local sym = dbg:resolve_address(pid, addr3)

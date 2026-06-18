@@ -7,8 +7,10 @@ dbg:on_initial_breakpoint(function(pid, tid, addr)
     -- Disassemble 5 instructions at the breakpoint
     local instrs = dbg:disassemble(pid, addr, 5)
     assert(#instrs == 5, "should disassemble 5 instructions, got " .. #instrs)
-    assert(instrs[1].mnemonic == "int3",
-        "first instruction at initial breakpoint should be int3, got " .. instrs[1].mnemonic)
+    -- Initial breakpoint instruction: int3 on x86, brk on AArch64.
+    local expected_bp = (ARCH == 'aarch64') and "brk" or "int3"
+    assert(instrs[1].mnemonic == expected_bp,
+        "first instruction at initial breakpoint should be " .. expected_bp .. ", got " .. instrs[1].mnemonic)
     assert(instrs[1].address > 0, "instruction address should be nonzero")
     assert(instrs[1].symbol ~= nil, "first instruction should have symbol info")
 

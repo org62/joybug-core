@@ -1,6 +1,8 @@
 use super::{utils, WindowsPlatform, stepper};
 use crate::interfaces::PlatformError;
 use crate::protocol::ModuleInfo;
+#[cfg(target_arch = "aarch64")]
+use super::debugged_process::InternalHardwareBreakpoint;
 use tracing::{error, trace, warn};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, FALSE, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, DUPLICATE_SAME_ACCESS, HANDLE, DuplicateHandle, STATUS_SINGLE_STEP, MAX_PATH};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, INFINITE};
@@ -285,6 +287,39 @@ fn get_module_path_from_handle(h_module: *mut core::ffi::c_void) -> Option<Strin
     String::from_utf16(&buf).ok()
 }
 
+/// ARM64: prepare to single-step past a hardware breakpoint/watchpoint hit.
+///
+/// The faulting instruction's PC is unchanged, so resuming would re-trigger
+/// forever. We disable ALL hardware debug registers (so the step itself can't
+/// re-trigger), set the CPSR single-step (SS) flag, and mark the thread for
+/// re-arm. The subsequent STATUS_SINGLE_STEP event re-applies every active
+/// breakpoint/watchpoint and clears SS.
+#[cfg(target_arch = "aarch64")]
+fn arm64_begin_step_over_hw_bp(
+    platform: &mut WindowsPlatform,
+    pid: u32,
+    tid: u32,
+) -> Result<(), PlatformError> {
+    let mut context = {
+        let process = platform.get_process(pid)?;
+        match super::thread_context::get_thread_context(process, pid, tid)? {
+            crate::protocol::ThreadContext::Win32RawContext(ctx) => ctx,
+        }
+    };
+    // Disable all breakpoint and watchpoint registers for the step.
+    super::hardware_breakpoints::clear_all_hw_bp_in_context(&mut context);
+    stepper::set_single_step_flag_native(&mut context)?;
+    super::thread_context::set_thread_context(
+        platform.get_process(pid)?,
+        pid,
+        tid,
+        crate::protocol::ThreadContext::Win32RawContext(context),
+    )?;
+    // dr_index is unused on ARM64 (we re-arm all active bps); pass 0 as a marker.
+    platform.get_process_mut(pid)?.schedule_hw_bp_rearm(tid, 0);
+    Ok(())
+}
+
 // Handle EXCEPTION_DEBUG_EVENT in a dedicated function to keep continue_exec simpler.
 pub(super) fn handle_exception_event(
     platform: &mut WindowsPlatform,
@@ -299,6 +334,53 @@ pub(super) fn handle_exception_event(
     if ex_record.ExceptionCode == windows_sys::Win32::Foundation::EXCEPTION_BREAKPOINT {
         let address = ex_record.ExceptionAddress as u64;
         trace!(pid = pid, tid = tid, address = %format!("0x{:X}", address), "Breakpoint event");
+
+        // ARM64 hardware breakpoints and watchpoints are both delivered as
+        // EXCEPTION_BREAKPOINT (there is no DR6-equivalent). Distinguish them:
+        //   - Watchpoint: NumberParameters == 2, ExceptionInformation[1] is the
+        //     accessed data address (matches a Write/ReadWrite watchpoint).
+        //   - Execute HW breakpoint: PC matches an active Execute breakpoint and
+        //     is not one of our software breakpoints.
+        // In both cases the PC stays at the faulting instruction, so we must
+        // single-step past it (with the registers disabled) and re-arm.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let hw_hit: Option<InternalHardwareBreakpoint> = {
+                let wp = if ex_record.NumberParameters >= 2 {
+                    let data_addr = ex_record.ExceptionInformation[1] as u64;
+                    process.active_hw_bp_for_access(data_addr, true)
+                } else {
+                    None
+                };
+                wp.or_else(|| {
+                    if process.has_single_shot_breakpoint(address)
+                        || process.is_persistent_breakpoint(address)
+                    {
+                        None
+                    } else {
+                        process.active_hw_bp_for_access(address, false)
+                    }
+                })
+            };
+
+            if let Some(bp) = hw_hit {
+                trace!(
+                    address = %format!("0x{:X}", bp.address),
+                    dr = bp.dr_index,
+                    ?bp.bp_type,
+                    "ARM64 hardware breakpoint/watchpoint hit"
+                );
+                // `process` borrow ends here; step over with HW debug disabled.
+                arm64_begin_step_over_hw_bp(platform, pid, tid)?;
+                return Ok(Some(crate::protocol::DebugEvent::HardwareBreakpoint {
+                    pid,
+                    tid,
+                    address: bp.address,
+                    dr_index: bp.dr_index,
+                    bp_type: bp.bp_type,
+                }));
+            }
+        }
 
         // Gather single-shot removal and possible step-over removal in one borrow
         let (single_shot_original_opt, step_over_hit_opt) = {
@@ -452,6 +534,22 @@ pub(super) fn handle_exception_event(
                     // Clear trap flag
                     aligned.context.EFlags &= !(0x100u32);
                     let _ = unsafe { windows_sys::Win32::System::Diagnostics::Debug::SetThreadContext(thread_handle, &aligned.context) };
+                }
+            }
+            // ARM64: we disabled all HW debug registers before the step. Clear the
+            // single-step (SS) flag and re-arm every active breakpoint/watchpoint.
+            #[cfg(target_arch = "aarch64")]
+            {
+                let _ = rearm_dr_index;
+                if let Err(e) = stepper::clear_single_step_flag_native2(platform, pid, tid) {
+                    error!("Failed to clear single-step flag during HW BP re-arm: {}", e);
+                }
+                let proc = platform.get_process(pid)?;
+                let active = proc.active_hardware_breakpoints();
+                if let Some(handle) = proc.thread_manager().get_thread_handle(tid) {
+                    if let Err(e) = super::hardware_breakpoints::apply_all_hw_bps_to_thread(handle, &active) {
+                        error!("Failed to re-arm ARM64 HW breakpoints: {}", e);
+                    }
                 }
             }
             return Ok(None);

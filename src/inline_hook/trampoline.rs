@@ -1,24 +1,38 @@
 use super::error::InlineHookError;
 use capstone::prelude::*;
+#[cfg(target_arch = "x86_64")]
 use capstone::arch::x86::X86OperandType;
+#[cfg(target_arch = "x86_64")]
 use capstone::arch::ArchDetail;
+#[cfg(target_arch = "x86_64")]
 use capstone::RegId;
 use std::cell::RefCell;
 
 /// X86 RIP register ID in Capstone.
+#[cfg(target_arch = "x86_64")]
 const X86_REG_RIP: u16 = 41;
 
-/// Minimum bytes we must overwrite at the target for a 5-byte E9 JMP rel32.
+/// Minimum bytes we must overwrite at the target for the patch jump.
+/// x86: 5-byte E9 JMP rel32. ARM64: one 4-byte `B` instruction.
+#[cfg(target_arch = "x86_64")]
 pub const MIN_HOOK_SIZE: usize = 5;
+#[cfg(target_arch = "aarch64")]
+pub const MIN_HOOK_SIZE: usize = 4;
 
-/// Size of the relay stub: FF 25 00 00 00 00 + 8-byte address.
+/// Size of the relay stub (absolute jump to the detour).
+/// x86: FF 25 00 00 00 00 + 8-byte address = 14. ARM64: LDR X17,#8 + BR X17 +
+/// 8-byte address = 16.
+#[cfg(target_arch = "x86_64")]
 pub const RELAY_SIZE: usize = 14;
+#[cfg(target_arch = "aarch64")]
+pub const RELAY_SIZE: usize = 16;
 
 
 thread_local! {
     static CS_ENGINE: RefCell<Option<Capstone>> = const { RefCell::new(None) };
 }
 
+#[cfg(target_arch = "x86_64")]
 fn with_capstone<F, R>(f: F) -> Result<R, InlineHookError>
 where
     F: FnOnce(&Capstone) -> Result<R, InlineHookError>,
@@ -30,6 +44,26 @@ where
                 .x86()
                 .mode(arch::x86::ArchMode::Mode64)
                 .syntax(arch::x86::ArchSyntax::Intel)
+                .detail(true)
+                .build()
+                .map_err(|e| InlineHookError::DisassemblyFailed(e.to_string()))?;
+            *opt = Some(engine);
+        }
+        f(opt.as_ref().unwrap())
+    })
+}
+
+#[cfg(target_arch = "aarch64")]
+fn with_capstone<F, R>(f: F) -> Result<R, InlineHookError>
+where
+    F: FnOnce(&Capstone) -> Result<R, InlineHookError>,
+{
+    CS_ENGINE.with(|cell| {
+        let mut opt = cell.borrow_mut();
+        if opt.is_none() {
+            let engine = Capstone::new()
+                .arm64()
+                .mode(arch::arm64::ArchMode::Arm)
                 .detail(true)
                 .build()
                 .map_err(|e| InlineHookError::DisassemblyFailed(e.to_string()))?;
@@ -180,9 +214,10 @@ pub fn build_trampoline(
     })
 }
 
-/// Build a 5-byte E9 relative JMP from `from` to `to`.
-/// Returns the 5 bytes to write at `from`.
-pub fn build_rel_jmp(from: u64, to: u64) -> Result<[u8; 5], InlineHookError> {
+/// Build the patch jump (overwrites the target prologue) from `from` to `to`.
+/// x86: 5-byte E9 JMP rel32. ARM64: one 4-byte `B` (±128MB range).
+#[cfg(target_arch = "x86_64")]
+pub fn build_rel_jmp(from: u64, to: u64) -> Result<Vec<u8>, InlineHookError> {
     let next_ip = from + 5;
     let offset = (to as i64) - (next_ip as i64);
     if offset < i32::MIN as i64 || offset > i32::MAX as i64 {
@@ -191,19 +226,60 @@ pub fn build_rel_jmp(from: u64, to: u64) -> Result<[u8; 5], InlineHookError> {
         )));
     }
     let rel32 = offset as i32;
-    let mut buf = [0u8; 5];
+    let mut buf = vec![0u8; 5];
     buf[0] = 0xE9;
     buf[1..5].copy_from_slice(&rel32.to_le_bytes());
     Ok(buf)
 }
 
-/// Build a 14-byte absolute JMP: FF 25 00 00 00 00 + 8-byte address.
-fn build_abs_jmp(target: u64) -> [u8; 14] {
-    let mut buf = [0u8; 14];
+#[cfg(target_arch = "aarch64")]
+pub fn build_rel_jmp(from: u64, to: u64) -> Result<Vec<u8>, InlineHookError> {
+    Ok(encode_b(from, to)?.to_vec())
+}
+
+/// Encode an AArch64 unconditional `B` from `from` to `to`.
+/// `B` uses a signed 26-bit immediate (instruction count) → ±128MB range.
+#[cfg(target_arch = "aarch64")]
+fn encode_b(from: u64, to: u64) -> Result<[u8; 4], InlineHookError> {
+    let offset = (to as i64) - (from as i64);
+    if offset & 0x3 != 0 {
+        return Err(InlineHookError::RelocationFailed(format!(
+            "B target 0x{to:X} from 0x{from:X} is not 4-byte aligned"
+        )));
+    }
+    let imm = offset >> 2;
+    if !(-(1 << 25)..(1 << 25)).contains(&imm) {
+        return Err(InlineHookError::RelocationFailed(format!(
+            "B from 0x{from:X} to 0x{to:X} out of ±128MB range"
+        )));
+    }
+    // B: 0b000101 | imm26
+    let insn: u32 = 0x1400_0000 | ((imm as u32) & 0x03FF_FFFF);
+    Ok(insn.to_le_bytes())
+}
+
+/// Build an absolute jump to `target`.
+/// x86: 14 bytes FF 25 00 00 00 00 + 8-byte address.
+/// ARM64: 16 bytes `LDR X17, #8` + `BR X17` + 8-byte address.
+#[cfg(target_arch = "x86_64")]
+fn build_abs_jmp(target: u64) -> Vec<u8> {
+    let mut buf = vec![0u8; 14];
     buf[0] = 0xFF;
     buf[1] = 0x25;
     // buf[2..6] = 0x00000000 (RIP+0 displacement — already zeroed)
     buf[6..14].copy_from_slice(&target.to_le_bytes());
+    buf
+}
+
+#[cfg(target_arch = "aarch64")]
+fn build_abs_jmp(target: u64) -> Vec<u8> {
+    let mut buf = vec![0u8; 16];
+    // LDR X17, #8  → load the 8-byte literal at PC+8 into X17 (imm19 = 8/4 = 2)
+    buf[0..4].copy_from_slice(&0x5800_0051u32.to_le_bytes());
+    // BR X17
+    buf[4..8].copy_from_slice(&0xD61F_0220u32.to_le_bytes());
+    // 8-byte absolute target
+    buf[8..16].copy_from_slice(&target.to_le_bytes());
     buf
 }
 
@@ -240,6 +316,7 @@ fn relocate_prologue(
 }
 
 /// Relocate a single instruction.
+#[cfg(target_arch = "x86_64")]
 fn relocate_instruction(
     cs: &Capstone,
     insn: &capstone::Insn,
@@ -318,7 +395,64 @@ fn relocate_instruction(
     Ok(bytes.to_vec())
 }
 
+/// Relocate a single AArch64 instruction moved from `old_ip` to `new_ip`.
+///
+/// Re-encodes PC-relative direct branches (`B`/`BL`). Instructions with other
+/// forms of PC-relative addressing (ADR/ADRP, conditional/compare/test branches,
+/// LDR-literal) cannot be trivially relocated in place and are rejected — these
+/// are rare as the first instruction of a function prologue. All other
+/// instructions are position-independent and copied verbatim.
+#[cfg(target_arch = "aarch64")]
+fn relocate_instruction(
+    _cs: &Capstone,
+    insn: &capstone::Insn,
+    old_ip: u64,
+    new_ip: u64,
+) -> Result<Vec<u8>, InlineHookError> {
+    let bytes = insn.bytes();
+    if bytes.len() != 4 {
+        return Err(InlineHookError::RelocationFailed(format!(
+            "unexpected AArch64 instruction length {} at 0x{old_ip:X}",
+            bytes.len()
+        )));
+    }
+    let raw = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+
+    // B (0x14000000) / BL (0x94000000): imm26, target = ip + SignExtend(imm26:00).
+    if (raw & 0xFC00_0000) == 0x1400_0000 || (raw & 0xFC00_0000) == 0x9400_0000 {
+        let imm26 = raw & 0x03FF_FFFF;
+        // sign-extend the 26-bit immediate, then *4
+        let off = ((imm26 as i32) << 6 >> 6) as i64 * 4;
+        let target = (old_ip as i64 + off) as u64;
+        let new_off = target as i64 - new_ip as i64;
+        if new_off & 0x3 != 0 || !(-(1 << 27)..(1 << 27)).contains(&new_off) {
+            return Err(InlineHookError::RelocationFailed(format!(
+                "B/BL relocation out of range at 0x{old_ip:X}"
+            )));
+        }
+        let new_imm = ((new_off >> 2) as u32) & 0x03FF_FFFF;
+        let new_raw = (raw & 0xFC00_0000) | new_imm;
+        return Ok(new_raw.to_le_bytes().to_vec());
+    }
+
+    // PC-relative forms we cannot relocate in place.
+    let pc_relative = (raw & 0x1F00_0000) == 0x1000_0000      // ADR / ADRP
+        || (raw & 0xFF00_0010) == 0x5400_0000                 // B.cond
+        || (raw & 0x7E00_0000) == 0x3400_0000                 // CBZ / CBNZ
+        || (raw & 0x7E00_0000) == 0x3600_0000                 // TBZ / TBNZ
+        || (raw & 0x3B00_0000) == 0x1800_0000;                // LDR (literal)
+    if pc_relative {
+        return Err(InlineHookError::RelocationFailed(format!(
+            "cannot relocate PC-relative instruction 0x{raw:08X} at 0x{old_ip:X}"
+        )));
+    }
+
+    // Position-independent — copy verbatim.
+    Ok(bytes.to_vec())
+}
+
 /// Check if an instruction uses RIP-relative addressing.
+#[cfg(target_arch = "x86_64")]
 fn has_rip_relative(cs: &Capstone, insn: &capstone::Insn) -> bool {
     let detail = match cs.insn_detail(insn) {
         Ok(d) => d,
@@ -340,6 +474,7 @@ fn has_rip_relative(cs: &Capstone, insn: &capstone::Insn) -> bool {
 ///
 /// The displacement field is a 32-bit signed offset from the end of the instruction
 /// to the target address. We recompute it for the new location.
+#[cfg(target_arch = "x86_64")]
 fn relocate_rip_relative(
     bytes: &[u8],
     old_ip: u64,
@@ -403,6 +538,7 @@ fn relocate_rip_relative(
 /// RIP-relative is encoded as ModR/M with mod=00, rm=101. The ModR/M byte
 /// follows opcode bytes and optional prefixes. After ModR/M (and optional SIB),
 /// the 4-byte displacement appears.
+#[cfg(target_arch = "x86_64")]
 fn find_rip_disp_offset(bytes: &[u8]) -> Option<usize> {
     let len = bytes.len();
     if len < 5 {

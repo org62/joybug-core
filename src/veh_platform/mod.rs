@@ -364,9 +364,14 @@ impl VEHPlatform {
             let shared = unsafe { &mut *proc.shared_mem };
             shared.continue_status = VEH_CONTINUE_EXECUTION;
 
-            // Windows reports the exception address AT the int3; skip past it
-            // (1 byte) so we don't re-execute the trap on continue.
-            shared.context_rip = address + 1;
+            // The exception address is AT the breakpoint instruction; skip past
+            // it so we don't re-execute the trap on continue. int3 is 1 byte on
+            // x86; brk is a 4-byte instruction on AArch64 (advancing by 1 would
+            // land mid-instruction and fault with STATUS_ILLEGAL_INSTRUCTION).
+            #[cfg(target_arch = "x86_64")]
+            { shared.context_rip = address + 1; }
+            #[cfg(target_arch = "aarch64")]
+            { shared.context_rip = address + 4; }
 
             if !proc.has_hit_initial_breakpoint {
                 proc.has_hit_initial_breakpoint = true;

@@ -1,5 +1,6 @@
 #![cfg(windows)]
 
+#[allow(unused_imports)]
 pub use joybug2::local_server::LocalServer as TestServer;
 use joybug2::interfaces::{Architecture, InstructionFormatter, ResolvedSymbol};
 use joybug2::protocol::ModuleInfo;

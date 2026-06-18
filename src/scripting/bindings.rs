@@ -747,7 +747,7 @@ impl LuaUserData for LuaDebugClient {
             let mut client = this.inner.borrow_mut();
             let resp = client.send_and_receive(&DebuggerRequest::DisassembleMemory {
                 pid, address: addr, count: count.unwrap_or(10),
-                arch: Architecture::X64, // TODO: detect
+                arch: Architecture::from_native(),
             }).map_err(|e| mlua::Error::external(e))?;
             match resp {
                 DebuggerResponse::Instructions { instructions } => {
@@ -768,7 +768,7 @@ impl LuaUserData for LuaDebugClient {
             let mut client = this.inner.borrow_mut();
             let resp = client.send_and_receive(&DebuggerRequest::DisassembleFunction {
                 pid, address: addr, max_instructions: max.unwrap_or(1000),
-                arch: Architecture::X64, // TODO: detect
+                arch: Architecture::from_native(),
             }).map_err(|e| mlua::Error::external(e))?;
             match resp {
                 DebuggerResponse::FunctionDisassembly { instructions, function_start, function_end, function_name } => {
@@ -1173,7 +1173,7 @@ impl LuaUserData for LuaDebugClient {
 
         methods.add_method("assemble", |lua, _this, (code, address): (String, Option<u64>)| {
             let addr = address.unwrap_or(0);
-            let arch = Architecture::X64; // TODO: detect from target
+            let arch = Architecture::from_native();
             let result = crate::assembler::assemble(arch, &code, addr)
                 .map_err(|e| mlua::Error::external(anyhow::anyhow!("Assemble failed: {}", e)))?;
             let table = lua.create_table()?;
@@ -1187,7 +1187,7 @@ impl LuaUserData for LuaDebugClient {
         // ---- Assemble and write to memory ----
 
         methods.add_method("assemble_to", |lua, this, (pid, address, code): (u32, u64, String)| {
-            let arch = Architecture::X64; // TODO: detect from target
+            let arch = Architecture::from_native();
             let result = crate::assembler::assemble(arch, &code, address)
                 .map_err(|e| mlua::Error::external(anyhow::anyhow!("Assemble failed: {}", e)))?;
             let mut client = this.inner.borrow_mut();

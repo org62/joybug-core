@@ -17,7 +17,7 @@ dbg:on_initial_breakpoint(function(pid, tid, addr)
 
         -- Read registers at the breakpoint
         local ctx = dbg:get_context(pid, tid)
-        bp_rip = ctx.rip
+        bp_rip = ipof(ctx)
 
         -- Get call stack at breakpoint
         local frames = dbg:get_call_stack(pid, tid)

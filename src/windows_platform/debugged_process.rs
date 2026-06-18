@@ -264,10 +264,31 @@ impl DebuggedProcess {
 
     // Hardware breakpoint methods
 
-    /// Find a free debug register (DR0-DR3). Returns None if all 4 are in use.
-    pub(super) fn find_free_debug_register(&self) -> Option<u8> {
-        let used: std::collections::HashSet<u8> = self.hardware_breakpoints.iter().map(|bp| bp.dr_index).collect();
-        (0..4u8).find(|i| !used.contains(i))
+    /// Find a free debug-register slot for a breakpoint of the given type.
+    ///
+    /// x86: a single shared bank of 4 registers (DR0-DR3) serves every type.
+    /// ARM64: two independent banks — 8 breakpoint slots (Bvr/Bcr, Execute) and
+    /// 2 watchpoint slots (Wvr/Wcr, Write/ReadWrite). Returns the slot index
+    /// within the relevant bank, or None if that bank is full.
+    pub(super) fn find_free_debug_register(&self, bp_type: HardwareBreakpointType) -> Option<u8> {
+        match self.architecture {
+            Architecture::X64 => {
+                let used: std::collections::HashSet<u8> =
+                    self.hardware_breakpoints.iter().map(|bp| bp.dr_index).collect();
+                (0..4u8).find(|i| !used.contains(i))
+            }
+            Architecture::Arm64 => {
+                let is_exec = matches!(bp_type, HardwareBreakpointType::Execute);
+                let max = if is_exec { 8u8 } else { 2u8 };
+                let used: std::collections::HashSet<u8> = self
+                    .hardware_breakpoints
+                    .iter()
+                    .filter(|bp| matches!(bp.bp_type, HardwareBreakpointType::Execute) == is_exec)
+                    .map(|bp| bp.dr_index)
+                    .collect();
+                (0..max).find(|i| !used.contains(i))
+            }
+        }
     }
 
     /// Add a hardware breakpoint to the internal tracking.
@@ -285,6 +306,7 @@ impl DebuggedProcess {
     }
 
     /// Find a hardware breakpoint by DR index.
+    #[cfg(target_arch = "x86_64")]
     pub(super) fn find_hardware_breakpoint_by_dr_index(&self, dr_index: u8) -> Option<&InternalHardwareBreakpoint> {
         self.hardware_breakpoints.iter().find(|bp| bp.dr_index == dr_index)
     }
@@ -292,6 +314,38 @@ impl DebuggedProcess {
     /// Check if a hardware breakpoint exists at the given address.
     pub(super) fn has_hardware_breakpoint_at(&self, addr: u64) -> bool {
         self.hardware_breakpoints.iter().any(|bp| bp.address == addr)
+    }
+
+    /// Whether a software single-shot breakpoint is registered at `addr`.
+    #[cfg(target_arch = "aarch64")]
+    pub(super) fn has_single_shot_breakpoint(&self, addr: u64) -> bool {
+        self.single_shot_breakpoints.contains_key(&addr)
+    }
+
+    /// Find the active hardware breakpoint/watchpoint responsible for an access
+    /// at `addr` (ARM64 hit detection).
+    ///
+    /// For watchpoints (`is_watchpoint`), Windows reports the accessed data
+    /// address; match it to the watched variable's doubleword-aligned window.
+    /// For execute breakpoints, match the instruction address exactly.
+    #[cfg(target_arch = "aarch64")]
+    pub(super) fn active_hw_bp_for_access(
+        &self,
+        addr: u64,
+        is_watchpoint: bool,
+    ) -> Option<InternalHardwareBreakpoint> {
+        self.hardware_breakpoints
+            .iter()
+            .filter(|bp| bp.is_active)
+            .find(|bp| {
+                let is_exec = matches!(bp.bp_type, HardwareBreakpointType::Execute);
+                if is_watchpoint {
+                    !is_exec && (addr & !0x7) == (bp.address & !0x7)
+                } else {
+                    is_exec && bp.address == addr
+                }
+            })
+            .cloned()
     }
 
     /// Return all active hardware breakpoints.

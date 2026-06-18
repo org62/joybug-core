@@ -108,12 +108,13 @@ fn test_lua_hook_basic() {
     assert_eq!(std::hint::black_box(test_multiply)(3, 4), 12);
 
     // Hook with a Lua callback that doubles the first argument.
+    // First integer arg register: RCX on Win64, X0 on AArch64.
+    #[cfg(target_arch = "x86_64")]
+    let callback_src = r#"function(ctx) ctx.rcx = ctx.rcx * 2 end"#;
+    #[cfg(target_arch = "aarch64")]
+    let callback_src = r#"function(ctx) ctx.x0 = ctx.x0 * 2 end"#;
     let callback = lua
-        .load(r#"
-            function(ctx)
-                ctx.rcx = ctx.rcx * 2
-            end
-        "#)
+        .load(callback_src)
         .eval::<mlua::Function>()
         .expect("parse lua callback");
 
@@ -145,12 +146,13 @@ fn test_lua_hook_read_only() {
     // Register a global for the Lua callback to write into.
     lua.globals().set("captured", 0u64).unwrap();
 
+    // First integer arg register: RCX on Win64, X0 on AArch64.
+    #[cfg(target_arch = "x86_64")]
+    let callback_src = r#"function(ctx) captured = ctx.rcx end"#;
+    #[cfg(target_arch = "aarch64")]
+    let callback_src = r#"function(ctx) captured = ctx.x0 end"#;
     let callback = lua
-        .load(r#"
-            function(ctx)
-                captured = ctx.rcx
-            end
-        "#)
+        .load(callback_src)
         .eval::<mlua::Function>()
         .expect("parse callback");
 
@@ -158,7 +160,7 @@ fn test_lua_hook_read_only() {
         .hook(test_sub as *const u8, &lua, callback)
         .expect("hook");
 
-    // Call the function — the hook should capture RCX (first arg = 100).
+    // Call the function — the hook should capture the first arg (= 100).
     let result = std::hint::black_box(test_sub)(100, 30);
     assert_eq!(result, 70); // original behavior unchanged
 

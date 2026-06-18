@@ -38,7 +38,7 @@ dbg:on_initial_breakpoint(function(pid, tid, addr)
 
         -- TEST 4: Stack pointer dereference (multiple entries)
         local ctx = dbg:get_context(pid, tid)
-        local stack_entries = dbg:dereference(pid, ctx.rsp, 10)
+        local stack_entries = dbg:dereference(pid, spof(ctx), 10)
         assert(#stack_entries == 10, "Should get exactly 10 entries")
         -- Verify offsets are correct (8 bytes apart for 64-bit)
         for i, entry in ipairs(stack_entries) do

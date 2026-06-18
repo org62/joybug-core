@@ -53,6 +53,8 @@ struct AlignedContext {
 pub(crate) struct StepState {
     pub(crate) kind: StepKind,
     /// If set, a hardware breakpoint DR index that needs re-arming after the step completes.
+    /// Only read on x86_64 (DR-register based HW breakpoints).
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) deferred_hw_bp_rearm: Option<u8>,
 }
 
@@ -407,10 +409,10 @@ impl PlatformAPI for WindowsPlatform {
             )));
         }
 
-        // Allocate a free debug register
-        let dr_index = process.find_free_debug_register()
+        // Allocate a free debug register slot from the appropriate bank
+        let dr_index = process.find_free_debug_register(bp_type)
             .ok_or_else(|| PlatformError::Other(
-                "All 4 hardware debug registers are in use".to_string()
+                "No free hardware debug register slot available for this breakpoint type".to_string()
             ))?;
 
         // Apply to all threads (skip threads that fail — they may be exiting or
@@ -456,7 +458,7 @@ impl PlatformAPI for WindowsPlatform {
         // Clear from all threads
         let thread_handles = process.thread_manager().all_thread_handles();
         for (_tid, handle) in &thread_handles {
-            let _ = hardware_breakpoints::clear_hw_bp_from_thread(*handle, bp.dr_index);
+            let _ = hardware_breakpoints::clear_hw_bp_from_thread(*handle, bp.dr_index, bp.bp_type);
         }
 
         info!(pid, addr, dr_index = bp.dr_index, "Hardware breakpoint removed");
