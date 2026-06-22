@@ -348,9 +348,9 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
-            DebuggerRequest::ScanMemoryStart { pid, value_type, compare_type, value, value2, alignment, float_tolerance, writable_only } => {
+            DebuggerRequest::ScanMemoryStart { pid, value_type, compare_type, value, value2, alignment, float_tolerance, writable_only, thread_count } => {
                 let p = platform.read().unwrap();
-                match scanner.start_scan(&*p, pid, value_type, compare_type, value, value2, alignment, float_tolerance, writable_only.unwrap_or(true)) {
+                match scanner.start_scan(&*p, pid, value_type, compare_type, value, value2, alignment, float_tolerance, writable_only.unwrap_or(true), thread_count) {
                     Ok((scan_id, match_count, scan_time_us)) => DebuggerResponse::ScanMemoryResult { scan_id, match_count, scan_time_us },
                     Err(e) => DebuggerResponse::Error { message: e },
                 }

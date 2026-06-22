@@ -470,6 +470,9 @@ pub mod request_response {
             /// If true (default), only scan writable memory regions.
             #[serde(default)]
             writable_only: Option<bool>,
+            /// Number of threads to use for the scan. `None`/`Some(0)` = all cores.
+            #[serde(default)]
+            thread_count: Option<usize>,
         },
         ScanMemoryNext {
             scan_id: u64,

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use rayon::prelude::*;
+
 use crate::interfaces::PlatformAPI;
 use crate::protocol::{ScanCompareType, ScanValue, ScanValueType};
 
@@ -19,7 +21,23 @@ struct ScanState {
     value_type: ScanValueType,
     alignment: usize,
     float_tolerance: f64,
+    /// Number of threads to use for scanning. `None` or `Some(0)` means the
+    /// global rayon pool (all cores); `Some(n)` uses a scoped pool of `n` threads.
+    thread_count: Option<usize>,
     storage: ScanStorage,
+}
+
+/// Runs `f` on a scoped rayon thread pool of `thread_count` threads, or on the
+/// global pool (all cores) when `thread_count` is `None`/`Some(0)` or the scoped
+/// pool fails to build.
+fn install_pool<T: Send>(thread_count: Option<usize>, f: impl FnOnce() -> T + Send) -> T {
+    match thread_count {
+        Some(n) if n > 0 => match rayon::ThreadPoolBuilder::new().num_threads(n).build() {
+            Ok(pool) => pool.install(f),
+            Err(_) => f(),
+        },
+        _ => f(),
+    }
 }
 
 enum ScanStorage {
@@ -51,6 +69,7 @@ impl MemoryScanner {
         alignment: Option<usize>,
         float_tolerance: Option<f64>,
         writable_only: bool,
+        thread_count: Option<usize>,
     ) -> Result<(u64, u64, u64), String> {
         // Validation
         validate_first_scan(compare_type, value_type, &value, &value2)?;
@@ -63,26 +82,41 @@ impl MemoryScanner {
         let regions = enumerate_scannable_regions(platform, pid, writable_only)?;
 
         let (storage, match_count) = if compare_type == ScanCompareType::UnknownInitialValue {
-            let mut snapshots = Vec::new();
+            // Read all regions in parallel, then filter empties / count sequentially.
+            let raw: Vec<(u64, Vec<u8>)> = install_pool(thread_count, || {
+                regions
+                    .par_iter()
+                    .map(|(base, size)| (*base, read_region_chunked(platform, pid, *base, *size)))
+                    .collect()
+            });
+            let mut snapshots = Vec::with_capacity(raw.len());
             let mut total = 0u64;
-            for (base, size) in &regions {
-                let data = read_region_chunked(platform, pid, *base, *size);
+            for (base, data) in raw {
                 if !data.is_empty() {
                     // Count how many aligned positions fit
                     total += ((data.len().saturating_sub(val_size - 1)) / alignment) as u64;
-                    snapshots.push((*base, data));
+                    snapshots.push((base, data));
                 }
             }
             (ScanStorage::RegionSnapshot(snapshots), total)
         } else {
             let value = value.unwrap(); // validated above
-            let mut entries = Vec::new();
-            for (base, size) in &regions {
-                scan_region_first(
-                    platform, pid, *base, *size, value_type, alignment,
-                    compare_type, value, value2, float_tolerance, &mut entries,
-                );
-            }
+            // Scan each region in parallel; collect per-region results then flatten so
+            // entries stay in ascending address order.
+            let entries: Vec<ScanEntry> = install_pool(thread_count, || {
+                regions
+                    .par_iter()
+                    .map(|(base, size)| {
+                        scan_region_first(
+                            platform, pid, *base, *size, value_type, alignment,
+                            compare_type, value, value2, float_tolerance,
+                        )
+                    })
+                    .collect::<Vec<Vec<ScanEntry>>>()
+            })
+            .into_iter()
+            .flatten()
+            .collect();
             let count = entries.len() as u64;
             (ScanStorage::FilteredEntries(entries), count)
         };
@@ -96,6 +130,7 @@ impl MemoryScanner {
             value_type,
             alignment,
             float_tolerance,
+            thread_count,
             storage,
         });
 
@@ -120,6 +155,7 @@ impl MemoryScanner {
         let value_type = state.value_type;
         let alignment = state.alignment;
         let float_tolerance = state.float_tolerance;
+        let thread_count = state.thread_count;
         let val_size = value_type.size();
 
         let old_storage = std::mem::replace(
@@ -127,7 +163,7 @@ impl MemoryScanner {
             ScanStorage::FilteredEntries(Vec::new()),
         );
 
-        let new_entries = match old_storage {
+        let new_entries = install_pool(thread_count, || match old_storage {
             ScanStorage::RegionSnapshot(snapshots) => {
                 next_scan_from_snapshot(
                     platform, pid, &snapshots, value_type, alignment,
@@ -140,7 +176,7 @@ impl MemoryScanner {
                     compare_type, value, value2, float_tolerance,
                 )
             }
-        };
+        });
 
         let match_count = new_entries.len() as u64;
         state.storage = ScanStorage::FilteredEntries(new_entries);
@@ -315,9 +351,9 @@ fn scan_region_first(
     value: ScanValue,
     value2: Option<ScanValue>,
     float_tolerance: f64,
-    entries: &mut Vec<ScanEntry>,
-) {
+) -> Vec<ScanEntry> {
     let val_size = value_type.size();
+    let mut entries = Vec::new();
     let mut offset = 0usize;
     while offset < size {
         let read_size = CHUNK_SIZE.min(size - offset);
@@ -349,6 +385,7 @@ fn scan_region_first(
             }
         }
     }
+    entries
 }
 
 // --- Next scan from snapshot ---
@@ -365,33 +402,39 @@ fn next_scan_from_snapshot(
     float_tolerance: f64,
 ) -> Vec<ScanEntry> {
     let val_size = value_type.size();
-    let mut entries = Vec::new();
 
-    for (base, old_data) in snapshots {
-        // Re-read the region
-        let new_data = read_region_chunked(platform, pid, *base, old_data.len());
-        let compare_len = old_data.len().min(new_data.len());
-        if compare_len < val_size {
-            continue;
-        }
-
-        let mut pos = 0usize;
-        while pos + val_size <= compare_len {
-            let old_bytes = &old_data[pos..pos + val_size];
-            let new_bytes = &new_data[pos..pos + val_size];
-            if compare_value_next(new_bytes, old_bytes, value_type, compare_type, value, value2, float_tolerance) {
-                let mut stored = [0u8; 8];
-                stored[..val_size].copy_from_slice(new_bytes);
-                entries.push(ScanEntry {
-                    address: base + pos as u64,
-                    value: stored,
-                });
+    // Re-read and compare each region in parallel; flatten preserves address order.
+    snapshots
+        .par_iter()
+        .map(|(base, old_data)| {
+            let mut entries = Vec::new();
+            // Re-read the region
+            let new_data = read_region_chunked(platform, pid, *base, old_data.len());
+            let compare_len = old_data.len().min(new_data.len());
+            if compare_len < val_size {
+                return entries;
             }
-            pos += alignment;
-        }
-    }
 
-    entries
+            let mut pos = 0usize;
+            while pos + val_size <= compare_len {
+                let old_bytes = &old_data[pos..pos + val_size];
+                let new_bytes = &new_data[pos..pos + val_size];
+                if compare_value_next(new_bytes, old_bytes, value_type, compare_type, value, value2, float_tolerance) {
+                    let mut stored = [0u8; 8];
+                    stored[..val_size].copy_from_slice(new_bytes);
+                    entries.push(ScanEntry {
+                        address: base + pos as u64,
+                        value: stored,
+                    });
+                }
+                pos += alignment;
+            }
+            entries
+        })
+        .collect::<Vec<Vec<ScanEntry>>>()
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 // --- Next scan from filtered entries ---
@@ -411,10 +454,10 @@ fn next_scan_from_filtered(
         return Vec::new();
     }
 
-    // Group nearby addresses into batch reads (within 4KB proximity)
-    let mut result = Vec::new();
+    // Group nearby addresses into batch reads (within 4KB proximity). Compute the
+    // batch index ranges sequentially (cheap), then process them in parallel.
+    let mut batches: Vec<(usize, usize)> = Vec::new();
     let mut batch_start = 0usize;
-
     while batch_start < entries.len() {
         let batch_base = entries[batch_start].address;
         let mut batch_end = batch_start + 1;
@@ -425,33 +468,44 @@ fn next_scan_from_filtered(
             }
             batch_end += 1;
         }
-
-        // Read the range covering all entries in this batch
-        let last_addr = entries[batch_end - 1].address;
-        let read_size = (last_addr - batch_base) as usize + val_size;
-        let read_data = platform.read_memory(pid, batch_base, read_size);
-
-        for entry in &entries[batch_start..batch_end] {
-            let offset = (entry.address - batch_base) as usize;
-            let new_bytes = match &read_data {
-                Ok(data) if offset + val_size <= data.len() => &data[offset..offset + val_size],
-                _ => continue, // can't read - drop this entry
-            };
-
-            if compare_value_next(new_bytes, &entry.value[..val_size], value_type, compare_type, value, value2, float_tolerance) {
-                let mut stored = [0u8; 8];
-                stored[..val_size].copy_from_slice(new_bytes);
-                result.push(ScanEntry {
-                    address: entry.address,
-                    value: stored,
-                });
-            }
-        }
-
+        batches.push((batch_start, batch_end));
         batch_start = batch_end;
     }
 
-    result
+    // Process each batch in parallel; flatten preserves address order.
+    batches
+        .par_iter()
+        .map(|&(batch_start, batch_end)| {
+            let mut result = Vec::new();
+            let batch_base = entries[batch_start].address;
+
+            // Read the range covering all entries in this batch
+            let last_addr = entries[batch_end - 1].address;
+            let read_size = (last_addr - batch_base) as usize + val_size;
+            let read_data = platform.read_memory(pid, batch_base, read_size);
+
+            for entry in &entries[batch_start..batch_end] {
+                let offset = (entry.address - batch_base) as usize;
+                let new_bytes = match &read_data {
+                    Ok(data) if offset + val_size <= data.len() => &data[offset..offset + val_size],
+                    _ => continue, // can't read - drop this entry
+                };
+
+                if compare_value_next(new_bytes, &entry.value[..val_size], value_type, compare_type, value, value2, float_tolerance) {
+                    let mut stored = [0u8; 8];
+                    stored[..val_size].copy_from_slice(new_bytes);
+                    result.push(ScanEntry {
+                        address: entry.address,
+                        value: stored,
+                    });
+                }
+            }
+            result
+        })
+        .collect::<Vec<Vec<ScanEntry>>>()
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 // --- Comparison functions ---

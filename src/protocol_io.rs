@@ -1155,8 +1155,9 @@ impl<S> DebugSession<S> {
         alignment: Option<usize>,
         float_tolerance: Option<f64>,
         writable_only: bool,
+        thread_count: Option<usize>,
     ) -> anyhow::Result<(u64, u64, u64)> {
-        let req = DebuggerRequest::ScanMemoryStart { pid, value_type, compare_type, value, value2, alignment, float_tolerance, writable_only: Some(writable_only) };
+        let req = DebuggerRequest::ScanMemoryStart { pid, value_type, compare_type, value, value2, alignment, float_tolerance, writable_only: Some(writable_only), thread_count };
         match self.send_and_receive(&req)? {
             DebuggerResponse::ScanMemoryResult { scan_id, match_count, scan_time_us } => Ok((scan_id, match_count, scan_time_us)),
             DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to start scan: {}", message)),

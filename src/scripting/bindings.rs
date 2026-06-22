@@ -1103,6 +1103,7 @@ impl LuaUserData for LuaDebugClient {
             let resp = client.send_and_receive(&DebuggerRequest::ScanMemoryStart {
                 pid, value_type, compare_type, value, value2: None,
                 alignment: None, float_tolerance: None, writable_only: Some(true),
+                thread_count: None,
             }).map_err(|e| mlua::Error::external(e))?;
             scan_result_to_lua(lua, resp, "ScanMemoryStart")
         });

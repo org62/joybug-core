@@ -118,6 +118,9 @@ fn memory_scan_exact_value() {
                                         None,
                                         tol,
                                         true,
+                                        // Exercise the scoped (fixed thread count) pool path;
+                                        // results must be identical to the all-cores path.
+                                        Some(2),
                                     )?;
                                 println!(
                                     "  {}: scan_id={}, matches={}, time={}us",
@@ -330,6 +333,7 @@ fn memory_scan_unknown_initial() {
                                     None,
                                     None,
                                     true,
+                                    None,
                                 )?;
                             println!(
                                 "  scan_id={}, matches={}, time={}us",
