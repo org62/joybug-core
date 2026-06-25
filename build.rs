@@ -129,6 +129,7 @@ fn main() {
         let _ = compile_test_program(&manifest_dir, &out_dir, "memory_search_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "assembler_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "memory_scan_test", None);
+        let _ = compile_test_program(&manifest_dir, &out_dir, "pointer_scan_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "parent_child_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "veh_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "anti_debug_test", None);

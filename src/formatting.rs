@@ -134,6 +134,19 @@ impl std::fmt::Debug for DebuggerResponse {
                     .field("total_count", total_count)
                     .finish()
             }
+            DebuggerResponse::PointerScanResult { scan_id, match_count, scan_time_us } => {
+                f.debug_struct("PointerScanResult")
+                    .field("scan_id", scan_id)
+                    .field("match_count", match_count)
+                    .field("scan_time_us", scan_time_us)
+                    .finish()
+            }
+            DebuggerResponse::PointerScanResults { paths, total_count } => {
+                f.debug_struct("PointerScanResults")
+                    .field("returned", &paths.len())
+                    .field("total_count", total_count)
+                    .finish()
+            }
             DebuggerResponse::PebHideResult { report } => {
                 f.debug_struct("PebHideResult")
                     .field("peb_address", &format_args!("0x{:X}", report.peb_address))

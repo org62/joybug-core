@@ -342,6 +342,29 @@ end
 dbg:scan_reset(scan.scan_id)
 ```
 
+### Pointer Scanning (Cheat-Engine style)
+
+Find chains of pointers that start at a *static* module base and resolve to a
+dynamic `target` address — useful for building stable pointers that survive
+restarts/relocation.
+
+```lua
+-- target = a dynamic address (e.g. from a value scan)
+local res = dbg:ptr_scan_start(pid, target, 0x1000, 5) -- max_offset, max_depth (optional)
+print("Paths found: " .. res.match_count)
+
+local got = dbg:ptr_scan_results(res.scan_id, 0, 100)   -- scan_id, offset, count (optional)
+for _, p in ipairs(got.paths) do
+    -- Resolve as: addr = p.module_base + p.base_offset
+    --             for each off in p.offsets: addr = read_u64(addr) + off  (== p.resolved)
+    local s = string.format("module[%d]+0x%x", p.module_index, p.base_offset)
+    for _, off in ipairs(p.offsets) do s = s .. string.format(" -> +0x%x", off) end
+    print(s .. string.format("  => 0x%x", p.resolved))
+end
+
+dbg:ptr_scan_reset(res.scan_id)
+```
+
 ### Anti-Anti-Debug
 
 Defeat common anti-debug probes by patching well-known fields in the target's PEB.

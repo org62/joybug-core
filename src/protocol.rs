@@ -488,6 +488,36 @@ pub mod request_response {
         ScanMemoryReset {
             scan_id: u64,
         },
+        // Pointer scan: find static pointer paths leading to a target address
+        PointerScanStart {
+            pid: u32,
+            target_address: u64,
+            /// Max offset window scanned at each level (struct size). Default 0x1000.
+            max_offset: u64,
+            /// Max pointer chain depth (number of indirections). Default 5.
+            max_depth: u32,
+            /// Slot alignment when scanning memory. `None` = pointer size (8).
+            #[serde(default)]
+            alignment: Option<usize>,
+            /// Cap on the number of returned paths. `None` = engine default.
+            #[serde(default)]
+            max_results: Option<u64>,
+            /// Restrict static bases to modules with these base addresses.
+            /// `None` (or empty) considers every loaded module.
+            #[serde(default)]
+            modules: Option<Vec<u64>>,
+            /// Number of threads to use. `None`/`Some(0)` = all cores.
+            #[serde(default)]
+            thread_count: Option<usize>,
+        },
+        PointerScanGetResults {
+            scan_id: u64,
+            offset: u64,
+            count: u64,
+        },
+        PointerScanReset {
+            scan_id: u64,
+        },
         // Anti-anti-debug
         HidePeb {
             pid: u32,
@@ -565,6 +595,15 @@ pub mod request_response {
         ScanMemoryResults {
             addresses: Vec<u64>,
             values: Vec<ScanValue>,
+            total_count: u64,
+        },
+        PointerScanResult {
+            scan_id: u64,
+            match_count: u64,
+            scan_time_us: u64,
+        },
+        PointerScanResults {
+            paths: Vec<PointerPath>,
             total_count: u64,
         },
         /// Tenet format trace result (for TraceInstructions and EmulateInstructions with InstructionTrace mode)
@@ -737,6 +776,22 @@ pub mod request_response {
         pub state: u32,          // MEM_COMMIT=0x1000, MEM_RESERVE=0x2000, MEM_FREE=0x10000
         pub protect: u32,        // PAGE_* flags
         pub region_type: u32,    // MEM_PRIVATE=0x20000, MEM_MAPPED=0x40000, MEM_IMAGE=0x1000000
+    }
+
+    /// A single pointer path found by the pointer scanner. Resolves to the scan
+    /// target via: `addr = module_base + base_offset; for off in offsets { addr = read_u64(addr) + off }`.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct PointerPath {
+        /// Index into the module list at scan time, or -1 if the base is non-static.
+        pub module_index: i32,
+        /// Base address of the module the static base lives in.
+        pub module_base: u64,
+        /// Offset of the static pointer within its module (`static_addr - module_base`).
+        pub base_offset: u64,
+        /// Offset chain, ordered from base toward the target (applied per indirection).
+        pub offsets: Vec<u64>,
+        /// Address this path resolves to (equals the scan target at scan time).
+        pub resolved: u64,
     }
 
     /// Entry for a single address in a dereference chain

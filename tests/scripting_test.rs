@@ -674,6 +674,12 @@ fn test_lua_file_memory_scan() {
     run_lua_test_file("memory/memory_scan.lua", Some(&test_exe));
 }
 
+#[test]
+fn test_lua_file_pointer_scan() {
+    let test_exe = common::get_test_program_path("pointer_scan_test");
+    run_lua_test_file("memory/pointer_scan.lua", Some(&test_exe));
+}
+
 // --- disassembly ---
 
 #[test]

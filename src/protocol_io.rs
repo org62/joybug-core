@@ -133,6 +133,8 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::MemorySearchResult { addresses, capped } => format!("MemorySearchResult ({} matches, capped={})", addresses.len(), capped),
         DebuggerResponse::ScanMemoryResult { match_count, .. } => format!("ScanMemoryResult ({} matches)", match_count),
         DebuggerResponse::ScanMemoryResults { addresses, total_count, .. } => format!("ScanMemoryResults ({}/{} returned)", addresses.len(), total_count),
+        DebuggerResponse::PointerScanResult { match_count, .. } => format!("PointerScanResult ({} paths)", match_count),
+        DebuggerResponse::PointerScanResults { paths, total_count } => format!("PointerScanResults ({}/{} returned)", paths.len(), total_count),
         DebuggerResponse::PebHideResult { report } => format!(
             "PebHideResult (peb=0x{:X}, applied={}, failed={}, wow64_skipped={})",
             report.peb_address, report.applied.len(), report.failures.len(), report.wow64_skipped,
@@ -1200,6 +1202,53 @@ impl<S> DebugSession<S> {
             DebuggerResponse::Ack => Ok(()),
             DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to reset scan: {}", message)),
             other => Err(anyhow::anyhow!("Unexpected response to ScanMemoryReset: {:?}", other)),
+        }
+    }
+
+    /// Start a pointer scan: find static pointer paths that resolve to `target_address`.
+    /// Returns `(scan_id, match_count, scan_time_us)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pointer_scan_start(
+        &mut self,
+        pid: u32,
+        target_address: u64,
+        max_offset: u64,
+        max_depth: u32,
+        alignment: Option<usize>,
+        max_results: Option<u64>,
+        modules: Option<Vec<u64>>,
+        thread_count: Option<usize>,
+    ) -> anyhow::Result<(u64, u64, u64)> {
+        let req = DebuggerRequest::PointerScanStart {
+            pid, target_address, max_offset, max_depth, alignment, max_results, modules, thread_count,
+        };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::PointerScanResult { scan_id, match_count, scan_time_us } => Ok((scan_id, match_count, scan_time_us)),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to start pointer scan: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to PointerScanStart: {:?}", other)),
+        }
+    }
+
+    pub fn pointer_scan_get_results(
+        &mut self,
+        scan_id: u64,
+        offset: u64,
+        count: u64,
+    ) -> anyhow::Result<(Vec<crate::protocol::PointerPath>, u64)> {
+        let req = DebuggerRequest::PointerScanGetResults { scan_id, offset, count };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::PointerScanResults { paths, total_count } => Ok((paths, total_count)),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to get pointer scan results: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to PointerScanGetResults: {:?}", other)),
+        }
+    }
+
+    pub fn pointer_scan_reset(&mut self, scan_id: u64) -> anyhow::Result<()> {
+        let req = DebuggerRequest::PointerScanReset { scan_id };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to reset pointer scan: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to PointerScanReset: {:?}", other)),
         }
     }
 

@@ -40,6 +40,7 @@ where
 {
     let mut framed_stream = FramedJsonStream::new(stream);
     let mut scanner = crate::memory_scanner::MemoryScanner::new();
+    let mut pointer_scanner = crate::pointer_scanner::PointerScanner::new();
     loop {
         let recv_start = Instant::now();
         let req: DebuggerRequest = match framed_stream.receive() {
@@ -371,6 +372,25 @@ where
             }
             DebuggerRequest::ScanMemoryReset { scan_id } => {
                 match scanner.reset_scan(scan_id) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::PointerScanStart { pid, target_address, max_offset, max_depth, alignment, max_results, modules, thread_count } => {
+                let p = platform.read().unwrap();
+                match pointer_scanner.start_scan(&*p, pid, target_address, max_offset, max_depth, alignment, max_results, modules, thread_count) {
+                    Ok((scan_id, match_count, scan_time_us)) => DebuggerResponse::PointerScanResult { scan_id, match_count, scan_time_us },
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::PointerScanGetResults { scan_id, offset, count } => {
+                match pointer_scanner.get_results(scan_id, offset, count) {
+                    Ok((paths, total_count)) => DebuggerResponse::PointerScanResults { paths, total_count },
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::PointerScanReset { scan_id } => {
+                match pointer_scanner.reset_scan(scan_id) {
                     Ok(()) => DebuggerResponse::Ack,
                     Err(e) => DebuggerResponse::Error { message: e },
                 }

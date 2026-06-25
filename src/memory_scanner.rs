@@ -30,7 +30,7 @@ struct ScanState {
 /// Runs `f` on a scoped rayon thread pool of `thread_count` threads, or on the
 /// global pool (all cores) when `thread_count` is `None`/`Some(0)` or the scoped
 /// pool fails to build.
-fn install_pool<T: Send>(thread_count: Option<usize>, f: impl FnOnce() -> T + Send) -> T {
+pub(crate) fn install_pool<T: Send>(thread_count: Option<usize>, f: impl FnOnce() -> T + Send) -> T {
     match thread_count {
         Some(n) if n > 0 => match rayon::ThreadPoolBuilder::new().num_threads(n).build() {
             Ok(pool) => pool.install(f),
@@ -303,7 +303,7 @@ fn validate_type_match(value_type: ScanValueType, value: &ScanValue) -> Result<(
 /// Writable protection mask: PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
 const PAGE_WRITABLE_MASK: u32 = 0x04 | 0x08 | 0x40 | 0x80;
 
-fn enumerate_scannable_regions(platform: &dyn PlatformAPI, pid: u32, writable_only: bool) -> Result<Vec<(u64, usize)>, String> {
+pub(crate) fn enumerate_scannable_regions(platform: &dyn PlatformAPI, pid: u32, writable_only: bool) -> Result<Vec<(u64, usize)>, String> {
     let regions = platform.enumerate_memory_regions(pid)
         .map_err(|e| format!("Failed to enumerate memory regions: {}", e))?;
 
@@ -319,7 +319,7 @@ fn enumerate_scannable_regions(platform: &dyn PlatformAPI, pid: u32, writable_on
         .collect())
 }
 
-fn read_region_chunked(platform: &dyn PlatformAPI, pid: u32, base: u64, size: usize) -> Vec<u8> {
+pub(crate) fn read_region_chunked(platform: &dyn PlatformAPI, pid: u32, base: u64, size: usize) -> Vec<u8> {
     let mut result = Vec::with_capacity(size);
     let mut offset = 0usize;
     while offset < size {

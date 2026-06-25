@@ -1149,6 +1149,79 @@ impl LuaUserData for LuaDebugClient {
             Ok(())
         });
 
+        // ---- Pointer scanning ----
+
+        // ptr_scan_start(pid, target_address, [max_offset=0x1000], [max_depth=5], [modules])
+        // `modules` is an optional list of base module addresses to restrict the
+        // static base of returned paths to. -> { scan_id, match_count, scan_time_us }
+        methods.add_method("ptr_scan_start", |lua, this, (pid, target_address, max_offset, max_depth, modules): (u32, u64, Option<u64>, Option<u32>, Option<Vec<u64>>)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::PointerScanStart {
+                pid,
+                target_address,
+                max_offset: max_offset.unwrap_or(0x1000),
+                max_depth: max_depth.unwrap_or(5),
+                alignment: None,
+                max_results: None,
+                modules,
+                thread_count: None,
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::PointerScanResult { scan_id, match_count, scan_time_us } => {
+                    let table = lua.create_table()?;
+                    table.set("scan_id", scan_id)?;
+                    table.set("match_count", match_count)?;
+                    table.set("scan_time_us", scan_time_us)?;
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("PointerScanStart failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // ptr_scan_results(scan_id, [offset=0], [count=100])
+        // -> { total_count, paths = { { module_index, module_base, base_offset, offsets={..}, resolved }, .. } }
+        methods.add_method("ptr_scan_results", |lua, this, (scan_id, offset, count): (u64, Option<u64>, Option<u64>)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::PointerScanGetResults {
+                scan_id, offset: offset.unwrap_or(0), count: count.unwrap_or(100),
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::PointerScanResults { paths, total_count } => {
+                    let table = lua.create_table()?;
+                    let path_list = lua.create_table()?;
+                    for (i, p) in paths.iter().enumerate() {
+                        let pt = lua.create_table()?;
+                        pt.set("module_index", p.module_index)?;
+                        pt.set("module_base", p.module_base)?;
+                        pt.set("base_offset", p.base_offset)?;
+                        pt.set("resolved", p.resolved)?;
+                        let offs = lua.create_table()?;
+                        for (j, o) in p.offsets.iter().enumerate() {
+                            offs.set(j + 1, *o)?;
+                        }
+                        pt.set("offsets", offs)?;
+                        path_list.set(i + 1, pt)?;
+                    }
+                    table.set("paths", path_list)?;
+                    table.set("total_count", total_count)?;
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("PointerScanGetResults failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        methods.add_method("ptr_scan_reset", |_lua, this, scan_id: u64| {
+            let mut client = this.inner.borrow_mut();
+            let _ = client.send_and_receive(&DebuggerRequest::PointerScanReset { scan_id });
+            Ok(())
+        });
+
         // ---- Utility: current state ----
 
         methods.add_method("pid", |_lua, this, ()| {
