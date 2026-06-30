@@ -134,9 +134,9 @@ impl std::fmt::Debug for DebuggerResponse {
                     .field("total_count", total_count)
                     .finish()
             }
-            DebuggerResponse::PointerScanResult { scan_id, match_count, scan_time_us } => {
+            DebuggerResponse::PointerScanResult { results_path, match_count, scan_time_us } => {
                 f.debug_struct("PointerScanResult")
-                    .field("scan_id", scan_id)
+                    .field("results_path", results_path)
                     .field("match_count", match_count)
                     .field("scan_time_us", scan_time_us)
                     .finish()
@@ -153,6 +153,11 @@ impl std::fmt::Debug for DebuggerResponse {
                     .field("applied", &report.applied)
                     .field("failures", &report.failures)
                     .field("wow64_skipped", &report.wow64_skipped)
+                    .finish()
+            }
+            DebuggerResponse::FreezeValueStarted { freeze_id } => {
+                f.debug_struct("FreezeValueStarted")
+                    .field("freeze_id", freeze_id)
                     .finish()
             }
         }

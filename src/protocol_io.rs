@@ -139,6 +139,7 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
             "PebHideResult (peb=0x{:X}, applied={}, failed={}, wow64_skipped={})",
             report.peb_address, report.applied.len(), report.failures.len(), report.wow64_skipped,
         ),
+        DebuggerResponse::FreezeValueStarted { freeze_id } => format!("FreezeValueStarted (id={})", freeze_id),
     };
     debug!("Received response: {}", summary);
     Ok(resp)
@@ -1089,6 +1090,54 @@ impl<S> DebugSession<S> {
         }
     }
 
+    /// Register a server-side value freeze: a thread on the server continuously
+    /// writes `data` to the target (every `interval_ms`, default ~30ms) until
+    /// stopped, returning the freeze id used to update/stop it. With an empty
+    /// `offsets` the fixed `address` is locked; otherwise `address` is a static
+    /// base and the server re-follows the pointer chain each tick so the lock
+    /// tracks a moving target (e.g. a level reload).
+    pub fn freeze_value(
+        &mut self,
+        pid: u32,
+        address: u64,
+        data: Vec<u8>,
+        interval_ms: Option<u64>,
+        offsets: Vec<u64>,
+    ) -> anyhow::Result<u64> {
+        let req = DebuggerRequest::FreezeValueStart { pid, address, data, interval_ms, offsets };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::FreezeValueStarted { freeze_id } => Ok(freeze_id),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to start freeze: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to FreezeValueStart: {:?}", other)),
+        }
+    }
+
+    /// Change the value written by an active freeze without re-registering it.
+    pub fn update_freeze_value(&mut self, freeze_id: u64, data: Vec<u8>) -> anyhow::Result<()> {
+        let req = DebuggerRequest::FreezeValueUpdate { freeze_id, data };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to update freeze: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to FreezeValueUpdate: {:?}", other)),
+        }
+    }
+
+    /// Stop an active value freeze.
+    pub fn unfreeze_value(&mut self, freeze_id: u64) -> anyhow::Result<()> {
+        let req = DebuggerRequest::FreezeValueStop { freeze_id };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to stop freeze: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to FreezeValueStop: {:?}", other)),
+        }
+    }
+
     /// Apply anti-anti-debug PEB patches to the target process. See
     /// [`crate::anti_anti_debug::peb::hide_peb`] for the field-by-field semantics.
     pub fn hide_peb(
@@ -1218,12 +1267,13 @@ impl<S> DebugSession<S> {
         max_results: Option<u64>,
         modules: Option<Vec<u64>>,
         thread_count: Option<usize>,
-    ) -> anyhow::Result<(u64, u64, u64)> {
+        writable_only: bool,
+    ) -> anyhow::Result<(String, u64, u64)> {
         let req = DebuggerRequest::PointerScanStart {
-            pid, target_address, max_offset, max_depth, alignment, max_results, modules, thread_count,
+            pid, target_address, max_offset, max_depth, alignment, max_results, modules, thread_count, writable_only,
         };
         match self.send_and_receive(&req)? {
-            DebuggerResponse::PointerScanResult { scan_id, match_count, scan_time_us } => Ok((scan_id, match_count, scan_time_us)),
+            DebuggerResponse::PointerScanResult { results_path, match_count, scan_time_us } => Ok((results_path, match_count, scan_time_us)),
             DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to start pointer scan: {}", message)),
             other => Err(anyhow::anyhow!("Unexpected response to PointerScanStart: {:?}", other)),
         }
@@ -1231,11 +1281,13 @@ impl<S> DebugSession<S> {
 
     pub fn pointer_scan_get_results(
         &mut self,
-        scan_id: u64,
+        pid: u32,
+        results_path: String,
         offset: u64,
         count: u64,
+        offset_filter: Vec<u64>,
     ) -> anyhow::Result<(Vec<crate::protocol::PointerPath>, u64)> {
-        let req = DebuggerRequest::PointerScanGetResults { scan_id, offset, count };
+        let req = DebuggerRequest::PointerScanGetResults { pid, results_path, offset, count, offset_filter };
         match self.send_and_receive(&req)? {
             DebuggerResponse::PointerScanResults { paths, total_count } => Ok((paths, total_count)),
             DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to get pointer scan results: {}", message)),
@@ -1243,8 +1295,30 @@ impl<S> DebugSession<S> {
         }
     }
 
-    pub fn pointer_scan_reset(&mut self, scan_id: u64) -> anyhow::Result<()> {
-        let req = DebuggerRequest::PointerScanReset { scan_id };
+    /// Re-resolve `results_path`'s paths and keep only those that still resolve to
+    /// `target_address`. Returns `(new_results_path, match_count, scan_time_us)`.
+    pub fn pointer_scan_rescan(&mut self, pid: u32, results_path: String, target_address: u64) -> anyhow::Result<(String, u64, u64)> {
+        let req = DebuggerRequest::PointerScanRescan { pid, results_path, target_address };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::PointerScanResult { results_path, match_count, scan_time_us } => Ok((results_path, match_count, scan_time_us)),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to rescan pointers: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to PointerScanRescan: {:?}", other)),
+        }
+    }
+
+    /// Reduce `results_path` to only the paths whose chain offsets contain every
+    /// value in `offset_filter`. Returns `(new_results_path, match_count, us)`.
+    pub fn pointer_scan_apply_filter(&mut self, results_path: String, offset_filter: Vec<u64>) -> anyhow::Result<(String, u64, u64)> {
+        let req = DebuggerRequest::PointerScanApplyFilter { results_path, offset_filter };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::PointerScanResult { results_path, match_count, scan_time_us } => Ok((results_path, match_count, scan_time_us)),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to apply pointer-scan filter: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to PointerScanApplyFilter: {:?}", other)),
+        }
+    }
+
+    pub fn pointer_scan_reset(&mut self, results_path: String) -> anyhow::Result<()> {
+        let req = DebuggerRequest::PointerScanReset { results_path };
         match self.send_and_receive(&req)? {
             DebuggerResponse::Ack => Ok(()),
             DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to reset pointer scan: {}", message)),

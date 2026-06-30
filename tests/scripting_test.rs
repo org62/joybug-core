@@ -680,6 +680,12 @@ fn test_lua_file_pointer_scan() {
     run_lua_test_file("memory/pointer_scan.lua", Some(&test_exe));
 }
 
+#[test]
+fn test_lua_file_freeze_value() {
+    let test_exe = common::get_test_program_path("freeze_value_test");
+    run_lua_test_file("memory/freeze_value.lua", Some(&test_exe));
+}
+
 // --- disassembly ---
 
 #[test]

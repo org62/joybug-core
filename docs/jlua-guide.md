@@ -185,6 +185,21 @@ dbg:write_memory(pid, addr, "\x90\x90\x90")  -- Write NOPs
 
 -- Search for a byte pattern in process memory
 local addrs, capped = dbg:search_memory(pid, "PATTERN", 100)
+
+-- Value freeze (Cheat-Engine style "lock"): a server-side thread continuously
+-- writes the given bytes to `addr` until unfrozen, so the value stays put even
+-- while the target runs. Returns a freeze id.
+local freeze_id = dbg:freeze_value(pid, addr, "\xDD\xCC\xBB\xAA")  -- optional 4th arg: interval_ms
+dbg:update_freeze_value(freeze_id, "\x01\x00\x00\x00")            -- change the frozen value
+dbg:unfreeze_value(freeze_id)                                     -- stop freezing
+
+-- Pointer-chain freeze: pass an offsets list as the 5th arg. `addr` is then the
+-- static base and the freeze re-resolves `base -> offsets` every tick, so the lock
+-- follows the value when the chain repoints (e.g. a level reload).
+local fid = dbg:freeze_value(pid, base, "\xDD\xCC\xBB\xAA", nil, { 0x10, 0x8 })
+
+-- Pause the script (milliseconds), e.g. to let a freeze thread tick
+dbg:sleep(100)
 ```
 
 ### Symbols
@@ -348,12 +363,19 @@ Find chains of pointers that start at a *static* module base and resolve to a
 dynamic `target` address — useful for building stable pointers that survive
 restarts/relocation.
 
+Results are streamed to a fixed-record file on the server (no in-RAM cap, millions
+of paths possible) and identified by its **path**, not a scan id. The server keeps
+no per-connection state for it, so the path can be persisted and reused after a full
+restart — `ptr_scan_results`/`ptr_scan_rescan` re-base each path through the
+*current* module list (by `module_index`), handling ASLR.
+
 ```lua
 -- target = a dynamic address (e.g. from a value scan)
 local res = dbg:ptr_scan_start(pid, target, 0x1000, 5) -- max_offset, max_depth (optional)
 print("Paths found: " .. res.match_count)
+-- res.results_path is the on-disk results file; persist it to survive a restart.
 
-local got = dbg:ptr_scan_results(res.scan_id, 0, 100)   -- scan_id, offset, count (optional)
+local got = dbg:ptr_scan_results(pid, res.results_path, 0, 100) -- pid, path, offset, count (optional)
 for _, p in ipairs(got.paths) do
     -- Resolve as: addr = p.module_base + p.base_offset
     --             for each off in p.offsets: addr = read_u64(addr) + off  (== p.resolved)
@@ -362,7 +384,17 @@ for _, p in ipairs(got.paths) do
     print(s .. string.format("  => 0x%x", p.resolved))
 end
 
-dbg:ptr_scan_reset(res.scan_id)
+-- Quick offset filter: page only the paths whose offsets contain ALL listed
+-- values (order-independent); total_count is the match count over the whole file.
+local hits = dbg:ptr_scan_results(pid, res.results_path, 0, 100, { 0x10, 0x8 })
+
+-- Commit that filter: write a new file with only the matches (old file deleted).
+local kept = dbg:ptr_scan_apply_filter(res.results_path, { 0x10, 0x8 })
+print("kept " .. kept.match_count .. " paths -> " .. kept.results_path)
+
+-- Re-resolve and keep only paths that still hit target; returns a NEW file path.
+local re = dbg:ptr_scan_rescan(pid, kept.results_path, target)
+dbg:ptr_scan_reset(re.results_path)
 ```
 
 ### Anti-Anti-Debug

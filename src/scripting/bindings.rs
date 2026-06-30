@@ -546,6 +546,62 @@ impl LuaUserData for LuaDebugClient {
             }
         });
 
+        // ---- Value freeze (server-side continuous write) ----
+
+        // dbg:freeze_value(pid, addr, data[, interval_ms][, offsets]) -> freeze_id
+        // With `offsets` (a pointer chain), `addr` is the static base and the freeze
+        // re-follows the chain each tick so it tracks a moving target.
+        methods.add_method("freeze_value", |_lua, this, (pid, addr, data, interval_ms, offsets): (u32, u64, LuaString, Option<u64>, Option<Vec<u64>>)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::FreezeValueStart {
+                pid, address: addr, data: data.as_bytes().to_vec(), interval_ms,
+                offsets: offsets.unwrap_or_default(),
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::FreezeValueStarted { freeze_id } => Ok(freeze_id),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("FreezeValueStart failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // dbg:update_freeze_value(freeze_id, data)
+        methods.add_method("update_freeze_value", |_lua, this, (freeze_id, data): (u64, LuaString)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::FreezeValueUpdate {
+                freeze_id, data: data.as_bytes().to_vec(),
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::Ack => Ok(()),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("FreezeValueUpdate failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // dbg:unfreeze_value(freeze_id)
+        methods.add_method("unfreeze_value", |_lua, this, freeze_id: u64| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::FreezeValueStop {
+                freeze_id,
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::Ack => Ok(()),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("FreezeValueStop failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // dbg:sleep(ms) — pause the script (useful e.g. to let a freeze thread tick).
+        methods.add_method("sleep", |_lua, _this, ms: u64| {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            Ok(())
+        });
+
         methods.add_method("read_string", |_lua, this, (pid, addr, max_len): (u32, u64, Option<usize>)| {
             let mut client = this.inner.borrow_mut();
             let resp = client.send_and_receive(&DebuggerRequest::ReadWideString {
@@ -1153,8 +1209,8 @@ impl LuaUserData for LuaDebugClient {
 
         // ptr_scan_start(pid, target_address, [max_offset=0x1000], [max_depth=5], [modules])
         // `modules` is an optional list of base module addresses to restrict the
-        // static base of returned paths to. -> { scan_id, match_count, scan_time_us }
-        methods.add_method("ptr_scan_start", |lua, this, (pid, target_address, max_offset, max_depth, modules): (u32, u64, Option<u64>, Option<u32>, Option<Vec<u64>>)| {
+        // static base of returned paths to. -> { results_path, match_count, scan_time_us }
+        methods.add_method("ptr_scan_start", |lua, this, (pid, target_address, max_offset, max_depth, modules, writable_only): (u32, u64, Option<u64>, Option<u32>, Option<Vec<u64>>, Option<bool>)| {
             let mut client = this.inner.borrow_mut();
             let resp = client.send_and_receive(&DebuggerRequest::PointerScanStart {
                 pid,
@@ -1165,11 +1221,12 @@ impl LuaUserData for LuaDebugClient {
                 max_results: None,
                 modules,
                 thread_count: None,
+                writable_only: writable_only.unwrap_or(false),
             }).map_err(|e| mlua::Error::external(e))?;
             match resp {
-                DebuggerResponse::PointerScanResult { scan_id, match_count, scan_time_us } => {
+                DebuggerResponse::PointerScanResult { results_path, match_count, scan_time_us } => {
                     let table = lua.create_table()?;
-                    table.set("scan_id", scan_id)?;
+                    table.set("results_path", results_path)?;
                     table.set("match_count", match_count)?;
                     table.set("scan_time_us", scan_time_us)?;
                     Ok(table)
@@ -1181,12 +1238,15 @@ impl LuaUserData for LuaDebugClient {
             }
         });
 
-        // ptr_scan_results(scan_id, [offset=0], [count=100])
+        // ptr_scan_results(pid, results_path, [offset=0], [count=100], [offset_filter])
+        // `offset_filter` is an optional list of chain offsets; only paths whose
+        // offsets contain ALL of them are returned (and total_count reflects that).
         // -> { total_count, paths = { { module_index, module_base, base_offset, offsets={..}, resolved }, .. } }
-        methods.add_method("ptr_scan_results", |lua, this, (scan_id, offset, count): (u64, Option<u64>, Option<u64>)| {
+        methods.add_method("ptr_scan_results", |lua, this, (pid, results_path, offset, count, offset_filter): (u32, String, Option<u64>, Option<u64>, Option<Vec<u64>>)| {
             let mut client = this.inner.borrow_mut();
             let resp = client.send_and_receive(&DebuggerRequest::PointerScanGetResults {
-                scan_id, offset: offset.unwrap_or(0), count: count.unwrap_or(100),
+                pid, results_path, offset: offset.unwrap_or(0), count: count.unwrap_or(100),
+                offset_filter: offset_filter.unwrap_or_default(),
             }).map_err(|e| mlua::Error::external(e))?;
             match resp {
                 DebuggerResponse::PointerScanResults { paths, total_count } => {
@@ -1216,10 +1276,55 @@ impl LuaUserData for LuaDebugClient {
             }
         });
 
-        methods.add_method("ptr_scan_reset", |_lua, this, scan_id: u64| {
+        methods.add_method("ptr_scan_reset", |_lua, this, results_path: String| {
             let mut client = this.inner.borrow_mut();
-            let _ = client.send_and_receive(&DebuggerRequest::PointerScanReset { scan_id });
+            let _ = client.send_and_receive(&DebuggerRequest::PointerScanReset { results_path });
             Ok(())
+        });
+
+        // ptr_scan_apply_filter(results_path, offset_filter)
+        // Reduce the file to only paths containing ALL listed offsets; writes a new
+        // file (old deleted). -> { results_path, match_count, scan_time_us }
+        methods.add_method("ptr_scan_apply_filter", |lua, this, (results_path, offset_filter): (String, Vec<u64>)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::PointerScanApplyFilter {
+                results_path, offset_filter,
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::PointerScanResult { results_path, match_count, scan_time_us } => {
+                    let table = lua.create_table()?;
+                    table.set("results_path", results_path)?;
+                    table.set("match_count", match_count)?;
+                    table.set("scan_time_us", scan_time_us)?;
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("PointerScanApplyFilter failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // ptr_scan_rescan(pid, results_path, target_address)
+        // Keep only paths that still resolve to target_address. -> { results_path, match_count, scan_time_us }
+        methods.add_method("ptr_scan_rescan", |lua, this, (pid, results_path, target_address): (u32, String, u64)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::PointerScanRescan {
+                pid, results_path, target_address,
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::PointerScanResult { results_path, match_count, scan_time_us } => {
+                    let table = lua.create_table()?;
+                    table.set("results_path", results_path)?;
+                    table.set("match_count", match_count)?;
+                    table.set("scan_time_us", scan_time_us)?;
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("PointerScanRescan failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
         });
 
         // ---- Utility: current state ----

@@ -44,7 +44,7 @@ dbg:on_initial_breakpoint(function(pid, tid, addr)
         for _, target in ipairs(vres.addresses) do
             local pscan = dbg:ptr_scan_start(pid, target, MAX_OFFSET, MAX_DEPTH, { image_base })
             if pscan.match_count > 0 then
-                local got = dbg:ptr_scan_results(pscan.scan_id, 0, pscan.match_count)
+                local got = dbg:ptr_scan_results(pid, pscan.results_path, 0, pscan.match_count)
                 for _, p in ipairs(got.paths) do
                     if p.resolved == target and p.module_base == image_base then
                         found_image_path = true
@@ -52,7 +52,30 @@ dbg:on_initial_breakpoint(function(pid, tid, addr)
                     end
                 end
             end
-            dbg:ptr_scan_reset(pscan.scan_id)
+            if found_image_path then
+                -- Offset quick-filter: the chain's final hop reaches the node's
+                -- `value` field at +8, so a {0x8} filter must keep at least one
+                -- path, while a bogus offset must match nothing.
+                local kept = dbg:ptr_scan_results(pid, pscan.results_path, 0, 100, { 0x8 })
+                assert(kept.total_count >= 1, "offset filter {0x8} should keep the value-field path")
+                local none = dbg:ptr_scan_results(pid, pscan.results_path, 0, 100, { 0xDEADBEEF })
+                assert(none.total_count == 0, "a bogus offset filter should match nothing")
+
+                -- Commit the {0x8} filter into a new, smaller file; the survivors
+                -- equal the filtered count, and the file path changes.
+                local committed = dbg:ptr_scan_apply_filter(pscan.results_path, { 0x8 })
+                assert(committed.match_count == kept.total_count, "apply_filter should keep exactly the matches")
+                assert(committed.results_path ~= pscan.results_path, "apply_filter writes a new file")
+                local after = dbg:ptr_scan_results(pid, committed.results_path, 0, 100)
+                assert(after.total_count == kept.total_count, "committed file holds only the matches")
+                pscan.results_path = committed.results_path -- old file is gone; track the new one
+
+                -- Rescan against the same target: the resolving path(s) must survive.
+                local re = dbg:ptr_scan_rescan(pid, pscan.results_path, target)
+                assert(re.match_count >= 1, "rescan with same target should keep resolving paths")
+                dbg:ptr_scan_reset(re.results_path)
+            end
+            dbg:ptr_scan_reset(pscan.results_path)
             if found_image_path then break end
         end
 

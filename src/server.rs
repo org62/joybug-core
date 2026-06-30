@@ -41,6 +41,8 @@ where
     let mut framed_stream = FramedJsonStream::new(stream);
     let mut scanner = crate::memory_scanner::MemoryScanner::new();
     let mut pointer_scanner = crate::pointer_scanner::PointerScanner::new();
+    // Per-connection value freezes; dropped (which stops all threads) on disconnect.
+    let mut freeze_manager = crate::freeze_manager::FreezeManager::new();
     loop {
         let recv_start = Instant::now();
         let req: DebuggerRequest = match framed_stream.receive() {
@@ -376,22 +378,36 @@ where
                     Err(e) => DebuggerResponse::Error { message: e },
                 }
             }
-            DebuggerRequest::PointerScanStart { pid, target_address, max_offset, max_depth, alignment, max_results, modules, thread_count } => {
+            DebuggerRequest::PointerScanStart { pid, target_address, max_offset, max_depth, alignment, max_results, modules, thread_count, writable_only } => {
                 let p = platform.read().unwrap();
-                match pointer_scanner.start_scan(&*p, pid, target_address, max_offset, max_depth, alignment, max_results, modules, thread_count) {
-                    Ok((scan_id, match_count, scan_time_us)) => DebuggerResponse::PointerScanResult { scan_id, match_count, scan_time_us },
+                match pointer_scanner.start_scan(&*p, pid, target_address, max_offset, max_depth, alignment, max_results, modules, thread_count, writable_only) {
+                    Ok((results_path, match_count, scan_time_us)) => DebuggerResponse::PointerScanResult { results_path, match_count, scan_time_us },
                     Err(e) => DebuggerResponse::Error { message: e },
                 }
             }
-            DebuggerRequest::PointerScanGetResults { scan_id, offset, count } => {
-                match pointer_scanner.get_results(scan_id, offset, count) {
+            DebuggerRequest::PointerScanGetResults { pid, results_path, offset, count, offset_filter } => {
+                let p = platform.read().unwrap();
+                match pointer_scanner.get_results(&*p, pid, &results_path, offset, count, &offset_filter) {
                     Ok((paths, total_count)) => DebuggerResponse::PointerScanResults { paths, total_count },
                     Err(e) => DebuggerResponse::Error { message: e },
                 }
             }
-            DebuggerRequest::PointerScanReset { scan_id } => {
-                match pointer_scanner.reset_scan(scan_id) {
+            DebuggerRequest::PointerScanReset { results_path } => {
+                match pointer_scanner.reset_scan(&results_path) {
                     Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::PointerScanApplyFilter { results_path, offset_filter } => {
+                match pointer_scanner.apply_filter(&results_path, &offset_filter) {
+                    Ok((results_path, match_count, scan_time_us)) => DebuggerResponse::PointerScanResult { results_path, match_count, scan_time_us },
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::PointerScanRescan { pid, results_path, target_address } => {
+                let p = platform.read().unwrap();
+                match pointer_scanner.rescan(&*p, pid, &results_path, target_address) {
+                    Ok((results_path, match_count, scan_time_us)) => DebuggerResponse::PointerScanResult { results_path, match_count, scan_time_us },
                     Err(e) => DebuggerResponse::Error { message: e },
                 }
             }
@@ -419,6 +435,22 @@ where
                 match crate::anti_anti_debug::peb::hide_peb(&*p, pid, &options) {
                     Ok(report) => DebuggerResponse::PebHideResult { report },
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::FreezeValueStart { pid, address, data, interval_ms, offsets } => {
+                let freeze_id = freeze_manager.start(platform.clone(), pid, address, data, interval_ms, offsets);
+                DebuggerResponse::FreezeValueStarted { freeze_id }
+            }
+            DebuggerRequest::FreezeValueUpdate { freeze_id, data } => {
+                match freeze_manager.update(freeze_id, data) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::FreezeValueStop { freeze_id } => {
+                match freeze_manager.stop(freeze_id) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e },
                 }
             }
         };

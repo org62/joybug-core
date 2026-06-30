@@ -509,19 +509,70 @@ pub mod request_response {
             /// Number of threads to use. `None`/`Some(0)` = all cores.
             #[serde(default)]
             thread_count: Option<usize>,
+            /// If true, only scan writable regions (heap/stack/.data) for pointer
+            /// slots — faster, but misses static roots in read-only sections.
+            #[serde(default)]
+            writable_only: bool,
         },
         PointerScanGetResults {
-            scan_id: u64,
+            pid: u32,
+            results_path: String,
             offset: u64,
             count: u64,
+            /// Quick filter: keep only paths whose chain offsets contain *every*
+            /// value listed here (order-independent). Empty = no filter. `offset`/
+            /// `count` then page over the filtered set, and `total_count` in the
+            /// response reflects the number of matches.
+            #[serde(default)]
+            offset_filter: Vec<u64>,
         },
         PointerScanReset {
-            scan_id: u64,
+            results_path: String,
+        },
+        /// Reduce a prior scan to only the paths whose chain offsets contain every
+        /// value in `offset_filter`. Writes the survivors to a new file and returns
+        /// its path (the old file is deleted) — i.e. commit a quick filter.
+        PointerScanApplyFilter {
+            results_path: String,
+            offset_filter: Vec<u64>,
+        },
+        /// Re-resolve a prior scan's paths against the live process and keep only
+        /// those that still resolve to `target_address`. Writes the survivors to a
+        /// new file and returns its path (the old file is deleted).
+        PointerScanRescan {
+            pid: u32,
+            results_path: String,
+            target_address: u64,
         },
         // Anti-anti-debug
         HidePeb {
             pid: u32,
             options: crate::anti_anti_debug::PebHideOptions,
+        },
+        // Value freeze: a server-side thread continuously writes `data` to `address`
+        // so the client doesn't have to stream repeated writes over the protocol.
+        FreezeValueStart {
+            pid: u32,
+            address: u64,
+            data: Vec<u8>,
+            /// Write interval in milliseconds. `None` = engine default (~30ms).
+            #[serde(default)]
+            interval_ms: Option<u64>,
+            /// Optional pointer chain. When non-empty, `address` is the *static
+            /// base* and the freeze re-resolves the target each tick as
+            /// `addr = base; for off in offsets { addr = read_u64(addr) + off }`
+            /// before writing — so the lock follows the value even when the chain
+            /// repoints (e.g. a level reload). Empty = freeze the fixed `address`.
+            #[serde(default)]
+            offsets: Vec<u64>,
+        },
+        /// Change the value written by an active freeze without re-registering it.
+        FreezeValueUpdate {
+            freeze_id: u64,
+            data: Vec<u8>,
+        },
+        FreezeValueStop {
+            freeze_id: u64,
         },
     }
 
@@ -598,7 +649,8 @@ pub mod request_response {
             total_count: u64,
         },
         PointerScanResult {
-            scan_id: u64,
+            /// Path of the disk file holding this scan's results.
+            results_path: String,
             match_count: u64,
             scan_time_us: u64,
         },
@@ -617,6 +669,10 @@ pub mod request_response {
         // Anti-anti-debug
         PebHideResult {
             report: crate::anti_anti_debug::PebHideReport,
+        },
+        // Value freeze
+        FreezeValueStarted {
+            freeze_id: u64,
         },
     }
 

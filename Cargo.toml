@@ -58,6 +58,7 @@ dirs = "5.0"
 capstone = "0.12"
 regex = "1.10"
 rayon = "1.10"
+memmap2 = "0.9"
 bincode = { version = "2.0.0-rc.3", features = ["serde"] }
 unicorn-engine = { git = "https://github.com/expend20/unicorn", branch = "AVX2-port" }
 keystone-engine = "0.1"
