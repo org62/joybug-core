@@ -321,13 +321,7 @@ impl PlatformAPI for WindowsPlatform {
     }
 
     fn detach(&mut self, pid: u32) -> Result<(), PlatformError> {
-        trace!(pid, "WindowsPlatform::detach called");
-        if self.processes.contains_key(&pid) {
-            self.remove_process(pid);
-            Ok(())
-        } else {
-            Err(PlatformError::Other(format!("Process {} not found", pid)))
-        }
+        process::detach(self, pid)
     }
 
     fn set_single_shot_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError> {

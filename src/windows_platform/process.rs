@@ -13,7 +13,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Diagnostics::Debug::{
     ContinueDebugEvent, WaitForDebugEvent,
     CREATE_PROCESS_DEBUG_EVENT, DEBUG_EVENT,
-    DebugActiveProcess,
+    DebugActiveProcess, DebugActiveProcessStop,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -168,6 +168,30 @@ pub(super) fn attach(platform: &mut WindowsPlatform, pid: u32) -> Result<Option<
         unsafe { ContinueDebugEvent(debug_event.dwProcessId, debug_event.dwThreadId, DBG_CONTINUE); }
         Err(PlatformError::Other("Unexpected debug event after attach".to_string()))
     }
+}
+
+pub(super) fn detach(platform: &mut WindowsPlatform, pid: u32) -> Result<(), PlatformError> {
+    trace!(pid, "WindowsPlatform::detach called");
+
+    // Restore original bytes for software breakpoints first, so the target does
+    // not execute leftover int3/brk instructions once we're gone.
+    platform.get_process_mut(pid)?.restore_all_software_breakpoints();
+
+    // DebugActiveProcessStop cleanly ends the debug relationship: it flushes any
+    // pending debug event, resumes the target, and lets it keep running without
+    // a debugger attached.
+    if unsafe { DebugActiveProcessStop(pid) } == 0 {
+        let error = unsafe { GetLastError() };
+        let error_str = utils::error_message(error);
+        error!(error, error_str, "DebugActiveProcessStop failed");
+        return Err(PlatformError::OsError(format!(
+            "DebugActiveProcessStop failed: {} ({})",
+            error, error_str
+        )));
+    }
+
+    platform.remove_process(pid);
+    Ok(())
 }
 
 pub(super) fn list_processes() -> Result<Vec<ProcessInfo>, PlatformError> {

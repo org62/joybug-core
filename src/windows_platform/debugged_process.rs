@@ -233,6 +233,24 @@ impl DebuggedProcess {
         }
     }
 
+    /// Restore the original bytes for every software breakpoint (persistent and
+    /// single-shot) and forget them. Used on detach so the target keeps running
+    /// without executing leftover int3/brk instructions.
+    pub(super) fn restore_all_software_breakpoints(&mut self) {
+        for (addr, original) in self
+            .persistent_breakpoints
+            .iter()
+            .chain(self.single_shot_breakpoints.iter())
+        {
+            if let Err(e) = self.restore_original_bytes(*addr, original) {
+                warn!(address = *addr, error = %e, "Failed to restore breakpoint byte on detach");
+            }
+        }
+        self.persistent_breakpoints.clear();
+        self.persistent_bp_tid_filters.clear();
+        self.single_shot_breakpoints.clear();
+    }
+
     /// Patch a memory buffer to replace breakpoint instruction bytes with the
     /// original bytes that were saved when each breakpoint was set.
     /// This should be used before disassembling memory so the user sees
