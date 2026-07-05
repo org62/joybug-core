@@ -191,10 +191,18 @@ pub struct DebugSession<S> {
     root_pid: Option<u32>,
 }
 
+/// TCP keepalive idle: proactively detect a silently-dropped connection (NAT /
+/// firewall idle-eviction, server host gone) instead of only noticing on the
+/// next request. Safe on every connection — a live server's TCP stack ACKs the
+/// probes regardless of application state, so an idle debug-loop connection
+/// waiting for the next event is never torn down while the server is alive.
+const KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl<S> DebugSession<S> {
     pub fn new(state: S, addr: Option<&str>) -> anyhow::Result<Self> {
         let addr = addr.unwrap_or("127.0.0.1:9000");
         let stream = TcpStream::connect(addr)?;
+        Self::configure_socket(&stream);
         let framed_stream = FramedJsonStream::new(stream);
         Ok(Self {
             stream: Mutex::new(framed_stream),
@@ -215,6 +223,26 @@ impl<S> DebugSession<S> {
             root_pid: None,
         })
     }
+
+    /// Enable TCP keepalive on the connection. Applied to every client so a
+    /// silently-dropped connection is detected rather than hanging forever.
+    fn configure_socket(stream: &TcpStream) {
+        let ka = socket2::TcpKeepalive::new().with_time(KEEPALIVE_IDLE);
+        let sock = socket2::SockRef::from(stream);
+        if let Err(e) = sock.set_tcp_keepalive(&ka) {
+            warn!("Failed to enable TCP keepalive: {}", e);
+        }
+    }
+
+    /// Bound how long a single request waits for its response. Intended for
+    /// request/response (OOB) clients — NOT the debug-loop connection, which
+    /// legitimately blocks for arbitrarily long between debug events. `None`
+    /// restores blocking reads.
+    pub fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> anyhow::Result<()> {
+        self.stream.lock().unwrap().set_read_timeout(dur)?;
+        Ok(())
+    }
+
     /// Handle the initial process breakpoint
     /// Callback receives: (session, pid, tid, address)
     pub fn on_initial_breakpoint<F>(mut self, handler: F) -> Self
@@ -752,6 +780,27 @@ impl<S> DebugSession<S> {
         }
     }
 
+    /// Open a process non-invasively (no debugger attach) so read-only features
+    /// (memory, modules, threads, disassembly, symbols, call stacks) work.
+    pub fn open_process(&mut self, pid: u32) -> anyhow::Result<()> {
+        let resp = self.send_and_receive(&DebuggerRequest::OpenProcess { pid })?;
+        match resp {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("OpenProcess failed: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to OpenProcess: {:?}", other)),
+        }
+    }
+
+    /// Release a non-invasively opened process.
+    pub fn close_process(&mut self, pid: u32) -> anyhow::Result<()> {
+        let resp = self.send_and_receive(&DebuggerRequest::CloseProcess { pid })?;
+        match resp {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("CloseProcess failed: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to CloseProcess: {:?}", other)),
+        }
+    }
+
     pub fn send_and_receive(
         &mut self,
         req: &crate::protocol::DebuggerRequest,
@@ -1222,8 +1271,9 @@ impl<S> DebugSession<S> {
         compare_type: ScanCompareType,
         value: Option<ScanValue>,
         value2: Option<ScanValue>,
+        float_tolerance: Option<f64>,
     ) -> anyhow::Result<(u64, u64)> {
-        let req = DebuggerRequest::ScanMemoryNext { scan_id, compare_type, value, value2 };
+        let req = DebuggerRequest::ScanMemoryNext { scan_id, compare_type, value, value2, float_tolerance };
         match self.send_and_receive(&req)? {
             DebuggerResponse::ScanMemoryResult { scan_id: _, match_count, scan_time_us } => Ok((match_count, scan_time_us)),
             DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to next scan: {}", message)),

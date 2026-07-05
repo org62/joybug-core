@@ -1171,7 +1171,7 @@ impl LuaUserData for LuaDebugClient {
             let value = value_str.as_deref().map(|v| parse_scan_value(&value_type, v)).transpose()?;
 
             let resp = client.send_and_receive(&DebuggerRequest::ScanMemoryNext {
-                scan_id, compare_type, value, value2: None,
+                scan_id, compare_type, value, value2: None, float_tolerance: None,
             }).map_err(|e| mlua::Error::external(e))?;
             scan_result_to_lua(lua, resp, "ScanMemoryNext")
         });

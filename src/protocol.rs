@@ -301,6 +301,14 @@ pub mod request_response {
         Detach {
             pid: u32,
         },
+        /// Open a process non-invasively (OpenProcess only, no DebugActiveProcess).
+        OpenProcess {
+            pid: u32,
+        },
+        /// Release a non-invasively opened process.
+        CloseProcess {
+            pid: u32,
+        },
         Launch {
             command: String,
             #[serde(default)]
@@ -479,6 +487,10 @@ pub mod request_response {
             compare_type: ScanCompareType,
             value: Option<ScanValue>,
             value2: Option<ScanValue>,
+            /// Absolute epsilon for float exact-match (see ScanMemoryStart). When
+            /// omitted, the tolerance from the initial scan is reused.
+            #[serde(default)]
+            float_tolerance: Option<f64>,
         },
         ScanMemoryGetResults {
             scan_id: u64,

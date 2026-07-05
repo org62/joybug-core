@@ -101,6 +101,20 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::OpenProcess { pid } => {
+                let mut p = platform.write().unwrap();
+                match p.open_process(pid) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::CloseProcess { pid } => {
+                let mut p = platform.write().unwrap();
+                match p.close_process(pid) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::SetBreakpoint { pid, addr, tid } => {
                 let mut p = platform.write().unwrap();
                 match p.set_breakpoint(pid, addr, tid) {
@@ -358,9 +372,9 @@ where
                     Err(e) => DebuggerResponse::Error { message: e },
                 }
             }
-            DebuggerRequest::ScanMemoryNext { scan_id, compare_type, value, value2 } => {
+            DebuggerRequest::ScanMemoryNext { scan_id, compare_type, value, value2, float_tolerance } => {
                 let p = platform.read().unwrap();
-                match scanner.next_scan(&*p, scan_id, compare_type, value, value2) {
+                match scanner.next_scan(&*p, scan_id, compare_type, value, value2, float_tolerance) {
                     Ok((match_count, scan_time_us)) => DebuggerResponse::ScanMemoryResult { scan_id, match_count, scan_time_us },
                     Err(e) => DebuggerResponse::Error { message: e },
                 }

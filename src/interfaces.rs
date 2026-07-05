@@ -228,6 +228,11 @@ pub trait Stepper: Send + Sync {
 pub trait PlatformAPI: Send + Sync {
     fn attach(&mut self, pid: u32) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>;
     fn detach(&mut self, pid: u32) -> Result<(), PlatformError>;
+    /// Open a process non-invasively (OpenProcess only, no debugger attach) so
+    /// read-only capabilities work without a debug loop.
+    fn open_process(&mut self, _pid: u32) -> Result<(), PlatformError> { Err(PlatformError::NotImplemented) }
+    /// Release a non-invasively opened process.
+    fn close_process(&mut self, _pid: u32) -> Result<(), PlatformError> { Err(PlatformError::NotImplemented) }
     fn continue_exec(&mut self, pid: u32, tid: u32) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>;
     fn set_breakpoint(&mut self, pid: u32, addr: u64, tid: Option<u32>) -> Result<(), PlatformError>;
     fn remove_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError>;

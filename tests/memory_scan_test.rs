@@ -151,6 +151,7 @@ fn memory_scan_exact_value() {
                                     ScanCompareType::ExactValue,
                                     Some(val),
                                     None,
+                                    None,
                                 )?;
                                 println!(
                                     "  {}: matches={}, time={}us",
@@ -350,6 +351,7 @@ fn memory_scan_unknown_initial() {
                                 scan_id,
                                 ScanCompareType::IncreasedValueBy,
                                 Some(ScanValue::U32(1)),
+                                None,
                                 None,
                             )?;
                             println!(

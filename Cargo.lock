@@ -924,6 +924,7 @@ dependencies = [
  "regex",
  "rustyline",
  "serde",
+ "socket2",
  "symsrv",
  "thiserror 1.0.69",
  "tokio",

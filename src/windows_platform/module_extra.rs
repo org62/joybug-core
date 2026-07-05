@@ -9,9 +9,8 @@ use windows_sys::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_ARM64;
 impl WindowsPlatform {
 
     pub(crate) fn parse_module_extra_info(&self, pid: u32, module_base: u64) -> Result<ModuleExtraInfo, PlatformError> {
-        let process = self.get_process(pid)?;
         // Resolve module path from our manager
-        let modules = process.module_manager().list_modules();
+        let modules = self.modules_for(pid);
         let module_path = modules.iter().find(|m| m.base == module_base).map(|m| m.name.clone())
             .ok_or_else(|| PlatformError::Other("Module not found at base".to_string()))?;
 

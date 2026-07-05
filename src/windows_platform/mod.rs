@@ -90,6 +90,26 @@ impl WindowsPlatform {
         self.processes.get(&pid)
             .ok_or_else(|| PlatformError::Other(format!("Process {} not found", pid)))
     }
+
+    /// Module list for symbolization/PE parsing: the debug-event-populated cache
+    /// when the process is attached, otherwise a Toolhelp snapshot so it works
+    /// non-invasively (no `DebugActiveProcess`).
+    fn modules_for(&self, pid: u32) -> Vec<ModuleInfo> {
+        match self.get_process(pid) {
+            Ok(p) => p.module_manager().list_modules(),
+            Err(_) => utils::get_modules(pid).unwrap_or_default(),
+        }
+    }
+
+    /// Target architecture: the attached process's arch, else the host arch. A
+    /// non-invasive session has no attached process to query, so we assume the
+    /// host arch (correct for same-arch targets; WOW64 is not distinguished here).
+    fn arch_for(&self, pid: u32) -> Architecture {
+        if let Ok(p) = self.get_process(pid) {
+            return p.architecture();
+        }
+        if cfg!(target_arch = "aarch64") { Architecture::Arm64 } else { Architecture::X64 }
+    }
     
     /// Get a mutable reference to a debugged process by PID
     fn get_process_mut(&mut self, pid: u32) -> Result<&mut DebuggedProcess, PlatformError> {
@@ -324,6 +344,14 @@ impl PlatformAPI for WindowsPlatform {
         process::detach(self, pid)
     }
 
+    fn open_process(&mut self, pid: u32) -> Result<(), PlatformError> {
+        process::open_non_invasive(self, pid)
+    }
+
+    fn close_process(&mut self, pid: u32) -> Result<(), PlatformError> {
+        process::close_non_invasive(self, pid)
+    }
+
     fn set_single_shot_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError> {
         let process = self.get_process_mut(pid)?;
         let process_handle = process.handle();
@@ -538,13 +566,17 @@ impl PlatformAPI for WindowsPlatform {
     }
 
     fn list_modules(&self, pid: u32) -> Result<Vec<ModuleInfo>, PlatformError> {
-        let process = self.get_process(pid)?;
-        Ok(process.module_manager().list_modules())
+        match self.get_process(pid) {
+            Ok(process) => Ok(process.module_manager().list_modules()),
+            Err(_) => utils::get_modules(pid).map_err(PlatformError::Other),
+        }
     }
 
     fn list_threads(&self, pid: u32) -> Result<Vec<ThreadInfo>, PlatformError> {
-        let process = self.get_process(pid)?;
-        Ok(process.thread_manager().list_threads())
+        match self.get_process(pid) {
+            Ok(process) => Ok(process.thread_manager().list_threads()),
+            Err(_) => utils::list_threads_toolhelp(pid),
+        }
     }
 
     fn list_processes(&self) -> Result<Vec<ProcessInfo>, PlatformError> {
@@ -580,9 +612,7 @@ impl PlatformAPI for WindowsPlatform {
 
     fn resolve_address_to_symbol(&self, pid: u32, address: u64) -> Result<Option<(String, ModuleSymbol, u64)>, SymbolError> {
         if let Some(ref symbol_manager) = self.symbol_manager {
-            let modules = self.get_process(pid).map_err(|e| SymbolError::SymbolsNotFound(e.to_string()))?
-                .module_manager()
-                .list_modules();
+            let modules = self.modules_for(pid);
 
             // Try chain-aware resolution first (handles PGO-split function fragments)
             if let Ok(Some(result)) = symbol_manager.resolve_address_with_chain(&modules, address) {
@@ -629,10 +659,7 @@ impl PlatformAPI for WindowsPlatform {
 
         // Time module list fetch
         let t1 = Instant::now();
-        let mut modules = self.get_process(pid)
-            .map_err(|e| DisassemblerError::InvalidData(format!("Process not found: {}", e)))?
-            .module_manager()
-            .list_modules();
+        let mut modules = self.modules_for(pid);
         // Sort modules by base address for binary search
         modules.sort_by_key(|m| m.base);
         let module_time = t1.elapsed();
@@ -755,12 +782,10 @@ impl PlatformAPI for WindowsPlatform {
         count: usize,
         reference_base: Option<u64>,
     ) -> Result<Vec<crate::protocol::DereferenceEntry>, PlatformError> {
-        // Get process - required for module list and architecture
-        let process = self.get_process(pid)?;
-        let arch = process.architecture();
+        let arch = self.arch_for(pid);
 
         // Build symbol resolver for instruction operand symbolization
-        let mut modules = process.module_manager().list_modules();
+        let mut modules = self.modules_for(pid);
         // Sort modules by base address for binary search in symbol resolution
         modules.sort_by_key(|m| m.base);
         let symbol_manager = self.symbol_manager.as_ref();

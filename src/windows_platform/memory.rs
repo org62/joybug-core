@@ -2,9 +2,9 @@ use super::{utils, WindowsPlatform};
 use crate::interfaces::{PlatformAPI, PlatformError};
 use tracing::{error, trace, warn, debug};
 use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE, HANDLE};
-use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
+use windows_sys::Win32::System::Diagnostics::Debug::{FlushInstructionCache, ReadProcessMemory, WriteProcessMemory};
 use windows_sys::Win32::System::Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION};
-use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_VM_READ, PROCESS_QUERY_INFORMATION};
+use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, PROCESS_QUERY_INFORMATION};
 
 pub(super) fn read_memory_internal(
     handle: HANDLE,
@@ -202,9 +202,39 @@ pub(super) fn write_memory(
     data: &[u8],
 ) -> Result<(), PlatformError> {
     trace!(pid, address = %format!("0x{:X}", address), data_len = data.len(), "WindowsPlatform::write_memory called");
-    let process = platform.get_process(pid)?;
-    let handle = process.handle();
-    write_memory_internal(handle, address, data)
+    match platform.get_process(pid) {
+        Ok(process) => write_memory_internal(process.handle(), address, data),
+        Err(_) => write_memory_unlocked(pid, address, data),
+    }
+}
+
+/// Write memory using an on-demand `OpenProcess` handle (no debug attach required).
+/// Mirrors `read_memory_unlocked`.
+pub(super) fn write_memory_unlocked(
+    pid: u32,
+    address: u64,
+    data: &[u8],
+) -> Result<(), PlatformError> {
+    trace!(pid, address = %format!("0x{:X}", address), data_len = data.len(), "write_memory_unlocked called");
+    unsafe {
+        let handle = OpenProcess(PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_VM_READ, 0, pid);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            let error = GetLastError();
+            let error_str = utils::error_message(error);
+            error!(error, error_str, "OpenProcess(PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_VM_READ) failed");
+            return Err(PlatformError::OsError(format!(
+                "OpenProcess(PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_VM_READ) failed: {} ({})",
+                error, error_str
+            )));
+        }
+        let res = write_memory_internal(handle, address, data);
+        if res.is_ok() {
+            // Best-effort: keep code caches coherent after patching executable memory.
+            FlushInstructionCache(handle, address as *const std::ffi::c_void, data.len());
+        }
+        windows_sys::Win32::Foundation::CloseHandle(handle);
+        res
+    }
 }
 
 pub(super) fn read_wide_string(

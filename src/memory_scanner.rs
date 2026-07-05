@@ -198,6 +198,7 @@ impl MemoryScanner {
         compare_type: ScanCompareType,
         value: Option<ScanValue>,
         value2: Option<ScanValue>,
+        float_tolerance: Option<f64>,
     ) -> Result<(u64, u64), String> {
         let state = self.scans.get_mut(&scan_id)
             .ok_or_else(|| format!("Scan ID {} not found", scan_id))?;
@@ -208,7 +209,7 @@ impl MemoryScanner {
         let pid = state.pid;
         let value_type = state.value_type;
         let alignment = state.alignment;
-        let float_tolerance = state.float_tolerance;
+        let float_tolerance = float_tolerance.unwrap_or(state.float_tolerance);
         let thread_count = state.thread_count;
         let val_size = value_type.size();
 
@@ -907,13 +908,13 @@ fn compare_value_first(
             let curr = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64;
             let t = scan_value_as_f64(target);
             let t2 = target2.map(scan_value_as_f64);
-            compare_float_first(curr, t, t2, compare_type, float_tolerance)
+            compare_float_first(curr, t, t2, compare_type, float_tolerance, f32_half_ulp(t))
         }
         ScanValueType::F64 => {
             let curr = f64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]]);
             let t = scan_value_as_f64(target);
             let t2 = target2.map(scan_value_as_f64);
-            compare_float_first(curr, t, t2, compare_type, float_tolerance)
+            compare_float_first(curr, t, t2, compare_type, float_tolerance, f64_half_ulp(t))
         }
     }
 }
@@ -961,14 +962,16 @@ fn compare_value_next(
             let prev = f32::from_le_bytes([old_bytes[0], old_bytes[1], old_bytes[2], old_bytes[3]]) as f64;
             let t = target.map(scan_value_as_f64);
             let t2 = target2.map(scan_value_as_f64);
-            compare_float_next(curr, prev, t, t2, compare_type, float_tolerance)
+            let min_eps = f32_half_ulp(t.unwrap_or(0.0));
+            compare_float_next(curr, prev, t, t2, compare_type, float_tolerance, min_eps)
         }
         ScanValueType::F64 => {
             let curr = f64::from_le_bytes([new_bytes[0], new_bytes[1], new_bytes[2], new_bytes[3], new_bytes[4], new_bytes[5], new_bytes[6], new_bytes[7]]);
             let prev = f64::from_le_bytes([old_bytes[0], old_bytes[1], old_bytes[2], old_bytes[3], old_bytes[4], old_bytes[5], old_bytes[6], old_bytes[7]]);
             let t = target.map(scan_value_as_f64);
             let t2 = target2.map(scan_value_as_f64);
-            compare_float_next(curr, prev, t, t2, compare_type, float_tolerance)
+            let min_eps = f64_half_ulp(t.unwrap_or(0.0));
+            compare_float_next(curr, prev, t, t2, compare_type, float_tolerance, min_eps)
         }
     }
 }
@@ -1007,9 +1010,9 @@ fn compare_int_next(curr: u64, prev: u64, target: Option<u64>, target2: Option<u
     }
 }
 
-fn compare_float_first(curr: f64, target: f64, target2: Option<f64>, compare_type: ScanCompareType, tol: f64) -> bool {
+fn compare_float_first(curr: f64, target: f64, target2: Option<f64>, compare_type: ScanCompareType, tol: f64, min_eps: f64) -> bool {
     match compare_type {
-        ScanCompareType::ExactValue => (curr - target).abs() <= float_eps(target, tol),
+        ScanCompareType::ExactValue => (curr - target).abs() <= tol.max(min_eps),
         ScanCompareType::BiggerThan => curr > target,
         ScanCompareType::SmallerThan => curr < target,
         ScanCompareType::ValueBetween => {
@@ -1021,12 +1024,15 @@ fn compare_float_first(curr: f64, target: f64, target2: Option<f64>, compare_typ
     }
 }
 
-fn compare_float_next(curr: f64, prev: f64, target: Option<f64>, target2: Option<f64>, compare_type: ScanCompareType, tol: f64) -> bool {
-    let eps = float_eps(curr, tol);
+fn compare_float_next(curr: f64, prev: f64, target: Option<f64>, target2: Option<f64>, compare_type: ScanCompareType, tol: f64, min_eps: f64) -> bool {
+    // `tol` is an ABSOLUTE epsilon throughout (derived from the typed precision,
+    // e.g. "18" → ±0.5), floored at half a ULP so exact matches stay robust at
+    // large magnitudes. Used uniformly for exact and delta-magnitude comparisons.
+    let eps = tol.max(min_eps);
     match compare_type {
         ScanCompareType::ExactValue => {
             let t = target.unwrap_or(0.0);
-            (curr - t).abs() <= float_eps(t, tol)
+            (curr - t).abs() <= eps
         }
         ScanCompareType::BiggerThan => curr > target.unwrap_or(0.0),
         ScanCompareType::SmallerThan => curr < target.unwrap_or(0.0),
@@ -1051,8 +1057,25 @@ fn compare_float_next(curr: f64, prev: f64, target: Option<f64>, target2: Option
     }
 }
 
-fn float_eps(value: f64, tol: f64) -> f64 {
-    (value.abs() * tol).max(f64::EPSILON)
+/// Half the gap between `value` and the next representable f32 — the smallest
+/// absolute epsilon that still lets the exact typed value match when it isn't
+/// exactly representable at large magnitudes. Returns 0 for non-finite input.
+fn f32_half_ulp(value: f64) -> f64 {
+    let v = value.abs() as f32;
+    if !v.is_finite() {
+        return 0.0;
+    }
+    0.5 * (v.next_up() - v) as f64
+}
+
+/// Half a ULP for f64 (see [`f32_half_ulp`]). Effectively negligible for normal
+/// magnitudes, but keeps exact f64 matches robust.
+fn f64_half_ulp(value: f64) -> f64 {
+    let v = value.abs();
+    if !v.is_finite() {
+        return 0.0;
+    }
+    0.5 * (v.next_up() - v)
 }
 
 // --- Value conversion helpers ---
@@ -1097,4 +1120,58 @@ fn read_current_value(platform: &dyn PlatformAPI, pid: u32, address: u64, value_
         return None;
     }
     Some(bytes_to_scan_value(&data, value_type))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ExactValue float scans use an ABSOLUTE epsilon derived from the typed
+    // precision by the caller: "18" → tol 0.5, "18.1" → tol 0.05.
+
+    #[test]
+    fn f32_exact_zero_decimals_matches_half_unit() {
+        let (target, tol) = (18.0f64, 0.5f64); // typed "18"
+        let min = f32_half_ulp(target);
+        let hit = |v: f64| compare_float_first(v, target, None, ScanCompareType::ExactValue, tol, min);
+        assert!(hit(17.5));
+        assert!(hit(18.0));
+        assert!(hit(18.5));
+        assert!(!hit(17.49));
+        assert!(!hit(18.51));
+    }
+
+    #[test]
+    fn f32_exact_one_decimal_is_tighter() {
+        let (target, tol) = (18.1f64, 0.05f64); // typed "18.1"
+        let min = f32_half_ulp(target);
+        let hit = |v: f64| compare_float_first(v, target, None, ScanCompareType::ExactValue, tol, min);
+        assert!(hit(18.06));
+        assert!(hit(18.14));
+        assert!(!hit(17.9));
+        assert!(!hit(18.3));
+    }
+
+    #[test]
+    fn f32_exact_floors_at_half_ulp_for_huge_values() {
+        // Near 2^24 an f32 ULP is 2.0, so a ±0.5 window would be narrower than the
+        // representable step; the floor keeps the exact value matchable.
+        let target = 16_777_217.0f64; // not exactly representable in f32
+        let tol = 0.5f64;
+        let min = f32_half_ulp(target);
+        assert!(min >= 0.5);
+        // The nearest f32 to the typed value must still match.
+        let nearest = (target as f32) as f64;
+        assert!(compare_float_first(nearest, target, None, ScanCompareType::ExactValue, tol, min));
+    }
+
+    #[test]
+    fn f64_exact_respects_absolute_tolerance() {
+        let (target, tol) = (100.0f64, 0.5f64);
+        let min = f64_half_ulp(target);
+        let hit = |v: f64| compare_float_first(v, target, None, ScanCompareType::ExactValue, tol, min);
+        assert!(hit(99.5));
+        assert!(hit(100.5));
+        assert!(!hit(101.0));
+    }
 }
