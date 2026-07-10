@@ -22,6 +22,7 @@ use crate::interfaces::{PlatformAPI, PlatformError, ModuleSymbol, ResolvedSymbol
 use crate::protocol::{ModuleInfo, ProcessInfo, ThreadInfo, StepKind};
 use crate::emulator::{Emulator, EmulationResult};
 use symbol_manager::SymbolManager;
+pub use crate::interfaces::SymbolConfig;
 use disassembler::CapstoneDisassembler;
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -71,7 +72,11 @@ pub struct WindowsPlatform {
 
 impl WindowsPlatform {
     pub fn new() -> Self {
-        let symbol_manager = SymbolManager::new().ok(); // Log error but don't fail initialization
+        Self::new_with_config(SymbolConfig::default())
+    }
+
+    pub fn new_with_config(symbol_config: SymbolConfig) -> Self {
+        let symbol_manager = SymbolManager::new_with_config(symbol_config).ok(); // Log error but don't fail initialization
         let disassembler = CapstoneDisassembler::new().ok(); // Log error but don't fail initialization
         Self {
             processes: HashMap::new(),
@@ -99,6 +104,19 @@ impl WindowsPlatform {
             Ok(p) => p.module_manager().list_modules(),
             Err(_) => utils::get_modules(pid).unwrap_or_default(),
         }
+    }
+
+    /// The symbol manager, or the uniform error when it failed to initialize.
+    fn symbols(&self) -> Result<&SymbolManager, SymbolError> {
+        self.symbol_manager.as_ref()
+            .ok_or_else(|| SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()))
+    }
+
+    /// Find a module by base address in `pid`'s module list.
+    fn module_at(&self, pid: u32, module_base: u64) -> Result<ModuleInfo, SymbolError> {
+        self.modules_for(pid).into_iter()
+            .find(|m| m.base == module_base)
+            .ok_or_else(|| SymbolError::ModuleNotLoaded(format!("No module at base 0x{:X}", module_base)))
     }
 
     /// Target architecture: the attached process's arch, else the host arch. A
@@ -625,7 +643,22 @@ impl PlatformAPI for WindowsPlatform {
             Err(SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()))
         }
     }
-    
+
+    fn get_symbol_status(&self, pid: u32) -> Result<Vec<crate::protocol::ModuleSymbolStatus>, SymbolError> {
+        Ok(self.symbols()?.get_symbol_status(self.modules_for(pid)))
+    }
+
+    fn load_pdb_from_path(&self, pid: u32, module_base: u64, pdb_path: &str, force: bool) -> Result<crate::protocol::PdbLoadOutcome, SymbolError> {
+        let module = self.module_at(pid, module_base)?;
+        self.symbols()?.load_pdb_from_path(&module, std::path::Path::new(pdb_path), force)
+    }
+
+    fn retry_symbol_load(&self, pid: u32, module_base: u64) -> Result<(), SymbolError> {
+        let module = self.module_at(pid, module_base)?;
+        self.symbols()?.retry_loading_symbols(&module);
+        Ok(())
+    }
+
     // Symbolized disassembly methods
     fn disassemble_memory(&self, pid: u32, address: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
         use std::time::Instant;
@@ -675,7 +708,10 @@ impl PlatformAPI for WindowsPlatform {
         let symbol_resolver = move |addr: u64| -> Option<crate::interfaces::SymbolInfo> {
             let t = Instant::now();
             let result = if let Some(symbol_manager) = symbol_manager {
-                if let Ok(Some((module_path, symbol, offset))) = symbol_manager.resolve_address_to_symbol(&modules, addr) {
+                // Non-blocking: skip symbolization while PDBs are still loading rather
+                // than stalling the disassembly response behind symbol downloads.
+                // The UI re-requests disassembly once symbols finish loading.
+                if let Ok(Some((module_path, symbol, offset))) = symbol_manager.try_resolve_address_to_symbol(&modules, addr) {
                     let module_name = std::path::Path::new(&module_path)
                         .file_stem()
                         .and_then(|s| s.to_str())

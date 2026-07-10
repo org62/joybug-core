@@ -228,6 +228,28 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::GetSymbolStatus { pid } => {
+                let p = platform.read().unwrap();
+                match p.get_symbol_status(pid) {
+                    Ok(statuses) => DebuggerResponse::SymbolStatusList { statuses },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::LoadPdbFromPath { pid, module_base, pdb_path, force } => {
+                let p = platform.read().unwrap();
+                match p.load_pdb_from_path(pid, module_base, &pdb_path, force) {
+                    Ok(crate::protocol::PdbLoadOutcome::Loaded { symbol_count }) => DebuggerResponse::PdbLoaded { symbol_count },
+                    Ok(crate::protocol::PdbLoadOutcome::Mismatch(info)) => DebuggerResponse::PdbMismatch(info),
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::RetrySymbolLoad { pid, module_base } => {
+                let p = platform.read().unwrap();
+                match p.retry_symbol_load(pid, module_base) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::ListSymbols { module_path } => {
                 let p = platform.read().unwrap();
                 match p.list_symbols(&module_path) {

@@ -24,6 +24,8 @@ pub mod anti_anti_debug;
 #[cfg(windows)]
 pub type PlatformImpl = windows_platform::WindowsPlatform;
 
+pub use interfaces::SymbolConfig;
+
 pub async fn run() -> anyhow::Result<()> {
     server::run_server().await
 }

@@ -797,6 +797,87 @@ impl LuaUserData for LuaDebugClient {
             }
         });
 
+        methods.add_method("symbol_status", |lua, this, pid: Option<u32>| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::GetSymbolStatus { pid })
+                .map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::SymbolStatusList { statuses } => {
+                    let table = lua.create_table()?;
+                    for (i, status) in statuses.iter().enumerate() {
+                        let st = lua.create_table()?;
+                        st.set("module", status.module_path.as_str())?;
+                        st.set("base", status.module_base)?;
+                        match &status.state {
+                            SymbolLoadState::Loaded { symbol_count } => {
+                                st.set("state", "loaded")?;
+                                st.set("symbol_count", *symbol_count)?;
+                            }
+                            SymbolLoadState::Loading => st.set("state", "loading")?,
+                            SymbolLoadState::Failed { error } => {
+                                st.set("state", "failed")?;
+                                st.set("error", error.as_str())?;
+                            }
+                            SymbolLoadState::NotRequested => st.set("state", "not_requested")?,
+                        }
+                        if let Some(pdb_path) = &status.pdb_path {
+                            st.set("pdb_path", pdb_path.as_str())?;
+                        }
+                        table.set(i + 1, st)?;
+                    }
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("GetSymbolStatus failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        methods.add_method("load_pdb", |lua, this, (pid, module_base, pdb_path, force): (u32, u64, String, Option<bool>)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::LoadPdbFromPath {
+                pid, module_base, pdb_path, force: force.unwrap_or(false),
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::PdbLoaded { symbol_count, .. } => {
+                    let table = lua.create_table()?;
+                    table.set("loaded", true)?;
+                    table.set("symbol_count", symbol_count)?;
+                    Ok(table)
+                }
+                DebuggerResponse::PdbMismatch(info) => {
+                    let table = lua.create_table()?;
+                    table.set("loaded", false)?;
+                    let mismatch = lua.create_table()?;
+                    mismatch.set("pe_guid", info.pe_guid)?;
+                    mismatch.set("pe_age", info.pe_age)?;
+                    mismatch.set("pdb_guid", info.pdb_guid)?;
+                    mismatch.set("pdb_age", info.pdb_age)?;
+                    table.set("mismatch", mismatch)?;
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("LoadPdbFromPath failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        methods.add_method("retry_symbols", |_lua, this, (pid, module_base): (u32, u64)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::RetrySymbolLoad { pid, module_base })
+                .map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::Ack => Ok(true),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("RetrySymbolLoad failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
         // ---- Disassembly ----
 
         methods.add_method("disassemble", |lua, this, (pid, addr, count): (u32, u64, Option<usize>)| {

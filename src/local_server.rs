@@ -28,6 +28,13 @@ impl LocalServer {
         Self::start_with(crate::PlatformImpl::new())
     }
 
+    /// Start a local debug server with the default backend and an explicit symbol
+    /// configuration (symbol path / offline mode).
+    #[cfg(windows)]
+    pub fn start_with_config(cfg: crate::interfaces::SymbolConfig) -> Result<Self, String> {
+        Self::start_with(crate::PlatformImpl::new_with_config(cfg))
+    }
+
     /// Start a local debug server with a custom platform implementation
     /// (e.g., `VEHPlatform`). Panics on failure.
     pub fn spawn_with<P>(platform: P) -> Self

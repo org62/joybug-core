@@ -85,6 +85,9 @@ const FN_SIGS: &[FnSig] = &[
     FnSig { name: "dbg:resolve_address", sig: "pid, addr", desc: "Resolve address to symbol. Returns {name, module, rva, offset, is_function}." },
     FnSig { name: "dbg:list_symbols", sig: "module_path", desc: "List all symbols in a module. Returns table of {name, rva, is_function}." },
     FnSig { name: "dbg:resolve_rva", sig: "module_path, rva", desc: "Resolve module-relative address to symbol." },
+    FnSig { name: "dbg:symbol_status", sig: "[pid]", desc: "Per-module symbol load status. Returns table of {module, base, state, symbol_count, error, pdb_path}." },
+    FnSig { name: "dbg:load_pdb", sig: "pid, module_base, pdb_path, [force=false]", desc: "Load symbols from a PDB file. Returns {loaded, symbol_count} or {loaded=false, mismatch={pe_guid, pe_age, pdb_guid, pdb_age}}." },
+    FnSig { name: "dbg:retry_symbols", sig: "pid, module_base", desc: "Retry a failed symbol download for a module." },
     // dbg methods - disassembly
     FnSig { name: "dbg:disassemble", sig: "pid, addr, [count=10]", desc: "Disassemble N instructions. Returns table of {address, mnemonic, operands, symbol, size, bytes, is_call, is_jump, is_ret}." },
     FnSig { name: "dbg:disassemble_function", sig: "pid, addr, [max=1000]", desc: "Disassemble entire function. Returns {instructions, start, end, name}." },

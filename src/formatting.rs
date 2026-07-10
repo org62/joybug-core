@@ -160,6 +160,19 @@ impl std::fmt::Debug for DebuggerResponse {
                     .field("freeze_id", freeze_id)
                     .finish()
             }
+            DebuggerResponse::SymbolStatusList { statuses } => {
+                f.debug_struct("SymbolStatusList")
+                    .field("count", &statuses.len())
+                    .finish()
+            }
+            DebuggerResponse::PdbLoaded { symbol_count } => {
+                f.debug_struct("PdbLoaded")
+                    .field("symbol_count", symbol_count)
+                    .finish()
+            }
+            DebuggerResponse::PdbMismatch(info) => {
+                f.debug_tuple("PdbMismatch").field(info).finish()
+            }
         }
     }
 }

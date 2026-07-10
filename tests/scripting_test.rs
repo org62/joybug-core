@@ -319,6 +319,12 @@ fn test_script_disassembly_and_callstack() {
         local result = {}
 
         dbg:on_initial_breakpoint(function(pid, tid, addr)
+            -- Disassembly symbolization is non-blocking: wait for ntdll's symbols
+            -- (the initial breakpoint lives there) before asserting on them.
+            local ntdll = wait_symbols(pid, "ntdll")
+            assert(ntdll and ntdll.state == "loaded",
+                "ntdll symbols should load: " .. tostring(ntdll and ntdll.error))
+
             -- Disassemble 5 instructions at the breakpoint
             local instrs = dbg:disassemble(pid, addr, 5)
             result.instr_count = #instrs
@@ -642,6 +648,18 @@ fn test_lua_file_modules_and_symbols() {
 #[test]
 fn test_lua_file_module_extra_info() {
     run_lua_test_file("modules/module_extra_info.lua", None);
+}
+
+#[test]
+fn test_lua_file_symbol_status() {
+    let test_exe = common::get_test_program_path("disassembly_test");
+    run_lua_test_file("modules/symbol_status.lua", Some(&test_exe));
+}
+
+#[test]
+fn test_lua_file_load_pdb() {
+    let test_exe = common::get_test_program_path("disassembly_test");
+    run_lua_test_file("modules/load_pdb.lua", Some(&test_exe));
 }
 
 // --- memory ---

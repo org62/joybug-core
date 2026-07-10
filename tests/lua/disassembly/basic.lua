@@ -4,6 +4,12 @@
 local result = {}
 
 dbg:on_initial_breakpoint(function(pid, tid, addr)
+    -- Disassembly symbolization is non-blocking: wait until ntdll's symbols
+    -- (the initial breakpoint lives there) finish loading before asserting on them.
+    local ntdll = wait_symbols(pid, "ntdll")
+    assert(ntdll and ntdll.state == "loaded",
+        "ntdll symbols should load: " .. tostring(ntdll and ntdll.error))
+
     -- Disassemble 5 instructions at the breakpoint
     local instrs = dbg:disassemble(pid, addr, 5)
     assert(#instrs == 5, "should disassemble 5 instructions, got " .. #instrs)

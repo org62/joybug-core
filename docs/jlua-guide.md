@@ -214,6 +214,25 @@ end
 -- Resolve an address to its symbol
 local info = dbg:resolve_address(pid, addr)
 print(info.name, info.module, info.offset)
+
+-- Per-module symbol load status. Each entry:
+-- {module, base, state = "loaded"|"loading"|"failed"|"not_requested",
+--  symbol_count?, error?, pdb_path?}
+for _, s in ipairs(dbg:symbol_status(pid)) do
+    print(s.module, s.state, s.symbol_count or "", s.error or "")
+end
+
+-- Load symbols from a user-supplied PDB file.
+-- Returns {loaded=true, symbol_count=N}, or when the PDB's GUID/age doesn't
+-- match the module: {loaded=false, mismatch={pe_guid, pe_age, pdb_guid, pdb_age}}
+local r = dbg:load_pdb(pid, module_base, "C:\\syms\\app.pdb")
+if not r.loaded then
+    -- pass force=true to load a mismatched PDB anyway
+    r = dbg:load_pdb(pid, module_base, "C:\\syms\\app.pdb", true)
+end
+
+-- Retry a failed symbol download for a module
+dbg:retry_symbols(pid, module_base)
 ```
 
 ### Disassembly
@@ -458,6 +477,7 @@ These functions are available globally:
 | `disasm(instrs)` | Pretty-print a list of instructions |
 | `callstack(frames)` | Pretty-print a call stack |
 | `modules(mods)` | Pretty-print a module list |
+| `wait_symbols(pid, pattern, [timeout_s=30])` | Wait until symbols for the first module matching `pattern` settle (`loaded`/`failed`); returns its status table, or nil on timeout |
 
 ## Example Scripts
 

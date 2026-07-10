@@ -1,11 +1,12 @@
-use crate::interfaces::{ModuleSymbol, ResolvedSymbol, SymbolError, SymbolProvider};
-use crate::protocol::ModuleInfo;
+use crate::interfaces::{ModuleSymbol, ResolvedSymbol, SymbolConfig, SymbolError, SymbolProvider};
+use crate::protocol::{ModuleInfo, ModuleSymbolStatus, PdbLoadOutcome, SymbolLoadState};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::{Arc, Mutex, Condvar, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{trace, warn, error};
-use crate::windows_platform::symbol_provider::WindowsSymbolProvider;
+use crate::windows_platform::symbol_provider::{WindowsSymbolProvider, parse_pdb_to_symbols, parse_pdb_matching_pe};
 use pelite::pe64::{Pe, PeFile};
 use pelite::image::{RUNTIME_FUNCTION, UNWIND_INFO, UNW_FLAG_CHAININFO};
 
@@ -14,6 +15,7 @@ use pelite::image::{RUNTIME_FUNCTION, UNWIND_INFO, UNW_FLAG_CHAININFO};
 pub struct ModuleSymbols {
     pub module_base: u64, // Base address where the module is loaded
     pub symbols: Vec<ModuleSymbol>, // All symbols stored as RVAs
+    pub pdb_path: Option<String>, // PDB file the symbols were loaded from
 }
 
 /// Cached PE exception data for chain resolution
@@ -36,6 +38,9 @@ pub struct SymbolManager {
 
     /// Set of modules currently being loaded
     pending_loads: Arc<Mutex<HashSet<String>>>,
+    /// Modules whose symbol load failed (module_path -> error message).
+    /// Failed modules are not retried automatically; retry is explicit.
+    failed_loads: Arc<Mutex<HashMap<String, String>>>,
     /// Condvar to notify waiters when a module finishes loading
     pending_cv: Arc<Condvar>,
 
@@ -47,15 +52,16 @@ pub struct SymbolManager {
 }
 
 impl SymbolManager {
-    pub fn new() -> Result<Self, SymbolError> {
+    pub fn new_with_config(cfg: SymbolConfig) -> Result<Self, SymbolError> {
         let symbol_cache = Arc::new(Mutex::new(HashMap::new()));
         let pending_loads = Arc::new(Mutex::new(HashSet::new()));
+        let failed_loads = Arc::new(Mutex::new(HashMap::new()));
         let pending_cv = Arc::new(Condvar::new());
-        
+
         let (worker_tx, worker_rx) = mpsc::channel::<ModuleInfo>();
         // Wrap receiver in Arc<Mutex> to share among multiple worker threads
         let worker_rx = Arc::new(Mutex::new(worker_rx));
-        
+
         let worker_count = Self::read_worker_count_from_env();
         trace!(worker_count, "Starting symbol worker threads");
 
@@ -63,13 +69,15 @@ impl SymbolManager {
             let rx = worker_rx.clone();
             let cache_clone = symbol_cache.clone();
             let pending_clone = pending_loads.clone();
+            let failed_clone = failed_loads.clone();
             let cv_clone = pending_cv.clone();
-            
+            let cfg_clone = cfg.clone();
+
             thread::spawn(move || {
                 trace!(worker_id = i, "Symbol worker thread started");
-                
+
                 // Create the provider (and its Runtime) ONCE per thread
-                let mut provider = match WindowsSymbolProvider::new() {
+                let mut provider = match WindowsSymbolProvider::with_config(&cfg_clone) {
                     Ok(p) => p,
                     Err(e) => {
                         error!(worker_id = i, error = %e, "Failed to create WindowsSymbolProvider in worker thread");
@@ -106,15 +114,19 @@ impl SymbolManager {
                             if let Ok(mut symbols) = provider.list_symbols(&module_path) {
                                 // Sort symbols by RVA for binary search
                                 symbols.sort_by_key(|s| s.rva);
+                                let pdb_path = provider.pdb_path_for(&module_path);
                                 let mut cache = cache_clone.lock().unwrap();
-                                cache.insert(module_path.clone(), ModuleSymbols {
+                                // or_insert: never clobber symbols a user loaded manually meanwhile
+                                cache.entry(module_path.clone()).or_insert(ModuleSymbols {
                                     module_base,
                                     symbols,
+                                    pdb_path,
                                 });
                             }
                         },
                         Err(e) => {
                             warn!(worker_id = i, module_path = %module_path, error = %e, "Symbol loading failed");
+                            failed_clone.lock().unwrap().insert(module_path.clone(), e.to_string());
                         }
                     }
                     
@@ -134,6 +146,7 @@ impl SymbolManager {
             symbol_cache,
             pdata_cache: Mutex::new(HashMap::new()),
             pending_loads,
+            failed_loads,
             pending_cv,
             worker_tx,
             wait_timeout: Self::read_timeout_from_env(),
@@ -164,7 +177,7 @@ impl SymbolManager {
     /// Start loading symbols for a module in the background
     pub fn start_loading_symbols(&self, module: &ModuleInfo) {
         let module_path = module.name.clone();
-        
+
         // Check if already loaded
         {
             let cache = self.symbol_cache.lock().unwrap();
@@ -172,7 +185,15 @@ impl SymbolManager {
                 return;
             }
         }
-        
+
+        // A previous attempt failed: don't retry automatically (retry is explicit)
+        {
+            let failed = self.failed_loads.lock().unwrap();
+            if failed.contains_key(&module_path) {
+                return;
+            }
+        }
+
         // Check if already pending
         {
             let mut pending = self.pending_loads.lock().unwrap();
@@ -233,6 +254,68 @@ impl SymbolManager {
                 break;
             }
         }
+    }
+
+    /// Report the symbol load state for each of the given modules.
+    /// Non-blocking: reads the cache/pending/failed sets as they are right now.
+    pub fn get_symbol_status(&self, modules: Vec<ModuleInfo>) -> Vec<ModuleSymbolStatus> {
+        let cache = self.symbol_cache.lock().unwrap();
+        let pending = self.pending_loads.lock().unwrap();
+        let failed = self.failed_loads.lock().unwrap();
+
+        modules.into_iter().map(|module| {
+            let (state, pdb_path) = if let Some(cached) = cache.get(&module.name) {
+                (SymbolLoadState::Loaded { symbol_count: cached.symbols.len() }, cached.pdb_path.clone())
+            } else if pending.contains(&module.name) {
+                (SymbolLoadState::Loading, None)
+            } else if let Some(error) = failed.get(&module.name) {
+                (SymbolLoadState::Failed { error: error.clone() }, None)
+            } else {
+                (SymbolLoadState::NotRequested, None)
+            };
+            ModuleSymbolStatus {
+                module_path: module.name,
+                module_base: module.base,
+                state,
+                pdb_path,
+            }
+        }).collect()
+    }
+
+    /// Load symbols for a module from a user-supplied PDB file.
+    /// Unless `force`, the PDB's GUID/age must match the module's PE debug directory;
+    /// a mismatch is returned as `PdbLoadOutcome::Mismatch`, not an error.
+    /// A user-loaded PDB replaces any previously cached symbols for the module.
+    pub fn load_pdb_from_path(&self, module: &ModuleInfo, pdb_path: &Path, force: bool) -> Result<PdbLoadOutcome, SymbolError> {
+        let mut symbols = if force {
+            parse_pdb_to_symbols(pdb_path)?
+        } else {
+            match parse_pdb_matching_pe(Path::new(&module.name), pdb_path)? {
+                Ok(symbols) => symbols,
+                Err(mismatch) => return Ok(PdbLoadOutcome::Mismatch(mismatch)),
+            }
+        };
+        symbols.sort_by_key(|s| s.rva);
+        let symbol_count = symbols.len();
+
+        {
+            let mut cache = self.symbol_cache.lock().unwrap();
+            cache.insert(module.name.clone(), ModuleSymbols {
+                module_base: module.base,
+                symbols,
+                pdb_path: Some(pdb_path.display().to_string()),
+            });
+        }
+        self.failed_loads.lock().unwrap().remove(&module.name);
+
+        trace!(module_path = %module.name, pdb_path = %pdb_path.display(), symbol_count, force, "Loaded user-supplied PDB");
+        Ok(PdbLoadOutcome::Loaded { symbol_count })
+    }
+
+    /// Retry a failed (or never-attempted) symbol download for a module.
+    pub fn retry_loading_symbols(&self, module: &ModuleInfo) {
+        self.failed_loads.lock().unwrap().remove(&module.name);
+        self.start_loading_symbols(module);
     }
 
     /// Find symbols across all loaded modules, returning up to max_results matches
@@ -341,13 +424,6 @@ impl SymbolManager {
         Ok(found_symbols)
     }
 
-    /// Resolve an RVA to a symbol, waiting for loading to complete if necessary
-    /// This method works directly with RVAs since symbols are stored as RVAs
-    pub fn resolve_rva_to_symbol(&self, module_path: &str, rva: u32) -> Result<Option<ResolvedSymbol>, SymbolError> {
-        self.wait_for_loading(module_path)?;
-        self.resolve_rva_to_symbol_from_cache(module_path, rva)
-    }
-
     /// Resolve an RVA to a symbol without waiting for loading to complete.
     /// Returns None immediately if the module's symbols are still loading.
     pub fn try_resolve_rva_to_symbol(&self, module_path: &str, rva: u32) -> Result<Option<ResolvedSymbol>, SymbolError> {
@@ -408,15 +484,8 @@ impl SymbolManager {
     /// Resolve an absolute address to a symbol by finding the appropriate module.
     /// Follows RUNTIME_FUNCTION unwind chains for PGO-split function fragments,
     /// then falls back to nearest-below symbol search.
-    pub fn resolve_address_to_symbol(&self, modules: &[ModuleInfo], address: u64) -> Result<Option<(String, ResolvedSymbol, u64)>, SymbolError> {
-        self.resolve_address_impl(modules, address, |module_path, rva| {
-            self.resolve_rva_to_symbol(module_path, rva)
-        })
-    }
-
-    /// Non-blocking variant of `resolve_address_to_symbol`.
-    /// Returns None immediately if the module's symbols are still loading,
-    /// instead of waiting up to the timeout duration.
+    /// Non-blocking: returns None immediately if the module's symbols are still
+    /// loading, instead of waiting up to the timeout duration.
     pub fn try_resolve_address_to_symbol(&self, modules: &[ModuleInfo], address: u64) -> Result<Option<(String, ResolvedSymbol, u64)>, SymbolError> {
         self.resolve_address_impl(modules, address, |module_path, rva| {
             self.try_resolve_rva_to_symbol(module_path, rva)

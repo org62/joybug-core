@@ -11,12 +11,13 @@ use pdb::{
     AddressMap, FallibleIterator, PdbInternalSectionOffset, ProcedureSymbol, PublicSymbol,
     SymbolData, PDB,
 };
-use symsrv::{SymsrvDownloader, parse_nt_symbol_path, get_symbol_path_from_environment, get_home_sym_dir};
+use symsrv::{SymsrvDownloader, NtSymbolPathEntry, parse_nt_symbol_path, get_symbol_path_from_environment, get_home_sym_dir};
 use tracing::{trace, debug};
 use uuid::Uuid;
 use tokio::runtime::{Runtime, Builder};
 
-use crate::interfaces::{Address, ModuleSymbol, ResolvedSymbol, SymbolError, SymbolProvider};
+use crate::interfaces::{Address, ModuleSymbol, ResolvedSymbol, SymbolConfig, SymbolError, SymbolProvider};
+use crate::protocol::PdbMismatchInfo;
 
 // --- PDB Identifier Logic (adapted from src/windows/symbols/pe_reader.rs) ---
 
@@ -101,19 +102,26 @@ pub fn extract_pdb_identifier_from_file(module_path: &Path) -> Result<PdbIdentif
 
 // --- Symbol Provider Implementation ---
 
+/// Symbols loaded for a module, plus where they came from.
+struct LoadedModule {
+    base: Address,
+    #[allow(dead_code)]
+    size: Option<usize>,
+    symbols: Vec<ModuleSymbol>,
+    pdb_path: Option<PathBuf>,
+}
+
 /// A Windows-specific symbol provider that uses PDB files.
 /// It can download PDBs from symbol servers and parse them to provide symbol information.
 pub struct WindowsSymbolProvider {
     downloader: SymsrvDownloader,
     runtime: Runtime,
-    /// Stores loaded symbols for modules.
-    /// Key: Module path (String)
-    /// Value: Tuple of (Module Base Address, Module Size (Option<usize>), Vec<ModuleSymbol from debugger_interface>)
-    loaded_modules: HashMap<String, (Address, Option<usize>, Vec<ModuleSymbol>)>,
+    /// Loaded symbols per module path.
+    loaded_modules: HashMap<String, LoadedModule>,
 }
 
 impl WindowsSymbolProvider {
-    pub fn new() -> Result<Self, SymbolError> {
+    pub fn with_config(cfg: &SymbolConfig) -> Result<Self, SymbolError> {
         // Create a single-threaded tokio runtime for async operations
         // Using current_thread ensures we don't spawn extra threads that might linger
         let runtime = Builder::new_current_thread()
@@ -121,22 +129,40 @@ impl WindowsSymbolProvider {
             .build()
             .map_err(|e| SymbolError::SymSrvError(format!("Failed to create async runtime: {}", e)))?;
 
-        // Parse the _NT_SYMBOL_PATH environment variable using symsrv
+        // Precedence: explicit config > _NT_SYMBOL_PATH > Microsoft symbol server
         let symbol_path_env = get_symbol_path_from_environment();
-        let symbol_path = symbol_path_env.as_deref().unwrap_or("srv**https://msdl.microsoft.com/download/symbols");
-        let parsed_symbol_path = parse_nt_symbol_path(symbol_path);
+        let symbol_path = cfg.symbol_path.as_deref()
+            .or(symbol_path_env.as_deref())
+            .unwrap_or("srv**https://msdl.microsoft.com/download/symbols");
+        let mut parsed_symbol_path = parse_nt_symbol_path(symbol_path);
+
+        if cfg.offline {
+            // Keep local caches/directories usable but never hit the network.
+            for entry in &mut parsed_symbol_path {
+                if let NtSymbolPathEntry::Chain { urls, .. } = entry {
+                    urls.clear();
+                }
+            }
+        }
 
         // Create a downloader which follows the _NT_SYMBOL_PATH recipe
         let mut downloader = SymsrvDownloader::new(parsed_symbol_path);
         downloader.set_default_downstream_store(get_home_sym_dir());
 
-        trace!(symbol_path, "Using symsrv downloader with symbol path");
+        trace!(symbol_path, offline = cfg.offline, "Using symsrv downloader with symbol path");
 
         Ok(Self {
             downloader,
             runtime,
             loaded_modules: HashMap::new(),
         })
+    }
+
+    /// Path of the PDB that symbols for `module_path` were loaded from, if loaded.
+    pub fn pdb_path_for(&self, module_path: &str) -> Option<String> {
+        self.loaded_modules.get(module_path)
+            .and_then(|m| m.pdb_path.as_ref())
+            .map(|p| p.display().to_string())
     }
 
     /// Internal helper to fetch a PDB file using symsrv.
@@ -152,12 +178,53 @@ impl WindowsSymbolProvider {
         Ok(local_path)
     }
 
-    /// Internal helper to parse a PDB file and extract symbols as ModuleSymbols.
-    fn internal_parse_pdb_to_symbols(&self, pdb_path: &Path) -> Result<Vec<ModuleSymbol>, SymbolError> {
+}
+
+fn open_pdb(pdb_path: &Path) -> Result<PDB<'static, File>, SymbolError> {
+    let file = File::open(pdb_path).map_err(SymbolError::IoError)?;
+    PDB::open(file)
+        .map_err(|e| SymbolError::PdbParsingFailed(format!("PDB::open for {}: {}", pdb_path.display(), e)))
+}
+
+/// Parse a PDB file and extract symbols as ModuleSymbols.
+/// Free function so callers (e.g. user-initiated PDB loads) can parse without a provider.
+pub(crate) fn parse_pdb_to_symbols(pdb_path: &Path) -> Result<Vec<ModuleSymbol>, SymbolError> {
+    extract_symbols(&mut open_pdb(pdb_path)?, pdb_path)
+}
+
+/// Parse a user-supplied PDB after validating its GUID/age against the module's
+/// PE debug directory, opening and parsing the PDB only once. The DBI age is
+/// authoritative for symbol-store matching; falls back to the PDB info-stream age
+/// when the DBI age is absent. On mismatch returns `Ok(Err(info))` without parsing
+/// the symbol streams.
+pub(crate) fn parse_pdb_matching_pe(
+    module_path: &Path,
+    pdb_path: &Path,
+) -> Result<std::result::Result<Vec<ModuleSymbol>, PdbMismatchInfo>, SymbolError> {
+    let pe_id = extract_pdb_identifier_from_file(module_path)?;
+
+    let mut pdb_parser = open_pdb(pdb_path)?;
+    let info = pdb_parser.pdb_information()
+        .map_err(|e| SymbolError::PdbParsingFailed(format!("PDB information from {}: {}", pdb_path.display(), e)))?;
+    let pdb_age = pdb_parser.debug_information()
+        .ok()
+        .and_then(|dbi| dbi.age())
+        .unwrap_or(info.age);
+
+    if info.guid != pe_id.guid || pdb_age != pe_id.age {
+        return Ok(Err(PdbMismatchInfo {
+            pe_guid: pe_id.guid.to_string(),
+            pe_age: pe_id.age,
+            pdb_guid: info.guid.to_string(),
+            pdb_age,
+        }));
+    }
+    Ok(Ok(extract_symbols(&mut pdb_parser, pdb_path)?))
+}
+
+/// Extract symbols from an already-open PDB parser.
+fn extract_symbols(pdb_parser: &mut PDB<'static, File>, pdb_path: &Path) -> Result<Vec<ModuleSymbol>, SymbolError> {
         trace!(path = %pdb_path.display(), "Parsing PDB file");
-        let file = File::open(pdb_path).map_err(SymbolError::IoError)?;
-        let mut pdb_parser = PDB::open(file)
-            .map_err(|e| SymbolError::PdbParsingFailed(format!("PDB::open for {}: {}", pdb_path.display(), e)))?;
 
         // Use a HashMap to deduplicate symbols by name.
         // Procedure symbols from DBI modules are inserted first (Phase 1),
@@ -249,7 +316,6 @@ impl WindowsSymbolProvider {
         let symbols_vec: Vec<ModuleSymbol> = symbols_map.into_values().collect();
         trace!(count = symbols_vec.len(), "Successfully parsed symbols from PDB");
         Ok(symbols_vec)
-    }
 }
 
 /// Helper to demangle a symbol name and insert it into the symbols map.
@@ -316,12 +382,16 @@ impl SymbolProvider for WindowsSymbolProvider {
         };
 
         // Parse the PDB file
-        let symbols = self.internal_parse_pdb_to_symbols(&pdb_path)?;
+        let symbols = parse_pdb_to_symbols(&pdb_path)?;
 
         // Store the symbols
-        self.loaded_modules.insert(module_path_str.to_string(), (module_base, module_size, symbols));
-
-        trace!(module_path = module_path_str, symbol_count = self.loaded_modules.get(module_path_str).unwrap().2.len(), "Successfully loaded symbols for module");
+        trace!(module_path = module_path_str, symbol_count = symbols.len(), "Successfully loaded symbols for module");
+        self.loaded_modules.insert(module_path_str.to_string(), LoadedModule {
+            base: module_base,
+            size: module_size,
+            symbols,
+            pdb_path: Some(pdb_path),
+        });
         Ok(())
     }
 
@@ -338,7 +408,7 @@ impl SymbolProvider for WindowsSymbolProvider {
             let target_symbol_name = &target_symbol_name[1..]; // Skip the '!' character
             
             // Search only in the specified module
-            for (module_path, (module_base, _size, symbols)) in &self.loaded_modules {
+            for (module_path, module) in &self.loaded_modules {
                 // Extract module name from path
                 let module_name = std::path::Path::new(module_path)
                     .file_stem()
@@ -348,14 +418,14 @@ impl SymbolProvider for WindowsSymbolProvider {
                 // Check if this is the target module (case-insensitive)
                 if module_name.to_lowercase() == target_module_name.to_lowercase() {
                     // Find all matching symbols in this specific module
-                    for symbol in symbols {
+                    for symbol in &module.symbols {
                         if symbol.name == target_symbol_name {
                             // Create ResolvedSymbol with VA calculated
                             let resolved_symbol = ResolvedSymbol {
                                 name: format!("{}!{}", module_name, symbol.name),
                                 module_name: module_name.to_string(),
                                 rva: symbol.rva,
-                                va: module_base + symbol.rva as u64,
+                                va: module.base + symbol.rva as u64,
                                 is_function: symbol.is_function,
                             };
                             
@@ -373,7 +443,7 @@ impl SymbolProvider for WindowsSymbolProvider {
             }
         } else {
             // Search through all loaded modules (original behavior with contains matching)
-            for (module_path, (module_base, _size, symbols)) in &self.loaded_modules {
+            for (module_path, module) in &self.loaded_modules {
                 // Extract module name from path  
                 let module_name = std::path::Path::new(module_path)
                     .file_stem()
@@ -382,14 +452,14 @@ impl SymbolProvider for WindowsSymbolProvider {
                     .to_string();
                     
                 // Find all matching symbols in this module (contains-based search)
-                for symbol in symbols {
+                for symbol in &module.symbols {
                     if symbol.name.to_lowercase().contains(&symbol_name.to_lowercase()) {
                         // Create ResolvedSymbol with VA calculated
                         let resolved_symbol = ResolvedSymbol {
                             name: format!("{}!{}", module_name, symbol.name),
                             module_name: module_name.clone(),
                             rva: symbol.rva,
-                            va: module_base + symbol.rva as u64,
+                            va: module.base + symbol.rva as u64,
                             is_function: symbol.is_function,
                         };
                         
@@ -410,9 +480,9 @@ impl SymbolProvider for WindowsSymbolProvider {
     }
 
     fn list_symbols(&self, module_path: &str) -> Result<Vec<ModuleSymbol>, SymbolError> {
-        if let Some((_base, _size, symbols)) = self.loaded_modules.get(module_path) {
-            trace!(module_path, count = symbols.len(), "Symbol listing completed");
-            Ok(symbols.clone())
+        if let Some(module) = self.loaded_modules.get(module_path) {
+            trace!(module_path, count = module.symbols.len(), "Symbol listing completed");
+            Ok(module.symbols.clone())
         } else {
             trace!(module_path, "No symbols loaded for module");
             Err(SymbolError::ModuleNotLoaded(format!("Module {} not loaded", module_path)))
@@ -424,10 +494,10 @@ impl SymbolProvider for WindowsSymbolProvider {
         module_path: &str,
         rva: u32,
     ) -> Result<Option<ModuleSymbol>, SymbolError> {
-        if let Some((_base, _size, symbols)) = self.loaded_modules.get(module_path) {
+        if let Some(module) = self.loaded_modules.get(module_path) {
             // Find the symbol with the highest RVA that is still <= the target RVA
             let mut best_match: Option<&ModuleSymbol> = None;
-            for symbol in symbols {
+            for symbol in &module.symbols {
                 if symbol.rva <= rva && (best_match.is_none() || symbol.rva > best_match.unwrap().rva) {
                     best_match = Some(symbol);
                 }

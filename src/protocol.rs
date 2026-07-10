@@ -372,6 +372,20 @@ pub mod request_response {
             symbol_name: String,
             max_results: usize,
         },
+        GetSymbolStatus {
+            pid: u32,
+        },
+        LoadPdbFromPath {
+            pid: u32,
+            module_base: u64,
+            pdb_path: String,
+            #[serde(default)]
+            force: bool,
+        },
+        RetrySymbolLoad {
+            pid: u32,
+            module_base: u64,
+        },
         ListSymbols {
             module_path: String,
         },
@@ -602,6 +616,11 @@ pub mod request_response {
         ThreadList { threads: Vec<ThreadInfo> },
         ProcessList { processes: Vec<ProcessInfo> },
         // Symbol-related responses
+        SymbolStatusList { statuses: Vec<ModuleSymbolStatus> },
+        PdbLoaded { symbol_count: usize },
+        /// Returned by LoadPdbFromPath when the PDB's GUID/age doesn't match the PE
+        /// and `force` was not set. The client may retry with `force: true`.
+        PdbMismatch(PdbMismatchInfo),
         Symbol { symbol: Option<crate::interfaces::ModuleSymbol> },
         SymbolList { symbols: Vec<crate::interfaces::ModuleSymbol> },
         ResolvedSymbolList { symbols: Vec<crate::interfaces::ResolvedSymbol> },
@@ -833,6 +852,42 @@ pub mod request_response {
         pub name: String,
         pub base: u64,
         pub size: Option<u64>,
+    }
+
+    /// Symbol load state for a single module.
+    #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+    pub enum SymbolLoadState {
+        Loaded { symbol_count: usize },
+        Loading,
+        Failed { error: String },
+        NotRequested,
+    }
+
+    /// Per-module symbol load status, as reported by `GetSymbolStatus`.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct ModuleSymbolStatus {
+        pub module_path: String,
+        pub module_base: u64,
+        pub state: SymbolLoadState,
+        /// Path of the PDB the symbols were loaded from, when loaded.
+        pub pdb_path: Option<String>,
+    }
+
+    /// PE vs PDB identity (GUID + age) details for a rejected PDB load.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct PdbMismatchInfo {
+        pub pe_guid: String,
+        pub pe_age: u32,
+        pub pdb_guid: String,
+        pub pdb_age: u32,
+    }
+
+    /// Outcome of a `LoadPdbFromPath` request: symbols loaded, or the PDB rejected
+    /// because its identity doesn't match the PE (retry with `force` to load anyway).
+    #[derive(Debug, Clone)]
+    pub enum PdbLoadOutcome {
+        Loaded { symbol_count: usize },
+        Mismatch(PdbMismatchInfo),
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone)]

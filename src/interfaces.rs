@@ -33,6 +33,16 @@ pub enum SymbolError {
     ModuleNotLoaded(String),
 }
 
+/// Configuration for symbol resolution, plumbed from the embedding application.
+#[derive(Debug, Clone, Default)]
+pub struct SymbolConfig {
+    /// Overrides the `_NT_SYMBOL_PATH` environment variable when set.
+    pub symbol_path: Option<String>,
+    /// When true, remote symbol-server URLs are stripped so nothing is downloaded;
+    /// local caches and directories still resolve.
+    pub offline: bool,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModuleSymbol {
     pub name: String,
@@ -255,7 +265,22 @@ pub trait PlatformAPI: Send + Sync {
     fn list_symbols(&self, module_path: &str) -> Result<Vec<ModuleSymbol>, SymbolError>;
     fn resolve_rva_to_symbol(&self, module_path: &str, rva: u32) -> Result<Option<ModuleSymbol>, SymbolError>;
     fn resolve_address_to_symbol(&self, pid: u32, address: u64) -> Result<Option<(String, ModuleSymbol, u64)>, SymbolError>; // Returns (module_path, symbol, offset_from_symbol)
-    
+
+    /// Per-module symbol load status (loaded/loading/failed/not requested).
+    fn get_symbol_status(&self, _pid: u32) -> Result<Vec<crate::protocol::ModuleSymbolStatus>, SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Symbol status not supported by this platform".to_string()))
+    }
+    /// Load symbols for a module from a user-supplied PDB file.
+    /// Unless `force`, the PDB's GUID/age must match the module's PE debug directory;
+    /// a mismatch is a negotiable outcome (`PdbLoadOutcome::Mismatch`), not an error.
+    fn load_pdb_from_path(&self, _pid: u32, _module_base: u64, _pdb_path: &str, _force: bool) -> Result<crate::protocol::PdbLoadOutcome, SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Loading PDB from path not supported by this platform".to_string()))
+    }
+    /// Retry a failed symbol download for a module.
+    fn retry_symbol_load(&self, _pid: u32, _module_base: u64) -> Result<(), SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Symbol retry not supported by this platform".to_string()))
+    }
+
     // Symbolized disassembly methods
     fn disassemble_memory(&self, pid: u32, address: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError>;
     

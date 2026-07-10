@@ -373,6 +373,27 @@ function sym(name, max)
     return syms[1].va
 end
 
+--- Wait for a module's symbols to settle (loaded or failed).
+--- wait_symbols(pid, pattern)            -- 30s default timeout
+--- wait_symbols(pid, pattern, timeout_s)
+--- `pattern` is matched (Lua pattern, case-insensitive) against module paths.
+--- Returns the module's status table ({module, base, state, symbol_count, error,
+--- pdb_path}), or nil if no matching module settled before the timeout.
+function wait_symbols(pid, pattern, timeout_s)
+    local deadline = os.clock() + (timeout_s or 30)
+    repeat
+        local found
+        for _, s in ipairs(dbg:symbol_status(pid)) do
+            if s.module:lower():find(pattern) then found = s end
+        end
+        if found and (found.state == "loaded" or found.state == "failed") then
+            return found
+        end
+        dbg:sleep(100)
+    until os.clock() >= deadline
+    return nil
+end
+
 --- Set a breakpoint by symbol name or address
 --- bp(addr_or_name)            -- set breakpoint, drop to REPL on hit
 --- bp(addr_or_name, handler)   -- set breakpoint with Lua handler

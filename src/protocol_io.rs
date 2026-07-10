@@ -2,8 +2,9 @@ use crate::interfaces::{Architecture, Instruction, ModuleSymbol};
 use crate::pe_types::ModuleExtraInfo;
 pub use crate::protocol::{
     DebuggerRequest, DebuggerResponse, DebugEvent, EmulationMode, HardwareBreakpointSize,
-    HardwareBreakpointType, ModuleInfo, ProcessInfo, ScanCompareType, ScanValue, ScanValueType,
-    StepAction, StepKind, ThreadContext, ThreadInfo, TraceExitCondition,
+    HardwareBreakpointType, ModuleInfo, ModuleSymbolStatus, PdbLoadOutcome, PdbMismatchInfo,
+    ProcessInfo, ScanCompareType, ScanValue, ScanValueType, StepAction, StepKind,
+    SymbolLoadState, ThreadContext, ThreadInfo, TraceExitCondition,
 };
 
 /// Result from trace_instructions()
@@ -140,6 +141,9 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
             report.peb_address, report.applied.len(), report.failures.len(), report.wow64_skipped,
         ),
         DebuggerResponse::FreezeValueStarted { freeze_id } => format!("FreezeValueStarted (id={})", freeze_id),
+        DebuggerResponse::SymbolStatusList { statuses } => format!("SymbolStatusList ({} modules)", statuses.len()),
+        DebuggerResponse::PdbLoaded { symbol_count } => format!("PdbLoaded ({} symbols)", symbol_count),
+        DebuggerResponse::PdbMismatch(_) => "PdbMismatch".to_string(),
     };
     debug!("Received response: {}", summary);
     Ok(resp)
@@ -861,6 +865,55 @@ impl<S> DebugSession<S> {
                 "Unexpected response to FindSymbol: {:?}",
                 other
             )),
+        }
+    }
+
+    /// Per-module symbol load status (loaded/loading/failed/not requested).
+    pub fn get_symbol_status(&mut self, pid: u32) -> anyhow::Result<Vec<ModuleSymbolStatus>> {
+        match self.send_and_receive(&DebuggerRequest::GetSymbolStatus { pid })? {
+            DebuggerResponse::SymbolStatusList { statuses } => Ok(statuses),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to get symbol status: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to GetSymbolStatus: {:?}", other)),
+        }
+    }
+
+    /// Load symbols for a module from a user-supplied PDB file.
+    /// Returns `Mismatch` (not an error) when the PDB doesn't match the PE and `force` is false.
+    pub fn load_pdb_from_path(
+        &mut self,
+        pid: u32,
+        module_base: u64,
+        pdb_path: &str,
+        force: bool,
+    ) -> anyhow::Result<PdbLoadOutcome> {
+        let req = DebuggerRequest::LoadPdbFromPath {
+            pid,
+            module_base,
+            pdb_path: pdb_path.to_string(),
+            force,
+        };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::PdbLoaded { symbol_count } => {
+                Ok(PdbLoadOutcome::Loaded { symbol_count })
+            }
+            DebuggerResponse::PdbMismatch(info) => Ok(PdbLoadOutcome::Mismatch(info)),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to load PDB '{}': {}", pdb_path, message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to LoadPdbFromPath: {:?}", other)),
+        }
+    }
+
+    /// Retry a failed symbol download for a module.
+    pub fn retry_symbol_load(&mut self, pid: u32, module_base: u64) -> anyhow::Result<()> {
+        match self.send_and_receive(&DebuggerRequest::RetrySymbolLoad { pid, module_base })? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to retry symbol load: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to RetrySymbolLoad: {:?}", other)),
         }
     }
 
