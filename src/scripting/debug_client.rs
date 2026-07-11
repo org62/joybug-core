@@ -382,6 +382,34 @@ impl DebugClient {
             }
         }
     }
+
+    /// Resolve an address to its (file, line) via the module's PDB line table.
+    fn resolve_line(&mut self, pid: u32, address: u64) -> Option<(String, u32)> {
+        match self.send_and_receive(&DebuggerRequest::ResolveAddressToLine { pid, address }).ok()? {
+            DebuggerResponse::AddressLine { info: Some(info) } => {
+                Some((info.file.path, info.line_entry.line_start))
+            }
+            _ => None,
+        }
+    }
+
+    /// Step by one source line: repeatedly `step_and_wait` until the PC leaves
+    /// the starting source line (or leaves mapped source). `kind` chooses Into vs
+    /// Over granularity. Degrades to a single step when the start has no line info.
+    pub fn step_source_line_and_wait(&mut self, pid: u32, tid: u32, kind: StepKind) -> mlua::Result<u64> {
+        const MAX_STEPS: u32 = 50_000;
+        let start = self.current_address.and_then(|pc| self.resolve_line(pid, pc));
+        let mut last = self.current_address.unwrap_or(0);
+        for _ in 0..MAX_STEPS {
+            last = self.step_and_wait(pid, tid, kind)?;
+            let Some(ref start) = start else { break }; // no start line info → single step
+            match self.resolve_line(pid, last) {
+                Some(ref cur) if cur == start => continue,
+                _ => break,
+            }
+        }
+        Ok(last)
+    }
 }
 
 // ---- Lua type conversion helpers ----

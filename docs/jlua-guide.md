@@ -147,6 +147,11 @@ local new_addr = dbg:step_out()        -- Step out of the current function
 
 -- Explicit pid/tid:
 dbg:step_into(pid, tid)
+
+-- Source-line stepping: single-steps until the PC leaves the current source
+-- line (needs PDB line info; degrades to a single step without it).
+local new_addr = dbg:step_line("over")  -- Step over one source line (default)
+local new_addr = dbg:step_line("into")  -- Step into one source line
 ```
 
 ### Registers
@@ -233,6 +238,33 @@ end
 
 -- Retry a failed symbol download for a module
 dbg:retry_symbols(pid, module_base)
+```
+
+### Source Lines (PDB line tables)
+
+The module's PDB line table is parsed lazily on the first source-line request
+and cached; while the module's symbols are still downloading these return nil
+or empty results rather than blocking.
+
+```lua
+-- Resolve an address to a source file/line. Returns nil when no line info
+-- covers the address. checksum_kind is "md5"|"sha1"|"sha256"|"none".
+local line = dbg:resolve_line(pid, addr)
+if line then
+    print(line.file .. ":" .. line.line, line.module, hex(line.rva))
+end
+
+-- All line->address entries for one source file of a module,
+-- sorted by line. Each entry: {rva, length, line, line_end}
+for _, e in ipairs(dbg:line_map(pid, module_base, line.file)) do
+    print(e.line, hex(e.rva))
+end
+
+-- All source files referenced by a module's PDB.
+-- Each entry: {path, checksum_kind, checksum}
+for _, f in ipairs(dbg:source_files(pid, module_base)) do
+    print(f.path)
+end
 ```
 
 ### Disassembly

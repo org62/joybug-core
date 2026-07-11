@@ -16,7 +16,7 @@ use tracing::{trace, debug};
 use uuid::Uuid;
 use tokio::runtime::{Runtime, Builder};
 
-use crate::interfaces::{Address, ModuleSymbol, ResolvedSymbol, SymbolConfig, SymbolError, SymbolProvider};
+use crate::interfaces::{Address, LineEntry, ModuleSymbol, ResolvedSymbol, SourceFileEntry, SymbolConfig, SymbolError, SymbolProvider};
 use crate::protocol::PdbMismatchInfo;
 
 // --- PDB Identifier Logic (adapted from src/windows/symbols/pe_reader.rs) ---
@@ -190,6 +190,117 @@ fn open_pdb(pdb_path: &Path) -> Result<PDB<'static, File>, SymbolError> {
 /// Free function so callers (e.g. user-initiated PDB loads) can parse without a provider.
 pub(crate) fn parse_pdb_to_symbols(pdb_path: &Path) -> Result<Vec<ModuleSymbol>, SymbolError> {
     extract_symbols(&mut open_pdb(pdb_path)?, pdb_path)
+}
+
+/// A module's complete PDB line table: source files plus RVA→line mappings.
+#[derive(Debug, Default)]
+pub struct ModuleLineTable {
+    /// Source files, deduplicated case-insensitively across compilands.
+    pub files: Vec<SourceFileEntry>,
+    /// All line entries, sorted by RVA. `file_index` points into `files`.
+    pub lines: Vec<LineEntry>,
+    /// file index (into `files`) -> indices into `lines`, sorted by line_start.
+    pub by_file: HashMap<u32, Vec<u32>>,
+}
+
+/// MSVC emits these line numbers for compiler-generated code with no source.
+const NO_SOURCE_SENTINELS: [u32; 2] = [0xfeefee, 0xf00f00];
+
+/// Parse the C13 line programs of a PDB into a bidirectional line table.
+/// Free function mirroring `parse_pdb_to_symbols`; parsed lazily on first
+/// source-level request, not during the initial symbol load.
+pub(crate) fn parse_pdb_to_lines(pdb_path: &Path) -> Result<ModuleLineTable, SymbolError> {
+    let mut pdb_parser = open_pdb(pdb_path)?;
+    let map_err = |what: &str, e: pdb::Error| {
+        SymbolError::PdbParsingFailed(format!("PDB {} from {}: {}", what, pdb_path.display(), e))
+    };
+
+    let address_map = pdb_parser.address_map().map_err(|e| map_err("address_map", e))?;
+    let string_table = pdb_parser.string_table().map_err(|e| map_err("string_table", e))?;
+    let dbi = pdb_parser.debug_information().map_err(|e| map_err("debug_information", e))?;
+    let mut modules = dbi.modules().map_err(|e| map_err("modules", e))?;
+
+    let mut table = ModuleLineTable::default();
+    // lowercased path -> index into table.files (files repeat across compilands)
+    let mut file_dedup: HashMap<String, u32> = HashMap::new();
+
+    while let Ok(Some(module)) = modules.next() {
+        let module_info = match pdb_parser.module_info(&module) {
+            Ok(Some(info)) => info,
+            _ => continue,
+        };
+        let program = match module_info.line_program() {
+            Ok(p) => p,
+            Err(e) => {
+                trace!(error = %e, module = %module.module_name(), "No line program for compiland, skipping");
+                continue;
+            }
+        };
+
+        // FileIndex values are compiland-local: remap to the global deduped list.
+        let mut local_files: HashMap<u32, u32> = HashMap::new();
+
+        let mut lines = program.lines();
+        while let Ok(Some(line)) = lines.next() {
+            if NO_SOURCE_SENTINELS.contains(&line.line_start) {
+                continue;
+            }
+            let rva = match line.offset.to_rva(&address_map) {
+                Some(rva) => rva.0,
+                None => continue,
+            };
+
+            let global_file_index = match local_files.get(&line.file_index.0) {
+                Some(&idx) => idx,
+                None => {
+                    let Ok(file_info) = program.get_file_info(line.file_index) else { continue };
+                    let Ok(path) = file_info.name.to_string_lossy(&string_table) else { continue };
+                    let path = path.into_owned();
+                    let idx = *file_dedup.entry(path.to_lowercase()).or_insert_with(|| {
+                        let (checksum_kind, checksum) = match file_info.checksum {
+                            pdb::FileChecksum::None => ("none", String::new()),
+                            pdb::FileChecksum::Md5(bytes) => ("md5", hex_encode(bytes)),
+                            pdb::FileChecksum::Sha1(bytes) => ("sha1", hex_encode(bytes)),
+                            pdb::FileChecksum::Sha256(bytes) => ("sha256", hex_encode(bytes)),
+                        };
+                        table.files.push(SourceFileEntry {
+                            path,
+                            checksum_kind: checksum_kind.to_string(),
+                            checksum,
+                        });
+                        (table.files.len() - 1) as u32
+                    });
+                    local_files.insert(line.file_index.0, idx);
+                    idx
+                }
+            };
+
+            table.lines.push(LineEntry {
+                rva,
+                length: line.length.unwrap_or(0),
+                file_index: global_file_index,
+                line_start: line.line_start,
+                line_end: line.line_end,
+                col_start: line.column_start,
+                col_end: line.column_end,
+            });
+        }
+    }
+
+    table.lines.sort_by_key(|l| l.rva);
+    for (idx, line) in table.lines.iter().enumerate() {
+        table.by_file.entry(line.file_index).or_default().push(idx as u32);
+    }
+    for indices in table.by_file.values_mut() {
+        indices.sort_by_key(|&i| table.lines[i as usize].line_start);
+    }
+
+    trace!(path = %pdb_path.display(), files = table.files.len(), lines = table.lines.len(), "Parsed PDB line table");
+    Ok(table)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Parse a user-supplied PDB after validating its GUID/age against the module's

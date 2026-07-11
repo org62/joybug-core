@@ -1,4 +1,4 @@
-use crate::interfaces::{ModuleSymbol, ResolvedSymbol, SymbolConfig, SymbolError, SymbolProvider};
+use crate::interfaces::{LineEntry, ModuleSymbol, ResolvedSymbol, SourceFileEntry, SourceLineRef, SymbolConfig, SymbolError, SymbolProvider};
 use crate::protocol::{ModuleInfo, ModuleSymbolStatus, PdbLoadOutcome, SymbolLoadState};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, Condvar, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{trace, warn, error};
-use crate::windows_platform::symbol_provider::{WindowsSymbolProvider, parse_pdb_to_symbols, parse_pdb_matching_pe};
+use crate::windows_platform::symbol_provider::{WindowsSymbolProvider, ModuleLineTable, parse_pdb_to_symbols, parse_pdb_matching_pe, parse_pdb_to_lines};
 use pelite::pe64::{Pe, PeFile};
 use pelite::image::{RUNTIME_FUNCTION, UNWIND_INFO, UNW_FLAG_CHAININFO};
 
@@ -16,6 +16,12 @@ pub struct ModuleSymbols {
     pub module_base: u64, // Base address where the module is loaded
     pub symbols: Vec<ModuleSymbol>, // All symbols stored as RVAs
     pub pdb_path: Option<String>, // PDB file the symbols were loaded from
+}
+
+/// Result of a lazy line-table parse, cached per module.
+enum LineTableState {
+    Ready(Arc<ModuleLineTable>),
+    Failed(String),
 }
 
 /// Cached PE exception data for chain resolution
@@ -35,6 +41,11 @@ pub struct SymbolManager {
 
     /// Cached .pdata + PE bytes per module for chain resolution
     pdata_cache: Mutex<HashMap<String, Option<PdataCache>>>,
+
+    /// Lazily parsed PDB line tables per module (module_path -> state).
+    /// Populated on the first source-level request, never during the
+    /// background symbol load.
+    line_cache: Mutex<HashMap<String, LineTableState>>,
 
     /// Set of modules currently being loaded
     pending_loads: Arc<Mutex<HashSet<String>>>,
@@ -145,6 +156,7 @@ impl SymbolManager {
         Ok(Self {
             symbol_cache,
             pdata_cache: Mutex::new(HashMap::new()),
+            line_cache: Mutex::new(HashMap::new()),
             pending_loads,
             failed_loads,
             pending_cv,
@@ -307,9 +319,145 @@ impl SymbolManager {
             });
         }
         self.failed_loads.lock().unwrap().remove(&module.name);
+        // The line table came from the previous PDB; re-parse from the new one on demand.
+        self.invalidate_line_table(&module.name);
 
         trace!(module_path = %module.name, pdb_path = %pdb_path.display(), symbol_count, force, "Loaded user-supplied PDB");
         Ok(PdbLoadOutcome::Loaded { symbol_count })
+    }
+
+    /// Get (lazily parsing) the PDB line table for a module.
+    /// Returns `Ok(None)` without blocking while the module's symbols are still
+    /// loading (the client re-requests once symbols finish), and when no PDB is
+    /// available. A failed parse is cached and returned as an error.
+    pub fn get_line_table(&self, module_path: &str) -> Result<Option<Arc<ModuleLineTable>>, SymbolError> {
+        {
+            let cache = self.line_cache.lock().unwrap();
+            match cache.get(module_path) {
+                Some(LineTableState::Ready(table)) => return Ok(Some(table.clone())),
+                Some(LineTableState::Failed(msg)) => {
+                    return Err(SymbolError::PdbParsingFailed(msg.clone()));
+                }
+                None => {}
+            }
+        }
+
+        // Symbols (and therefore the PDB download) still in flight: don't block.
+        {
+            let pending = self.pending_loads.lock().unwrap();
+            if pending.contains(module_path) {
+                return Ok(None);
+            }
+        }
+
+        let pdb_path = {
+            let cache = self.symbol_cache.lock().unwrap();
+            match cache.get(module_path).and_then(|m| m.pdb_path.clone()) {
+                Some(path) => path,
+                None => return Ok(None), // no PDB (load failed / not requested / no path)
+            }
+        };
+
+        // Parse outside all locks; a rare duplicate parse under concurrency is fine.
+        let state = match parse_pdb_to_lines(Path::new(&pdb_path)) {
+            Ok(table) => LineTableState::Ready(Arc::new(table)),
+            Err(e) => {
+                warn!(module_path, pdb_path = %pdb_path, error = %e, "Failed to parse PDB line table");
+                LineTableState::Failed(e.to_string())
+            }
+        };
+        let mut cache = self.line_cache.lock().unwrap();
+        let state = cache.entry(module_path.to_string()).or_insert(state);
+        match state {
+            LineTableState::Ready(table) => Ok(Some(table.clone())),
+            LineTableState::Failed(msg) => Err(SymbolError::PdbParsingFailed(msg.clone())),
+        }
+    }
+
+    /// Drop a module's cached line table (e.g. after a user loads a different PDB).
+    pub fn invalidate_line_table(&self, module_path: &str) {
+        self.line_cache.lock().unwrap().remove(module_path);
+    }
+
+    /// Resolve an RVA against an already-parsed line table.
+    /// Picks the entry covering `[rva, rva+length)`; for zero-length entries the
+    /// nearest entry at or below the RVA wins (entries are RVA-sorted).
+    fn resolve_rva_in_table(table: &ModuleLineTable, rva: u32) -> Option<(SourceFileEntry, LineEntry)> {
+        let idx = table.lines.partition_point(|l| l.rva <= rva);
+        if idx == 0 {
+            return None;
+        }
+        let entry = &table.lines[idx - 1];
+        if entry.length > 0 && rva >= entry.rva + entry.length {
+            return None; // in the gap past this entry's covered range
+        }
+        let file = table.files.get(entry.file_index as usize)?.clone();
+        Some((file, entry.clone()))
+    }
+
+    /// Resolve an RVA to a source line, lazily parsing the module's line table.
+    pub fn resolve_rva_to_line(&self, module_path: &str, rva: u32) -> Result<Option<(SourceFileEntry, LineEntry)>, SymbolError> {
+        match self.get_line_table(module_path)? {
+            Some(table) => Ok(Self::resolve_rva_in_table(&table, rva)),
+            None => Ok(None),
+        }
+    }
+
+    /// Resolve an absolute address to a source line from ALREADY-CACHED line
+    /// tables only — never triggers a parse. Used by the bulk disassembly
+    /// symbolizer so it can annotate instructions without ever stalling.
+    pub fn try_resolve_address_to_line_cached(&self, modules: &[ModuleInfo], address: u64) -> Option<SourceLineRef> {
+        let module = Self::find_module_binary_search(modules, address)?;
+        let rva = (address - module.base) as u32;
+        let table = {
+            let cache = self.line_cache.lock().unwrap();
+            match cache.get(&module.name) {
+                Some(LineTableState::Ready(table)) => table.clone(),
+                _ => return None,
+            }
+        };
+        let (file, entry) = Self::resolve_rva_in_table(&table, rva)?;
+        Some(SourceLineRef { file_path: file.path, line: entry.line_start })
+    }
+
+    /// All line entries for one source file of a module (case-insensitive path
+    /// match), plus the matched file record. Lazily parses the line table.
+    /// `start_line`/`end_line` (inclusive, 1-based) bound the returned entries by
+    /// `line_start` so the response stays small for very large files.
+    pub fn file_line_map(&self, module_path: &str, file_path: &str, start_line: Option<u32>, end_line: Option<u32>) -> Result<(Option<SourceFileEntry>, Vec<LineEntry>), SymbolError> {
+        let table = match self.get_line_table(module_path)? {
+            Some(table) => table,
+            None => return Ok((None, Vec::new())),
+        };
+        let wanted = file_path.to_lowercase();
+        let file_index = table.files.iter().position(|f| f.path.to_lowercase() == wanted);
+        let Some(file_index) = file_index else {
+            return Ok((None, Vec::new()));
+        };
+        let lo = start_line.unwrap_or(0);
+        let hi = end_line.unwrap_or(u32::MAX);
+        // `by_file` indices are sorted by line_start, so this is a cheap filter.
+        let entries = table
+            .by_file
+            .get(&(file_index as u32))
+            .map(|indices| {
+                indices
+                    .iter()
+                    .map(|&i| &table.lines[i as usize])
+                    .filter(|e| e.line_start >= lo && e.line_start <= hi)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok((Some(table.files[file_index].clone()), entries))
+    }
+
+    /// All source files referenced by a module's line table. Lazily parses it.
+    pub fn list_source_files(&self, module_path: &str) -> Result<Vec<SourceFileEntry>, SymbolError> {
+        match self.get_line_table(module_path)? {
+            Some(table) => Ok(table.files.clone()),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Retry a failed (or never-attempted) symbol download for a module.
@@ -548,7 +696,7 @@ impl SymbolManager {
 
     /// Binary search to find the module containing an address
     /// Much faster than linear scan for large module lists
-    fn find_module_binary_search(modules: &[ModuleInfo], address: u64) -> Option<&ModuleInfo> {
+    pub(crate) fn find_module_binary_search(modules: &[ModuleInfo], address: u64) -> Option<&ModuleInfo> {
         if modules.is_empty() {
             return None;
         }

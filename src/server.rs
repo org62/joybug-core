@@ -280,6 +280,27 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::ResolveAddressToLine { pid, address } => {
+                let p = platform.read().unwrap();
+                match p.resolve_address_to_line(pid, address) {
+                    Ok(info) => DebuggerResponse::AddressLine { info },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::GetSourceFileLineMap { pid, module_base, file_path, start_line, end_line } => {
+                let p = platform.read().unwrap();
+                match p.get_source_file_line_map(pid, module_base, &file_path, start_line, end_line) {
+                    Ok((file, entries)) => DebuggerResponse::SourceFileLineMap { file, entries },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::ListSourceFiles { pid, module_base } => {
+                let p = platform.read().unwrap();
+                match p.list_source_files(pid, module_base) {
+                    Ok(files) => DebuggerResponse::SourceFileList { files },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::DisassembleMemory { pid, address, count, arch } => {
                 let p = platform.read().unwrap();
                 match p.disassemble_memory(pid, address, count, arch) {

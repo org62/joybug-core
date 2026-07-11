@@ -659,6 +659,35 @@ impl PlatformAPI for WindowsPlatform {
         Ok(())
     }
 
+    fn resolve_address_to_line(&self, pid: u32, address: u64) -> Result<Option<crate::protocol::AddressLineInfo>, SymbolError> {
+        let symbol_manager = self.symbols()?;
+        let mut modules = self.modules_for(pid);
+        modules.sort_by_key(|m| m.base);
+        let Some(module) = SymbolManager::find_module_binary_search(&modules, address) else {
+            return Ok(None);
+        };
+        let rva = (address - module.base) as u32;
+        Ok(symbol_manager.resolve_rva_to_line(&module.name, rva)?.map(|(file, line_entry)| {
+            crate::protocol::AddressLineInfo {
+                module_path: module.name.clone(),
+                module_base: module.base,
+                rva,
+                file,
+                line_entry,
+            }
+        }))
+    }
+
+    fn get_source_file_line_map(&self, pid: u32, module_base: u64, file_path: &str, start_line: Option<u32>, end_line: Option<u32>) -> Result<(Option<crate::interfaces::SourceFileEntry>, Vec<crate::interfaces::LineEntry>), SymbolError> {
+        let module = self.module_at(pid, module_base)?;
+        self.symbols()?.file_line_map(&module.name, file_path, start_line, end_line)
+    }
+
+    fn list_source_files(&self, pid: u32, module_base: u64) -> Result<Vec<crate::interfaces::SourceFileEntry>, SymbolError> {
+        let module = self.module_at(pid, module_base)?;
+        self.symbols()?.list_source_files(&module.name)
+    }
+
     // Symbolized disassembly methods
     fn disassemble_memory(&self, pid: u32, address: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
         use std::time::Instant;
@@ -696,6 +725,8 @@ impl PlatformAPI for WindowsPlatform {
         // Sort modules by base address for binary search
         modules.sort_by_key(|m| m.base);
         let module_time = t1.elapsed();
+        // The symbol resolver closure consumes `modules`; keep a copy for line annotation.
+        let modules_for_lines = modules.clone();
 
         let symbol_manager = self.symbol_manager.as_ref();
 
@@ -769,6 +800,15 @@ impl PlatformAPI for WindowsPlatform {
                         instr.jump_target = Some(actual_target);
                     }
                 }
+            }
+        }
+
+        // Annotate with source lines from already-cached line tables only.
+        // The first source-view request triggers the parse; until then this is a no-op,
+        // so bulk disassembly never stalls behind a PDB line-table parse.
+        if let Some(symbol_manager) = self.symbol_manager.as_ref() {
+            for instr in &mut instructions {
+                instr.line_info = symbol_manager.try_resolve_address_to_line_cached(&modules_for_lines, instr.address);
             }
         }
         Ok(instructions)

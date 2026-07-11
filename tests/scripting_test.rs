@@ -662,6 +662,12 @@ fn test_lua_file_load_pdb() {
     run_lua_test_file("modules/load_pdb.lua", Some(&test_exe));
 }
 
+#[test]
+fn test_lua_file_source_lines() {
+    let test_exe = common::get_test_program_path("xtea_test");
+    run_lua_test_file("modules/source_lines.lua", Some(&test_exe));
+}
+
 // --- memory ---
 
 #[test]
@@ -771,6 +777,12 @@ fn test_lua_file_repl_stepping() {
 #[test]
 fn test_lua_file_step_sequence() {
     run_lua_test_file("stepping/step_sequence.lua", None);
+}
+
+#[test]
+fn test_lua_file_step_line() {
+    let test_exe = common::get_test_program_path("xtea_test");
+    run_lua_test_file("stepping/step_line.lua", Some(&test_exe));
 }
 
 // --- emulation ---

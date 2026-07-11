@@ -268,6 +268,7 @@ impl DisassemblerProvider for CapstoneDisassembler {
                     is_ret,
                     jump_target,
                     addresses_to_symbolize,
+                    line_info: None,
                 });
             }
 

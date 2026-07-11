@@ -73,6 +73,16 @@ impl std::fmt::Debug for DebuggerResponse {
             DebuggerResponse::SymbolList { symbols } => f.debug_struct("SymbolList").field("symbols", symbols).finish(),
             DebuggerResponse::ResolvedSymbolList { symbols } => f.debug_struct("ResolvedSymbolList").field("symbols", symbols).finish(),
             DebuggerResponse::AddressSymbol { module_path, symbol, offset } => f.debug_struct("AddressSymbol").field("module_path", module_path).field("symbol", symbol).field("offset", offset).finish(),
+            DebuggerResponse::AddressLine { info } => f.debug_struct("AddressLine")
+                .field("info", &info.as_ref().map(|i| format!("{}:{} (rva 0x{:X})", i.file.path, i.line_entry.line_start, i.rva)))
+                .finish(),
+            DebuggerResponse::SourceFileLineMap { file, entries } => f.debug_struct("SourceFileLineMap")
+                .field("file", &file.as_ref().map(|f| f.path.as_str()))
+                .field("entries", &entries.len())
+                .finish(),
+            DebuggerResponse::SourceFileList { files } => f.debug_struct("SourceFileList")
+                .field("count", &files.len())
+                .finish(),
             DebuggerResponse::Instructions { instructions } => f.debug_struct("Instructions").field("instructions", instructions).finish(),
             DebuggerResponse::FunctionArguments { arguments } => f.debug_struct("FunctionArguments").field("arguments", arguments).finish(),
             DebuggerResponse::WideStringData { data } => f.debug_struct("WideStringData").field("data", data).finish(),

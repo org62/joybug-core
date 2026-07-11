@@ -397,6 +397,29 @@ pub mod request_response {
             pid: u32,
             address: u64,
         },
+        /// Resolve an address to a source file/line via the module's PDB line table.
+        ResolveAddressToLine {
+            pid: u32,
+            address: u64,
+        },
+        /// All line→address entries for one source file of a module. When
+        /// `start_line`/`end_line` are set, only entries whose `line_start` falls
+        /// in that inclusive range are returned — bounding the response for very
+        /// large files (windowed source view). `None` = whole file.
+        GetSourceFileLineMap {
+            pid: u32,
+            module_base: u64,
+            file_path: String,
+            #[serde(default)]
+            start_line: Option<u32>,
+            #[serde(default)]
+            end_line: Option<u32>,
+        },
+        /// All source files referenced by a module's PDB line table.
+        ListSourceFiles {
+            pid: u32,
+            module_base: u64,
+        },
         DisassembleMemory {
             pid: u32,
             address: u64,
@@ -629,6 +652,13 @@ pub mod request_response {
             symbol: Option<crate::interfaces::ModuleSymbol>,
             offset: Option<u64>,
         },
+        // Source line responses
+        AddressLine { info: Option<AddressLineInfo> },
+        SourceFileLineMap {
+            file: Option<crate::interfaces::SourceFileEntry>,
+            entries: Vec<crate::interfaces::LineEntry>,
+        },
+        SourceFileList { files: Vec<crate::interfaces::SourceFileEntry> },
         // Disassembly responses
         Instructions { instructions: Vec<crate::interfaces::Instruction> },
         /// Function disassembly with bounds from exception directory
@@ -871,6 +901,16 @@ pub mod request_response {
         pub state: SymbolLoadState,
         /// Path of the PDB the symbols were loaded from, when loaded.
         pub pdb_path: Option<String>,
+    }
+
+    /// A resolved address → source line mapping, as returned by `ResolveAddressToLine`.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct AddressLineInfo {
+        pub module_path: String,
+        pub module_base: u64,
+        pub rva: u32,
+        pub file: crate::interfaces::SourceFileEntry,
+        pub line_entry: crate::interfaces::LineEntry,
     }
 
     /// PE vs PDB identity (GUID + age) details for a rejected PDB load.

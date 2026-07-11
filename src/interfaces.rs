@@ -85,6 +85,40 @@ pub struct Instruction {
     pub is_ret: bool,            // ret instruction
     pub jump_target: Option<u64>, // Target address if resolvable (for jumps/calls)
     pub addresses_to_symbolize: Vec<u64>, // Addresses extracted from operands for symbolization
+    #[serde(default)]
+    pub line_info: Option<SourceLineRef>, // Source file/line, if the module's line table is loaded
+}
+
+/// A source file referenced by a module's PDB line table.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SourceFileEntry {
+    /// File path as recorded in the PDB (compile-time path).
+    pub path: String,
+    /// Checksum algorithm: "md5" | "sha1" | "sha256" | "none".
+    pub checksum_kind: String,
+    /// Hex-encoded checksum of the file contents; empty when kind is "none".
+    pub checksum: String,
+}
+
+/// One address-range → source-line mapping from a PDB line table.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LineEntry {
+    pub rva: u32,
+    /// Byte length of the covered code; 0 if unknown.
+    pub length: u32,
+    /// Index into the module's deduplicated source file list.
+    pub file_index: u32,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub col_start: Option<u32>,
+    pub col_end: Option<u32>,
+}
+
+/// A resolved source location attached to an instruction.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SourceLineRef {
+    pub file_path: String,
+    pub line: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -279,6 +313,22 @@ pub trait PlatformAPI: Send + Sync {
     /// Retry a failed symbol download for a module.
     fn retry_symbol_load(&self, _pid: u32, _module_base: u64) -> Result<(), SymbolError> {
         Err(SymbolError::SymbolsNotFound("Symbol retry not supported by this platform".to_string()))
+    }
+
+    // Source line methods (PDB line tables)
+    /// Resolve an address to a source file/line. Lazily parses the module's line table.
+    fn resolve_address_to_line(&self, _pid: u32, _address: u64) -> Result<Option<crate::protocol::AddressLineInfo>, SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Source line resolution not supported by this platform".to_string()))
+    }
+    /// All line→address entries for one source file of a module, plus the matched
+    /// file record. `start_line`/`end_line` (inclusive, 1-based) bound the returned
+    /// entries by `line_start`; `None` = whole file.
+    fn get_source_file_line_map(&self, _pid: u32, _module_base: u64, _file_path: &str, _start_line: Option<u32>, _end_line: Option<u32>) -> Result<(Option<SourceFileEntry>, Vec<LineEntry>), SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Source line maps not supported by this platform".to_string()))
+    }
+    /// All source files referenced by a module's PDB line table.
+    fn list_source_files(&self, _pid: u32, _module_base: u64) -> Result<Vec<SourceFileEntry>, SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Source file listing not supported by this platform".to_string()))
     }
 
     // Symbolized disassembly methods

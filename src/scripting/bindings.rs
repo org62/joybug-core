@@ -516,6 +516,18 @@ impl LuaUserData for LuaDebugClient {
             client.step_and_wait(pid, tid, StepKind::Out)
         });
 
+        // Step by one source line. `dir` is "into" (default) or "over".
+        methods.add_method("step_line", |_lua, this, (dir, pid, tid): (Option<String>, Option<u32>, Option<u32>)| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let tid = tid.or(client.current_tid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current tid")))?;
+            let kind = match dir.as_deref() {
+                Some("over") => StepKind::Over,
+                _ => StepKind::Into,
+            };
+            client.step_source_line_and_wait(pid, tid, kind)
+        });
+
         // ---- Memory ----
 
         methods.add_method("read_memory", |lua, this, (pid, addr, size): (u32, u64, usize)| {
@@ -873,6 +885,87 @@ impl LuaUserData for LuaDebugClient {
                 DebuggerResponse::Ack => Ok(true),
                 DebuggerResponse::Error { message } => Err(mlua::Error::external(
                     anyhow::anyhow!("RetrySymbolLoad failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // ---- Source lines (PDB line tables) ----
+
+        methods.add_method("resolve_line", |lua, this, (pid, addr): (u32, u64)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::ResolveAddressToLine {
+                pid, address: addr,
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::AddressLine { info } => {
+                    match info {
+                        Some(info) => {
+                            let table = lua.create_table()?;
+                            table.set("module", info.module_path.as_str())?;
+                            table.set("module_base", info.module_base)?;
+                            table.set("rva", info.rva as u64)?;
+                            table.set("file", info.file.path.as_str())?;
+                            table.set("checksum_kind", info.file.checksum_kind.as_str())?;
+                            table.set("checksum", info.file.checksum.as_str())?;
+                            table.set("line", info.line_entry.line_start)?;
+                            table.set("line_end", info.line_entry.line_end)?;
+                            table.set("length", info.line_entry.length as u64)?;
+                            Ok(mlua::Value::Table(table))
+                        }
+                        None => Ok(mlua::Value::Nil),
+                    }
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("ResolveAddressToLine failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        methods.add_method("line_map", |lua, this, (pid, module_base, file_path, start_line, end_line): (u32, u64, String, Option<u32>, Option<u32>)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::GetSourceFileLineMap {
+                pid, module_base, file_path, start_line, end_line,
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::SourceFileLineMap { file: _, entries } => {
+                    let table = lua.create_table()?;
+                    for (i, entry) in entries.iter().enumerate() {
+                        let et = lua.create_table()?;
+                        et.set("rva", entry.rva as u64)?;
+                        et.set("length", entry.length as u64)?;
+                        et.set("line", entry.line_start)?;
+                        et.set("line_end", entry.line_end)?;
+                        table.set(i + 1, et)?;
+                    }
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("GetSourceFileLineMap failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        methods.add_method("source_files", |lua, this, (pid, module_base): (u32, u64)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::ListSourceFiles { pid, module_base })
+                .map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::SourceFileList { files } => {
+                    let table = lua.create_table()?;
+                    for (i, file) in files.iter().enumerate() {
+                        let ft = lua.create_table()?;
+                        ft.set("path", file.path.as_str())?;
+                        ft.set("checksum_kind", file.checksum_kind.as_str())?;
+                        ft.set("checksum", file.checksum.as_str())?;
+                        table.set(i + 1, ft)?;
+                    }
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("ListSourceFiles failed: {}", message),
                 )),
                 _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
             }

@@ -1,10 +1,10 @@
 use crate::interfaces::{Architecture, Instruction, ModuleSymbol};
 use crate::pe_types::ModuleExtraInfo;
 pub use crate::protocol::{
-    DebuggerRequest, DebuggerResponse, DebugEvent, EmulationMode, HardwareBreakpointSize,
-    HardwareBreakpointType, ModuleInfo, ModuleSymbolStatus, PdbLoadOutcome, PdbMismatchInfo,
-    ProcessInfo, ScanCompareType, ScanValue, ScanValueType, StepAction, StepKind,
-    SymbolLoadState, ThreadContext, ThreadInfo, TraceExitCondition,
+    AddressLineInfo, DebuggerRequest, DebuggerResponse, DebugEvent, EmulationMode,
+    HardwareBreakpointSize, HardwareBreakpointType, ModuleInfo, ModuleSymbolStatus,
+    PdbLoadOutcome, PdbMismatchInfo, ProcessInfo, ScanCompareType, ScanValue, ScanValueType,
+    StepAction, StepKind, SymbolLoadState, ThreadContext, ThreadInfo, TraceExitCondition,
 };
 
 /// Result from trace_instructions()
@@ -144,6 +144,9 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::SymbolStatusList { statuses } => format!("SymbolStatusList ({} modules)", statuses.len()),
         DebuggerResponse::PdbLoaded { symbol_count } => format!("PdbLoaded ({} symbols)", symbol_count),
         DebuggerResponse::PdbMismatch(_) => "PdbMismatch".to_string(),
+        DebuggerResponse::AddressLine { .. } => "AddressLine".to_string(),
+        DebuggerResponse::SourceFileLineMap { entries, .. } => format!("SourceFileLineMap ({} entries)", entries.len()),
+        DebuggerResponse::SourceFileList { files } => format!("SourceFileList ({} files)", files.len()),
     };
     debug!("Received response: {}", summary);
     Ok(resp)
@@ -1062,6 +1065,76 @@ impl<S> DebugSession<S> {
             )),
             other => Err(anyhow::anyhow!(
                 "Unexpected response to ResolveAddressToSymbol: {:?}",
+                other
+            )),
+        }
+    }
+
+    /// Resolve an address to a source file/line via the module's PDB line table.
+    pub fn resolve_address_to_line(
+        &mut self,
+        pid: u32,
+        address: u64,
+    ) -> anyhow::Result<Option<crate::protocol::AddressLineInfo>> {
+        let req = DebuggerRequest::ResolveAddressToLine { pid, address };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::AddressLine { info } => Ok(info),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!(
+                "Failed to resolve address to line: {}",
+                message
+            )),
+            other => Err(anyhow::anyhow!(
+                "Unexpected response to ResolveAddressToLine: {:?}",
+                other
+            )),
+        }
+    }
+
+    /// All line→address entries for one source file of a module. `start_line`/
+    /// `end_line` (inclusive, 1-based) bound the response; `None` = whole file.
+    pub fn get_source_file_line_map(
+        &mut self,
+        pid: u32,
+        module_base: u64,
+        file_path: &str,
+        start_line: Option<u32>,
+        end_line: Option<u32>,
+    ) -> anyhow::Result<(Option<crate::interfaces::SourceFileEntry>, Vec<crate::interfaces::LineEntry>)> {
+        let req = DebuggerRequest::GetSourceFileLineMap {
+            pid,
+            module_base,
+            file_path: file_path.to_string(),
+            start_line,
+            end_line,
+        };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::SourceFileLineMap { file, entries } => Ok((file, entries)),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!(
+                "Failed to get source file line map: {}",
+                message
+            )),
+            other => Err(anyhow::anyhow!(
+                "Unexpected response to GetSourceFileLineMap: {:?}",
+                other
+            )),
+        }
+    }
+
+    /// All source files referenced by a module's PDB line table.
+    pub fn list_source_files(
+        &mut self,
+        pid: u32,
+        module_base: u64,
+    ) -> anyhow::Result<Vec<crate::interfaces::SourceFileEntry>> {
+        let req = DebuggerRequest::ListSourceFiles { pid, module_base };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::SourceFileList { files } => Ok(files),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!(
+                "Failed to list source files: {}",
+                message
+            )),
+            other => Err(anyhow::anyhow!(
+                "Unexpected response to ListSourceFiles: {:?}",
                 other
             )),
         }
