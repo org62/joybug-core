@@ -504,7 +504,7 @@ impl SymbolManager {
             // against a large catalog doesn't allocate for the misses.
             for entry in info.summaries() {
                 if let Some(f) = filter {
-                    if !contains_ignore_ascii_case(&entry.name, f) {
+                    if !crate::string_results::contains_ascii_ci(entry.name.as_bytes(), f.as_bytes()) {
                         continue;
                     }
                 }
@@ -1010,17 +1010,3 @@ fn extract_module_name(module_path: &str) -> String {
         .to_string()
 }
 
-/// Allocation-free ASCII-case-insensitive substring test (PDB type names are
-/// ASCII); used by the type filter, which runs over the whole catalog per query.
-fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-    if needle.len() > haystack.len() {
-        return false;
-    }
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
-}

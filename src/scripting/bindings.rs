@@ -1576,6 +1576,88 @@ impl LuaUserData for LuaDebugClient {
             }
         });
 
+        // ---- String scanning ----
+
+        // string_scan_start(pid, start_address, size, [min_length=5], [region_filter="readable"], [encodings="both"], [contains=""])
+        // Scan [start_address, start_address+size) for printable ASCII/UTF-16
+        // strings. `region_filter` is "readable"|"writable"|"executable"|"image"|
+        // "mapped"|"private"; `encodings` is "both"|"ascii"|"utf16"; `contains`
+        // keeps only strings containing the substring (case-insensitive).
+        // -> { results_path, match_count, scan_time_us, capped }
+        methods.add_method("string_scan_start", |lua, this, (pid, start_address, size, min_length, region_filter, encodings, contains): (u32, u64, u64, Option<u32>, Option<String>, Option<String>, Option<String>)| {
+            let region_filter = region_filter
+                .map(|s| s.parse().map_err(mlua::Error::external))
+                .transpose()?
+                .unwrap_or_default();
+            let encodings = encodings
+                .map(|s| s.parse().map_err(mlua::Error::external))
+                .transpose()?
+                .unwrap_or_default();
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::StringScanStart {
+                pid, start_address, size,
+                min_length: min_length.unwrap_or(5),
+                max_results: None,
+                thread_count: None,
+                region_filter,
+                encodings,
+                contains: contains.unwrap_or_default(),
+            }).map_err(mlua::Error::external)?;
+            match resp {
+                DebuggerResponse::StringScanResult { results_path, match_count, scan_time_us, capped } => {
+                    let table = lua.create_table()?;
+                    table.set("results_path", results_path)?;
+                    table.set("match_count", match_count)?;
+                    table.set("scan_time_us", scan_time_us)?;
+                    table.set("capped", capped)?;
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("StringScanStart failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // string_scan_results(results_path, [offset=0], [count=100], [filter=""], [sort="address"], [ascending=true])
+        // `sort` is "address", "value", or "length". -> { total_count, strings = { { address, encoding, length, text, truncated }, .. } }
+        methods.add_method("string_scan_results", |lua, this, (results_path, offset, count, filter, sort, ascending): (String, Option<u64>, Option<u64>, Option<String>, Option<String>, Option<bool>)| {
+            let sort: StringSortKey = sort.as_deref().and_then(|s| s.parse().ok()).unwrap_or_default();
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::StringScanGetResults {
+                results_path, offset: offset.unwrap_or(0), count: count.unwrap_or(100),
+                filter: filter.unwrap_or_default(), sort, ascending: ascending.unwrap_or(true),
+            }).map_err(mlua::Error::external)?;
+            match resp {
+                DebuggerResponse::StringScanResults { strings, total_count } => {
+                    let table = lua.create_table()?;
+                    let list = lua.create_table()?;
+                    for (i, s) in strings.iter().enumerate() {
+                        let st = lua.create_table()?;
+                        st.set("address", s.address)?;
+                        st.set("encoding", s.encoding.as_str())?;
+                        st.set("length", s.length)?;
+                        st.set("text", s.text.clone())?;
+                        st.set("truncated", s.truncated)?;
+                        list.set(i + 1, st)?;
+                    }
+                    table.set("strings", list)?;
+                    table.set("total_count", total_count)?;
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("StringScanGetResults failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        methods.add_method("string_scan_reset", |_lua, this, results_path: String| {
+            let mut client = this.inner.borrow_mut();
+            let _ = client.send_and_receive(&DebuggerRequest::StringScanReset { results_path });
+            Ok(())
+        });
+
         // ---- Utility: current state ----
 
         methods.add_method("pid", |_lua, this, ()| {

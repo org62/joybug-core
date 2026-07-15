@@ -3,9 +3,11 @@ use crate::pe_types::ModuleExtraInfo;
 pub use crate::protocol::{
     AddressLineInfo, DebuggerRequest, DebuggerResponse, DebugEvent, EmulationMode,
     HardwareBreakpointSize, HardwareBreakpointType, ModuleInfo, ModuleSymbolStatus,
-    PdbLoadOutcome, PdbMismatchInfo, ProcessInfo, ScanCompareType, ScanValue, ScanValueType,
-    StepAction, StepKind, SymbolLoadState, ThreadContext, ThreadInfo, TraceExitCondition,
-    TypeClass, TypeEnumValue, TypeLayout, TypeMember, TypeRef, TypeSummary, UdtKind,
+    PdbLoadOutcome, PdbMismatchInfo, ProcessInfo, ScanCompareType, ScanRegionFilter, ScanValue,
+    ScanValueType, StepAction, StepKind, StringEncodingFilter, StringHit, StringSortKey,
+    SymbolLoadState, ThreadContext, ThreadInfo,
+    TraceExitCondition, TypeClass, TypeEnumValue, TypeLayout, TypeMember, TypeRef, TypeSummary,
+    UdtKind,
 };
 
 /// Result from trace_instructions()
@@ -137,6 +139,8 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::ScanMemoryResults { addresses, total_count, .. } => format!("ScanMemoryResults ({}/{} returned)", addresses.len(), total_count),
         DebuggerResponse::PointerScanResult { match_count, .. } => format!("PointerScanResult ({} paths)", match_count),
         DebuggerResponse::PointerScanResults { paths, total_count } => format!("PointerScanResults ({}/{} returned)", paths.len(), total_count),
+        DebuggerResponse::StringScanResult { match_count, capped, .. } => format!("StringScanResult ({} strings{})", match_count, if *capped { ", capped" } else { "" }),
+        DebuggerResponse::StringScanResults { strings, total_count } => format!("StringScanResults ({}/{} returned)", strings.len(), total_count),
         DebuggerResponse::PebHideResult { report } => format!(
             "PebHideResult (peb=0x{:X}, applied={}, failed={}, wow64_skipped={})",
             report.peb_address, report.applied.len(), report.failures.len(), report.wow64_skipped,
@@ -1598,6 +1602,58 @@ impl<S> DebugSession<S> {
             DebuggerResponse::Ack => Ok(()),
             DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to reset pointer scan: {}", message)),
             other => Err(anyhow::anyhow!("Unexpected response to PointerScanReset: {:?}", other)),
+        }
+    }
+
+    /// Start a string scan over `[start_address, start_address+size)`, visiting
+    /// only regions matching `region_filter`, detecting only `encodings`, and
+    /// (when `contains` is non-empty) storing only strings containing it.
+    /// Returns `(results_path, match_count, scan_time_us, capped)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn string_scan_start(
+        &mut self,
+        pid: u32,
+        start_address: u64,
+        size: u64,
+        min_length: u32,
+        max_results: Option<u64>,
+        thread_count: Option<usize>,
+        region_filter: ScanRegionFilter,
+        encodings: StringEncodingFilter,
+        contains: String,
+    ) -> anyhow::Result<(String, u64, u64, bool)> {
+        let req = DebuggerRequest::StringScanStart { pid, start_address, size, min_length, max_results, thread_count, region_filter, encodings, contains };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::StringScanResult { results_path, match_count, scan_time_us, capped } => Ok((results_path, match_count, scan_time_us, capped)),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to start string scan: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to StringScanStart: {:?}", other)),
+        }
+    }
+
+    /// Read a page of string-scan results, filtered and sorted server-side.
+    pub fn string_scan_get_results(
+        &mut self,
+        results_path: String,
+        offset: u64,
+        count: u64,
+        filter: String,
+        sort: StringSortKey,
+        ascending: bool,
+    ) -> anyhow::Result<(Vec<StringHit>, u64)> {
+        let req = DebuggerRequest::StringScanGetResults { results_path, offset, count, filter, sort, ascending };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::StringScanResults { strings, total_count } => Ok((strings, total_count)),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to get string scan results: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to StringScanGetResults: {:?}", other)),
+        }
+    }
+
+    pub fn string_scan_reset(&mut self, results_path: String) -> anyhow::Result<()> {
+        let req = DebuggerRequest::StringScanReset { results_path };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to reset string scan: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to StringScanReset: {:?}", other)),
         }
     }
 

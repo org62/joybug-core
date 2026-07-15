@@ -170,6 +170,20 @@ impl std::fmt::Debug for DebuggerResponse {
                     .field("total_count", total_count)
                     .finish()
             }
+            DebuggerResponse::StringScanResult { results_path, match_count, scan_time_us, capped } => {
+                f.debug_struct("StringScanResult")
+                    .field("results_path", results_path)
+                    .field("match_count", match_count)
+                    .field("scan_time_us", scan_time_us)
+                    .field("capped", capped)
+                    .finish()
+            }
+            DebuggerResponse::StringScanResults { strings, total_count } => {
+                f.debug_struct("StringScanResults")
+                    .field("returned", &strings.len())
+                    .field("total_count", total_count)
+                    .finish()
+            }
             DebuggerResponse::PebHideResult { report } => {
                 f.debug_struct("PebHideResult")
                     .field("peb_address", &format_args!("0x{:X}", report.peb_address))

@@ -22,7 +22,10 @@ use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
 
 use crate::interfaces::PlatformAPI;
-use crate::memory_scanner::{enumerate_scannable_regions, install_pool, read_region_chunked};
+use crate::memory_scanner::{
+    delete_results_file, enumerate_scannable_regions, install_pool, read_region_chunked,
+    unique_temp_path,
+};
 use crate::protocol::PointerPath;
 
 /// Pointer size on the supported 64-bit targets (x64 / ARM64).
@@ -148,11 +151,7 @@ pub struct PointerScanner;
 
 /// Unique temp-file path for a scan's results.
 fn results_file_path(pid: u32) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    std::env::temp_dir().join(format!("joybug_ptrresults_{}_{}.bin", pid, nanos))
+    unique_temp_path("ptrresults", pid)
 }
 
 /// A node in the reverse walk: the address we are currently looking for pointers
@@ -200,7 +199,12 @@ impl PointerScanner {
         // `writable_only` we scan only writable regions (heap/stack/.data) — much
         // faster on processes with large read-only mappings, but misses static
         // roots in read-only sections.
-        let regions = enumerate_scannable_regions(platform, pid, writable_only)?;
+        let region_filter = if writable_only {
+            crate::protocol::ScanRegionFilter::Writable
+        } else {
+            crate::protocol::ScanRegionFilter::Readable
+        };
+        let regions = enumerate_scannable_regions(platform, pid, region_filter)?;
 
         // Sorted, disjoint region ranges for the "is this value a plausible
         // pointer?" bounds filter.
@@ -329,8 +333,7 @@ impl PointerScanner {
     }
 
     pub fn reset_scan(&self, results_path: &str) -> Result<(), String> {
-        let _ = std::fs::remove_file(results_path);
-        Ok(())
+        delete_results_file(results_path, "joybug_ptrresults_")
     }
 
     /// Commit a quick filter: keep only paths whose chain offsets contain every

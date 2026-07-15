@@ -9,7 +9,7 @@ use memmap2::{Mmap, MmapOptions};
 use rayon::prelude::*;
 
 use crate::interfaces::PlatformAPI;
-use crate::protocol::{ScanCompareType, ScanValue, ScanValueType};
+use crate::protocol::{ScanCompareType, ScanRegionFilter, ScanValue, ScanValueType};
 use crate::scan_results::{ScanResultReader, ScanResultWriter, TempPath};
 
 /// Batch size for streaming the previous scan generation through a next-scan
@@ -27,13 +27,28 @@ const SNAPSHOT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// timestamp so concurrent scans (and parallel build segments) never collide.
 static FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn unique_temp_path(prefix: &str, pid: u32) -> PathBuf {
+pub(crate) fn unique_temp_path(prefix: &str, pid: u32) -> PathBuf {
     let id = FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     std::env::temp_dir().join(format!("joybug_{}_{}_{}_{}.bin", prefix, pid, id, nanos))
+}
+
+/// Delete a scan-results temp file, refusing any path whose filename doesn't
+/// carry `expected_prefix` — a network client could otherwise unlink arbitrary
+/// server-side files via a `*ScanReset` request.
+pub(crate) fn delete_results_file(path: &str, expected_prefix: &str) -> Result<(), String> {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if !name.starts_with(expected_prefix) {
+        return Err("Refusing to delete non-scan file".to_string());
+    }
+    let _ = std::fs::remove_file(path);
+    Ok(())
 }
 
 const PAGE_NOACCESS: u32 = 0x01;
@@ -150,7 +165,8 @@ impl MemoryScanner {
         let val_size = value_type.size();
 
         let start = Instant::now();
-        let regions = enumerate_scannable_regions(platform, pid, writable_only)?;
+        let region_filter = if writable_only { ScanRegionFilter::Writable } else { ScanRegionFilter::Readable };
+        let regions = enumerate_scannable_regions(platform, pid, region_filter)?;
 
         let (storage, match_count) = if compare_type == ScanCompareType::UnknownInitialValue {
             // Snapshot every region's bytes to a disk-backed mmap file instead of
@@ -361,8 +377,13 @@ fn validate_type_match(value_type: ScanValueType, value: &ScanValue) -> Result<(
 
 /// Writable protection mask: PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
 const PAGE_WRITABLE_MASK: u32 = 0x04 | 0x08 | 0x40 | 0x80;
+/// Executable protection mask: PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
+const PAGE_EXECUTABLE_MASK: u32 = 0x10 | 0x20 | 0x40 | 0x80;
+const MEM_IMAGE: u32 = 0x100_0000;
+const MEM_MAPPED: u32 = 0x4_0000;
+const MEM_PRIVATE: u32 = 0x2_0000;
 
-pub(crate) fn enumerate_scannable_regions(platform: &dyn PlatformAPI, pid: u32, writable_only: bool) -> Result<Vec<(u64, usize)>, String> {
+pub(crate) fn enumerate_scannable_regions(platform: &dyn PlatformAPI, pid: u32, filter: ScanRegionFilter) -> Result<Vec<(u64, usize)>, String> {
     let regions = platform.enumerate_memory_regions(pid)
         .map_err(|e| format!("Failed to enumerate memory regions: {}", e))?;
 
@@ -372,7 +393,14 @@ pub(crate) fn enumerate_scannable_regions(platform: &dyn PlatformAPI, pid: u32, 
             && r.protect != 0
             && (r.protect & PAGE_NOACCESS) == 0
             && (r.protect & PAGE_GUARD) == 0
-            && (!writable_only || (r.protect & PAGE_WRITABLE_MASK) != 0)
+            && match filter {
+                ScanRegionFilter::Readable => true,
+                ScanRegionFilter::Writable => (r.protect & PAGE_WRITABLE_MASK) != 0,
+                ScanRegionFilter::Executable => (r.protect & PAGE_EXECUTABLE_MASK) != 0,
+                ScanRegionFilter::Image => r.region_type == MEM_IMAGE,
+                ScanRegionFilter::Mapped => r.region_type == MEM_MAPPED,
+                ScanRegionFilter::Private => r.region_type == MEM_PRIVATE,
+            }
         })
         .map(|r| (r.base_address, r.region_size as usize))
         .collect())
@@ -384,7 +412,7 @@ pub(crate) fn enumerate_scannable_regions(platform: &dyn PlatformAPI, pid: u32, 
 /// continue (used by the value scan, so a single bad page doesn't truncate the
 /// region) or stop (used when streaming raw bytes, where a gap can't be tolerated).
 /// `f` returns `false` to stop early (e.g. on a downstream write error).
-fn for_each_region_chunk(
+pub(crate) fn for_each_region_chunk(
     platform: &dyn PlatformAPI,
     pid: u32,
     base: u64,

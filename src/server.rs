@@ -41,6 +41,7 @@ where
     let mut framed_stream = FramedJsonStream::new(stream);
     let mut scanner = crate::memory_scanner::MemoryScanner::new();
     let mut pointer_scanner = crate::pointer_scanner::PointerScanner::new();
+    let mut string_scanner = crate::string_scanner::StringScanner::new();
     // Per-connection value freezes; dropped (which stops all threads) on disconnect.
     let mut freeze_manager = crate::freeze_manager::FreezeManager::new();
     loop {
@@ -500,6 +501,25 @@ where
                 let p = platform.read().unwrap();
                 match pointer_scanner.rescan(&*p, pid, &results_path, target_address) {
                     Ok((results_path, match_count, scan_time_us)) => DebuggerResponse::PointerScanResult { results_path, match_count, scan_time_us },
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::StringScanStart { pid, start_address, size, min_length, max_results, thread_count, region_filter, encodings, contains } => {
+                let p = platform.read().unwrap();
+                match string_scanner.start_scan(&*p, pid, start_address, size, min_length, max_results, thread_count, region_filter, encodings, &contains) {
+                    Ok((results_path, match_count, scan_time_us, capped)) => DebuggerResponse::StringScanResult { results_path, match_count, scan_time_us, capped },
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::StringScanGetResults { results_path, offset, count, filter, sort, ascending } => {
+                match string_scanner.get_results(&results_path, offset, count, &filter, sort, ascending) {
+                    Ok((strings, total_count)) => DebuggerResponse::StringScanResults { strings, total_count },
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::StringScanReset { results_path } => {
+                match string_scanner.reset_scan(&results_path) {
+                    Ok(()) => DebuggerResponse::Ack,
                     Err(e) => DebuggerResponse::Error { message: e },
                 }
             }

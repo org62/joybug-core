@@ -14,6 +14,8 @@ pub mod assembler;
 pub mod memory_scanner;
 pub mod pointer_scanner;
 pub mod pointer_results;
+pub mod string_scanner;
+pub mod string_results;
 pub mod scan_results;
 pub mod freeze_manager;
 pub mod scripting;

@@ -491,6 +491,42 @@ local re = dbg:ptr_scan_rescan(pid, kept.results_path, target)
 dbg:ptr_scan_reset(re.results_path)
 ```
 
+### String Scanning
+
+Find printable ASCII and UTF-16LE strings in a memory span (e.g. a module's
+`[base, base+size)`, or `0, 2^48` for the whole user address space). Like pointer
+scanning, results stream to a server-side file identified by its **path**, and are
+filtered/sorted/paged on the server.
+
+```lua
+-- Pick a module to scan.
+local mod
+for _, m in ipairs(dbg:list_modules(pid)) do
+    if string.find(m.name:lower(), "myapp.exe", 1, true) then mod = m end
+end
+
+-- Scan for strings >= 5 chars. -> { results_path, match_count, scan_time_us, capped }
+-- Optional args after min_length:
+--   region_filter: "readable" (default) | "writable" | "executable" | "image" | "mapped" | "private"
+--   encodings:     "both" (default) | "ascii" | "utf16"
+--   contains:      store only strings containing this substring (case-insensitive)
+local scan = dbg:string_scan_start(pid, mod.base, mod.size, 5)
+print(scan.match_count .. " strings found" .. (scan.capped and " (capped)" or ""))
+
+-- e.g. UTF-16 strings containing "license" anywhere in writable memory:
+-- local scan = dbg:string_scan_start(pid, 0, 0xFFFFFFFFFFFF, 5, "writable", "utf16", "license")
+
+-- Page results (offset, count) with an optional case-insensitive substring
+-- filter and sort ("address" | "value" | "length", ascending). -> { total_count, strings }
+local res = dbg:string_scan_results(scan.results_path, 0, 100, "error", "value", true)
+for _, s in ipairs(res.strings) do
+    -- s = { address, encoding = "ascii"|"utf16", length, text, truncated }
+    print(string.format("0x%x  [%s]  %s", s.address, s.encoding, s.text))
+end
+
+dbg:string_scan_reset(scan.results_path)
+```
+
 ### Anti-Anti-Debug
 
 Defeat common anti-debug probes by patching well-known fields in the target's PEB.

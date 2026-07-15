@@ -625,6 +625,48 @@ pub mod request_response {
             results_path: String,
             target_address: u64,
         },
+        // String scan: find printable ASCII/UTF-16 strings in a memory span
+        StringScanStart {
+            pid: u32,
+            /// Start of the span to scan (e.g. a module base).
+            start_address: u64,
+            /// Length of the span in bytes (e.g. a module size).
+            size: u64,
+            /// Minimum string length in characters (clamped to 2..=128).
+            min_length: u32,
+            /// Cap on stored hits. `None` = engine default (1,000,000).
+            #[serde(default)]
+            max_results: Option<u64>,
+            /// Number of threads to use. `None`/`Some(0)` = all cores.
+            #[serde(default)]
+            thread_count: Option<usize>,
+            /// Which memory regions inside the span to scan.
+            #[serde(default)]
+            region_filter: ScanRegionFilter,
+            /// Which string encodings to detect.
+            #[serde(default)]
+            encodings: StringEncodingFilter,
+            /// Case-insensitive substring a string must contain to be stored.
+            /// Empty = keep every string.
+            #[serde(default)]
+            contains: String,
+        },
+        StringScanGetResults {
+            results_path: String,
+            offset: u64,
+            count: u64,
+            /// Case-insensitive substring filter. Empty = no filter. `offset`/
+            /// `count` page over the filtered set; `total_count` is the match count.
+            #[serde(default)]
+            filter: String,
+            #[serde(default)]
+            sort: StringSortKey,
+            #[serde(default = "default_true")]
+            ascending: bool,
+        },
+        StringScanReset {
+            results_path: String,
+        },
         // Anti-anti-debug
         HidePeb {
             pid: u32,
@@ -754,6 +796,19 @@ pub mod request_response {
         },
         PointerScanResults {
             paths: Vec<PointerPath>,
+            total_count: u64,
+        },
+        StringScanResult {
+            /// Path of the disk file holding this scan's results.
+            results_path: String,
+            match_count: u64,
+            scan_time_us: u64,
+            /// True if more strings were found than the cap; only the first
+            /// `match_count` (in address order) are stored.
+            capped: bool,
+        },
+        StringScanResults {
+            strings: Vec<StringHit>,
             total_count: u64,
         },
         /// Tenet format trace result (for TraceInstructions and EmulateInstructions with InstructionTrace mode)
@@ -1097,6 +1152,128 @@ pub mod request_response {
         pub offsets: Vec<u64>,
         /// Address this path resolves to (equals the scan target at scan time).
         pub resolved: u64,
+    }
+
+    fn default_true() -> bool {
+        true
+    }
+
+    /// Encoding of a discovered string.
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+    pub enum StringEncoding {
+        Ascii,
+        Utf16,
+    }
+
+    impl StringEncoding {
+        /// Canonical lowercase name used by every string-facing surface (UI, Lua).
+        pub fn as_str(self) -> &'static str {
+            match self {
+                StringEncoding::Ascii => "ascii",
+                StringEncoding::Utf16 => "utf16",
+            }
+        }
+    }
+
+    /// Sort key for paging string-scan results.
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum StringSortKey {
+        /// Ascending memory address (the file's natural order).
+        #[default]
+        Address,
+        /// Lexicographic by string value (case-insensitive).
+        Value,
+        /// By string length in characters (ties stay address-ordered).
+        Length,
+    }
+
+    impl std::str::FromStr for StringSortKey {
+        type Err = String;
+
+        /// Parses the canonical lowercase names "address" / "value" / "length".
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s {
+                "address" => Ok(StringSortKey::Address),
+                "value" => Ok(StringSortKey::Value),
+                "length" => Ok(StringSortKey::Length),
+                _ => Err(format!("unknown string sort key '{}'", s)),
+            }
+        }
+    }
+
+    /// Which memory regions a scan should visit. Every variant implies the base
+    /// requirements (committed, not NOACCESS, not guard); the protection/type
+    /// variants narrow further.
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum ScanRegionFilter {
+        /// Any readable committed memory (the base filter alone).
+        #[default]
+        Readable,
+        /// Writable pages only.
+        Writable,
+        /// Executable pages only.
+        Executable,
+        /// Image-backed regions (loaded modules, MEM_IMAGE).
+        Image,
+        /// Mapped-file regions (MEM_MAPPED).
+        Mapped,
+        /// Private regions — heaps, stacks, VirtualAlloc'd memory (MEM_PRIVATE).
+        Private,
+    }
+
+    impl std::str::FromStr for ScanRegionFilter {
+        type Err = String;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s {
+                "readable" => Ok(ScanRegionFilter::Readable),
+                "writable" => Ok(ScanRegionFilter::Writable),
+                "executable" => Ok(ScanRegionFilter::Executable),
+                "image" => Ok(ScanRegionFilter::Image),
+                "mapped" => Ok(ScanRegionFilter::Mapped),
+                "private" => Ok(ScanRegionFilter::Private),
+                _ => Err(format!("unknown region filter '{}'", s)),
+            }
+        }
+    }
+
+    /// Which string encodings a string scan detects.
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum StringEncodingFilter {
+        /// Detect both ASCII and UTF-16 strings.
+        #[default]
+        Both,
+        /// Detect ASCII strings only.
+        Ascii,
+        /// Detect UTF-16 strings only.
+        Utf16,
+    }
+
+    impl std::str::FromStr for StringEncodingFilter {
+        type Err = String;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s {
+                "both" => Ok(StringEncodingFilter::Both),
+                "ascii" => Ok(StringEncodingFilter::Ascii),
+                "utf16" => Ok(StringEncodingFilter::Utf16),
+                _ => Err(format!("unknown encoding filter '{}'", s)),
+            }
+        }
+    }
+
+    /// A single string found by the string scanner.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct StringHit {
+        /// Address of the first byte of the string.
+        pub address: u64,
+        pub encoding: StringEncoding,
+        /// True length in characters (may exceed the stored `text` length).
+        pub length: u32,
+        /// The string text, truncated to a fixed cap of characters.
+        pub text: String,
+        /// True if `text` was truncated (i.e. `length` exceeds the stored cap).
+        pub truncated: bool,
     }
 
     /// Entry for a single address in a dereference chain
