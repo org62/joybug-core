@@ -4,7 +4,7 @@ use crate::protocol::ModuleInfo;
 #[cfg(target_arch = "aarch64")]
 use super::debugged_process::InternalHardwareBreakpoint;
 use tracing::{error, trace, warn};
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, FALSE, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, DUPLICATE_SAME_ACCESS, HANDLE, DuplicateHandle, STATUS_SINGLE_STEP, MAX_PATH};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, FALSE, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, DBG_REPLY_LATER, DUPLICATE_SAME_ACCESS, HANDLE, DuplicateHandle, NTSTATUS, STATUS_SINGLE_STEP, MAX_PATH};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, INFINITE};
 use windows_sys::Win32::System::Diagnostics::Debug::{
     ContinueDebugEvent, WaitForDebugEvent, DEBUG_EVENT, EXCEPTION_DEBUG_EVENT,
@@ -17,6 +17,20 @@ use std::ptr;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 
 // Non-locking helpers to minimize lock holding in server
+fn continue_with_status(pid: u32, tid: u32, status: NTSTATUS, label: &str) -> Result<(), PlatformError> {
+    let cont_res = unsafe { ContinueDebugEvent(pid, tid, status) };
+    if cont_res == FALSE {
+        let error = unsafe { GetLastError() };
+        let error_str = utils::error_message(error);
+        error!(error, error_str, "{} failed", label);
+        return Err(PlatformError::OsError(format!(
+            "{} failed: {} ({})",
+            label, error, error_str
+        )));
+    }
+    Ok(())
+}
+
 pub fn continue_debug_event(pid: u32, tid: u32, pass_exception: bool) -> Result<(), PlatformError> {
     let status = if pass_exception {
         DBG_EXCEPTION_NOT_HANDLED
@@ -24,22 +38,36 @@ pub fn continue_debug_event(pid: u32, tid: u32, pass_exception: bool) -> Result<
         DBG_CONTINUE
     };
     trace!(pid, tid, pass_exception, "ContinueDebugEvent");
-    let cont_res = unsafe { ContinueDebugEvent(pid, tid, status) };
-    if cont_res == FALSE {
-        let error = unsafe { GetLastError() };
-        let error_str = utils::error_message(error);
-        error!(error, error_str, "ContinueDebugEvent failed");
-        return Err(PlatformError::OsError(format!(
-            "ContinueDebugEvent failed: {} ({})",
-            error, error_str
-        )));
-    }
-    Ok(())
+    continue_with_status(pid, tid, status, "ContinueDebugEvent")
 }
 
 /// Convenience wrapper that always uses DBG_CONTINUE
 pub fn continue_only(pid: u32, tid: u32) -> Result<(), PlatformError> {
     continue_debug_event(pid, tid, false)
+}
+
+/// Continue a debug event with DBG_REPLY_LATER (Windows 10 1507+): the event is
+/// re-queued and the reporting thread stays suspended, to be delivered again on a
+/// later WaitForDebugEvent. Used to defer another thread's exception while a
+/// software-breakpoint step-over is in flight, so it is not processed until the
+/// breakpoint has been re-armed. This is the same mechanism x64dbg/TitanEngine
+/// use for their multi-threaded "safe step".
+pub fn continue_reply_later(pid: u32, tid: u32) -> Result<(), PlatformError> {
+    trace!(pid, tid, "ContinueDebugEvent (DBG_REPLY_LATER)");
+    continue_with_status(pid, tid, DBG_REPLY_LATER, "ContinueDebugEvent(DBG_REPLY_LATER)")
+}
+
+/// Whether `debug_event` must be deferred with [`continue_reply_later`] instead
+/// of dispatched: another thread of the same process is mid software-breakpoint
+/// step-over (INT3 removed), so the event must not be processed until the
+/// breakpoint is re-armed. Every event pump that dispatches exceptions while
+/// step-overs may be in flight should consult this before `handle_debug_event`.
+pub(super) fn should_defer_event(platform: &WindowsPlatform, debug_event: &DEBUG_EVENT) -> bool {
+    debug_event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT
+        && platform
+            .get_process(debug_event.dwProcessId)
+            .map(|proc| proc.is_stepping_over_other_thread(debug_event.dwThreadId))
+            .unwrap_or(false)
 }
 
 pub fn wait_for_debug_event_blocking() -> Result<DEBUG_EVENT, PlatformError> {
@@ -464,6 +492,14 @@ pub(super) fn handle_exception_event(
 
             // Not a step-out: schedule SS to pass and re-arm
             process.schedule_rearm_after_single_step(tid, address, false);
+            // Freeze all other threads for the duration of the single-step so no
+            // other thread can execute through `address` while its INT3 is
+            // temporarily removed (multi-threaded software-breakpoint race). They
+            // are resumed once every stepper's breakpoint is re-armed.
+            let frozen = process.begin_step_over(tid, address);
+            if frozen > 0 {
+                trace!(pid, tid, address = %format!("0x{:X}", address), frozen, "Froze other threads for breakpoint step-over");
+            }
             let mut ctx2 = match super::thread_context::get_thread_context(process, pid, tid)? {
                 crate::protocol::ThreadContext::Win32RawContext(ctx) => ctx,
             };
@@ -511,8 +547,13 @@ pub(super) fn handle_exception_event(
             trace!(pid = pid, tid = tid, rearm_addr = %format!("0x{:X}", rearm_addr), "SS used for persistent breakpoint re-arm");
             if let Err(e) = stepper::clear_single_step_flag_native2(platform, pid, tid) { error!("Failed to clear single-step flag: {}", e); }
             {
-                let process = platform.get_process(pid)?;
-                let _ = process.rearm_persistent_breakpoint_if_matches_original(rearm_addr);
+                let process = platform.get_process_mut(pid)?;
+                // This thread finished stepping over its breakpoint: re-arm the
+                // INT3 and, once no step-over remains, resume the frozen threads.
+                let resumed = process.complete_step_over(tid);
+                if resumed > 0 {
+                    trace!(pid, tid, resumed, "Resumed other threads after breakpoint step-over");
+                }
             }
             return Ok(None);
         }
@@ -586,8 +627,16 @@ pub(super) fn handle_exception_event(
                 if let Err(e) = stepper::clear_single_step_flag_native2(platform, pid, tid) { error!("Failed to clear single-step flag: {}", e); }
             }
             {
-                let process = platform.get_process(pid)?;
+                let process = platform.get_process_mut(pid)?;
                 let _ = process.rearm_persistent_breakpoint_if_matches_original(rearm_addr);
+                // If this step was an explicit user step that took over an
+                // in-flight software-breakpoint step-over, the other threads were
+                // frozen at the breakpoint hit; re-arm that breakpoint and release
+                // them. No-op if this thread was not mid-step-over.
+                let resumed = process.complete_step_over(tid);
+                if resumed > 0 {
+                    trace!(pid, tid, resumed, "Resumed other threads after breakpoint step-over (explicit step)");
+                }
             }
             return Ok(Some(crate::protocol::DebugEvent::StepComplete { pid, tid, kind: step_state.kind, address: ex_record.ExceptionAddress as u64 }));
         }

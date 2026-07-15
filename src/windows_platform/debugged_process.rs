@@ -1,8 +1,9 @@
 use crate::interfaces::{Architecture, PlatformError};
 use crate::protocol::{HardwareBreakpointType, HardwareBreakpointSize};
-use tracing::{error, warn};
+use tracing::{error, trace, warn};
 use windows_sys::Win32::Foundation::{FALSE, GetLastError, HANDLE};
 use windows_sys::Win32::System::Diagnostics::Debug::{SymCleanup, SymInitialize};
+use windows_sys::Win32::System::Threading::{ResumeThread, SuspendThread};
 
 #[derive(Debug, Clone)]
 pub(crate) struct InternalHardwareBreakpoint {
@@ -33,6 +34,15 @@ pub(crate) struct DebuggedProcess {
     step_out_breakpoints: std::collections::HashMap<u64, (u32, u64)>, // (tid, original_return_address)
     /// Track threads that need re-arming after a single-step: tid -> (address, is_single_shot)
     pending_rearm_breakpoints: std::collections::HashMap<u32, (u64, bool)>,
+    /// Threads currently stepping over a temporarily-removed software breakpoint
+    /// (INT3 removed, awaiting the single-step that re-arms it), mapped to the
+    /// breakpoint address they are stepping over. Such a thread must be allowed to
+    /// run and must never be frozen by another thread's step-over.
+    stepping_over_threads: std::collections::HashMap<u32, u64>,
+    /// Threads we have `SuspendThread`'d (exactly once each) to keep them out of
+    /// a software breakpoint while its INT3 is removed. Resumed once no step-over
+    /// remains in flight.
+    frozen_threads: std::collections::HashSet<u32>,
     /// Hardware breakpoints (DR0-DR3, max 4)
     hardware_breakpoints: Vec<InternalHardwareBreakpoint>,
     /// Pending HW BP re-arm after single-step: tid -> dr_index
@@ -66,6 +76,8 @@ impl DebuggedProcess {
             step_over_breakpoints: std::collections::HashMap::new(),
             step_out_breakpoints: std::collections::HashMap::new(),
             pending_rearm_breakpoints: std::collections::HashMap::new(),
+            stepping_over_threads: std::collections::HashMap::new(),
+            frozen_threads: std::collections::HashSet::new(),
             hardware_breakpoints: Vec::new(),
             pending_hw_bp_rearm: std::collections::HashMap::new(),
         })
@@ -174,6 +186,122 @@ impl DebuggedProcess {
     /// Remove and return a pending rearm entry for a thread, if any.
     pub(super) fn take_pending_rearm_for_tid(&mut self, tid: u32) -> Option<(u64, bool)> {
         self.pending_rearm_breakpoints.remove(&tid)
+    }
+
+    /// Begin a software-breakpoint step-over for `tid` at `address`: freeze every
+    /// other thread so none can execute through `address` while its INT3 is
+    /// temporarily removed (the multi-threaded software-breakpoint race).
+    ///
+    /// `ContinueDebugEvent` resumes the *entire* process, not just the stepping
+    /// thread, so without this freeze another thread could run straight through
+    /// the now-INT3-less address and its hit would be silently lost.
+    ///
+    /// Only one step-over is ever in flight at a time: the debug loop defers any
+    /// other thread's exception with `DBG_REPLY_LATER` (see `server_continue`)
+    /// until the step-over completes, so a second thread that also hit the same
+    /// breakpoint is not processed concurrently. The stepping thread itself is
+    /// never frozen (it must run to deliver its single-step); a defensive thaw is
+    /// kept in case an earlier step-over had frozen it.
+    ///
+    /// Returns the number of threads newly frozen.
+    pub(super) fn begin_step_over(&mut self, tid: u32, address: u64) -> usize {
+        self.stepping_over_threads.insert(tid, address);
+
+        // The stepping thread must run; thaw it if an earlier step-over froze it.
+        if self.frozen_threads.remove(&tid) {
+            if let Some(handle) = self.thread_manager.get_thread_handle(tid) {
+                unsafe { ResumeThread(handle); }
+            }
+        }
+
+        let mut newly_frozen = 0;
+        for (other, handle) in self.thread_manager.iter_handles() {
+            if other == tid
+                || self.stepping_over_threads.contains_key(&other)
+                || self.frozen_threads.contains(&other)
+            {
+                continue;
+            }
+            // SuspendThread returns the previous suspend count, or (DWORD)-1 on failure.
+            let prev = unsafe { SuspendThread(handle) };
+            if prev == u32::MAX {
+                // Typically a thread that has already exited (the thread manager
+                // keeps handles across exit); such a thread cannot run through the
+                // breakpoint anyway, so this is not a correctness concern.
+                let err = unsafe { GetLastError() };
+                trace!(tid = other, err, "SuspendThread skipped during breakpoint step-over (thread may have exited)");
+            } else {
+                self.frozen_threads.insert(other);
+                newly_frozen += 1;
+            }
+        }
+        newly_frozen
+    }
+
+    /// Whether some *other* thread is currently mid software-breakpoint step-over
+    /// (INT3 removed) — i.e. an event for `tid` should be deferred via
+    /// `DBG_REPLY_LATER` rather than processed now. False for the stepping thread's
+    /// own single-step event.
+    pub(super) fn is_stepping_over_other_thread(&self, tid: u32) -> bool {
+        self.stepping_over_threads.keys().any(|&stepper| stepper != tid)
+    }
+
+    /// Complete the step-over for `tid` (its single-step has delivered): re-arm
+    /// the INT3 it was stepping over and, once no step-over remains in flight,
+    /// resume the threads frozen by [`begin_step_over`]. The order is the safety
+    /// contract — frozen threads may only run again after the INT3 is back in
+    /// place.
+    ///
+    /// `DBG_REPLY_LATER` guarantees at most one thread is ever mid-step-over at a
+    /// time (another thread's breakpoint event is deferred, not processed
+    /// concurrently), so no per-address deferral is needed here.
+    ///
+    /// No-op returning 0 if `tid` was not mid-step-over. Returns the number of
+    /// threads resumed.
+    pub(super) fn complete_step_over(&mut self, tid: u32) -> usize {
+        let Some(addr) = self.stepping_over_threads.remove(&tid) else {
+            return 0;
+        };
+        let _ = self.rearm_persistent_breakpoint_if_matches_original(addr);
+        if self.stepping_over_threads.is_empty() {
+            self.resume_frozen_threads()
+        } else {
+            0
+        }
+    }
+
+    /// Resume every thread frozen for a step-over. Returns the number resumed.
+    pub(super) fn resume_frozen_threads(&mut self) -> usize {
+        let mut resumed = 0;
+        for other in std::mem::take(&mut self.frozen_threads) {
+            if let Some(handle) = self.thread_manager.get_thread_handle(other) {
+                let prev = unsafe { ResumeThread(handle) };
+                if prev == u32::MAX {
+                    let err = unsafe { GetLastError() };
+                    trace!(tid = other, err, "ResumeThread skipped after breakpoint step-over (thread may have exited)");
+                } else {
+                    resumed += 1;
+                }
+            }
+        }
+        resumed
+    }
+
+    /// Drop `tid` from all step-over bookkeeping (used when a thread exits). If it
+    /// was the last stepper in flight, remaining frozen threads are resumed.
+    pub(super) fn forget_thread_step_over(&mut self, tid: u32) {
+        self.frozen_threads.remove(&tid);
+        self.stepping_over_threads.remove(&tid);
+        if self.stepping_over_threads.is_empty() {
+            self.resume_frozen_threads();
+        }
+    }
+
+    /// Resume every frozen thread and clear step-over state (safety net on
+    /// process cleanup).
+    pub(super) fn resume_all_step_over_suspensions(&mut self) {
+        self.stepping_over_threads.clear();
+        self.resume_frozen_threads();
     }
 
     /// Record that a thread is in an active single-step operation. Returns true if an existing

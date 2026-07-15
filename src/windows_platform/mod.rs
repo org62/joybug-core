@@ -162,6 +162,7 @@ impl WindowsPlatform {
     /// Cleanup all step-related breakpoint state for a process
     fn cleanup_step_state_for_process(&mut self, pid: u32) -> (usize, usize) {
         if let Some(proc) = self.processes.get_mut(&pid) {
+            proc.resume_all_step_over_suspensions();
             let removed_over = proc.clear_step_over_breakpoints();
             let removed_out = proc.clear_step_out_breakpoints();
 
@@ -177,6 +178,8 @@ impl WindowsPlatform {
     /// Cleanup all step-related breakpoint state for a specific thread
     fn cleanup_step_state_for_thread(&mut self, pid: u32, tid: u32) -> (usize, usize) {
         if let Some(proc) = self.processes.get_mut(&pid) {
+            // If the exiting thread was mid step-over, drop it and lift its freeze.
+            proc.forget_thread_step_over(tid);
             let removed_over = proc.retain_step_over_breakpoints_excluding_tid(tid);
             let removed_out = proc.retain_step_out_breakpoints_excluding_tid(tid);
 
@@ -943,15 +946,40 @@ impl PlatformAPI for WindowsPlatform {
         let mut cont_pid = pid;
         let mut cont_tid = tid;
         let mut cont_pass = pass_exception;
+        let mut cont_reply_later = false;
         loop {
-            crate::windows_platform::debug_events::continue_debug_event(
-                cont_pid, cont_tid, cont_pass,
-            )?;
+            if cont_reply_later {
+                crate::windows_platform::debug_events::continue_reply_later(cont_pid, cont_tid)?;
+            } else {
+                crate::windows_platform::debug_events::continue_debug_event(
+                    cont_pid, cont_tid, cont_pass,
+                )?;
+            }
 
             let debug_event =
                 crate::windows_platform::debug_events::wait_for_debug_event_blocking()?;
 
             let mut p = platform.write().unwrap();
+
+            // Multi-threaded software-breakpoint safety: while one thread is
+            // stepping over a temporarily-removed INT3, defer any OTHER thread's
+            // exception via DBG_REPLY_LATER instead of processing it. Windows
+            // re-queues the event and keeps that thread suspended until the
+            // step-over completes and the breakpoint is re-armed. Combined with
+            // suspending the other threads when the step-over begins, this closes
+            // the race (a thread sailing through the disarmed address) and — by
+            // ensuring only one step-over is ever in flight — avoids the
+            // double-hit that concurrent step-overs would cause. Same approach as
+            // x64dbg/TitanEngine's "safe step".
+            if crate::windows_platform::debug_events::should_defer_event(&p, &debug_event) {
+                drop(p);
+                cont_pid = debug_event.dwProcessId;
+                cont_tid = debug_event.dwThreadId;
+                cont_reply_later = true;
+                continue;
+            }
+
+            cont_reply_later = false;
             match crate::windows_platform::debug_events::handle_debug_event(&mut *p, &debug_event)?
             {
                 Some(event) => return Ok(Some(event)),

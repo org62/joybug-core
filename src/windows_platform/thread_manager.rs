@@ -33,8 +33,14 @@ impl ThreadManager {
         self.threads.values().map(|(info, _)| info.clone()).collect()
     }
 
+    /// Borrowing variant of [`all_thread_handles`](Self::all_thread_handles) for
+    /// hot paths — no per-call allocation.
+    pub fn iter_handles(&self) -> impl Iterator<Item = (u32, HANDLE)> + '_ {
+        self.threads.iter().map(|(tid, (_, handle))| (*tid, handle.0))
+    }
+
     pub fn all_thread_handles(&self) -> Vec<(u32, HANDLE)> {
-        self.threads.iter().map(|(tid, (_, handle))| (*tid, handle.0)).collect()
+        self.iter_handles().collect()
     }
 
     pub fn clear(&mut self) {

@@ -175,9 +175,13 @@ pub(super) fn attach(platform: &mut WindowsPlatform, pid: u32) -> Result<Option<
 pub(super) fn detach(platform: &mut WindowsPlatform, pid: u32) -> Result<(), PlatformError> {
     trace!(pid, "WindowsPlatform::detach called");
 
-    // Restore original bytes for software breakpoints first, so the target does
-    // not execute leftover int3/brk instructions once we're gone.
-    platform.get_process_mut(pid)?.restore_all_software_breakpoints();
+    // Undo debugger-injected side effects first: restore original bytes for
+    // software breakpoints (so the target does not execute leftover int3/brk
+    // instructions once we're gone) and lift any step-over thread suspensions
+    // (DebugActiveProcessStop does not undo explicit SuspendThread calls).
+    let proc = platform.get_process_mut(pid)?;
+    proc.restore_all_software_breakpoints();
+    proc.resume_all_step_over_suspensions();
 
     // DebugActiveProcessStop cleanly ends the debug relationship: it flushes any
     // pending debug event, resumes the target, and lets it keep running without
