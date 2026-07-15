@@ -180,7 +180,7 @@ impl WindowsSymbolProvider {
 
 }
 
-fn open_pdb(pdb_path: &Path) -> Result<PDB<'static, File>, SymbolError> {
+pub(crate) fn open_pdb(pdb_path: &Path) -> Result<PDB<'static, File>, SymbolError> {
     let file = File::open(pdb_path).map_err(SymbolError::IoError)?;
     PDB::open(file)
         .map_err(|e| SymbolError::PdbParsingFailed(format!("PDB::open for {}: {}", pdb_path.display(), e)))

@@ -890,6 +890,81 @@ impl LuaUserData for LuaDebugClient {
             }
         });
 
+        // ---- Types (PDB TPI stream) ----
+
+        methods.add_method("list_types", |lua, this, (filter, pid, module_base, max_results): (Option<String>, Option<u32>, Option<u64>, Option<usize>)| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::ListTypes {
+                pid, module_base, filter, max_results: max_results.unwrap_or(1000),
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::TypeList { types } => {
+                    let table = lua.create_table()?;
+                    for (i, t) in types.iter().enumerate() {
+                        let st = lua.create_table()?;
+                        st.set("name", t.name.as_str())?;
+                        st.set("size", t.size as u64)?;
+                        st.set("index", t.index as u64)?;
+                        st.set("module_base", t.module_base)?;
+                        st.set("module", t.module_name.as_str())?;
+                        table.set(i + 1, st)?;
+                    }
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("ListTypes failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        methods.add_method("get_type", |lua, this, (name, pid, module_base): (String, Option<u32>, Option<u64>)| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::GetType {
+                pid, module_base, name,
+            }).map_err(|e| mlua::Error::external(e))?;
+            type_result_to_lua(lua, resp, "GetType")
+        });
+
+        methods.add_method("get_type_by_index", |lua, this, (module_base, index, pid): (u64, u32, Option<u32>)| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::GetTypeByIndex {
+                pid, module_base, index,
+            }).map_err(|e| mlua::Error::external(e))?;
+            type_result_to_lua(lua, resp, "GetTypeByIndex")
+        });
+
+        methods.add_method("get_teb_address", |_lua, this, (tid, pid): (u32, Option<u32>)| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::GetTebAddress { pid, tid })
+                .map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::TebAddress { address } => Ok(address),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("GetTebAddress failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        methods.add_method("get_peb_address", |_lua, this, pid: Option<u32>| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::GetPebAddress { pid })
+                .map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::PebAddress { address } => Ok(address),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("GetPebAddress failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
         // ---- Source lines (PDB line tables) ----
 
         methods.add_method("resolve_line", |lua, this, (pid, addr): (u32, u64)| {
@@ -1882,6 +1957,123 @@ fn address_symbol_to_lua_table(lua: &Lua, module_path: Option<String>, symbol: O
         table.set("offset", off)?;
     }
     Ok(table)
+}
+
+/// Convert a resolved `TypeLayout` into a Lua table:
+/// `{ name, size, kind, index, module_base, members = { {name, offset, type, size, kind,
+///    [type_index], [pointee], [element], [count], [bit_position], [bit_length]} },
+///    values = { {name, value} } }`.
+/// `type_index` (for udt/enum members) feeds `dbg:get_type_by_index`; `pointee`/
+/// `element` are nested `{type, size, kind, [type_index], ...}` tables.
+fn type_layout_to_lua_table(lua: &Lua, layout: &TypeLayout) -> mlua::Result<LuaTable> {
+    let table = lua.create_table()?;
+    table.set("name", layout.name.as_str())?;
+    table.set("size", layout.size as u64)?;
+    table.set("index", layout.index as u64)?;
+    table.set("module_base", layout.module_base)?;
+    table.set("kind", type_kind_str(layout.kind))?;
+
+    let members = lua.create_table()?;
+    for (i, m) in layout.members.iter().enumerate() {
+        let mt = lua.create_table()?;
+        mt.set("name", m.name.as_str())?;
+        mt.set("offset", m.offset as u64)?;
+        mt.set("type", m.type_ref.name.as_str())?;
+        mt.set("size", m.type_ref.size as u64)?;
+        mt.set("kind", type_class_str(&m.type_ref.class))?;
+        set_type_class_fields(lua, &mt, &m.type_ref.class)?;
+        if let Some(bp) = m.bit_position {
+            mt.set("bit_position", bp as u64)?;
+        }
+        if let Some(bl) = m.bit_length {
+            mt.set("bit_length", bl as u64)?;
+        }
+        members.set(i + 1, mt)?;
+    }
+    table.set("members", members)?;
+
+    if !layout.enum_values.is_empty() {
+        let values = lua.create_table()?;
+        for (i, v) in layout.enum_values.iter().enumerate() {
+            let vt = lua.create_table()?;
+            vt.set("name", v.name.as_str())?;
+            vt.set("value", v.value)?;
+            values.set(i + 1, vt)?;
+        }
+        table.set("values", values)?;
+    }
+    Ok(table)
+}
+
+fn type_kind_str(kind: UdtKind) -> &'static str {
+    match kind {
+        UdtKind::Struct => "struct",
+        UdtKind::Class => "class",
+        UdtKind::Union => "union",
+        UdtKind::Enum => "enum",
+    }
+}
+
+fn type_class_str(class: &TypeClass) -> &'static str {
+    match class {
+        TypeClass::Int => "int",
+        TypeClass::UInt => "uint",
+        TypeClass::Float => "float",
+        TypeClass::Bool => "bool",
+        TypeClass::Char => "char",
+        TypeClass::WChar => "wchar",
+        TypeClass::Void => "void",
+        TypeClass::Pointer { .. } => "pointer",
+        TypeClass::Array { .. } => "array",
+        TypeClass::Udt { .. } => "udt",
+        TypeClass::Enum { .. } => "enum",
+        TypeClass::Unknown => "unknown",
+    }
+}
+
+/// Structured fields for a type class, mirroring what the protocol carries:
+/// the TPI `type_index` for udt/enum (feeds `get_type_by_index`), and nested
+/// `pointee`/`element` (+ `count`) tables for pointers/arrays.
+fn set_type_class_fields(lua: &Lua, table: &LuaTable, class: &TypeClass) -> mlua::Result<()> {
+    match class {
+        TypeClass::Udt { index } | TypeClass::Enum { index } => {
+            table.set("type_index", *index as u64)?;
+        }
+        TypeClass::Pointer { pointee } => {
+            table.set("pointee", type_ref_to_lua(lua, pointee)?)?;
+        }
+        TypeClass::Array { element, count } => {
+            table.set("element", type_ref_to_lua(lua, element)?)?;
+            table.set("count", *count as u64)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Convert a `TypeRef` (a pointer's pointee / an array's element) to a Lua table.
+fn type_ref_to_lua(lua: &Lua, r: &TypeRef) -> mlua::Result<LuaTable> {
+    let table = lua.create_table()?;
+    table.set("type", r.name.as_str())?;
+    table.set("size", r.size as u64)?;
+    table.set("kind", type_class_str(&r.class))?;
+    set_type_class_fields(lua, &table, &r.class)?;
+    Ok(table)
+}
+
+/// Convert a TypeResult response (from GetType / GetTypeByIndex) to a Lua value:
+/// the layout table, or nil when the type wasn't found.
+fn type_result_to_lua(lua: &Lua, resp: DebuggerResponse, op_name: &str) -> mlua::Result<LuaValue> {
+    match resp {
+        DebuggerResponse::TypeResult { layout } => match layout {
+            Some(layout) => Ok(LuaValue::Table(type_layout_to_lua_table(lua, &layout)?)),
+            None => Ok(LuaValue::Nil),
+        },
+        DebuggerResponse::Error { message } => Err(mlua::Error::external(
+            anyhow::anyhow!("{} failed: {}", op_name, message),
+        )),
+        _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+    }
 }
 
 /// Convert a ScanMemoryResult response to a Lua table.

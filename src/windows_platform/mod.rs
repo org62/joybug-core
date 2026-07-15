@@ -7,6 +7,7 @@ mod memory;
 mod thread_context;
 mod symbol_manager;
 mod symbol_provider;
+mod type_provider;
 pub mod disassembler;
 mod callstack;
 mod stepper;
@@ -117,6 +118,17 @@ impl WindowsPlatform {
         self.modules_for(pid).into_iter()
             .find(|m| m.base == module_base)
             .ok_or_else(|| SymbolError::ModuleNotLoaded(format!("No module at base 0x{:X}", module_base)))
+    }
+
+    /// Modules to search for a type query: just the one at `module_base`, or the
+    /// full list sorted by base address.
+    fn type_query_modules(&self, pid: u32, module_base: Option<u64>) -> Vec<ModuleInfo> {
+        let mut modules = self.modules_for(pid);
+        match module_base {
+            Some(base) => modules.retain(|m| m.base == base),
+            None => modules.sort_by_key(|m| m.base),
+        }
+        modules
     }
 
     /// Target architecture: the attached process's arch, else the host arch. A
@@ -686,6 +698,24 @@ impl PlatformAPI for WindowsPlatform {
     fn list_source_files(&self, pid: u32, module_base: u64) -> Result<Vec<crate::interfaces::SourceFileEntry>, SymbolError> {
         let module = self.module_at(pid, module_base)?;
         self.symbols()?.list_source_files(&module.name)
+    }
+
+    // Type system methods (PDB TPI stream)
+    fn list_types(&self, pid: u32, module_base: Option<u64>, filter: Option<&str>, max_results: usize) -> Result<Vec<crate::protocol::TypeSummary>, SymbolError> {
+        let symbol_manager = self.symbols()?;
+        let modules = self.type_query_modules(pid, module_base);
+        Ok(symbol_manager.list_types(&modules, filter, max_results))
+    }
+
+    fn get_type(&self, pid: u32, module_base: Option<u64>, name: &str) -> Result<Option<crate::protocol::TypeLayout>, SymbolError> {
+        let symbol_manager = self.symbols()?;
+        let modules = self.type_query_modules(pid, module_base);
+        symbol_manager.get_type(&modules, name)
+    }
+
+    fn get_type_by_index(&self, pid: u32, module_base: u64, index: u32) -> Result<Option<crate::protocol::TypeLayout>, SymbolError> {
+        let module = self.module_at(pid, module_base)?;
+        self.symbols()?.get_type_by_index(&module, index)
     }
 
     // Symbolized disassembly methods

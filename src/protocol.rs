@@ -420,6 +420,38 @@ pub mod request_response {
             pid: u32,
             module_base: u64,
         },
+        /// List UDT/enum types from loaded module PDBs. `module_base = None` searches
+        /// all loaded modules; `filter` is a case-insensitive substring on the name.
+        ListTypes {
+            pid: u32,
+            #[serde(default)]
+            module_base: Option<u64>,
+            #[serde(default)]
+            filter: Option<String>,
+            max_results: usize,
+        },
+        /// Resolve a named type's layout. `module_base = None` searches all modules.
+        GetType {
+            pid: u32,
+            #[serde(default)]
+            module_base: Option<u64>,
+            name: String,
+        },
+        /// Resolve a type by its TPI index within a specific module (nested expansion).
+        GetTypeByIndex {
+            pid: u32,
+            module_base: u64,
+            index: u32,
+        },
+        /// TEB base address of thread `tid` — anchor for overlaying `_TEB`.
+        GetTebAddress {
+            pid: u32,
+            tid: u32,
+        },
+        /// PEB base address of a process — anchor for overlaying `_PEB`.
+        GetPebAddress {
+            pid: u32,
+        },
         DisassembleMemory {
             pid: u32,
             address: u64,
@@ -659,6 +691,11 @@ pub mod request_response {
             entries: Vec<crate::interfaces::LineEntry>,
         },
         SourceFileList { files: Vec<crate::interfaces::SourceFileEntry> },
+        // Type system responses
+        TypeList { types: Vec<TypeSummary> },
+        TypeResult { layout: Option<TypeLayout> },
+        TebAddress { address: u64 },
+        PebAddress { address: u64 },
         // Disassembly responses
         Instructions { instructions: Vec<crate::interfaces::Instruction> },
         /// Function disassembly with bounds from exception directory
@@ -928,6 +965,111 @@ pub mod request_response {
     pub enum PdbLoadOutcome {
         Loaded { symbol_count: usize },
         Mismatch(PdbMismatchInfo),
+    }
+
+    // ---------------------------------------------------------------------
+    // Type system (parsed from the PDB TPI stream)
+    // ---------------------------------------------------------------------
+
+    /// Struct/class/union/enum discriminator.
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+    pub enum UdtKind {
+        Struct,
+        Class,
+        Union,
+        Enum,
+    }
+
+    /// Broad value category of a type — enough for the UI to render raw bytes and
+    /// decide whether a member is expandable. Recursive for pointers/arrays.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub enum TypeClass {
+        /// Signed integer of the ref's `size` bytes.
+        Int,
+        /// Unsigned integer.
+        UInt,
+        /// IEEE floating point (2/4/8/10/16 bytes).
+        Float,
+        /// Boolean.
+        Bool,
+        /// Narrow character (1 byte).
+        Char,
+        /// Wide character (2 bytes).
+        WChar,
+        /// `void` / uncharacterized — rendered as raw bytes.
+        Void,
+        /// Pointer to `pointee` (ref `size` is the pointer width, usually 8).
+        Pointer { pointee: Box<TypeRef> },
+        /// Fixed-length array of `element` with `count` elements.
+        Array { element: Box<TypeRef>, count: u32 },
+        /// Named struct/class/union; `index` is the TPI type index in the owning
+        /// module's PDB, for lazy layout expansion via `GetTypeByIndex`.
+        Udt { index: u32 },
+        /// Enumeration; `index` for value→name lookup via `GetTypeByIndex`.
+        Enum { index: u32 },
+        /// Anything not modeled yet — rendered as raw bytes.
+        Unknown,
+    }
+
+    /// A reference to a type: display name, byte size, and value class.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct TypeRef {
+        /// Human-readable type name, e.g. "unsigned long", "_PEB *", "wchar_t[16]".
+        pub name: String,
+        /// Size in bytes (0 if unknown).
+        pub size: u32,
+        pub class: TypeClass,
+    }
+
+    /// One field of a struct/class/union type.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct TypeMember {
+        pub name: String,
+        /// Byte offset from the start of the containing type.
+        pub offset: u32,
+        pub type_ref: TypeRef,
+        /// Bit offset within the field, for a bitfield member.
+        #[serde(default)]
+        pub bit_position: Option<u8>,
+        /// Bit width, for a bitfield member.
+        #[serde(default)]
+        pub bit_length: Option<u8>,
+    }
+
+    /// An enumerator (name/value pair) of an enum type.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct TypeEnumValue {
+        pub name: String,
+        pub value: i64,
+    }
+
+    /// A fully resolved type layout, one level deep: nested UDT members are
+    /// referenced by index in their `type_ref` and expanded on demand.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct TypeLayout {
+        pub name: String,
+        pub size: u32,
+        pub kind: UdtKind,
+        /// TPI type index of this type within the owning module's PDB.
+        pub index: u32,
+        /// Base address of the module whose PDB defines this type.
+        pub module_base: u64,
+        pub members: Vec<TypeMember>,
+        /// For enums: the enumerator (name, value) pairs.
+        #[serde(default)]
+        pub enum_values: Vec<TypeEnumValue>,
+    }
+
+    /// Lightweight type descriptor for browsing/listing.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct TypeSummary {
+        pub name: String,
+        pub size: u32,
+        pub kind: UdtKind,
+        pub index: u32,
+        pub module_base: u64,
+        /// Owning module file name (for display/grouping).
+        pub module_name: String,
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -5,6 +5,7 @@ pub use crate::protocol::{
     HardwareBreakpointSize, HardwareBreakpointType, ModuleInfo, ModuleSymbolStatus,
     PdbLoadOutcome, PdbMismatchInfo, ProcessInfo, ScanCompareType, ScanValue, ScanValueType,
     StepAction, StepKind, SymbolLoadState, ThreadContext, ThreadInfo, TraceExitCondition,
+    TypeClass, TypeEnumValue, TypeLayout, TypeMember, TypeRef, TypeSummary, UdtKind,
 };
 
 /// Result from trace_instructions()
@@ -147,6 +148,10 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::AddressLine { .. } => "AddressLine".to_string(),
         DebuggerResponse::SourceFileLineMap { entries, .. } => format!("SourceFileLineMap ({} entries)", entries.len()),
         DebuggerResponse::SourceFileList { files } => format!("SourceFileList ({} files)", files.len()),
+        DebuggerResponse::TypeList { types } => format!("TypeList ({} types)", types.len()),
+        DebuggerResponse::TypeResult { layout } => format!("TypeResult ({})", layout.as_ref().map(|l| l.name.as_str()).unwrap_or("none")),
+        DebuggerResponse::TebAddress { .. } => "TebAddress".to_string(),
+        DebuggerResponse::PebAddress { .. } => "PebAddress".to_string(),
     };
     debug!("Received response: {}", summary);
     Ok(resp)
@@ -918,6 +923,100 @@ impl<S> DebugSession<S> {
             }
             other => Err(anyhow::anyhow!("Unexpected response to RetrySymbolLoad: {:?}", other)),
         }
+    }
+
+    /// List UDT/enum types from loaded module PDBs. `module_base = None` searches
+    /// all loaded modules; `filter` is a case-insensitive substring on the name.
+    pub fn list_types(
+        &mut self,
+        pid: u32,
+        module_base: Option<u64>,
+        filter: Option<&str>,
+        max_results: usize,
+    ) -> anyhow::Result<Vec<TypeSummary>> {
+        let req = DebuggerRequest::ListTypes {
+            pid,
+            module_base,
+            filter: filter.map(|s| s.to_string()),
+            max_results,
+        };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::TypeList { types } => Ok(types),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to list types: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to ListTypes: {:?}", other)),
+        }
+    }
+
+    /// Resolve a named type's layout. `module_base = None` searches all modules.
+    pub fn get_type(
+        &mut self,
+        pid: u32,
+        module_base: Option<u64>,
+        name: &str,
+    ) -> anyhow::Result<Option<TypeLayout>> {
+        let req = DebuggerRequest::GetType {
+            pid,
+            module_base,
+            name: name.to_string(),
+        };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::TypeResult { layout } => Ok(layout),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to get type '{}': {}", name, message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to GetType: {:?}", other)),
+        }
+    }
+
+    /// Resolve a type by its TPI index within a specific module (nested expansion).
+    pub fn get_type_by_index(
+        &mut self,
+        pid: u32,
+        module_base: u64,
+        index: u32,
+    ) -> anyhow::Result<Option<TypeLayout>> {
+        let req = DebuggerRequest::GetTypeByIndex { pid, module_base, index };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::TypeResult { layout } => Ok(layout),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to get type by index {}: {}", index, message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to GetTypeByIndex: {:?}", other)),
+        }
+    }
+
+    /// TEB base address of thread `tid`.
+    pub fn get_teb_address(&mut self, pid: u32, tid: u32) -> anyhow::Result<u64> {
+        match self.send_and_receive(&DebuggerRequest::GetTebAddress { pid, tid })? {
+            DebuggerResponse::TebAddress { address } => Ok(address),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to get TEB address: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to GetTebAddress: {:?}", other)),
+        }
+    }
+
+    /// PEB base address of a process.
+    pub fn get_peb_address(&mut self, pid: u32) -> anyhow::Result<u64> {
+        match self.send_and_receive(&DebuggerRequest::GetPebAddress { pid })? {
+            DebuggerResponse::PebAddress { address } => Ok(address),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to get PEB address: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to GetPebAddress: {:?}", other)),
+        }
+    }
+
+    /// Convenience: TEB (for `tid`) and PEB base addresses, with `None` for an
+    /// address that fails to resolve (e.g. a platform without TEB support).
+    pub fn get_teb_peb_addresses(
+        &mut self,
+        pid: u32,
+        tid: u32,
+    ) -> anyhow::Result<(Option<u64>, Option<u64>)> {
+        Ok((self.get_teb_address(pid, tid).ok(), self.get_peb_address(pid).ok()))
     }
 
     // removed older helper to avoid duplicate names; use set_breakpoint_by_symbol with handler below

@@ -331,6 +331,21 @@ pub trait PlatformAPI: Send + Sync {
         Err(SymbolError::SymbolsNotFound("Source file listing not supported by this platform".to_string()))
     }
 
+    // Type system methods (PDB TPI stream)
+    /// List UDT/enum type summaries from loaded module PDBs. `module_base = None`
+    /// searches all loaded modules; `filter` is a case-insensitive name substring.
+    fn list_types(&self, _pid: u32, _module_base: Option<u64>, _filter: Option<&str>, _max_results: usize) -> Result<Vec<crate::protocol::TypeSummary>, SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Type listing not supported by this platform".to_string()))
+    }
+    /// Resolve a named type's layout. `module_base = None` searches all modules.
+    fn get_type(&self, _pid: u32, _module_base: Option<u64>, _name: &str) -> Result<Option<crate::protocol::TypeLayout>, SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Type resolution not supported by this platform".to_string()))
+    }
+    /// Resolve a type by its TPI index within a specific module (nested expansion).
+    fn get_type_by_index(&self, _pid: u32, _module_base: u64, _index: u32) -> Result<Option<crate::protocol::TypeLayout>, SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Type resolution not supported by this platform".to_string()))
+    }
+
     // Symbolized disassembly methods
     fn disassemble_memory(&self, pid: u32, address: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError>;
     

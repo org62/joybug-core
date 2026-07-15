@@ -301,6 +301,41 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::ListTypes { pid, module_base, filter, max_results } => {
+                let p = platform.read().unwrap();
+                match p.list_types(pid, module_base, filter.as_deref(), max_results) {
+                    Ok(types) => DebuggerResponse::TypeList { types },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::GetType { pid, module_base, name } => {
+                let p = platform.read().unwrap();
+                match p.get_type(pid, module_base, &name) {
+                    Ok(layout) => DebuggerResponse::TypeResult { layout },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::GetTypeByIndex { pid, module_base, index } => {
+                let p = platform.read().unwrap();
+                match p.get_type_by_index(pid, module_base, index) {
+                    Ok(layout) => DebuggerResponse::TypeResult { layout },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::GetTebAddress { pid, tid } => {
+                let p = platform.read().unwrap();
+                match p.get_teb_address(pid, tid) {
+                    Ok(address) => DebuggerResponse::TebAddress { address },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::GetPebAddress { pid } => {
+                let p = platform.read().unwrap();
+                match p.get_peb_address(pid) {
+                    Ok(address) => DebuggerResponse::PebAddress { address },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::DisassembleMemory { pid, address, count, arch } => {
                 let p = platform.read().unwrap();
                 match p.disassemble_memory(pid, address, count, arch) {

@@ -668,6 +668,11 @@ fn test_lua_file_source_lines() {
     run_lua_test_file("modules/source_lines.lua", Some(&test_exe));
 }
 
+#[test]
+fn test_lua_file_types() {
+    run_lua_test_file("modules/types.lua", None);
+}
+
 // --- memory ---
 
 #[test]

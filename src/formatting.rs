@@ -106,6 +106,19 @@ impl std::fmt::Debug for DebuggerResponse {
                 .field("matches", &addresses.len())
                 .field("capped", capped)
                 .finish(),
+            DebuggerResponse::TypeList { types } => f.debug_struct("TypeList")
+                .field("count", &types.len())
+                .finish(),
+            DebuggerResponse::TypeResult { layout } => f.debug_struct("TypeResult")
+                .field("name", &layout.as_ref().map(|l| &l.name))
+                .field("members", &layout.as_ref().map(|l| l.members.len()))
+                .finish(),
+            DebuggerResponse::TebAddress { address } => f.debug_struct("TebAddress")
+                .field("address", &format_args!("0x{:X}", address))
+                .finish(),
+            DebuggerResponse::PebAddress { address } => f.debug_struct("PebAddress")
+                .field("address", &format_args!("0x{:X}", address))
+                .finish(),
             DebuggerResponse::FunctionDisassembly { instructions, function_start, function_end, function_name } => {
                 f.debug_struct("FunctionDisassembly")
                     .field("instructions_count", &instructions.len())

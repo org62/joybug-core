@@ -240,6 +240,49 @@ end
 dbg:retry_symbols(pid, module_base)
 ```
 
+### Types (PDB TPI stream)
+
+Read struct/class/union/enum layouts straight from module PDBs. The classic
+Windows OS structs (`_PEB`, `_TEB`, `_KUSER_SHARED_DATA` and their dependencies)
+live in ntdll's PDB, so they resolve once ntdll symbols are loaded.
+
+```lua
+-- List types (optionally filtered by a case-insensitive name substring).
+-- Args: (filter?, pid?, module_base?, max_results?). pid defaults to current.
+-- Returns array of {name, size, index, module_base, module}.
+for _, t in ipairs(dbg:list_types("_KUSER")) do
+    print(t.name, t.size, t.module)
+end
+
+-- Resolve a named type to its full one-level layout.
+-- Args: (name, pid?, module_base?). module_base=nil searches all modules.
+local peb = dbg:get_type("_PEB")
+-- peb = { name, size, kind="struct"|"class"|"union"|"enum", index, module_base,
+--         members = { {name, offset, type, size, kind,
+--                      type_index?,          -- for kind "udt"/"enum": TPI index
+--                      pointee?, element?, count?,  -- for pointers/arrays: nested
+--                                            -- {type, size, kind, type_index?} (+count)
+--                      bit_position?, bit_length?} },
+--         values? = { {name, value} }  -- for enums }
+for _, m in ipairs(peb.members) do
+    print(hex(m.offset), m.name, m.type)  -- e.g. 0x2 BeingDebugged  unsigned char
+end
+
+-- Expand a nested member type: udt/enum members carry their TPI index as
+-- type_index, which get_type_by_index resolves within the owning module.
+local teb = dbg:get_type("_TEB")
+for _, m in ipairs(teb.members) do
+    if m.name == "NtTib" then
+        local nt_tib = dbg:get_type_by_index(teb.module_base, m.type_index)
+        print(nt_tib.name, #nt_tib.members)  -- _NT_TIB and its members
+    end
+end
+
+-- TEB/PEB base addresses — anchors for overlaying _TEB/_PEB.
+-- Args: get_teb_address(tid, pid?), get_peb_address(pid?).
+local peb_addr = dbg:get_peb_address()
+```
+
 ### Source Lines (PDB line tables)
 
 The module's PDB line table is parsed lazily on the first source-line request

@@ -7,6 +7,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{trace, warn, error};
 use crate::windows_platform::symbol_provider::{WindowsSymbolProvider, ModuleLineTable, parse_pdb_to_symbols, parse_pdb_matching_pe, parse_pdb_to_lines};
+use crate::windows_platform::type_provider::{ModuleTypeInfo, parse_pdb_to_types};
+use crate::protocol::{TypeLayout, TypeSummary};
 use pelite::pe64::{Pe, PeFile};
 use pelite::image::{RUNTIME_FUNCTION, UNWIND_INFO, UNW_FLAG_CHAININFO};
 
@@ -18,9 +20,10 @@ pub struct ModuleSymbols {
     pub pdb_path: Option<String>, // PDB file the symbols were loaded from
 }
 
-/// Result of a lazy line-table parse, cached per module.
-enum LineTableState {
-    Ready(Arc<ModuleLineTable>),
+/// Result of a lazy per-module PDB parse (line table, type info), cached by
+/// module path.
+enum PdbArtifactState<T> {
+    Ready(Arc<T>),
     Failed(String),
 }
 
@@ -45,7 +48,12 @@ pub struct SymbolManager {
     /// Lazily parsed PDB line tables per module (module_path -> state).
     /// Populated on the first source-level request, never during the
     /// background symbol load.
-    line_cache: Mutex<HashMap<String, LineTableState>>,
+    line_cache: Mutex<HashMap<String, PdbArtifactState<ModuleLineTable>>>,
+
+    /// Lazily parsed PDB type information per module (module_path -> state).
+    /// Populated on the first type-level request, never during the background
+    /// symbol load.
+    type_cache: Mutex<HashMap<String, PdbArtifactState<ModuleTypeInfo>>>,
 
     /// Set of modules currently being loaded
     pending_loads: Arc<Mutex<HashSet<String>>>,
@@ -157,6 +165,7 @@ impl SymbolManager {
             symbol_cache,
             pdata_cache: Mutex::new(HashMap::new()),
             line_cache: Mutex::new(HashMap::new()),
+            type_cache: Mutex::new(HashMap::new()),
             pending_loads,
             failed_loads,
             pending_cv,
@@ -319,23 +328,31 @@ impl SymbolManager {
             });
         }
         self.failed_loads.lock().unwrap().remove(&module.name);
-        // The line table came from the previous PDB; re-parse from the new one on demand.
+        // The line/type tables came from the previous PDB; re-parse on demand.
         self.invalidate_line_table(&module.name);
+        self.type_cache.lock().unwrap().remove(&module.name);
 
         trace!(module_path = %module.name, pdb_path = %pdb_path.display(), symbol_count, force, "Loaded user-supplied PDB");
         Ok(PdbLoadOutcome::Loaded { symbol_count })
     }
 
-    /// Get (lazily parsing) the PDB line table for a module.
+    /// Get (lazily parsing) a per-module PDB artifact from `cache` — shared body
+    /// of `get_line_table` and `get_type_info`.
     /// Returns `Ok(None)` without blocking while the module's symbols are still
     /// loading (the client re-requests once symbols finish), and when no PDB is
     /// available. A failed parse is cached and returned as an error.
-    pub fn get_line_table(&self, module_path: &str) -> Result<Option<Arc<ModuleLineTable>>, SymbolError> {
+    fn get_pdb_artifact<T>(
+        &self,
+        cache: &Mutex<HashMap<String, PdbArtifactState<T>>>,
+        module_path: &str,
+        what: &str,
+        parse: impl FnOnce(&Path) -> Result<T, SymbolError>,
+    ) -> Result<Option<Arc<T>>, SymbolError> {
         {
-            let cache = self.line_cache.lock().unwrap();
+            let cache = cache.lock().unwrap();
             match cache.get(module_path) {
-                Some(LineTableState::Ready(table)) => return Ok(Some(table.clone())),
-                Some(LineTableState::Failed(msg)) => {
+                Some(PdbArtifactState::Ready(v)) => return Ok(Some(v.clone())),
+                Some(PdbArtifactState::Failed(msg)) => {
                     return Err(SymbolError::PdbParsingFailed(msg.clone()));
                 }
                 None => {}
@@ -351,27 +368,33 @@ impl SymbolManager {
         }
 
         let pdb_path = {
-            let cache = self.symbol_cache.lock().unwrap();
-            match cache.get(module_path).and_then(|m| m.pdb_path.clone()) {
+            let symbols = self.symbol_cache.lock().unwrap();
+            match symbols.get(module_path).and_then(|m| m.pdb_path.clone()) {
                 Some(path) => path,
                 None => return Ok(None), // no PDB (load failed / not requested / no path)
             }
         };
 
         // Parse outside all locks; a rare duplicate parse under concurrency is fine.
-        let state = match parse_pdb_to_lines(Path::new(&pdb_path)) {
-            Ok(table) => LineTableState::Ready(Arc::new(table)),
+        let state = match parse(Path::new(&pdb_path)) {
+            Ok(v) => PdbArtifactState::Ready(Arc::new(v)),
             Err(e) => {
-                warn!(module_path, pdb_path = %pdb_path, error = %e, "Failed to parse PDB line table");
-                LineTableState::Failed(e.to_string())
+                warn!(module_path, pdb_path = %pdb_path, error = %e, "Failed to parse PDB {}", what);
+                PdbArtifactState::Failed(e.to_string())
             }
         };
-        let mut cache = self.line_cache.lock().unwrap();
+        let mut cache = cache.lock().unwrap();
         let state = cache.entry(module_path.to_string()).or_insert(state);
         match state {
-            LineTableState::Ready(table) => Ok(Some(table.clone())),
-            LineTableState::Failed(msg) => Err(SymbolError::PdbParsingFailed(msg.clone())),
+            PdbArtifactState::Ready(v) => Ok(Some(v.clone())),
+            PdbArtifactState::Failed(msg) => Err(SymbolError::PdbParsingFailed(msg.clone())),
         }
+    }
+
+    /// Get (lazily parsing) the PDB line table for a module. See `get_pdb_artifact`
+    /// for the caching/non-blocking contract.
+    pub fn get_line_table(&self, module_path: &str) -> Result<Option<Arc<ModuleLineTable>>, SymbolError> {
+        self.get_pdb_artifact(&self.line_cache, module_path, "line table", parse_pdb_to_lines)
     }
 
     /// Drop a module's cached line table (e.g. after a user loads a different PDB).
@@ -412,7 +435,7 @@ impl SymbolManager {
         let table = {
             let cache = self.line_cache.lock().unwrap();
             match cache.get(&module.name) {
-                Some(LineTableState::Ready(table)) => table.clone(),
+                Some(PdbArtifactState::Ready(table)) => table.clone(),
                 _ => return None,
             }
         };
@@ -457,6 +480,67 @@ impl SymbolManager {
         match self.get_line_table(module_path)? {
             Some(table) => Ok(table.files.clone()),
             None => Ok(Vec::new()),
+        }
+    }
+
+    /// Get (lazily parsing) the PDB type information for a module. See
+    /// `get_pdb_artifact` for the caching/non-blocking contract.
+    fn get_type_info(&self, module_path: &str) -> Result<Option<Arc<ModuleTypeInfo>>, SymbolError> {
+        self.get_pdb_artifact(&self.type_cache, module_path, "type info", parse_pdb_to_types)
+    }
+
+    /// List UDT/enum type summaries across the given modules, optionally filtered by
+    /// a case-insensitive name substring, capped at `max_results`. Skips modules
+    /// whose PDB isn't parsed yet (they contribute nothing rather than blocking).
+    pub fn list_types(&self, modules: &[ModuleInfo], filter: Option<&str>, max_results: usize) -> Vec<TypeSummary> {
+        let mut out: Vec<TypeSummary> = Vec::new();
+        for module in modules {
+            let info = match self.get_type_info(&module.name) {
+                Ok(Some(info)) => info,
+                _ => continue,
+            };
+            let module_name = extract_module_name(&module.name);
+            // Filter before building the outgoing summaries, so a narrow query
+            // against a large catalog doesn't allocate for the misses.
+            for entry in info.summaries() {
+                if let Some(f) = filter {
+                    if !contains_ignore_ascii_case(&entry.name, f) {
+                        continue;
+                    }
+                }
+                out.push(TypeSummary {
+                    name: entry.name.clone(),
+                    size: entry.size,
+                    kind: entry.kind,
+                    index: entry.index,
+                    module_base: module.base,
+                    module_name: module_name.clone(),
+                });
+                if out.len() >= max_results {
+                    return out;
+                }
+            }
+        }
+        out
+    }
+
+    /// Resolve a named type's layout, searching the given modules in order.
+    pub fn get_type(&self, modules: &[ModuleInfo], name: &str) -> Result<Option<TypeLayout>, SymbolError> {
+        for module in modules {
+            if let Some(info) = self.get_type_info(&module.name)? {
+                if let Some(layout) = info.resolve_by_name(name, module.base) {
+                    return Ok(Some(layout));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resolve a type by its TPI index within a specific module (nested expansion).
+    pub fn get_type_by_index(&self, module: &ModuleInfo, index: u32) -> Result<Option<TypeLayout>, SymbolError> {
+        match self.get_type_info(&module.name)? {
+            Some(info) => Ok(info.resolve(index, module.base)),
+            None => Ok(None),
         }
     }
 
@@ -924,4 +1008,19 @@ fn extract_module_name(module_path: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or(module_path)
         .to_string()
+}
+
+/// Allocation-free ASCII-case-insensitive substring test (PDB type names are
+/// ASCII); used by the type filter, which runs over the whole catalog per query.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
 }
