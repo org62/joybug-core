@@ -123,6 +123,7 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::Symbol { .. } => "Symbol".to_string(),
         DebuggerResponse::SymbolList { .. } => "SymbolList".to_string(),
         DebuggerResponse::ResolvedSymbolList { .. } => "ResolvedSymbolList".to_string(),
+        DebuggerResponse::CoverageResults { hits } => format!("CoverageResults ({} entries)", hits.len()),
         DebuggerResponse::AddressSymbol { .. } => "AddressSymbol".to_string(),
         DebuggerResponse::CallStack { .. } => "CallStack".to_string(),
         DebuggerResponse::FunctionArguments { .. } => "FunctionArguments".to_string(),
@@ -877,6 +878,63 @@ impl<S> DebugSession<S> {
                 "Unexpected response to FindSymbol: {:?}",
                 other
             )),
+        }
+    }
+
+    /// List every symbol in a loaded module (raw RVAs, no VA calculation).
+    /// `module_path` is the module's full path (`ModuleInfo.name`). Unlike
+    /// `find_symbols`, this enumerates the whole module without a pattern/limit.
+    pub fn list_symbols(
+        &mut self,
+        module_path: &str,
+    ) -> anyhow::Result<Vec<crate::interfaces::ModuleSymbol>> {
+        let req = DebuggerRequest::ListSymbols { module_path: module_path.to_string() };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::SymbolList { symbols } => Ok(symbols),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!(
+                "Failed to list symbols for '{}': {}",
+                module_path,
+                message
+            )),
+            other => Err(anyhow::anyhow!("Unexpected response to ListSymbols: {:?}", other)),
+        }
+    }
+
+    /// Arm code-coverage breakpoints on every address in `addrs`. Hits are counted
+    /// server-side and the debuggee auto-continues silently; poll with
+    /// [`get_coverage`]. `limit` is the hit count after which each is auto-removed
+    /// (`0` = never, `1` = remove on first hit = pure coverage).
+    pub fn start_coverage(&mut self, pid: u32, addrs: Vec<u64>, limit: u64) -> anyhow::Result<()> {
+        match self.send_and_receive(&DebuggerRequest::StartCodeCoverage { pid, addrs, limit })? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to start code coverage: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to StartCodeCoverage: {:?}", other)),
+        }
+    }
+
+    /// Fetch a [`crate::protocol::CoverageHit`] (address, hit count, first-hit
+    /// order, thread ids) for every coverage breakpoint hit at least once
+    /// (never-hit addresses are omitted; the caller knows the armed set).
+    pub fn get_coverage(&mut self, pid: u32) -> anyhow::Result<Vec<crate::protocol::CoverageHit>> {
+        match self.send_and_receive(&DebuggerRequest::GetCodeCoverage { pid })? {
+            DebuggerResponse::CoverageResults { hits } => Ok(hits),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to get code coverage: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to GetCodeCoverage: {:?}", other)),
+        }
+    }
+
+    /// Remove all coverage breakpoints and clear coverage state.
+    pub fn stop_coverage(&mut self, pid: u32) -> anyhow::Result<()> {
+        match self.send_and_receive(&DebuggerRequest::StopCodeCoverage { pid })? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to stop code coverage: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to StopCodeCoverage: {:?}", other)),
         }
     }
 

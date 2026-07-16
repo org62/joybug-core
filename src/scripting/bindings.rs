@@ -1658,6 +1658,75 @@ impl LuaUserData for LuaDebugClient {
             Ok(())
         });
 
+        // ---- Code Coverage ----
+
+        // start_coverage([pid], addrs, [limit=1])
+        // Arm silent, server-side-counted coverage breakpoints on every address in
+        // `addrs`. Hits are counted in the server and the debuggee auto-continues
+        // without a client event; poll counts with `get_coverage`. `limit` is the
+        // hit count after which each breakpoint auto-removes (1 = remove on first
+        // hit = pure coverage, >1 = heat map, 0 = never remove).
+        methods.add_method("start_coverage", |_lua, this, (pid, addrs, limit): (Option<u32>, Vec<u64>, Option<u64>)| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::StartCodeCoverage {
+                pid, addrs, limit: limit.unwrap_or(1),
+            }).map_err(mlua::Error::external)?;
+            match resp {
+                DebuggerResponse::Ack => Ok(()),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("StartCodeCoverage failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // get_coverage([pid]) -> { { address, hit_count, first_hit_seq, thread_ids }, .. }
+        // One entry per coverage breakpoint hit at least once (never-hit addresses
+        // are omitted; the caller knows the armed set). `first_hit_seq` is the
+        // 1-based first-execution order across the run (reset by stop_coverage);
+        // `thread_ids` lists the distinct threads that hit it, in first-hit order.
+        methods.add_method("get_coverage", |lua, this, pid: Option<u32>| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::GetCodeCoverage { pid })
+                .map_err(mlua::Error::external)?;
+            match resp {
+                DebuggerResponse::CoverageResults { hits } => {
+                    let table = lua.create_table()?;
+                    for (i, hit) in hits.iter().enumerate() {
+                        let entry = lua.create_table()?;
+                        entry.set("address", hit.address)?;
+                        entry.set("hit_count", hit.hit_count)?;
+                        entry.set("first_hit_seq", hit.first_hit_seq)?;
+                        entry.set("thread_ids", hit.thread_ids.clone())?;
+                        table.set(i + 1, entry)?;
+                    }
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("GetCodeCoverage failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // stop_coverage([pid])
+        // Remove all coverage breakpoints and clear the coverage map.
+        methods.add_method("stop_coverage", |_lua, this, pid: Option<u32>| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::StopCodeCoverage { pid })
+                .map_err(mlua::Error::external)?;
+            match resp {
+                DebuggerResponse::Ack => Ok(()),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("StopCodeCoverage failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
         // ---- Utility: current state ----
 
         methods.add_method("pid", |_lua, this, ()| {

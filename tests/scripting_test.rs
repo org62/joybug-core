@@ -836,6 +836,13 @@ fn test_lua_file_mass_breakpoints() {
     run_lua_test_file("breakpoints/mass_breakpoints.lua", None);
 }
 
+// --- code coverage ---
+
+#[test]
+fn test_lua_file_code_coverage() {
+    run_lua_test_file("breakpoints/code_coverage.lua", None);
+}
+
 // --- anti-anti-debug ---
 
 #[test]

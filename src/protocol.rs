@@ -348,6 +348,24 @@ pub mod request_response {
             pid: u32,
             addr: u64,
         },
+        /// Arm code-coverage breakpoints (silent, server-side counted) at every
+        /// address in `addrs`. `limit` is the hit count after which each is
+        /// auto-removed (`0` = never, `1` = remove on first hit = pure coverage).
+        StartCodeCoverage {
+            pid: u32,
+            addrs: Vec<u64>,
+            limit: u64,
+        },
+        /// Fetch a [`CoverageHit`] (address, hit count, first-hit order, thread
+        /// ids) for every coverage breakpoint hit at least once (never-hit
+        /// addresses are omitted).
+        GetCodeCoverage {
+            pid: u32,
+        },
+        /// Remove all coverage breakpoints and clear the coverage map.
+        StopCodeCoverage {
+            pid: u32,
+        },
         ReadMemory {
             pid: u32,
             address: u64,
@@ -699,6 +717,20 @@ pub mod request_response {
         },
     }
 
+    /// One code-coverage breakpoint that has been hit at least once.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct CoverageHit {
+        pub address: u64,
+        pub hit_count: u64,
+        /// 1-based first-execution order across the whole coverage run (1 = the
+        /// first covered address executed). Assigned once on the first hit and
+        /// never changed; reset by `StopCodeCoverage`.
+        pub first_hit_seq: u64,
+        /// Distinct thread ids that hit this address, in first-hit order (the
+        /// first element is the thread that executed it first).
+        pub thread_ids: Vec<u32>,
+    }
+
     #[derive(Serialize, Deserialize, Clone)]
     pub enum DebuggerResponse {
         Ack,
@@ -721,6 +753,9 @@ pub mod request_response {
         Symbol { symbol: Option<crate::interfaces::ModuleSymbol> },
         SymbolList { symbols: Vec<crate::interfaces::ModuleSymbol> },
         ResolvedSymbolList { symbols: Vec<crate::interfaces::ResolvedSymbol> },
+        /// Code-coverage results: one [`CoverageHit`] per coverage breakpoint
+        /// hit at least once.
+        CoverageResults { hits: Vec<CoverageHit> },
         AddressSymbol {
             module_path: Option<String>,
             symbol: Option<crate::interfaces::ModuleSymbol>,

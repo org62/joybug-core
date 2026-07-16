@@ -137,6 +137,27 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::StartCodeCoverage { pid, addrs, limit } => {
+                let mut p = platform.write().unwrap();
+                match p.start_code_coverage(pid, &addrs, limit) {
+                    Ok(_) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::GetCodeCoverage { pid } => {
+                let p = platform.read().unwrap();
+                match p.get_code_coverage(pid) {
+                    Ok(hits) => DebuggerResponse::CoverageResults { hits },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::StopCodeCoverage { pid } => {
+                let mut p = platform.write().unwrap();
+                match p.stop_code_coverage(pid) {
+                    Ok(_) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::SetHardwareBreakpoint { pid, addr, bp_type, size } => {
                 let mut p = platform.write().unwrap();
                 match p.set_hardware_breakpoint(pid, addr, bp_type, size) {

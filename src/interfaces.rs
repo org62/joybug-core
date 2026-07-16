@@ -283,6 +283,18 @@ pub trait PlatformAPI: Send + Sync {
     fn set_single_shot_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError>;
     fn set_hardware_breakpoint(&mut self, pid: u32, addr: u64, bp_type: crate::protocol::HardwareBreakpointType, size: crate::protocol::HardwareBreakpointSize) -> Result<u8, PlatformError>;
     fn remove_hardware_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError>;
+
+    // Code-coverage: silent, server-side-counted software breakpoints. Hits are
+    // counted in the server and the debuggee auto-continues without notifying the
+    // client (see `handle_exception_event`). `limit` is the hit count after which
+    // each breakpoint is auto-removed (`0` = never, `1` = remove on first hit).
+    fn start_code_coverage(&mut self, _pid: u32, _addrs: &[u64], _limit: u64) -> Result<(), PlatformError> { Err(PlatformError::NotImplemented) }
+    /// Fetch a [`crate::protocol::CoverageHit`] (address, hit count, first-hit
+    /// order, thread ids) for every coverage breakpoint hit at least once
+    /// (never-hit addresses are omitted; the client knows the armed set).
+    fn get_code_coverage(&self, _pid: u32) -> Result<Vec<crate::protocol::CoverageHit>, PlatformError> { Err(PlatformError::NotImplemented) }
+    /// Remove all coverage breakpoints and clear coverage state.
+    fn stop_code_coverage(&mut self, _pid: u32) -> Result<(), PlatformError> { Err(PlatformError::NotImplemented) }
     fn launch(&mut self, command: &str, debug_children: bool, working_directory: Option<&str>) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>;
     fn read_memory(&self, pid: u32, address: u64, size: usize) -> Result<Vec<u8>, PlatformError>;
     fn write_memory(&self, pid: u32, address: u64, data: &[u8]) -> Result<(), PlatformError>;

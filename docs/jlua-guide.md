@@ -527,6 +527,49 @@ end
 dbg:string_scan_reset(scan.results_path)
 ```
 
+### Code Coverage
+
+Arm silent, server-side-counted breakpoints on a set of addresses (typically every
+function entry in a module). Hits are counted inside the server and the debuggee
+auto-continues **without** a client breakpoint event, so coverage runs while the
+target executes freely. `limit` is the hit count after which each breakpoint
+auto-removes: `1` (default) = remove on first hit (pure coverage), `>1` = heat map
+capped at `limit`, `0` = never remove (uncapped heat map).
+
+```lua
+dbg:on_initial_breakpoint(function(pid, tid, addr)
+    -- Enumerate a module's function entry points. With PDBs, use list_symbols;
+    -- without them, ntdll/system DLLs expose a RUNTIME_FUNCTION table.
+    local base
+    for _, m in ipairs(dbg:list_modules(pid)) do
+        if m.name:lower():find("ntdll%.dll") then base = m.base end
+    end
+    local addrs = {}
+    for _, rf in ipairs(dbg:get_module_info(pid, base).runtime_functions) do
+        addrs[#addrs + 1] = base + rf.begin_address
+    end
+
+    -- Arm coverage (limit=1 => each function counted once, then its INT3 removed).
+    dbg:start_coverage(pid, addrs, 1)
+end)
+
+dbg:on_process_exited(function(pid, exit_code)
+    -- get_coverage returns only addresses hit at least once (the caller knows the
+    -- armed set and fills zeros): { { address, hit_count, first_hit_seq, thread_ids }, .. }
+    -- first_hit_seq is the 1-based first-execution order across the run (reset by
+    -- stop_coverage); thread_ids lists the distinct threads that hit the address,
+    -- in first-hit order.
+    local hits = dbg:get_coverage(pid)
+    print(#hits .. " functions executed")
+    -- dbg:stop_coverage(pid)  -- remove all coverage breakpoints, clear the map
+end)
+
+dbg:launch('cmd.exe /c "echo test"')
+dbg:run()
+```
+
+`pid` is optional on all three methods and defaults to the current process.
+
 ### Anti-Anti-Debug
 
 Defeat common anti-debug probes by patching well-known fields in the target's PEB.

@@ -2,9 +2,8 @@
 
 mod common;
 
-use common::TestServer;
+use common::{module_file_name_matches, runtime_function_entry_vas, TestServer};
 use joybug2::protocol_io::DebugSession;
-use std::collections::HashSet;
 use std::path::Path;
 
 /// Per-module breakpoint stats
@@ -26,13 +25,9 @@ struct MassBreakpointState {
 const TARGET_MODULES: &[&str] = &["cmd.exe", "ntdll.dll", "kernel32.dll", "kernelbase.dll"];
 
 fn is_target_module(image_name: &str) -> bool {
-    let file_name = Path::new(image_name)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(image_name);
     TARGET_MODULES
         .iter()
-        .any(|t| file_name.eq_ignore_ascii_case(t))
+        .any(|t| module_file_name_matches(image_name, t))
 }
 
 fn set_breakpoints_for_module(
@@ -41,50 +36,26 @@ fn set_breakpoints_for_module(
     module_name: &str,
     module_base: u64,
 ) {
-    let info = match session.get_module_extra_info(pid, module_base) {
-        Ok(info) => info,
-        Err(e) => {
-            println!(
-                "  WARN: Failed to get extra info for {} @ 0x{:x}: {}",
-                module_name, module_base, e
-            );
-            return;
-        }
-    };
-
-    let runtime_functions = match &info.runtime_functions {
-        Some(rfs) => rfs,
-        None => {
-            println!("  WARN: No RUNTIME_FUNCTION entries for {}", module_name);
-            return;
-        }
-    };
-
-    // Deduplicate by BeginAddress and filter invalid entries
-    let mut seen = HashSet::new();
-    let unique_entries: Vec<_> = runtime_functions
-        .iter()
-        .filter(|rf| rf.EndAddress > rf.BeginAddress)
-        .filter(|rf| seen.insert(rf.BeginAddress))
-        .collect();
+    let entry_vas = runtime_function_entry_vas(session, pid, module_base);
+    if entry_vas.is_empty() {
+        return;
+    }
 
     let mut stats = ModuleStats {
         name: module_name.to_string(),
-        runtime_functions: unique_entries.len(),
+        runtime_functions: entry_vas.len(),
         breakpoints_set: 0,
         breakpoints_failed: 0,
     };
 
     println!(
-        "  {} @ 0x{:x}: {} total entries, {} unique valid",
+        "  {} @ 0x{:x}: {} unique valid entries",
         module_name,
         module_base,
-        runtime_functions.len(),
-        unique_entries.len()
+        entry_vas.len()
     );
 
-    for rf in &unique_entries {
-        let va = module_base + rf.BeginAddress as u64;
+    for &va in &entry_vas {
         match session.set_single_shot_breakpoint_at(
             pid,
             va,

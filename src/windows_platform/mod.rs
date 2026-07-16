@@ -447,6 +447,49 @@ impl PlatformAPI for WindowsPlatform {
         process.remove_breakpoint(addr)
     }
 
+    fn start_code_coverage(&mut self, pid: u32, addrs: &[u64], limit: u64) -> Result<(), PlatformError> {
+        trace!(pid, count = addrs.len(), limit, "WindowsPlatform::start_code_coverage called");
+        let process = self.get_process_mut(pid)?;
+        let process_handle = process.handle();
+        let bp_bytes = process.breakpoint_instruction_bytes();
+        let bp_len = bp_bytes.len();
+        let mut armed = 0usize;
+        for &addr in addrs {
+            // Skip addresses already covered by a user/persistent breakpoint so we
+            // never collide with (or double-handle) an existing INT3.
+            if process.is_persistent_breakpoint(addr) {
+                continue;
+            }
+            let original_bytes = match memory::read_memory_internal(process_handle, addr, bp_len) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(pid, addr, error = %e, "Skipping coverage breakpoint: failed to read original bytes");
+                    continue;
+                }
+            };
+            if let Err(e) = memory::write_memory_internal(process_handle, addr, &bp_bytes) {
+                warn!(pid, addr, error = %e, "Failed to write coverage breakpoint byte");
+                continue;
+            }
+            process.arm_coverage(addr, original_bytes, limit);
+            armed += 1;
+        }
+        trace!(pid, armed, requested = addrs.len(), "Coverage breakpoints armed");
+        Ok(())
+    }
+
+    fn get_code_coverage(&self, pid: u32) -> Result<Vec<crate::protocol::CoverageHit>, PlatformError> {
+        let process = self.get_process(pid)?;
+        Ok(process.coverage_snapshot())
+    }
+
+    fn stop_code_coverage(&mut self, pid: u32) -> Result<(), PlatformError> {
+        trace!(pid, "WindowsPlatform::stop_code_coverage called");
+        let process = self.get_process_mut(pid)?;
+        process.clear_coverage();
+        Ok(())
+    }
+
     fn set_hardware_breakpoint(
         &mut self,
         pid: u32,

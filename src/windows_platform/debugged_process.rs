@@ -14,6 +14,24 @@ pub(crate) struct InternalHardwareBreakpoint {
     pub is_active: bool,
 }
 
+/// A single code-coverage breakpoint's counter. The INT3 byte itself lives in
+/// `persistent_breakpoints` so it reuses the existing restore/re-arm/step-over
+/// machinery; this entry only tracks how many times the address has been hit and
+/// the auto-remove limit. `limit == 0` means never auto-remove; `1` removes on the
+/// first hit (pure coverage). `active` goes false once the INT3 has been removed
+/// (limit reached), while the final `hit_count` is kept for reporting.
+#[derive(Debug, Clone)]
+pub(crate) struct CoverageEntry {
+    pub hit_count: u64,
+    pub limit: u64,
+    pub active: bool,
+    /// 1-based first-execution order across the coverage run (0 = never hit).
+    /// Assigned once when `hit_count` transitions 0 -> 1.
+    pub first_hit_seq: u64,
+    /// Distinct thread ids that hit this address, in first-hit order.
+    pub thread_ids: Vec<u32>,
+}
+
 /// Represents a single debugged process with its associated state
 #[derive(Debug)]
 pub(crate) struct DebuggedProcess {
@@ -47,6 +65,12 @@ pub(crate) struct DebuggedProcess {
     hardware_breakpoints: Vec<InternalHardwareBreakpoint>,
     /// Pending HW BP re-arm after single-step: tid -> dr_index
     pending_hw_bp_rearm: std::collections::HashMap<u32, u8>,
+    /// Code-coverage breakpoints by address. The INT3 bytes are stored in
+    /// `persistent_breakpoints`; this map holds the hit counter + auto-remove limit.
+    coverage_breakpoints: std::collections::HashMap<u64, CoverageEntry>,
+    /// Monotonic first-hit counter backing `CoverageEntry::first_hit_seq`.
+    /// Reset (with the map) by `forget_coverage_state`, not by re-arming mid-run.
+    coverage_seq: u64,
 }
 
 impl DebuggedProcess {
@@ -80,6 +104,8 @@ impl DebuggedProcess {
             frozen_threads: std::collections::HashSet::new(),
             hardware_breakpoints: Vec::new(),
             pending_hw_bp_rearm: std::collections::HashMap::new(),
+            coverage_breakpoints: std::collections::HashMap::new(),
+            coverage_seq: 0,
         })
     }
 }
@@ -120,9 +146,14 @@ impl DebuggedProcess {
         true
     }
 
-    /// Get a clone of the original bytes for a persistent breakpoint.
-    pub(super) fn persistent_original_bytes(&self, address: u64) -> Option<Vec<u8>> {
-        self.persistent_breakpoints.get(&address).cloned()
+    /// Restore the original instruction bytes for the persistent breakpoint at
+    /// `address`, if one exists. Borrows the stored bytes directly (no clone) —
+    /// this runs on the silent coverage auto-continue hot path.
+    pub(super) fn restore_persistent_original(&self, address: u64) -> Result<(), PlatformError> {
+        if let Some(original) = self.persistent_breakpoints.get(&address) {
+            self.restore_original_bytes(address, original)?;
+        }
+        Ok(())
     }
 
     /// Remove and return an active step-over breakpoint at `address`, if any.
@@ -361,6 +392,92 @@ impl DebuggedProcess {
         }
     }
 
+    // --- Code-coverage breakpoints -------------------------------------------
+    // Coverage INT3s are stored in `persistent_breakpoints` (so they reuse the
+    // restore / re-arm / step-over / patch machinery); `coverage_breakpoints`
+    // adds the per-address hit counter + auto-remove limit.
+
+    /// Register a coverage breakpoint at `address`: store its original bytes as a
+    /// persistent breakpoint (no tid filter) and start a counter with `limit`.
+    pub(super) fn arm_coverage(&mut self, address: u64, original_bytes: Vec<u8>, limit: u64) {
+        self.insert_persistent_breakpoint(address, original_bytes, None);
+        self.coverage_breakpoints.insert(
+            address,
+            CoverageEntry { hit_count: 0, limit, active: true, first_hit_seq: 0, thread_ids: Vec::new() },
+        );
+    }
+
+    /// If an *active* coverage breakpoint exists at `address`, increment its hit
+    /// counter (recording first-hit order and the hitting thread) and return
+    /// `(new_hit_count, limit)`; `None` otherwise. One map lookup for both the
+    /// "is this a coverage hit?" test and the count — this runs on the silent
+    /// auto-continue hot path.
+    pub(super) fn record_coverage_hit(&mut self, address: u64, tid: u32) -> Option<(u64, u64)> {
+        let entry = self.coverage_breakpoints.get_mut(&address).filter(|e| e.active)?;
+        if entry.hit_count == 0 {
+            self.coverage_seq += 1;
+            entry.first_hit_seq = self.coverage_seq;
+        }
+        entry.hit_count += 1;
+        if !entry.thread_ids.contains(&tid) {
+            entry.thread_ids.push(tid);
+        }
+        Some((entry.hit_count, entry.limit))
+    }
+
+    /// Permanently remove the INT3 for a coverage breakpoint (limit reached) but
+    /// keep the entry (now `active == false`) so its final count is still reported.
+    pub(super) fn deactivate_coverage(&mut self, address: u64) {
+        if let Err(e) = self.remove_breakpoint(address) {
+            warn!(address, error = %e, "Failed to remove coverage breakpoint at limit");
+        }
+        if let Some(entry) = self.coverage_breakpoints.get_mut(&address) {
+            entry.active = false;
+        }
+    }
+
+    /// Snapshot of every coverage breakpoint hit at least once (active or
+    /// already auto-removed). Never-hit addresses are omitted — the client
+    /// knows the armed set and fills zeros — so a poll doesn't serialize
+    /// thousands of zero entries.
+    pub(super) fn coverage_snapshot(&self) -> Vec<crate::protocol::CoverageHit> {
+        self.coverage_breakpoints
+            .iter()
+            .filter(|(_, e)| e.hit_count > 0)
+            .map(|(addr, e)| crate::protocol::CoverageHit {
+                address: *addr,
+                hit_count: e.hit_count,
+                first_hit_seq: e.first_hit_seq,
+                thread_ids: e.thread_ids.clone(),
+            })
+            .collect()
+    }
+
+    /// Remove all coverage breakpoints (restoring original bytes for any still
+    /// active) and clear the coverage map.
+    pub(super) fn clear_coverage(&mut self) {
+        let active: Vec<u64> = self
+            .coverage_breakpoints
+            .iter()
+            .filter(|(_, e)| e.active)
+            .map(|(addr, _)| *addr)
+            .collect();
+        for addr in active {
+            if let Err(e) = self.remove_breakpoint(addr) {
+                warn!(address = addr, error = %e, "Failed to remove coverage breakpoint on clear");
+            }
+        }
+        self.forget_coverage_state();
+    }
+
+    /// Forget all coverage bookkeeping (counters and the first-hit sequence).
+    /// Restoring the INT3 bytes is the caller's job — the single owner of what
+    /// "coverage state" consists of, shared by `clear_coverage` and detach.
+    fn forget_coverage_state(&mut self) {
+        self.coverage_breakpoints.clear();
+        self.coverage_seq = 0;
+    }
+
     /// Restore the original bytes for every software breakpoint (persistent and
     /// single-shot) and forget them. Used on detach so the target keeps running
     /// without executing leftover int3/brk instructions.
@@ -377,6 +494,7 @@ impl DebuggedProcess {
         self.persistent_breakpoints.clear();
         self.persistent_bp_tid_filters.clear();
         self.single_shot_breakpoints.clear();
+        self.forget_coverage_state();
     }
 
     /// Patch a memory buffer to replace breakpoint instruction bytes with the

@@ -348,6 +348,31 @@ fn arm64_begin_step_over_hw_bp(
     Ok(())
 }
 
+/// Rewind `tid`'s instruction pointer to `address` (the software breakpoint
+/// whose INT3/BRK byte was just restored) and, when `single_step` is set, also
+/// set the CPU single-step flag — one GetThreadContext/SetThreadContext round
+/// trip for both. Shared by the single-shot, coverage, and persistent
+/// breakpoint paths.
+fn reset_ip_after_breakpoint(
+    process: &super::debugged_process::DebuggedProcess,
+    pid: u32,
+    tid: u32,
+    address: u64,
+    single_step: bool,
+) -> Result<(), PlatformError> {
+    let mut context = match super::thread_context::get_thread_context(process, pid, tid)? {
+        crate::protocol::ThreadContext::Win32RawContext(ctx) => ctx,
+    };
+    #[cfg(target_arch = "x86_64")]
+    { context.Rip = address; }
+    #[cfg(target_arch = "aarch64")]
+    { context.Pc = address; }
+    if single_step {
+        stepper::set_single_step_flag_native(&mut context)?;
+    }
+    super::thread_context::set_thread_context(process, pid, tid, crate::protocol::ThreadContext::Win32RawContext(context))
+}
+
 // Handle EXCEPTION_DEBUG_EVENT in a dedicated function to keep continue_exec simpler.
 pub(super) fn handle_exception_event(
     platform: &mut WindowsPlatform,
@@ -419,18 +444,9 @@ pub(super) fn handle_exception_event(
         if let Some(original_bytes) = single_shot_original_opt {
             trace!(address = %format!("0x{:X}", address), "Single-shot breakpoint hit. Restoring original bytes.");
 
-            // Restore the original byte
+            // Restore the original byte and set IP back to the original instruction
             process.restore_original_bytes(address, &original_bytes)?;
-
-            // Set IP back to the original instruction's address
-            let mut context = match super::thread_context::get_thread_context(process, pid, tid)? {
-                crate::protocol::ThreadContext::Win32RawContext(ctx) => ctx,
-            };
-            #[cfg(target_arch = "x86_64")]
-            { context.Rip = address; }
-            #[cfg(target_arch = "aarch64")]
-            { context.Pc = address; }
-            super::thread_context::set_thread_context(process, pid, tid, crate::protocol::ThreadContext::Win32RawContext(context.clone()))?;
+            reset_ip_after_breakpoint(process, pid, tid, address, false)?;
 
             // If this was a step-over breakpoint, we already removed it above
             if let Some((tid_hit, kind)) = step_over_hit_opt {
@@ -445,34 +461,49 @@ pub(super) fn handle_exception_event(
             }
         }
 
+        // Code-coverage breakpoint path: count the hit server-side and
+        // auto-continue *silently* (never forwarded to the client). Reuses the
+        // same restore / reset-IP / step-over-re-arm machinery as the persistent
+        // path below. Checked before the persistent path because coverage INT3s
+        // are also stored in `persistent_breakpoints`.
+        if let Some((count, limit)) = process.record_coverage_hit(address, tid) {
+            trace!(address = %format!("0x{:X}", address), count, limit, "Coverage breakpoint hit");
+
+            // Restore the original instruction bytes so the real instruction runs.
+            process.restore_persistent_original(address)?;
+
+            if limit != 0 && count >= limit {
+                // Limit reached: leave the original byte in place (INT3 gone) and
+                // drop the persistent entry. The instruction runs normally on the
+                // auto-continue; no single-step / re-arm needed.
+                process.deactivate_coverage(address);
+                reset_ip_after_breakpoint(process, pid, tid, address, false)?;
+            } else {
+                // Keep counting: single-step over the restored instruction and
+                // re-arm the INT3 afterwards, freezing other threads while it is
+                // temporarily removed (multi-threaded software-breakpoint race).
+                process.schedule_rearm_after_single_step(tid, address, false);
+                let frozen = process.begin_step_over(tid, address);
+                if frozen > 0 {
+                    trace!(pid, tid, address = %format!("0x{:X}", address), frozen, "Froze other threads for coverage step-over");
+                }
+                reset_ip_after_breakpoint(process, pid, tid, address, true)?;
+            }
+
+            // Silent: the server auto-continues without exposing this to the client.
+            return Ok(None);
+        }
+
         // Persistent breakpoint path
         if process.is_persistent_breakpoint(address)
         {
             trace!(address = %format!("0x{:X}", address), "Persistent breakpoint hit. Restoring original bytes and handling re-arm or step-out.");
 
-            // Collect data needed with minimal borrows
-            let (is_thread_match, original_bytes_opt, is_step_out_hit) = {
-                (
-                    process.persistent_allowed_for_tid(address, tid),
-                    process.persistent_original_bytes(address),
-                    process.has_step_out_breakpoint(address),
-                )
-            };
+            let is_thread_match = process.persistent_allowed_for_tid(address, tid);
+            let is_step_out_hit = process.has_step_out_breakpoint(address);
 
             // Restore original instruction bytes
-            if let Some(original_bytes) = original_bytes_opt {
-                process.restore_original_bytes(address, &original_bytes)?;
-            }
-
-            // Reset IP to original instruction
-            let mut context = match super::thread_context::get_thread_context(process, pid, tid)? {
-                crate::protocol::ThreadContext::Win32RawContext(ctx) => ctx,
-            };
-            #[cfg(target_arch = "x86_64")]
-            { context.Rip = address; }
-            #[cfg(target_arch = "aarch64")]
-            { context.Pc = address; }
-            super::thread_context::set_thread_context(process, pid, tid, crate::protocol::ThreadContext::Win32RawContext(context.clone()))?;
+            process.restore_persistent_original(address)?;
 
             // Is this a step-out completion?
             if is_thread_match && is_step_out_hit {
@@ -480,6 +511,7 @@ pub(super) fn handle_exception_event(
                     process.remove_step_out_breakpoint(address)
                 };
                 if let Some((tid2, original_return_address)) = step_out_info {
+                    reset_ip_after_breakpoint(process, pid, tid, address, false)?;
                     let _ = process.remove_breakpoint(address);
                     return Ok(Some(crate::protocol::DebugEvent::StepComplete {
                         pid,
@@ -500,11 +532,9 @@ pub(super) fn handle_exception_event(
             if frozen > 0 {
                 trace!(pid, tid, address = %format!("0x{:X}", address), frozen, "Froze other threads for breakpoint step-over");
             }
-            let mut ctx2 = match super::thread_context::get_thread_context(process, pid, tid)? {
-                crate::protocol::ThreadContext::Win32RawContext(ctx) => ctx,
-            };
-            super::stepper::set_single_step_flag_native(&mut ctx2)?;
-            super::thread_context::set_thread_context(process, pid, tid, crate::protocol::ThreadContext::Win32RawContext(ctx2))?;
+            // Reset IP to the original instruction and set the single-step flag
+            // in one context round trip.
+            reset_ip_after_breakpoint(process, pid, tid, address, true)?;
 
             if is_thread_match {
                 return Ok(Some(crate::protocol::DebugEvent::Breakpoint { pid, tid, address }));
