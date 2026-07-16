@@ -32,6 +32,28 @@ pub(crate) struct CoverageEntry {
     pub thread_ids: Vec<u32>,
 }
 
+/// One distinct accessor of a watched address, keyed by raw trap instruction
+/// pointer, and how often it hit. On x86 the trap fires *after* the accessing
+/// instruction, so the raw RIP points at the following instruction (the platform
+/// back-steps to attribute it when snapshotting); on ARM64 it is the exact
+/// faulting PC.
+#[derive(Debug, Clone)]
+pub(crate) struct WatchpointAccessEntry {
+    pub hit_count: u64,
+    pub first_seq: u64,
+    pub thread_ids: Vec<u32>,
+}
+
+/// One active hardware access trace. Presence of an entry for a watched address
+/// means the hardware watchpoint there is in silent "collect accessors" mode: on a
+/// hit the server records the accessor and auto-continues instead of forwarding a
+/// `HardwareBreakpoint` event. The watchpoint's DR/register state itself lives in
+/// `hardware_breakpoints`; this only accumulates who touched it.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WatchpointTraceEntry {
+    pub accessors: std::collections::HashMap<u64 /*raw rip*/, WatchpointAccessEntry>,
+}
+
 /// Represents a single debugged process with its associated state
 #[derive(Debug)]
 pub(crate) struct DebuggedProcess {
@@ -71,6 +93,11 @@ pub(crate) struct DebuggedProcess {
     /// Monotonic first-hit counter backing `CoverageEntry::first_hit_seq`.
     /// Reset (with the map) by `forget_coverage_state`, not by re-arming mid-run.
     coverage_seq: u64,
+    /// Active hardware access traces by watched address. An entry marks the
+    /// hardware watchpoint at that address as silent "collect accessors" mode.
+    watchpoint_traces: std::collections::HashMap<u64, WatchpointTraceEntry>,
+    /// Monotonic first-access counter backing `WatchpointAccessEntry::first_seq`.
+    watchpoint_seq: u64,
 }
 
 impl DebuggedProcess {
@@ -106,6 +133,8 @@ impl DebuggedProcess {
             pending_hw_bp_rearm: std::collections::HashMap::new(),
             coverage_breakpoints: std::collections::HashMap::new(),
             coverage_seq: 0,
+            watchpoint_traces: std::collections::HashMap::new(),
+            watchpoint_seq: 0,
         })
     }
 }
@@ -476,6 +505,63 @@ impl DebuggedProcess {
     fn forget_coverage_state(&mut self) {
         self.coverage_breakpoints.clear();
         self.coverage_seq = 0;
+    }
+
+    // --- Hardware access traces ----------------------------------------------
+    // The watchpoint's DR/register state lives in `hardware_breakpoints` (armed by
+    // `set_hardware_breakpoint`); an entry here just puts it in silent
+    // "collect accessors" mode.
+
+    /// Mark the watched `address` as an active access trace (idempotent).
+    pub(super) fn arm_watchpoint_trace(&mut self, address: u64) {
+        self.watchpoint_traces.entry(address).or_default();
+    }
+
+    /// If an access trace is active for `watched_addr`, record an access from
+    /// `raw_rip` by thread `tid` and return `true` (the caller then silently
+    /// auto-continues); return `false` if the address is not being traced (a normal
+    /// hardware breakpoint that should break into the client). Runs on the silent
+    /// auto-continue hot path.
+    pub(super) fn record_watchpoint_access(&mut self, watched_addr: u64, raw_rip: u64, tid: u32) -> bool {
+        let Some(trace) = self.watchpoint_traces.get_mut(&watched_addr) else { return false; };
+        let entry = trace.accessors.entry(raw_rip).or_insert(WatchpointAccessEntry {
+            hit_count: 0,
+            first_seq: 0,
+            thread_ids: Vec::new(),
+        });
+        if entry.hit_count == 0 {
+            self.watchpoint_seq += 1;
+            entry.first_seq = self.watchpoint_seq;
+        }
+        entry.hit_count += 1;
+        if !entry.thread_ids.contains(&tid) {
+            entry.thread_ids.push(tid);
+        }
+        true
+    }
+
+    /// Snapshot of every distinct instruction that accessed `address` at least once.
+    /// Empty if no trace is (or was) active for that address. `accessor` is filled
+    /// with the raw trap RIP; the platform layer attributes it (x86 back-step).
+    pub(super) fn watchpoint_snapshot(&self, address: u64) -> Vec<crate::protocol::WatchpointAccess> {
+        let Some(trace) = self.watchpoint_traces.get(&address) else { return Vec::new(); };
+        trace
+            .accessors
+            .iter()
+            .map(|(rip, e)| crate::protocol::WatchpointAccess {
+                accessor: *rip,
+                accessor_raw_rip: *rip,
+                hit_count: e.hit_count,
+                first_seq: e.first_seq,
+                thread_ids: e.thread_ids.clone(),
+            })
+            .collect()
+    }
+
+    /// Stop tracing `address`: drop the accumulated accessors. Removing the
+    /// underlying hardware watchpoint is the caller's job.
+    pub(super) fn clear_watchpoint_trace(&mut self, address: u64) {
+        self.watchpoint_traces.remove(&address);
     }
 
     /// Restore the original bytes for every software breakpoint (persistent and

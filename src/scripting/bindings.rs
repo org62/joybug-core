@@ -446,24 +446,8 @@ impl LuaUserData for LuaDebugClient {
         methods.add_method("set_hw_breakpoint", |lua, this, (pid, addr, bp_type_str, size_str, handler): (u32, u64, String, Option<String>, Option<LuaFunction>)| {
             let mut client = this.inner.borrow_mut();
 
-            let bp_type = match bp_type_str.as_str() {
-                "execute" | "x" => HardwareBreakpointType::Execute,
-                "write" | "w" => HardwareBreakpointType::Write,
-                "readwrite" | "rw" => HardwareBreakpointType::ReadWrite,
-                _ => return Err(mlua::Error::external(
-                    anyhow::anyhow!("Invalid bp_type: '{}'. Use 'execute'/'x', 'write'/'w', or 'readwrite'/'rw'", bp_type_str),
-                )),
-            };
-
-            let size = match size_str.as_deref().unwrap_or("1") {
-                "1" => HardwareBreakpointSize::Byte1,
-                "2" => HardwareBreakpointSize::Byte2,
-                "4" => HardwareBreakpointSize::Byte4,
-                "8" => HardwareBreakpointSize::Byte8,
-                s => return Err(mlua::Error::external(
-                    anyhow::anyhow!("Invalid size: '{}'. Use '1', '2', '4', or '8'", s),
-                )),
-            };
+            let bp_type = parse_hw_type_str(&bp_type_str, true)?;
+            let size = parse_hw_size_str(size_str.as_deref().unwrap_or("1"))?;
 
             let resp = client.send_and_receive(&DebuggerRequest::SetHardwareBreakpoint {
                 pid, addr, bp_type, size,
@@ -1727,6 +1711,77 @@ impl LuaUserData for LuaDebugClient {
             }
         });
 
+        // ---- Hardware access trace ("find what reads/writes an address") ----
+
+        // start_watchpoint_trace([pid], addr, type, [size="1"])
+        // Arm a hardware watchpoint at `addr` in silent "collect accessors" mode:
+        // every access is recorded server-side (the accessing instruction) and the
+        // target auto-continues instead of breaking. `type` is 'write'/'w' or
+        // 'readwrite'/'rw' (x86 cannot trap read-only). Poll with
+        // `get_watchpoint_accesses`; tear down with `stop_watchpoint_trace`.
+        methods.add_method("start_watchpoint_trace", |_lua, this, (pid, addr, bp_type_str, size_str): (Option<u32>, u64, String, Option<String>)| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let bp_type = parse_hw_type_str(&bp_type_str, false)?;
+            let size = parse_hw_size_str(size_str.as_deref().unwrap_or("1"))?;
+            let resp = client.send_and_receive(&DebuggerRequest::StartWatchpointTrace { pid, addr, bp_type, size })
+                .map_err(mlua::Error::external)?;
+            match resp {
+                DebuggerResponse::Ack => Ok(()),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("StartWatchpointTrace failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // get_watchpoint_accesses([pid], addr) -> { { accessor, accessor_raw_rip, hit_count, first_seq, thread_ids }, .. }
+        // One entry per distinct instruction that has accessed `addr`. `accessor`
+        // is the attributed accessing instruction (on x86 the hardware traps
+        // *after* the access; the server back-steps to attribute it);
+        // `accessor_raw_rip` is the raw trap PC.
+        methods.add_method("get_watchpoint_accesses", |lua, this, (pid, addr): (Option<u32>, u64)| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::GetWatchpointAccesses { pid, addr })
+                .map_err(mlua::Error::external)?;
+            match resp {
+                DebuggerResponse::WatchpointAccesses { accesses } => {
+                    let table = lua.create_table()?;
+                    for (i, acc) in accesses.iter().enumerate() {
+                        let entry = lua.create_table()?;
+                        entry.set("accessor", acc.accessor)?;
+                        entry.set("accessor_raw_rip", acc.accessor_raw_rip)?;
+                        entry.set("hit_count", acc.hit_count)?;
+                        entry.set("first_seq", acc.first_seq)?;
+                        entry.set("thread_ids", acc.thread_ids.clone())?;
+                        table.set(i + 1, entry)?;
+                    }
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("GetWatchpointAccesses failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // stop_watchpoint_trace([pid], addr)
+        // Remove the watchpoint at `addr` and clear its collected accesses.
+        methods.add_method("stop_watchpoint_trace", |_lua, this, (pid, addr): (Option<u32>, u64)| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::StopWatchpointTrace { pid, addr })
+                .map_err(mlua::Error::external)?;
+            match resp {
+                DebuggerResponse::Ack => Ok(()),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("StopWatchpointTrace failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
         // ---- Utility: current state ----
 
         methods.add_method("pid", |_lua, this, ()| {
@@ -2073,6 +2128,34 @@ fn resolve_addr_or_sym(client: &mut DebugClient, val: LuaValue) -> mlua::Result<
         }
         _ => Err(mlua::Error::external(
             anyhow::anyhow!("Address must be integer or symbol name string"),
+        )),
+    }
+}
+
+/// Parse a Lua hardware-breakpoint type string. `allow_execute` is false for
+/// watchpoint traces (data access only).
+fn parse_hw_type_str(s: &str, allow_execute: bool) -> mlua::Result<HardwareBreakpointType> {
+    match s {
+        "execute" | "x" if allow_execute => Ok(HardwareBreakpointType::Execute),
+        "write" | "w" => Ok(HardwareBreakpointType::Write),
+        "readwrite" | "rw" => Ok(HardwareBreakpointType::ReadWrite),
+        _ => Err(mlua::Error::external(anyhow::anyhow!(
+            "Invalid type: '{}'. Use {}'write'/'w' or 'readwrite'/'rw'",
+            s,
+            if allow_execute { "'execute'/'x', " } else { "" },
+        ))),
+    }
+}
+
+/// Parse a Lua hardware-breakpoint size string ("1" | "2" | "4" | "8").
+fn parse_hw_size_str(s: &str) -> mlua::Result<HardwareBreakpointSize> {
+    match s {
+        "1" => Ok(HardwareBreakpointSize::Byte1),
+        "2" => Ok(HardwareBreakpointSize::Byte2),
+        "4" => Ok(HardwareBreakpointSize::Byte4),
+        "8" => Ok(HardwareBreakpointSize::Byte8),
+        _ => Err(mlua::Error::external(
+            anyhow::anyhow!("Invalid size: '{}'. Use '1', '2', '4', or '8'", s),
         )),
     }
 }

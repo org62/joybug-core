@@ -138,6 +138,9 @@ end)
 dbg:remove_hw_breakpoint(pid, addr)
 ```
 
+To find **what** reads/writes an address (rather than break on it), use a silent
+[access trace](#hardware-access-trace) instead.
+
 ### Stepping
 
 ```lua
@@ -565,6 +568,43 @@ dbg:on_process_exited(function(pid, exit_code)
 end)
 
 dbg:launch('cmd.exe /c "echo test"')
+dbg:run()
+```
+
+`pid` is optional on all three methods and defaults to the current process.
+
+### Hardware Access Trace
+
+Answer *"what code reads/writes this address?"* Arm a hardware watchpoint in silent
+"collect accessors" mode: every read/write is recorded server-side (the accessing
+instruction) and the target **auto-continues instead of breaking**, so it runs
+freely while accessors accumulate. This is the hardware-watchpoint analogue of code
+coverage. `type` is `"write"`/`"w"` or `"readwrite"`/`"rw"` — x86 hardware cannot
+trap read-only, so use `"rw"` to catch reads. `size` is `"1"|"2"|"4"|"8"`.
+
+```lua
+dbg:on_initial_breakpoint(function(pid, tid, addr)
+    dbg:set_breakpoint(pid, "breakpoint_here", function(pid, tid, addr)
+        local va = dbg:find_symbol("g_rw_dword", 5)[1].va
+        dbg:start_watchpoint_trace(pid, va, "rw", "4")  -- silent; no handler
+        return "remove"
+    end)
+end)
+
+dbg:on_process_exited(function(pid, exit_code)
+    -- One entry per distinct instruction that touched the address:
+    --   { accessor, accessor_raw_rip, hit_count, first_seq, thread_ids }
+    -- accessor is the attributed accessing instruction (on x86 the hardware traps
+    -- *after* the access; the server back-steps to attribute it — accessor_raw_rip
+    -- keeps the raw trap PC). first_seq is the 1-based first-access order across
+    -- the run.
+    for _, a in ipairs(dbg:get_watchpoint_accesses(pid, va)) do
+        print(hex(a.accessor) .. "  x" .. a.hit_count)
+    end
+    -- dbg:stop_watchpoint_trace(pid, va)  -- remove the watchpoint, clear accesses
+end)
+
+dbg:launch(test_exe)
 dbg:run()
 ```
 

@@ -158,6 +158,27 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::StartWatchpointTrace { pid, addr, bp_type, size } => {
+                let mut p = platform.write().unwrap();
+                match p.start_watchpoint_trace(pid, addr, bp_type, size) {
+                    Ok(_) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::GetWatchpointAccesses { pid, addr } => {
+                let p = platform.read().unwrap();
+                match p.get_watchpoint_accesses(pid, addr) {
+                    Ok(accesses) => DebuggerResponse::WatchpointAccesses { accesses },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::StopWatchpointTrace { pid, addr } => {
+                let mut p = platform.write().unwrap();
+                match p.stop_watchpoint_trace(pid, addr) {
+                    Ok(_) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::SetHardwareBreakpoint { pid, addr, bp_type, size } => {
                 let mut p = platform.write().unwrap();
                 match p.set_hardware_breakpoint(pid, addr, bp_type, size) {

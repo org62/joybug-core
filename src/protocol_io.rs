@@ -124,6 +124,7 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::SymbolList { .. } => "SymbolList".to_string(),
         DebuggerResponse::ResolvedSymbolList { .. } => "ResolvedSymbolList".to_string(),
         DebuggerResponse::CoverageResults { hits } => format!("CoverageResults ({} entries)", hits.len()),
+        DebuggerResponse::WatchpointAccesses { accesses } => format!("WatchpointAccesses ({} entries)", accesses.len()),
         DebuggerResponse::AddressSymbol { .. } => "AddressSymbol".to_string(),
         DebuggerResponse::CallStack { .. } => "CallStack".to_string(),
         DebuggerResponse::FunctionArguments { .. } => "FunctionArguments".to_string(),
@@ -935,6 +936,45 @@ impl<S> DebugSession<S> {
                 Err(anyhow::anyhow!("Failed to stop code coverage: {}", message))
             }
             other => Err(anyhow::anyhow!("Unexpected response to StopCodeCoverage: {:?}", other)),
+        }
+    }
+
+    /// Arm a hardware watchpoint at `addr` in silent "access trace" mode: every
+    /// read/write is recorded server-side (the accessing instruction) and the target
+    /// auto-continues instead of breaking. Poll with [`get_watchpoint_accesses`] and
+    /// tear down with [`stop_watchpoint_trace`]. `bp_type` should be `Write` or
+    /// `ReadWrite` (x86 hardware cannot trap read-only).
+    pub fn start_watchpoint_trace(&mut self, pid: u32, addr: u64, bp_type: crate::protocol::HardwareBreakpointType, size: crate::protocol::HardwareBreakpointSize) -> anyhow::Result<()> {
+        match self.send_and_receive(&DebuggerRequest::StartWatchpointTrace { pid, addr, bp_type, size })? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to start watchpoint trace: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to StartWatchpointTrace: {:?}", other)),
+        }
+    }
+
+    /// Fetch a [`crate::protocol::WatchpointAccess`] (accessing instruction pointer,
+    /// hit count, first-access order, thread ids) for every distinct instruction
+    /// that has accessed the watched `addr` at least once.
+    pub fn get_watchpoint_accesses(&mut self, pid: u32, addr: u64) -> anyhow::Result<Vec<crate::protocol::WatchpointAccess>> {
+        match self.send_and_receive(&DebuggerRequest::GetWatchpointAccesses { pid, addr })? {
+            DebuggerResponse::WatchpointAccesses { accesses } => Ok(accesses),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to get watchpoint accesses: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to GetWatchpointAccesses: {:?}", other)),
+        }
+    }
+
+    /// Remove the watchpoint at `addr` and clear its collected accesses.
+    pub fn stop_watchpoint_trace(&mut self, pid: u32, addr: u64) -> anyhow::Result<()> {
+        match self.send_and_receive(&DebuggerRequest::StopWatchpointTrace { pid, addr })? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to stop watchpoint trace: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to StopWatchpointTrace: {:?}", other)),
         }
     }
 

@@ -113,6 +113,26 @@ impl WindowsPlatform {
             .ok_or_else(|| SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()))
     }
 
+    /// Attribute a watchpoint trap instruction pointer to the accessing
+    /// instruction. On x86 the hardware traps *after* the access, so the accessor
+    /// is the instruction ending exactly at `raw_rip` (decode the up-to-15-byte
+    /// window before it; closest wins if several align). ARM64 reports the exact
+    /// faulting PC. Falls back to `raw_rip` when no clean decode is found.
+    fn attribute_watchpoint_accessor(&self, pid: u32, raw_rip: u64) -> u64 {
+        if cfg!(target_arch = "aarch64") || raw_rip < 16 {
+            return raw_rip;
+        }
+        match self.disassemble_memory(pid, raw_rip - 15, 15, Architecture::X64) {
+            Ok(ins) => ins
+                .iter()
+                .filter(|i| i.address + i.size as u64 == raw_rip)
+                .map(|i| i.address)
+                .max()
+                .unwrap_or(raw_rip),
+            Err(_) => raw_rip,
+        }
+    }
+
     /// Find a module by base address in `pid`'s module list.
     fn module_at(&self, pid: u32, module_base: u64) -> Result<ModuleInfo, SymbolError> {
         self.modules_for(pid).into_iter()
@@ -487,6 +507,35 @@ impl PlatformAPI for WindowsPlatform {
         trace!(pid, "WindowsPlatform::stop_code_coverage called");
         let process = self.get_process_mut(pid)?;
         process.clear_coverage();
+        Ok(())
+    }
+
+    fn start_watchpoint_trace(&mut self, pid: u32, addr: u64, bp_type: crate::protocol::HardwareBreakpointType, size: crate::protocol::HardwareBreakpointSize) -> Result<(), PlatformError> {
+        trace!(pid, addr, ?bp_type, ?size, "WindowsPlatform::start_watchpoint_trace called");
+        // Arm the underlying hardware watchpoint (allocates a DR slot, applies to
+        // all threads), then mark it as a silent access trace.
+        self.set_hardware_breakpoint(pid, addr, bp_type, size)?;
+        self.get_process_mut(pid)?.arm_watchpoint_trace(addr);
+        info!(pid, addr, "Hardware access trace started");
+        Ok(())
+    }
+
+    fn get_watchpoint_accesses(&self, pid: u32, addr: u64) -> Result<Vec<crate::protocol::WatchpointAccess>, PlatformError> {
+        let mut accesses = self.get_process(pid)?.watchpoint_snapshot(addr);
+        for a in &mut accesses {
+            a.accessor = self.attribute_watchpoint_accessor(pid, a.accessor_raw_rip);
+        }
+        Ok(accesses)
+    }
+
+    fn stop_watchpoint_trace(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError> {
+        trace!(pid, addr, "WindowsPlatform::stop_watchpoint_trace called");
+        // Remove the hardware watchpoint; ignore "no breakpoint" so stop is
+        // idempotent even if it was already cleared (e.g. module unload).
+        if let Err(e) = self.remove_hardware_breakpoint(pid, addr) {
+            warn!(pid, addr, error = %e, "stop_watchpoint_trace: hardware watchpoint already gone");
+        }
+        self.get_process_mut(pid)?.clear_watchpoint_trace(addr);
         Ok(())
     }
 

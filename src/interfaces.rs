@@ -295,6 +295,18 @@ pub trait PlatformAPI: Send + Sync {
     fn get_code_coverage(&self, _pid: u32) -> Result<Vec<crate::protocol::CoverageHit>, PlatformError> { Err(PlatformError::NotImplemented) }
     /// Remove all coverage breakpoints and clear coverage state.
     fn stop_code_coverage(&mut self, _pid: u32) -> Result<(), PlatformError> { Err(PlatformError::NotImplemented) }
+
+    // Hardware access trace: a hardware watchpoint (Write / ReadWrite) run in
+    // silent "find what accesses this address" mode. Each read/write is recorded
+    // server-side (the accessing instruction pointer) and the target auto-continues
+    // without notifying the client (see `handle_exception_event`).
+    /// Arm a watchpoint at `addr` and start collecting accessors.
+    fn start_watchpoint_trace(&mut self, _pid: u32, _addr: u64, _bp_type: crate::protocol::HardwareBreakpointType, _size: crate::protocol::HardwareBreakpointSize) -> Result<(), PlatformError> { Err(PlatformError::NotImplemented) }
+    /// Fetch a [`crate::protocol::WatchpointAccess`] for every distinct instruction
+    /// that has accessed the watched `addr` at least once.
+    fn get_watchpoint_accesses(&self, _pid: u32, _addr: u64) -> Result<Vec<crate::protocol::WatchpointAccess>, PlatformError> { Err(PlatformError::NotImplemented) }
+    /// Remove the watchpoint at `addr` and clear its collected accesses.
+    fn stop_watchpoint_trace(&mut self, _pid: u32, _addr: u64) -> Result<(), PlatformError> { Err(PlatformError::NotImplemented) }
     fn launch(&mut self, command: &str, debug_children: bool, working_directory: Option<&str>) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>;
     fn read_memory(&self, pid: u32, address: u64, size: usize) -> Result<Vec<u8>, PlatformError>;
     fn write_memory(&self, pid: u32, address: u64, data: &[u8]) -> Result<(), PlatformError>;

@@ -425,6 +425,12 @@ pub(super) fn handle_exception_event(
                 );
                 // `process` borrow ends here; step over with HW debug disabled.
                 arm64_begin_step_over_hw_bp(platform, pid, tid)?;
+                // Silent access-trace path: ARM64 reports the exact faulting PC
+                // (`address`), so no client-side back-step is needed. If the watched
+                // address is being traced, record and auto-continue silently.
+                if platform.get_process_mut(pid)?.record_watchpoint_access(bp.address, address, tid) {
+                    return Ok(None);
+                }
                 return Ok(Some(crate::protocol::DebugEvent::HardwareBreakpoint {
                     pid,
                     tid,
@@ -694,6 +700,15 @@ pub(super) fn handle_exception_event(
 
                         // Schedule re-arm after the single step completes
                         process.schedule_hw_bp_rearm(tid, dr_index);
+
+                        // Silent access-trace path: if this watched address is being
+                        // traced, record the accessing instruction (raw RIP; x86
+                        // traps *after* the access, so this is the following
+                        // instruction — attributed back at snapshot time) and
+                        // auto-continue without forwarding a HardwareBreakpoint event.
+                        if process.record_watchpoint_access(bp_address, aligned.context.Rip, tid) {
+                            return Ok(None);
+                        }
 
                         return Ok(Some(crate::protocol::DebugEvent::HardwareBreakpoint {
                             pid, tid, address: bp_address, dr_index, bp_type,

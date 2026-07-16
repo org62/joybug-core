@@ -773,6 +773,13 @@ fn test_lua_file_hw_breakpoint_stepping() {
     run_lua_test_file("breakpoints/hw_breakpoint_stepping.lua", Some(&test_exe));
 }
 
+#[test]
+#[cfg(not(target_arch = "aarch64"))]
+fn test_lua_file_watchpoint_trace() {
+    let test_exe = common::get_test_program_path("hardware_bp_test");
+    run_lua_test_file("breakpoints/watchpoint_trace.lua", Some(&test_exe));
+}
+
 // --- stepping ---
 
 #[test]

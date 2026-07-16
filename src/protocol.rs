@@ -366,6 +366,28 @@ pub mod request_response {
         StopCodeCoverage {
             pid: u32,
         },
+        /// Arm a hardware watchpoint at `addr` in silent "access trace" mode: every
+        /// read/write is recorded server-side (the accessing instruction pointer)
+        /// and the target auto-continues instead of breaking. Reuses the DR0-DR3 /
+        /// ARM64 watchpoint machinery of `SetHardwareBreakpoint`.
+        StartWatchpointTrace {
+            pid: u32,
+            addr: u64,
+            bp_type: HardwareBreakpointType,
+            size: HardwareBreakpointSize,
+        },
+        /// Fetch a [`WatchpointAccess`] (accessing instruction pointer, hit count,
+        /// first-hit order, thread ids) for every distinct instruction that has
+        /// accessed the watched `addr` at least once.
+        GetWatchpointAccesses {
+            pid: u32,
+            addr: u64,
+        },
+        /// Remove the watchpoint at `addr` and clear its collected accesses.
+        StopWatchpointTrace {
+            pid: u32,
+            addr: u64,
+        },
         ReadMemory {
             pid: u32,
             address: u64,
@@ -731,6 +753,27 @@ pub mod request_response {
         pub thread_ids: Vec<u32>,
     }
 
+    /// One distinct instruction that has accessed a watched address at least once
+    /// (produced by a hardware access trace).
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct WatchpointAccess {
+        /// The attributed accessing instruction. On x86 the hardware traps *after*
+        /// the access, so the server back-steps from the trap RIP to attribute it;
+        /// on ARM64 it is the exact faulting PC. Equals `accessor_raw_rip` when
+        /// attribution is not possible.
+        pub accessor: u64,
+        /// The raw trap instruction pointer (the instruction *following* the access
+        /// on x86; equal to `accessor` on ARM64).
+        pub accessor_raw_rip: u64,
+        pub hit_count: u64,
+        /// 1-based first-access order across the whole trace run (1 = the first
+        /// instruction that touched the watched address).
+        pub first_seq: u64,
+        /// Distinct thread ids whose instruction accessed the address, in first-hit
+        /// order.
+        pub thread_ids: Vec<u32>,
+    }
+
     #[derive(Serialize, Deserialize, Clone)]
     pub enum DebuggerResponse {
         Ack,
@@ -756,6 +799,9 @@ pub mod request_response {
         /// Code-coverage results: one [`CoverageHit`] per coverage breakpoint
         /// hit at least once.
         CoverageResults { hits: Vec<CoverageHit> },
+        /// Access-trace results: one [`WatchpointAccess`] per distinct instruction
+        /// that touched the watched address at least once.
+        WatchpointAccesses { accesses: Vec<WatchpointAccess> },
         AddressSymbol {
             module_path: Option<String>,
             symbol: Option<crate::interfaces::ModuleSymbol>,
