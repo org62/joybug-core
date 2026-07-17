@@ -191,6 +191,25 @@ fn flush(state: &mut RunState, cfg: &DetectorConfig, out: &mut Vec<StringHit>) {
     state.next_addr = None;
 }
 
+/// Scan a raw byte buffer for ASCII/UTF-16 strings without a live process.
+/// `base` is the address assigned to `bytes[0]` (e.g. a file offset, RVA, or VA);
+/// each hit's `address` is `base + index`. Session-independent — used by the
+/// standalone PE viewer to scan a file buffer.
+pub fn scan_bytes(
+    bytes: &[u8],
+    base: u64,
+    min_len: usize,
+    encodings: StringEncodingFilter,
+    contains: &str,
+) -> Vec<StringHit> {
+    let cfg = DetectorConfig::new(min_len, encodings, contains);
+    let mut state = RunState::default();
+    let mut out = Vec::new();
+    feed_chunk(&mut state, base, bytes, &cfg, &mut out);
+    flush(&mut state, &cfg, &mut out);
+    out
+}
+
 fn scan_region(
     platform: &dyn PlatformAPI,
     pid: u32,

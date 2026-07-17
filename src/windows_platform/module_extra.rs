@@ -14,12 +14,23 @@ impl WindowsPlatform {
         let module_path = modules.iter().find(|m| m.base == module_base).map(|m| m.name.clone())
             .ok_or_else(|| PlatformError::Other("Module not found at base".to_string()))?;
 
-        // Read file bytes and parse with pelite
+        // Read file bytes and delegate to the byte-based parser
         let file_bytes = std::fs::read(&module_path)
             .map_err(|e| PlatformError::Other(format!("Failed to read module file '{}': {}", module_path, e)))?;
-        let pe = PeFile::from_bytes(&file_bytes)
-            .map_err(|e| PlatformError::Other(format!("pelite failed to parse '{}': {:?}", module_path, e)))?;
         trace!({module_path, file_size = file_bytes.len()}, "Reading module extra info");
+        parse_module_extra_info_from_bytes(&file_bytes)
+    }
+}
+
+/// Parse a PE image (64-bit) from raw file bytes into serializable extra info.
+///
+/// This is the session-independent core of [`WindowsPlatform::parse_module_extra_info`]:
+/// it maps pelite headers/sections/imports/exports/exception-directory into our
+/// `ModuleExtraInfo` without requiring a debug session or loaded module. Only
+/// 64-bit PE images are supported (pelite `pe64`).
+pub fn parse_module_extra_info_from_bytes(file_bytes: &[u8]) -> Result<ModuleExtraInfo, PlatformError> {
+        let pe = PeFile::from_bytes(file_bytes)
+            .map_err(|e| PlatformError::Other(format!("pelite failed to parse PE: {:?}", e)))?;
 
         // Map pelite headers into our serializable types
         let dos = pe.dos_header();
@@ -260,7 +271,6 @@ impl WindowsPlatform {
         // Return dos + complete nt headers + sections + imports + exports + runtime functions
         let info = ModuleExtraInfo { dos_header, nt_headers, sections, imports, exports, runtime_functions };
         Ok(info)
-    }
 }
 
 

@@ -308,7 +308,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// authoritative for symbol-store matching; falls back to the PDB info-stream age
 /// when the DBI age is absent. On mismatch returns `Ok(Err(info))` without parsing
 /// the symbol streams.
-pub(crate) fn parse_pdb_matching_pe(
+pub fn parse_pdb_matching_pe(
     module_path: &Path,
     pdb_path: &Path,
 ) -> Result<std::result::Result<Vec<ModuleSymbol>, PdbMismatchInfo>, SymbolError> {

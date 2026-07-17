@@ -13,6 +13,8 @@ mod callstack;
 mod stepper;
 mod debugged_process;
 mod module_extra;
+pub use module_extra::parse_module_extra_info_from_bytes;
+pub use symbol_provider::{WindowsSymbolProvider, parse_pdb_matching_pe};
 mod dbghelp;
 mod dereference;
 mod tracer;
