@@ -134,6 +134,7 @@ fn main() {
         let _ = compile_test_program(&manifest_dir, &out_dir, "xtea_test", Some(0x140000000));
         let _ = compile_test_program(&manifest_dir, &out_dir, "emulator_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "exception_test", None);
+        let _ = compile_test_program(&manifest_dir, &out_dir, "single_step_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "hardware_bp_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "memory_search_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "assembler_test", None);

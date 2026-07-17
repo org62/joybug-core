@@ -836,6 +836,18 @@ fn test_lua_file_exception_passed() {
     run_lua_test_file("basics/exception_passed.lua", Some(&test_exe));
 }
 
+#[test]
+fn test_lua_file_single_step_handled() {
+    let test_exe = common::get_test_program_path("single_step_test");
+    run_lua_test_file("basics/single_step_handled.lua", Some(&test_exe));
+}
+
+#[test]
+fn test_lua_file_single_step_passed() {
+    let test_exe = common::get_test_program_path("single_step_test");
+    run_lua_test_file("basics/single_step_passed.lua", Some(&test_exe));
+}
+
 // --- mass breakpoints ---
 
 #[test]
