@@ -547,6 +547,15 @@ pub mod request_response {
             max_instructions: usize,
             arch: crate::interfaces::Architecture,
         },
+        /// Backward disassembly: up to `count` instructions ending immediately
+        /// before `target` (x64dbg-style self-resynchronizing decode). Reuses the
+        /// `Instructions` response.
+        DisassembleBackward {
+            pid: u32,
+            target: u64,
+            count: usize,
+            arch: crate::interfaces::Architecture,
+        },
         // Emulator requests (one-shot: create, emulate, destroy in single call)
         /// Emulate N instructions from current debugger state
         EmulateInstructions {

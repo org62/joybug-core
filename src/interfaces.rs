@@ -372,7 +372,67 @@ pub trait PlatformAPI: Send + Sync {
 
     // Symbolized disassembly methods
     fn disassemble_memory(&self, pid: u32, address: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError>;
-    
+
+    /// Like `disassemble_memory`, but bounded by bytes instead of instruction
+    /// count: decodes only instructions contained entirely within
+    /// `[address, address + byte_len)`. The default trims a plain
+    /// `disassemble_memory` decode; platforms should override it to also bound
+    /// the underlying read (`disassemble_memory` reads `count * 16` bytes and
+    /// decodes past the window, wasting reads/symbolization and risking a
+    /// wholesale read failure if the over-read straddles an unmapped page).
+    fn disassemble_memory_bytes(&self, pid: u32, address: u64, byte_len: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
+        let end = address.saturating_add(byte_len as u64);
+        let instructions = self.disassemble_memory(pid, address, byte_len, arch)?;
+        Ok(instructions
+            .into_iter()
+            .take_while(|i| i.address + i.size as u64 <= end)
+            .collect())
+    }
+
+    /// Disassemble up to `count` instructions ending immediately before `target`
+    /// ("backward disassembly", x64dbg-style). Decodes forward from a point safely
+    /// before `target` and exploits x86 self-resynchronization: a linear decode
+    /// started at a slightly-wrong offset re-aligns to the true instruction stream
+    /// within a few instructions. `target` is expected to be a real instruction
+    /// boundary (it is when scrolling up: the address of an already-decoded row, or
+    /// the trap RIP after a retired instruction). Used to let the UI scroll up past
+    /// functions with no `.pdata` bounds, and to attribute HW-watchpoint accesses.
+    ///
+    /// The backward read is clamped to the containing memory region's base so
+    /// [start, target) never touches an unmapped page (such a read fails
+    /// wholesale, e.g. just before a section); platforms whose
+    /// `query_memory_region` errors keep the unclamped start.
+    fn disassemble_backward(&self, pid: u32, target: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
+        if count == 0 || target == 0 {
+            return Ok(Vec::new());
+        }
+        // Max instruction length per architecture; one extra instruction of
+        // lead-in gives an x86 decode room to resynchronize before it reaches
+        // `target` (ARM64 is fixed-width, so any aligned start decodes exactly).
+        let max_ilen: u64 = match arch {
+            Architecture::X64 => 15,
+            Architecture::Arm64 => 4,
+        };
+        let back = max_ilen * count as u64 + max_ilen;
+        let mut start = target.saturating_sub(back);
+        // Region-clamp only when the window can cross a 4K page boundary —
+        // within one page it's mapped iff `target` is, and skipping the query
+        // matters on the per-access watchpoint hot path.
+        if start >> 12 != (target - 1) >> 12 {
+            if let Ok(region) = self.query_memory_region(pid, target - 1) {
+                if region.base_address > start && region.base_address <= target {
+                    start = region.base_address;
+                }
+            }
+        }
+        if start >= target {
+            return Ok(Vec::new());
+        }
+        let window = (target - start) as usize;
+        let instructions = self.disassemble_memory_bytes(pid, start, window, arch)?;
+        Ok(align_backward_instructions(instructions, target, count))
+    }
+
     // Call stack methods
     fn get_call_stack(&self, pid: u32, tid: u32) -> Result<Vec<CallFrame>, PlatformError>;
     // Process control
@@ -595,6 +655,26 @@ pub trait PlatformAPI: Send + Sync {
             "disassemble_function not supported by this platform".into(),
         ))
     }
+}
+
+/// From a forward linear decode `ins` (ascending addresses) that was started before
+/// `target` and runs past it, return up to `count` instructions immediately preceding
+/// `target` — the aligned predecessors. Relies on x86 self-resynchronization: by the
+/// time the decode reaches `target` it has realigned to the true instruction stream,
+/// so keeping only instructions that end at or before `target` yields the correct
+/// predecessors (the last one ends exactly at `target` for well-formed code). Never
+/// keeps an instruction that straddles `target`, so the result can't contradict the
+/// anchor row.
+pub fn align_backward_instructions(ins: Vec<Instruction>, target: u64, count: usize) -> Vec<Instruction> {
+    let mut v: Vec<Instruction> = ins
+        .into_iter()
+        .filter(|i| i.address < target && i.address + i.size as u64 <= target)
+        .collect();
+    let n = v.len();
+    if n > count {
+        v.drain(0..n - count);
+    }
+    v
 }
 
 impl SymbolInfo {

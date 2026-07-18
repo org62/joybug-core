@@ -326,6 +326,12 @@ end
 local func = dbg:disassemble_function(pid, addr)
 print("Function: " .. (func.name or "unknown"))
 disasm(func.instructions)
+
+-- Backward disassembly: up to N instructions ending immediately before `target`
+-- (x64dbg-style self-resynchronizing decode). `target` should be a real instruction
+-- boundary. Useful for scrolling up past functions with no `.pdata` bounds.
+local prev = dbg:disassemble_backward(pid, target, 5)
+disasm(prev)  -- prev[#prev] ends exactly at `target` for well-formed code
 ```
 
 ### Call Stack

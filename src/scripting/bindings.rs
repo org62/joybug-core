@@ -1079,6 +1079,27 @@ impl LuaUserData for LuaDebugClient {
             }
         });
 
+        methods.add_method("disassemble_backward", |lua, this, (pid, target, count): (u32, u64, Option<usize>)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::DisassembleBackward {
+                pid, target, count: count.unwrap_or(10),
+                arch: Architecture::from_native(),
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::Instructions { instructions } => {
+                    let table = lua.create_table()?;
+                    for (i, inst) in instructions.iter().enumerate() {
+                        table.set(i + 1, instruction_to_lua_table(lua, inst)?)?;
+                    }
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("DisassembleBackward failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
         // ---- Call stack ----
 
         methods.add_method("get_call_stack", |lua, this, (pid, tid): (Option<u32>, Option<u32>)| {

@@ -117,19 +117,19 @@ impl WindowsPlatform {
 
     /// Attribute a watchpoint trap instruction pointer to the accessing
     /// instruction. On x86 the hardware traps *after* the access, so the accessor
-    /// is the instruction ending exactly at `raw_rip` (decode the up-to-15-byte
-    /// window before it; closest wins if several align). ARM64 reports the exact
-    /// faulting PC. Falls back to `raw_rip` when no clean decode is found.
+    /// is the instruction ending exactly at `raw_rip`. Uses the shared backward
+    /// disassembler (self-resynchronizing decode) to find the instruction ending at
+    /// `raw_rip`. ARM64 reports the exact faulting PC. Falls back to `raw_rip` when
+    /// no instruction ends exactly there (misaligned/undecodable window).
     fn attribute_watchpoint_accessor(&self, pid: u32, raw_rip: u64) -> u64 {
         if cfg!(target_arch = "aarch64") || raw_rip < 16 {
             return raw_rip;
         }
-        match self.disassemble_memory(pid, raw_rip - 15, 15, Architecture::X64) {
+        match self.disassemble_backward(pid, raw_rip, 1, Architecture::X64) {
             Ok(ins) => ins
-                .iter()
+                .last()
                 .filter(|i| i.address + i.size as u64 == raw_rip)
                 .map(|i| i.address)
-                .max()
                 .unwrap_or(raw_rip),
             Err(_) => raw_rip,
         }
@@ -817,128 +817,14 @@ impl PlatformAPI for WindowsPlatform {
 
     // Symbolized disassembly methods
     fn disassemble_memory(&self, pid: u32, address: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
-        use std::time::Instant;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use std::cell::Cell;
+        self.disassemble_memory_impl(pid, address, count * 16, count, arch)
+    }
 
-        // Thread-local timing accumulators
-        thread_local! {
-            static MEMORY_READ_US: Cell<u64> = const { Cell::new(0) };
-            static MODULE_LIST_US: Cell<u64> = const { Cell::new(0) };
-            static DISASM_US: Cell<u64> = const { Cell::new(0) };
-            static SYMBOL_US: Cell<u64> = const { Cell::new(0) };
-            static CALL_COUNT: Cell<u64> = const { Cell::new(0) };
-            static SYMBOL_CALLS: Cell<u64> = const { Cell::new(0) };
-        }
-
-        if self.disassembler.is_none() {
-            return Err(DisassemblerError::CapstoneError("Disassembler not initialized".to_string()));
-        }
-
-        // Time memory read
-        let t0 = Instant::now();
-        let mut data = memory::read_memory_unlocked(pid, address, count * 16)
-            .map_err(|e| DisassemblerError::InvalidData(format!("Failed to read memory: {}", e)))?;
-
-        // Patch breakpoint bytes with originals so disassembly shows real instructions
-        if let Ok(process) = self.get_process(pid) {
-            process.patch_breakpoint_bytes(address, &mut data);
-        }
-        let memory_time = t0.elapsed();
-
-        // Time module list fetch
-        let t1 = Instant::now();
-        let mut modules = self.modules_for(pid);
-        // Sort modules by base address for binary search
-        modules.sort_by_key(|m| m.base);
-        let module_time = t1.elapsed();
-        // The symbol resolver closure consumes `modules`; keep a copy for line annotation.
-        let modules_for_lines = modules.clone();
-
-        let symbol_manager = self.symbol_manager.as_ref();
-
-        // Track symbol resolution time
-        let symbol_time_us = std::sync::Arc::new(AtomicU64::new(0));
-        let symbol_call_count = std::sync::Arc::new(AtomicU64::new(0));
-        let symbol_time_clone = symbol_time_us.clone();
-        let symbol_count_clone = symbol_call_count.clone();
-
-        let symbol_resolver = move |addr: u64| -> Option<crate::interfaces::SymbolInfo> {
-            let t = Instant::now();
-            let result = if let Some(symbol_manager) = symbol_manager {
-                // Non-blocking: skip symbolization while PDBs are still loading rather
-                // than stalling the disassembly response behind symbol downloads.
-                // The UI re-requests disassembly once symbols finish loading.
-                if let Ok(Some((module_path, symbol, offset))) = symbol_manager.try_resolve_address_to_symbol(&modules, addr) {
-                    let module_name = std::path::Path::new(&module_path)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(&module_path)
-                        .to_string();
-                    Some(crate::interfaces::SymbolInfo { module_name, symbol_name: symbol.name, offset })
-                } else { None }
-            } else { None };
-            symbol_time_clone.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-            symbol_count_clone.fetch_add(1, Ordering::Relaxed);
-            result
-        };
-
-        // Time disassembly
-        let t2 = Instant::now();
-        let result = self.disassembler.as_ref().unwrap().disassemble_with_symbols(arch, &data, address, count, symbol_resolver);
-        let disasm_time = t2.elapsed();
-
-        // Accumulate timing stats
-        MEMORY_READ_US.with(|c| c.set(c.get() + memory_time.as_micros() as u64));
-        MODULE_LIST_US.with(|c| c.set(c.get() + module_time.as_micros() as u64));
-        DISASM_US.with(|c| c.set(c.get() + disasm_time.as_micros() as u64));
-        SYMBOL_US.with(|c| c.set(c.get() + symbol_time_us.load(Ordering::Relaxed)));
-        SYMBOL_CALLS.with(|c| c.set(c.get() + symbol_call_count.load(Ordering::Relaxed)));
-        let call_count = CALL_COUNT.with(|c| { c.set(c.get() + 1); c.get() });
-
-        // Print stats every 1000 calls
-        if call_count % 1000 == 0 {
-            let mem_ms = MEMORY_READ_US.with(|c| c.get()) as f64 / 1000.0;
-            let mod_ms = MODULE_LIST_US.with(|c| c.get()) as f64 / 1000.0;
-            let dis_ms = DISASM_US.with(|c| c.get()) as f64 / 1000.0;
-            let sym_ms = SYMBOL_US.with(|c| c.get()) as f64 / 1000.0;
-            let sym_calls = SYMBOL_CALLS.with(|c| c.get());
-            println!("\n=== TIMING STATS after {} calls ===", call_count);
-            println!("  Memory read:    {:8.2} ms", mem_ms);
-            println!("  Module list:    {:8.2} ms", mod_ms);
-            println!("  Disassembly:    {:8.2} ms (includes symbol resolution)", dis_ms);
-            println!("  Symbol resolve: {:8.2} ms ({} calls, {:.3} ms/call avg)",
-                sym_ms, sym_calls, if sym_calls > 0 { sym_ms / sym_calls as f64 } else { 0.0 });
-            println!("=====================================\n");
-        }
-
-        // Resolve indirect jump/call targets (e.g., `call qword ptr [IAT_slot]`)
-        // by reading the pointer value so clicking navigates to the actual function.
-        let mut instructions = result?;
-        let ptr_size = match arch {
-            Architecture::X64 | Architecture::Arm64 => 8usize,
-        };
-        for instr in &mut instructions {
-            if (instr.is_call || instr.is_jump) && instr.jump_target.is_some() && instr.op_str.contains('[') {
-                let ptr_addr = instr.jump_target.unwrap();
-                if let Ok(data) = memory::read_memory_unlocked(pid, ptr_addr, ptr_size) {
-                    if data.len() >= ptr_size {
-                        let actual_target = u64::from_le_bytes(data[..8].try_into().unwrap());
-                        instr.jump_target = Some(actual_target);
-                    }
-                }
-            }
-        }
-
-        // Annotate with source lines from already-cached line tables only.
-        // The first source-view request triggers the parse; until then this is a no-op,
-        // so bulk disassembly never stalls behind a PDB line-table parse.
-        if let Some(symbol_manager) = self.symbol_manager.as_ref() {
-            for instr in &mut instructions {
-                instr.line_info = symbol_manager.try_resolve_address_to_line_cached(&modules_for_lines, instr.address);
-            }
-        }
-        Ok(instructions)
+    fn disassemble_memory_bytes(&self, pid: u32, address: u64, byte_len: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
+        // Reading and decoding exactly `byte_len` bytes means the decode cannot
+        // produce an instruction extending past the window (Capstone stops at
+        // the buffer end), so no post-trim is needed.
+        self.disassemble_memory_impl(pid, address, byte_len, byte_len, arch)
     }
 
     fn get_call_stack(&self, pid: u32, tid: u32) -> Result<Vec<crate::interfaces::CallFrame>, PlatformError> {
@@ -1267,5 +1153,132 @@ impl WindowsPlatform {
         };
 
         Ok((filtered_instructions, func_start, func_end, func_name))
+    }
+
+    /// Shared body of `disassemble_memory` / `disassemble_memory_bytes`:
+    /// reads `read_len` bytes and decodes up to `count` instructions.
+    fn disassemble_memory_impl(&self, pid: u32, address: u64, read_len: usize, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
+        use std::time::Instant;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::cell::Cell;
+
+        // Thread-local timing accumulators
+        thread_local! {
+            static MEMORY_READ_US: Cell<u64> = const { Cell::new(0) };
+            static MODULE_LIST_US: Cell<u64> = const { Cell::new(0) };
+            static DISASM_US: Cell<u64> = const { Cell::new(0) };
+            static SYMBOL_US: Cell<u64> = const { Cell::new(0) };
+            static CALL_COUNT: Cell<u64> = const { Cell::new(0) };
+            static SYMBOL_CALLS: Cell<u64> = const { Cell::new(0) };
+        }
+
+        if self.disassembler.is_none() {
+            return Err(DisassemblerError::CapstoneError("Disassembler not initialized".to_string()));
+        }
+
+        // Time memory read
+        let t0 = Instant::now();
+        let mut data = memory::read_memory_unlocked(pid, address, read_len)
+            .map_err(|e| DisassemblerError::InvalidData(format!("Failed to read memory: {}", e)))?;
+
+        // Patch breakpoint bytes with originals so disassembly shows real instructions
+        if let Ok(process) = self.get_process(pid) {
+            process.patch_breakpoint_bytes(address, &mut data);
+        }
+        let memory_time = t0.elapsed();
+
+        // Time module list fetch
+        let t1 = Instant::now();
+        let mut modules = self.modules_for(pid);
+        // Sort modules by base address for binary search
+        modules.sort_by_key(|m| m.base);
+        let module_time = t1.elapsed();
+        // The symbol resolver closure consumes `modules`; keep a copy for line annotation.
+        let modules_for_lines = modules.clone();
+
+        let symbol_manager = self.symbol_manager.as_ref();
+
+        // Track symbol resolution time
+        let symbol_time_us = std::sync::Arc::new(AtomicU64::new(0));
+        let symbol_call_count = std::sync::Arc::new(AtomicU64::new(0));
+        let symbol_time_clone = symbol_time_us.clone();
+        let symbol_count_clone = symbol_call_count.clone();
+
+        let symbol_resolver = move |addr: u64| -> Option<crate::interfaces::SymbolInfo> {
+            let t = Instant::now();
+            let result = if let Some(symbol_manager) = symbol_manager {
+                // Non-blocking: skip symbolization while PDBs are still loading rather
+                // than stalling the disassembly response behind symbol downloads.
+                // The UI re-requests disassembly once symbols finish loading.
+                if let Ok(Some((module_path, symbol, offset))) = symbol_manager.try_resolve_address_to_symbol(&modules, addr) {
+                    let module_name = std::path::Path::new(&module_path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&module_path)
+                        .to_string();
+                    Some(crate::interfaces::SymbolInfo { module_name, symbol_name: symbol.name, offset })
+                } else { None }
+            } else { None };
+            symbol_time_clone.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+            symbol_count_clone.fetch_add(1, Ordering::Relaxed);
+            result
+        };
+
+        // Time disassembly
+        let t2 = Instant::now();
+        let result = self.disassembler.as_ref().unwrap().disassemble_with_symbols(arch, &data, address, count, symbol_resolver);
+        let disasm_time = t2.elapsed();
+
+        // Accumulate timing stats
+        MEMORY_READ_US.with(|c| c.set(c.get() + memory_time.as_micros() as u64));
+        MODULE_LIST_US.with(|c| c.set(c.get() + module_time.as_micros() as u64));
+        DISASM_US.with(|c| c.set(c.get() + disasm_time.as_micros() as u64));
+        SYMBOL_US.with(|c| c.set(c.get() + symbol_time_us.load(Ordering::Relaxed)));
+        SYMBOL_CALLS.with(|c| c.set(c.get() + symbol_call_count.load(Ordering::Relaxed)));
+        let call_count = CALL_COUNT.with(|c| { c.set(c.get() + 1); c.get() });
+
+        // Print stats every 1000 calls
+        if call_count % 1000 == 0 {
+            let mem_ms = MEMORY_READ_US.with(|c| c.get()) as f64 / 1000.0;
+            let mod_ms = MODULE_LIST_US.with(|c| c.get()) as f64 / 1000.0;
+            let dis_ms = DISASM_US.with(|c| c.get()) as f64 / 1000.0;
+            let sym_ms = SYMBOL_US.with(|c| c.get()) as f64 / 1000.0;
+            let sym_calls = SYMBOL_CALLS.with(|c| c.get());
+            println!("\n=== TIMING STATS after {} calls ===", call_count);
+            println!("  Memory read:    {:8.2} ms", mem_ms);
+            println!("  Module list:    {:8.2} ms", mod_ms);
+            println!("  Disassembly:    {:8.2} ms (includes symbol resolution)", dis_ms);
+            println!("  Symbol resolve: {:8.2} ms ({} calls, {:.3} ms/call avg)",
+                sym_ms, sym_calls, if sym_calls > 0 { sym_ms / sym_calls as f64 } else { 0.0 });
+            println!("=====================================\n");
+        }
+
+        // Resolve indirect jump/call targets (e.g., `call qword ptr [IAT_slot]`)
+        // by reading the pointer value so clicking navigates to the actual function.
+        let mut instructions = result?;
+        let ptr_size = match arch {
+            Architecture::X64 | Architecture::Arm64 => 8usize,
+        };
+        for instr in &mut instructions {
+            if (instr.is_call || instr.is_jump) && instr.jump_target.is_some() && instr.op_str.contains('[') {
+                let ptr_addr = instr.jump_target.unwrap();
+                if let Ok(data) = memory::read_memory_unlocked(pid, ptr_addr, ptr_size) {
+                    if data.len() >= ptr_size {
+                        let actual_target = u64::from_le_bytes(data[..8].try_into().unwrap());
+                        instr.jump_target = Some(actual_target);
+                    }
+                }
+            }
+        }
+
+        // Annotate with source lines from already-cached line tables only.
+        // The first source-view request triggers the parse; until then this is a no-op,
+        // so bulk disassembly never stalls behind a PDB line-table parse.
+        if let Some(symbol_manager) = self.symbol_manager.as_ref() {
+            for instr in &mut instructions {
+                instr.line_info = symbol_manager.try_resolve_address_to_line_cached(&modules_for_lines, instr.address);
+            }
+        }
+        Ok(instructions)
     }
 }

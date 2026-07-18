@@ -1397,6 +1397,33 @@ impl<S> DebugSession<S> {
         }
     }
 
+    /// Backward disassembly: up to `count` instructions ending immediately before
+    /// `target` (x64dbg-style self-resynchronizing decode).
+    pub fn disassemble_backward(
+        &mut self,
+        pid: u32,
+        target: u64,
+        count: usize,
+        arch: Architecture,
+    ) -> anyhow::Result<Vec<Instruction>> {
+        let req = DebuggerRequest::DisassembleBackward {
+            pid,
+            target,
+            count,
+            arch,
+        };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::Instructions { instructions } => Ok(instructions),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to disassemble backward: {}", message))
+            }
+            other => Err(anyhow::anyhow!(
+                "Unexpected response to DisassembleBackward: {:?}",
+                other
+            )),
+        }
+    }
+
     pub fn get_thread_context(&mut self, pid: u32, tid: u32) -> anyhow::Result<ThreadContext> {
         let req = DebuggerRequest::GetThreadContext { pid, tid };
         match self.send_and_receive(&req)? {

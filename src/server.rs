@@ -442,6 +442,13 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::DisassembleBackward { pid, target, count, arch } => {
+                let p = platform.read().unwrap();
+                match p.disassemble_backward(pid, target, count, arch) {
+                    Ok(instructions) => DebuggerResponse::Instructions { instructions },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::Step { pid, tid, kind } => {
                 let mut p = platform.write().unwrap();
                 match p.step(pid, tid, kind) {
