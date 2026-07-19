@@ -356,6 +356,11 @@ print("Entry point: " .. hex(info.entry_point))
 for _, s in ipairs(info.sections) do
     print(s.name, hex(s.virtual_address), hex(s.virtual_size))
 end
+
+-- TLS callback RVAs (empty table if the module has none)
+for _, rva in ipairs(info.tls_callbacks) do
+    print("TLS callback: " .. hex(module_base + rva))
+end
 ```
 
 ### Memory Regions

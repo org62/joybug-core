@@ -379,7 +379,10 @@ pub struct ModuleExtraInfo {
     pub sections: Vec<ImageSectionHeader>,
     pub imports: Vec<ImportDescriptorInfo>,
     pub exports: Option<ExportInfo>,
-    pub runtime_functions: Option<Vec<RuntimeFunction>>, 
+    pub runtime_functions: Option<Vec<RuntimeFunction>>,
+    /// RVAs of the module's TLS callbacks (empty if the module has none).
+    #[serde(default)]
+    pub tls_callbacks: Vec<u32>,
 }
 
 // ---------------- Imports (for PE Import Directory) ----------------

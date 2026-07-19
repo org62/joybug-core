@@ -268,8 +268,19 @@ pub fn parse_module_extra_info_from_bytes(file_bytes: &[u8]) -> Result<ModuleExt
             }
         };
 
-        // Return dos + complete nt headers + sections + imports + exports + runtime functions
-        let info = ModuleExtraInfo { dos_header, nt_headers, sections, imports, exports, runtime_functions };
+        // Parse TLS callbacks (data directory 9). pelite returns each callback as an
+        // absolute VA at the file's preferred ImageBase; store RVAs so they rebase onto
+        // the actual (ASLR) load base at the call site. `va_to_rva` rejects null and
+        // out-of-image VAs. Absent/empty TLS => no callbacks.
+        let tls_callbacks: Vec<u32> = pe.tls()
+            .and_then(|tls| tls.callbacks())
+            .map(|cbs| cbs.iter()
+                .filter_map(|&va| pe.va_to_rva(va).ok())
+                .collect())
+            .unwrap_or_default();
+
+        // Return dos + complete nt headers + sections + imports + exports + runtime functions + tls
+        let info = ModuleExtraInfo { dos_header, nt_headers, sections, imports, exports, runtime_functions, tls_callbacks };
         Ok(info)
 }
 

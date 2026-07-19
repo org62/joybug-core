@@ -1272,6 +1272,12 @@ impl LuaUserData for LuaDebugClient {
                         sections.set(i + 1, st)?;
                     }
                     table.set("sections", sections)?;
+                    // TLS callbacks (RVAs)
+                    let tls = lua.create_table()?;
+                    for (i, rva) in info.tls_callbacks.iter().enumerate() {
+                        tls.set(i + 1, *rva as u64)?;
+                    }
+                    table.set("tls_callbacks", tls)?;
                     // Runtime functions (Exception Directory)
                     if let Some(ref rfs) = info.runtime_functions {
                         let rf_table = lua.create_table()?;

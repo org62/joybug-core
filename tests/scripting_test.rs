@@ -651,6 +651,12 @@ fn test_lua_file_module_extra_info() {
 }
 
 #[test]
+fn test_lua_file_tls_callbacks() {
+    let test_exe = common::get_test_program_path("tls_test");
+    run_lua_test_file("modules/tls_callbacks.lua", Some(&test_exe));
+}
+
+#[test]
 fn test_lua_file_symbol_status() {
     let test_exe = common::get_test_program_path("disassembly_test");
     run_lua_test_file("modules/symbol_status.lua", Some(&test_exe));
