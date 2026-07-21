@@ -159,6 +159,19 @@ fn test_big_source_line_table() {
         session.state.map_entries = entries.len();
         session.state.peak_mem = peak_working_set();
 
+        // PDBs store the start line in 24 bits, so a file past 16,777,215 lines
+        // wraps unless the parser unfolds it. When we generated more lines than
+        // that, the largest reported line must still reach into the real range —
+        // without the overflow correction it would be capped near 0xFF_FFFF.
+        if lines as u32 > 0x00ff_ffff {
+            let max_line = entries.iter().map(|e| e.line_start).max().unwrap_or(0);
+            assert!(
+                max_line > 0x00ff_ffff,
+                "line numbers past the 24-bit PDB limit were not unfolded (max line {})",
+                max_line
+            );
+        }
+
         // Spot-check that a mid-file line resolves too (not just the entry).
         if let Some(mid) = entries.get(entries.len() / 2) {
             let va = module.base + mid.rva as u64;

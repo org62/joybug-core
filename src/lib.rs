@@ -3,6 +3,7 @@ pub mod formatting;
 pub mod protocol_io;
 pub mod interfaces;
 pub mod pe_types;
+pub mod pe_image;
 pub mod windows_platform;
 pub mod server;
 pub mod framed_json_stream;

@@ -125,7 +125,11 @@ impl WindowsPlatform {
         if cfg!(target_arch = "aarch64") || raw_rip < 16 {
             return raw_rip;
         }
-        match self.disassemble_backward(pid, raw_rip, 1, Architecture::X64) {
+        // Use the cheap self-resync decode, not the anchored `disassemble_backward`
+        // override: this runs on every watchpoint trap in an auto-continue trace
+        // loop, and the anchored path can decode kilobytes from the function start
+        // (with symbol/line enrichment) just to yield one instruction.
+        match self.disassemble_backward_resync(pid, raw_rip, 1, Architecture::X64) {
             Ok(ins) => ins
                 .last()
                 .filter(|i| i.address + i.size as u64 == raw_rip)
@@ -827,6 +831,62 @@ impl PlatformAPI for WindowsPlatform {
         self.disassemble_memory_impl(pid, address, byte_len, byte_len, arch)
     }
 
+    /// Backward disassembly, anchored on known-good instruction boundaries.
+    ///
+    /// The trait default (interfaces.rs) blindly starts a forward decode at
+    /// `target - back` and trusts x86 self-resynchronization. Here we instead
+    /// seed the decode from a *guaranteed* boundary when one is available — the
+    /// containing function's start from the PE exception directory (`.pdata`),
+    /// or the nearest symbol start — so the forward decode is exactly aligned all
+    /// the way to `target` with no guessing. We probe near `target - back` first
+    /// (to preserve full backward reach); if that byte sits in an uncovered gap
+    /// we fall back to the boundary containing the byte just before `target`
+    /// (aligning at least the rows nearest `target`), and finally to the plain
+    /// self-resync window when no boundary is known (leaf/JIT code, no symbols).
+    fn disassemble_backward(&self, pid: u32, target: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
+        if count == 0 || target == 0 {
+            return Ok(Vec::new());
+        }
+        let back = crate::interfaces::backward_resync_window(arch, count);
+        let fallback_start = target.saturating_sub(back);
+        // Never anchor an anchored decode more than this far before `target`, so a
+        // huge function can't turn each scroll-up tick into a massive re-decode.
+        const MAX_ANCHOR_SPAN: u64 = 8192;
+        let min_anchor = target.saturating_sub(MAX_ANCHOR_SPAN.max(back));
+
+        // Largest guaranteed instruction boundary <= `probe`, within
+        // [min_anchor, target): `.pdata` function start first, then nearest symbol.
+        let modules = self.modules_for(pid);
+        let boundary_before = |probe: u64| -> Option<u64> {
+            let mut best: Option<u64> = None;
+            if let Ok(Some((func_start, _, _))) = self.find_function_bounds(pid, probe) {
+                if func_start >= min_anchor && func_start < target {
+                    best = Some(func_start);
+                }
+            }
+            if let Some(ref symbol_manager) = self.symbol_manager {
+                if let Ok(Some((_, _, offset))) = symbol_manager.try_resolve_address_to_symbol(&modules, probe) {
+                    let sym_start = probe.saturating_sub(offset);
+                    if sym_start >= min_anchor && sym_start < target {
+                        best = Some(best.map_or(sym_start, |b| b.max(sym_start)));
+                    }
+                }
+            }
+            best
+        };
+
+        // No known boundary (leaf/JIT code, no symbols) — plain self-resync
+        // fallback, provided by the trait. An anchor needs no region clamp: it
+        // is already inside a mapped module and `boundary_before` guarantees
+        // min_anchor <= start < target.
+        let Some(start) = boundary_before(fallback_start).or_else(|| boundary_before(target - 1)) else {
+            return self.disassemble_backward_resync(pid, target, count, arch);
+        };
+        let window = (target - start) as usize;
+        let instructions = self.disassemble_memory_bytes(pid, start, window, arch)?;
+        Ok(crate::interfaces::align_backward_instructions(instructions, target, count))
+    }
+
     fn get_call_stack(&self, pid: u32, tid: u32) -> Result<Vec<crate::interfaces::CallFrame>, PlatformError> {
         callstack::get_call_stack(self, pid, tid)
     }
@@ -1036,6 +1096,24 @@ impl Stepper for WindowsPlatform {
     }
 }
 
+/// Binary-search a module's `.pdata` runtime functions for the entry containing
+/// `rva`. Returns `(BeginAddress, EndAddress)` RVAs.
+fn runtime_function_bounds(info: &crate::pe_types::ModuleExtraInfo, rva: u32) -> Option<(u32, u32)> {
+    let funcs = info.runtime_functions.as_ref().filter(|f| !f.is_empty())?;
+    let idx = funcs
+        .binary_search_by(|rf| {
+            if rva < rf.BeginAddress {
+                std::cmp::Ordering::Greater
+            } else if rva >= rf.EndAddress {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .ok()?;
+    Some((funcs[idx].BeginAddress, funcs[idx].EndAddress))
+}
+
 impl WindowsPlatform {
     /// Find function boundaries for an address using the exception directory (RuntimeFunction).
     /// Returns (function_start_va, function_end_va, function_name) if found.
@@ -1054,59 +1132,48 @@ impl WindowsPlatform {
             None => return Ok(None),
         };
 
-        // Get module extra info (which contains runtime_functions)
-        let extra_info = match self.get_module_extra_info(pid, module.base) {
-            Ok(info) => info,
-            Err(_) => return Ok(None),
-        };
-
-        let runtime_functions = match &extra_info.runtime_functions {
-            Some(funcs) if !funcs.is_empty() => funcs,
-            _ => return Ok(None),
-        };
-
         // Convert address to RVA
         let rva = (address - module.base) as u32;
 
-        // Binary search for the function containing this RVA
-        let result = runtime_functions.binary_search_by(|rf| {
-            if rva < rf.BeginAddress {
-                std::cmp::Ordering::Greater
-            } else if rva >= rf.EndAddress {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        });
+        // Search the cached extra info by reference — this runs per backward-
+        // disassembly boundary probe, and `get_extra_info`'s deep clone of the
+        // whole ModuleExtraInfo just to binary-search `.pdata` is wasteful.
+        // Fall back to a file parse only when nothing is cached yet.
+        let bounds = match process
+            .module_manager()
+            .with_extra_info(module.base, |info| runtime_function_bounds(info, rva))
+        {
+            Some(b) => b,
+            None => match self.parse_module_extra_info(pid, module.base) {
+                Ok(info) => runtime_function_bounds(&info, rva),
+                Err(_) => return Ok(None),
+            },
+        };
+        let Some((begin_rva, end_rva)) = bounds else {
+            return Ok(None);
+        };
+        let func_start = module.base + begin_rva as u64;
+        let func_end = module.base + end_rva as u64;
 
-        match result {
-            Ok(idx) => {
-                let rf = &runtime_functions[idx];
-                let func_start = module.base + rf.BeginAddress as u64;
-                let func_end = module.base + rf.EndAddress as u64;
+        // Try to get function name from symbol
+        let func_name = if let Some(ref symbol_manager) = self.symbol_manager {
+            symbol_manager
+                .resolve_address_to_symbol_raw(&modules, func_start)
+                .ok()
+                .flatten()
+                .map(|(module_path, symbol, _offset)| {
+                    let module_name = std::path::Path::new(&module_path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&module_path)
+                        .to_string();
+                    format!("{}!{}", module_name, symbol.name)
+                })
+        } else {
+            None
+        };
 
-                // Try to get function name from symbol
-                let func_name = if let Some(ref symbol_manager) = self.symbol_manager {
-                    symbol_manager
-                        .resolve_address_to_symbol_raw(&modules, func_start)
-                        .ok()
-                        .flatten()
-                        .map(|(module_path, symbol, _offset)| {
-                            let module_name = std::path::Path::new(&module_path)
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or(&module_path)
-                                .to_string();
-                            format!("{}!{}", module_name, symbol.name)
-                        })
-                } else {
-                    None
-                };
-
-                Ok(Some((func_start, func_end, func_name)))
-            }
-            Err(_) => Ok(None),
-        }
+        Ok(Some((func_start, func_end, func_name)))
     }
 
     /// Disassemble a function with bounds detection.
@@ -1277,6 +1344,18 @@ impl WindowsPlatform {
         if let Some(symbol_manager) = self.symbol_manager.as_ref() {
             for instr in &mut instructions {
                 instr.line_info = symbol_manager.try_resolve_address_to_line_cached(&modules_for_lines, instr.address);
+                // At a symbol start, collect every name sharing this address (aliases
+                // like NtClose/ZwClose) so the UI can show all labels, not just the
+                // one `symbol_info` picked. Gated on offset == 0 to avoid a lookup for
+                // the vast majority of instructions that sit mid-symbol.
+                if instr.symbol_info.as_ref().is_some_and(|s| s.offset == 0) {
+                    let all = symbol_manager.resolve_all_at_exact_address(&modules_for_lines, instr.address);
+                    // Keep the trait-default seed (the single resolved symbol) if
+                    // the alias lookup unexpectedly comes back empty.
+                    if !all.is_empty() {
+                        instr.symbols_at_address = all;
+                    }
+                }
             }
         }
         Ok(instructions)

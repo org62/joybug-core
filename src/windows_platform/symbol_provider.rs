@@ -8,8 +8,8 @@ use pelite::pe64::{Pe, PeFile};
 use pelite::image::IMAGE_DEBUG_TYPE_CODEVIEW;
 use pelite::Error as PeliteError;
 use pdb::{
-    AddressMap, FallibleIterator, PdbInternalSectionOffset, ProcedureSymbol, PublicSymbol,
-    SymbolData, PDB,
+    AddressMap, DataSymbol, FallibleIterator, LabelSymbol, PdbInternalSectionOffset,
+    ProcedureSymbol, PublicSymbol, SymbolData, PDB,
 };
 use symsrv::{SymsrvDownloader, NtSymbolPathEntry, parse_nt_symbol_path, get_symbol_path_from_environment, get_home_sym_dir};
 use tracing::{trace, debug};
@@ -288,6 +288,7 @@ pub(crate) fn parse_pdb_to_lines(pdb_path: &Path) -> Result<ModuleLineTable, Sym
     }
 
     table.lines.sort_by_key(|l| l.rva);
+    correct_line_number_overflow(&mut table.lines);
     for (idx, line) in table.lines.iter().enumerate() {
         table.by_file.entry(line.file_index).or_default().push(idx as u32);
     }
@@ -297,6 +298,51 @@ pub(crate) fn parse_pdb_to_lines(pdb_path: &Path) -> Result<ModuleLineTable, Sym
 
     trace!(path = %pdb_path.display(), files = table.files.len(), lines = table.lines.len(), "Parsed PDB line table");
     Ok(table)
+}
+
+/// Undo the 24-bit wraparound of PDB start-line numbers for very large files.
+///
+/// A PDB `CV_Line_t` stores the start line in only 24 bits (`linenumStart:24`),
+/// so the largest line it can represent is `0xFF_FFFF` (16,777,215). Any source
+/// file longer than that wraps: line 16,777,216 is stored as 0, line 16,777,217
+/// as 1, and so on. This never happens for hand-written code but does for
+/// machine-generated sources (e.g. a multi-million-line `.asm`), and the raw
+/// wrapped numbers make the source view jump back to the top of the file.
+///
+/// `lines` must be sorted by RVA. Within one source file, RVA order tracks
+/// source-line order for straight-line generated code (the only kind that grows
+/// this large), so a sudden drop from ~`0xFF_FFFF` back to ~0 marks a wrap. We
+/// track the fold count per file and lift each line back into its true range.
+/// Mirrors x64dbg's `SymbolSourceDIA::loadSourceLinesAsync` overflow handling,
+/// generalised from its single-file case to one fold counter per source file.
+///
+/// The detection only fires once a file's running line count actually reaches
+/// the 16M boundary, so it is inert for every normal PDB.
+fn correct_line_number_overflow(lines: &mut [LineEntry]) {
+    const FOLD: u32 = 0x0100_0000; // 2^24 — the value one wrap adds back.
+
+    // Per source file: (running max corrected line_start, number of folds seen).
+    let mut per_file: HashMap<u32, (u32, u32)> = HashMap::new();
+
+    for line in lines.iter_mut() {
+        let (max_line, folds) = per_file.entry(line.file_index).or_insert((0, 0));
+
+        // The next boundary this file is approaching: 0xFF_FFFF, 0x1FF_FFFF, ...
+        let boundary = FOLD.wrapping_mul(*folds + 1).wrapping_sub(1);
+        // A wrap looks like the running max sitting on the boundary (within 16
+        // lines) while the new raw value is near 0 (within 16). The 16-line slack
+        // absorbs blank/label lines straddling the boundary, matching x64dbg.
+        if (line.line_start & 0x00ff_fff0) == 0 && (*max_line & 0xffff_fff0) == (boundary & 0xffff_fff0) {
+            *folds += 1;
+        }
+
+        let shift = folds.wrapping_mul(FOLD);
+        line.line_start = line.line_start.wrapping_add(shift);
+        line.line_end = line.line_end.wrapping_add(shift);
+        if line.line_start > *max_line {
+            *max_line = line.line_start;
+        }
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -379,8 +425,19 @@ fn extract_symbols(pdb_parser: &mut PDB<'static, File>, pdb_path: &Path) -> Resu
                 loop {
                     match sym_iter.next() {
                         Ok(Some(symbol)) => {
-                            if let Ok(SymbolData::Procedure(ProcedureSymbol { name, offset, .. })) = symbol.parse() {
-                                insert_symbol(&name.to_string(), offset, &address_map, &mut symbols_map, true);
+                            // Capture procedures (private functions), plus data symbols
+                            // (file-static / function-local statics) and labels. x64dbg
+                            // surfaces all of these from the module streams; we previously
+                            // kept only procedures.
+                            match symbol.parse() {
+                                Ok(SymbolData::Procedure(ProcedureSymbol { name, offset, .. })) => {
+                                    insert_symbol(&name.to_string(), offset, &address_map, &mut symbols_map, true);
+                                }
+                                Ok(SymbolData::Data(DataSymbol { name, offset, .. })
+                                    | SymbolData::Label(LabelSymbol { name, offset, .. })) => {
+                                    insert_symbol(&name.to_string(), offset, &address_map, &mut symbols_map, false);
+                                }
+                                _ => {}
                             }
                         }
                         Ok(None) => break,
@@ -409,6 +466,13 @@ fn extract_symbols(pdb_parser: &mut PDB<'static, File>, pdb_path: &Path) -> Resu
                         }
                         Ok(SymbolData::Procedure(ProcedureSymbol { name, offset, .. })) => {
                             insert_symbol(&name.to_string(), offset, &address_map, &mut symbols_map, true);
+                        }
+                        // Global/static data variables (S_GDATA32/S_LDATA32) and code
+                        // labels (S_LABEL32). x64dbg keeps these; we previously dropped
+                        // them via the catch-all below.
+                        Ok(SymbolData::Data(DataSymbol { name, offset, .. })
+                            | SymbolData::Label(LabelSymbol { name, offset, .. })) => {
+                            insert_symbol(&name.to_string(), offset, &address_map, &mut symbols_map, false);
                         }
                         Ok(_other_data) => { /* Skip other symbol types */ }
                         Err(pdb_parse_err) => {
@@ -439,14 +503,19 @@ fn insert_symbol(
     symbols_map: &mut HashMap<String, ModuleSymbol>,
     is_function: bool,
 ) {
+    // Skip symbols whose section offset does not map to a valid RVA (e.g. TLS/absolute
+    // symbols). Otherwise they collapse onto rva 0 and pollute nearest-symbol lookups.
+    // Mirrors x64dbg, which rejects symbols with no valid virtual address.
+    let Some(rva) = offset.to_rva(address_map).map(|r| r.0) else {
+        return;
+    };
+
     let demangled_name = if name_str.starts_with('?') {
         msvc_demangler::demangle(name_str, DemangleFlags::COMPLETE)
             .unwrap_or_else(|_| name_str.to_string())
     } else {
         name_str.to_string()
     };
-
-    let rva = offset.to_rva(address_map).unwrap_or_default().0;
 
     symbols_map.entry(demangled_name.clone()).or_insert(ModuleSymbol {
         name: demangled_name,
@@ -629,4 +698,85 @@ impl SymbolProvider for WindowsSymbolProvider {
             Err(SymbolError::ModuleNotLoaded(format!("Module {} not loaded", module_path)))
         }
     }
-} 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(rva: u32, file_index: u32, line_start: u32) -> LineEntry {
+        LineEntry {
+            rva,
+            length: 1,
+            file_index,
+            line_start,
+            line_end: line_start,
+            col_start: None,
+            col_end: None,
+        }
+    }
+
+    /// A single source file that crosses two 2^24 boundaries has its wrapped
+    /// line numbers lifted back into their true, monotonically increasing range.
+    #[test]
+    fn corrects_single_file_wraparound() {
+        const FOLD: u32 = 0x0100_0000;
+        // Raw line numbers as the PDB would store them (24-bit wrapped): climb
+        // to the boundary, wrap to ~0, climb again, wrap again.
+        let raw = [
+            1,               // near start
+            FOLD - 2,        // approaching the first boundary (0xFFFFFE)
+            3,               // wrapped: true line = FOLD + 3
+            FOLD - 1,        // approaching the second boundary in true space
+            5,               // wrapped again: true line = 2*FOLD + 5
+        ];
+        let mut lines: Vec<LineEntry> =
+            raw.iter().enumerate().map(|(i, &l)| line(i as u32 * 4, 0, l)).collect();
+
+        correct_line_number_overflow(&mut lines);
+
+        let corrected: Vec<u32> = lines.iter().map(|l| l.line_start).collect();
+        assert_eq!(corrected, vec![1, FOLD - 2, FOLD + 3, 2 * FOLD - 1, 2 * FOLD + 5]);
+        // The whole file is now strictly increasing, as source order demands.
+        assert!(corrected.windows(2).all(|w| w[0] < w[1]));
+        // line_end travels with line_start (they share the wrapped high bits).
+        assert_eq!(lines[2].line_end, FOLD + 3);
+    }
+
+    /// Normal PDBs (no file anywhere near 16M lines) are left untouched, even
+    /// when several files interleave in RVA order.
+    #[test]
+    fn leaves_normal_line_tables_untouched() {
+        let mut lines = vec![
+            line(0x00, 0, 10),
+            line(0x08, 1, 5),
+            line(0x10, 0, 11),
+            line(0x18, 1, 6),
+            line(0x20, 0, 12),
+        ];
+        let before = lines.clone();
+        correct_line_number_overflow(&mut lines);
+        for (a, b) in before.iter().zip(&lines) {
+            assert_eq!(a.line_start, b.line_start);
+            assert_eq!(a.line_end, b.line_end);
+        }
+    }
+
+    /// Each source file keeps its own fold counter: one file can wrap while
+    /// another, interleaved in RVA order, stays in its normal range.
+    #[test]
+    fn folds_are_tracked_per_file() {
+        const FOLD: u32 = 0x0100_0000;
+        let mut lines = vec![
+            line(0x00, 0, FOLD - 1), // big generated file, at the boundary
+            line(0x04, 1, 42),       // small companion file, ordinary line
+            line(0x08, 0, 2),        // big file wraps -> FOLD + 2
+            line(0x0c, 1, 43),       // small file, still ordinary
+        ];
+        correct_line_number_overflow(&mut lines);
+        assert_eq!(lines[0].line_start, FOLD - 1);
+        assert_eq!(lines[1].line_start, 42);
+        assert_eq!(lines[2].line_start, FOLD + 2);
+        assert_eq!(lines[3].line_start, 43);
+    }
+}

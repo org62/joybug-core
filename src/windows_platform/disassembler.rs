@@ -231,45 +231,87 @@ impl DisassemblerProvider for CapstoneDisassembler {
             return Ok(Vec::new());
         }
 
+        // Longest possible instruction encoding per architecture. Used as the
+        // buffer-tail guard below: a decode stall with fewer than this many
+        // bytes left is buffer truncation, not a genuine bad byte.
+        let max_ilen = arch.max_instruction_len();
+
         Self::with_engine(arch, |engine| {
-            let instructions = engine
-                .disasm_count(data, address, count)
-                .map_err(|e| DisassemblerError::CapstoneError(e.to_string()))?;
+            let mut result: Vec<Instruction> = Vec::new();
+            let mut offset: usize = 0;
 
-            let mut result = Vec::new();
-            for insn in instructions.iter() {
-                let mnemonic = insn.mnemonic().unwrap_or("");
-                let op_str = insn.op_str().unwrap_or("");
+            // Resync loop: Capstone's `disasm_count` silently stops at the first
+            // undecodable byte and returns only what it decoded. Rather than
+            // truncate the whole listing there, we emit a 1-byte `db 0xXX`
+            // placeholder for the bad byte and resume decoding after it —
+            // x64dbg/TitanEngine style — so valid code below a bad byte stays
+            // visible and the UI can keep scrolling past it.
+            while result.len() < count && offset < data.len() {
+                let remaining = count - result.len();
+                let instructions = engine
+                    .disasm_count(&data[offset..], address + offset as u64, remaining)
+                    .map_err(|e| DisassemblerError::CapstoneError(e.to_string()))?;
 
-                let is_jump = is_jump_mnemonic(mnemonic, arch);
-                let is_call = is_call_mnemonic(mnemonic, arch);
-                let is_ret = is_ret_mnemonic(mnemonic, arch);
+                if instructions.is_empty() {
+                    // Stalled at `offset`. If too few bytes remain for a full
+                    // instruction this is a buffer-end truncation (reads are
+                    // sized `count * 16`, so a real bad byte always leaves
+                    // >= max_ilen bytes) — stop instead of emitting a spurious
+                    // trailing `db`.
+                    if data.len() - offset < max_ilen {
+                        break;
+                    }
+                    let bad = data[offset];
+                    result.push(Instruction {
+                        address: address + offset as u64,
+                        bytes: vec![bad],
+                        mnemonic: "db".to_string(),
+                        op_str: format!("0x{:02X}", bad),
+                        size: 1,
+                        is_invalid: true,
+                        ..Default::default()
+                    });
+                    offset += 1;
+                    continue;
+                }
 
-                // Extract jump target for jumps and calls using structured operand data
-                let jump_target = if is_jump || is_call {
-                    extract_jump_target_from_operands(engine, &insn, arch)
-                } else {
-                    None
-                };
+                let mut consumed: usize = 0;
+                for insn in instructions.iter() {
+                    let mnemonic = insn.mnemonic().unwrap_or("");
+                    let op_str = insn.op_str().unwrap_or("");
 
-                // Extract all addresses that should be symbolized from operands
-                let addresses_to_symbolize = extract_addresses_from_operands(engine, &insn, arch);
+                    let is_jump = is_jump_mnemonic(mnemonic, arch);
+                    let is_call = is_call_mnemonic(mnemonic, arch);
+                    let is_ret = is_ret_mnemonic(mnemonic, arch);
 
-                result.push(crate::interfaces::Instruction {
-                    address: insn.address(),
-                    bytes: insn.bytes().to_vec(),
-                    mnemonic: mnemonic.to_string(),
-                    op_str: op_str.to_string(),
-                    size: insn.len(),
-                    symbol_info: None,
-                    symbolized_op_str: None,
-                    is_jump,
-                    is_call,
-                    is_ret,
-                    jump_target,
-                    addresses_to_symbolize,
-                    line_info: None,
-                });
+                    // Extract jump target for jumps and calls using structured operand data
+                    let jump_target = if is_jump || is_call {
+                        extract_jump_target_from_operands(engine, &insn, arch)
+                    } else {
+                        None
+                    };
+
+                    // Extract all addresses that should be symbolized from operands
+                    let addresses_to_symbolize = extract_addresses_from_operands(engine, &insn, arch);
+
+                    result.push(Instruction {
+                        address: insn.address(),
+                        bytes: insn.bytes().to_vec(),
+                        mnemonic: mnemonic.to_string(),
+                        op_str: op_str.to_string(),
+                        size: insn.len(),
+                        is_jump,
+                        is_call,
+                        is_ret,
+                        jump_target,
+                        addresses_to_symbolize,
+                        ..Default::default()
+                    });
+                    consumed += insn.len();
+                }
+                // Every decoded instruction has size >= 1, so `offset` always
+                // advances — the loop cannot spin.
+                offset += consumed;
             }
 
             Ok(result)
@@ -282,3 +324,78 @@ impl Clone for CapstoneDisassembler {
         Self {}
     }
 } 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interfaces::{Architecture, DisassemblerProvider, SymbolInfo};
+
+    // Operand extraction ignores addresses <= 0x10000, so use realistic VAs:
+    // call 0x140002000 encoded at 0x140001000: E8 FB 0F 00 00 (rel32 = 0xFFB)
+    const CALL_BYTES: &[u8] = &[0xE8, 0xFB, 0x0F, 0x00, 0x00];
+    const CALL_SITE: u64 = 0x140001000;
+    const CALL_TARGET: u64 = 0x140002000;
+
+    fn resolver_with_offset(offset: u64) -> impl Fn(u64) -> Option<SymbolInfo> {
+        move |addr| {
+            (addr == CALL_TARGET).then(|| SymbolInfo {
+                module_name: "mod".to_string(),
+                symbol_name: "sym".to_string(),
+                offset,
+            })
+        }
+    }
+
+    #[test]
+    fn operand_symbolized_at_exact_symbol() {
+        let disasm = CapstoneDisassembler::new().unwrap();
+        let instrs = disasm
+            .disassemble_with_symbols(Architecture::X64, CALL_BYTES, CALL_SITE, 1, resolver_with_offset(0))
+            .unwrap();
+        assert_eq!(instrs[0].symbolized_op_str.as_deref(), Some("mod!sym"));
+    }
+
+    #[test]
+    fn operand_stays_raw_at_nonzero_offset() {
+        let disasm = CapstoneDisassembler::new().unwrap();
+        let instrs = disasm
+            .disassemble_with_symbols(Architecture::X64, CALL_BYTES, CALL_SITE, 1, resolver_with_offset(5))
+            .unwrap();
+        assert_eq!(instrs[0].symbolized_op_str, None);
+        assert!(instrs[0].op_str.contains("0x140002000"));
+    }
+
+    // A decode that hits an undecodable byte must emit a 1-byte `db` placeholder
+    // and continue past it, not truncate the listing at the bad byte.
+    #[test]
+    fn resilient_decode_emits_db_and_continues() {
+        // 0x06 (PUSH ES) is invalid in x64 long mode. Sandwich it between a NOP
+        // and a run of NOPs long enough that the buffer-tail guard (>= 15 bytes
+        // remaining at the stall) still classifies 0x06 as a real bad byte.
+        let mut bytes = vec![0x90u8, 0x06];
+        bytes.extend(std::iter::repeat(0x90u8).take(20));
+        let base = 0x140001000u64;
+
+        let disasm = CapstoneDisassembler::new().unwrap();
+        let instrs = disasm.disassemble(Architecture::X64, &bytes, base, 64).unwrap();
+
+        // First row: the leading NOP, decoded normally.
+        assert_eq!(instrs[0].mnemonic, "nop");
+        assert!(!instrs[0].is_invalid);
+
+        // Second row: the synthetic invalid byte.
+        assert!(instrs[1].is_invalid);
+        assert_eq!(instrs[1].mnemonic, "db");
+        assert_eq!(instrs[1].size, 1);
+        assert_eq!(instrs[1].bytes, vec![0x06]);
+        assert_eq!(instrs[1].address, base + 1);
+        assert!(instrs[1].op_str.contains("06"));
+
+        // Third row: decoding resumed AFTER the bad byte (not truncated at it).
+        assert_eq!(instrs[2].mnemonic, "nop");
+        assert!(!instrs[2].is_invalid);
+        assert_eq!(instrs[2].address, base + 2);
+
+        // All 22 bytes accounted for: NOP + db + 20 NOPs.
+        assert_eq!(instrs.len(), 22);
+    }
+}

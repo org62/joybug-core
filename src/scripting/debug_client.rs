@@ -531,6 +531,14 @@ pub fn instruction_to_lua_table(lua: &Lua, inst: &Instruction) -> mlua::Result<L
     if let Some(ref sym) = inst.symbol_info {
         table.set("symbol", sym.format_symbol())?;
     }
+    // Every name starting exactly at this address (aliases like NtClose/ZwClose).
+    if !inst.symbols_at_address.is_empty() {
+        let names = lua.create_table()?;
+        for (i, sym) in inst.symbols_at_address.iter().enumerate() {
+            names.set(i + 1, sym.format_symbol())?;
+        }
+        table.set("symbols", names)?;
+    }
     // Raw bytes as Lua string
     table.set("bytes", lua.create_string(&inst.bytes)?)?;
     Ok(table)

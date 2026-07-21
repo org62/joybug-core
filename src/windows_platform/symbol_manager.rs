@@ -803,6 +803,51 @@ impl SymbolManager {
         }
     }
     
+    /// Every symbol that starts exactly at `address` (offset 0), across the module
+    /// that contains it. Multiple distinct names can share one RVA (e.g. ntdll's
+    /// `NtClose`/`ZwClose` aliases); the nearest-below resolvers surface only one,
+    /// so this exists to list them all for the disassembly label rows. Names are
+    /// sorted for a stable UI. Non-blocking: returns empty while the module's
+    /// symbols are still loading.
+    pub fn resolve_all_at_exact_address(
+        &self,
+        modules: &[ModuleInfo],
+        address: u64,
+    ) -> Vec<crate::interfaces::SymbolInfo> {
+        let Some(module) = Self::find_module_binary_search(modules, address) else {
+            return Vec::new();
+        };
+        {
+            let pending = self.pending_loads.lock().unwrap();
+            if pending.contains(module.name.as_str()) {
+                return Vec::new();
+            }
+        }
+        let rva = (address - module.base) as u32;
+        let cache = self.symbol_cache.lock().unwrap();
+        let Some(module_symbols) = cache.get(&module.name) else {
+            return Vec::new();
+        };
+        // symbols are sorted by RVA; collect the contiguous run with rva == target.
+        let symbols = &module_symbols.symbols;
+        let start = symbols.partition_point(|s| s.rva < rva);
+        let module_name = extract_module_name(&module.name);
+        let mut names: Vec<String> = symbols[start..]
+            .iter()
+            .take_while(|s| s.rva == rva)
+            .map(|s| s.name.clone())
+            .collect();
+        names.sort();
+        names
+            .into_iter()
+            .map(|symbol_name| crate::interfaces::SymbolInfo {
+                module_name: module_name.clone(),
+                symbol_name,
+                offset: 0,
+            })
+            .collect()
+    }
+
     /// List all symbols in the specified module as raw ModuleSymbols (without VA calculation)
     pub fn list_symbols_raw(&self, module_path: &str) -> Result<Vec<ModuleSymbol>, SymbolError> {
         self.wait_for_loading(module_path)?;

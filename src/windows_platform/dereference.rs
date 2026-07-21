@@ -335,10 +335,7 @@ where
     }
 
     // Read enough bytes for one instruction (max instruction size)
-    let max_instr_size = match arch {
-        Architecture::X64 => 15,  // x86-64 max instruction length
-        Architecture::Arm64 => 4, // ARM64 fixed instruction size
-    };
+    let max_instr_size = arch.max_instruction_len();
 
     let data = super::memory::read_memory_unlocked(pid, address, max_instr_size).ok()?;
     if data.is_empty() {

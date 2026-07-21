@@ -69,9 +69,26 @@ impl Architecture {
     pub fn from_native() -> Self {
         if cfg!(target_arch = "x86_64") { Architecture::X64 } else { Architecture::Arm64 }
     }
+
+    /// Longest possible instruction encoding, in bytes (ARM64 is fixed-width).
+    pub fn max_instruction_len(self) -> usize {
+        match self {
+            Architecture::X64 => 15,
+            Architecture::Arm64 => 4,
+        }
+    }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Byte window for a self-resync backward decode of `count` instructions:
+/// one max-length instruction per row plus one extra instruction of lead-in,
+/// which gives an x86 decode room to resynchronize before it reaches the
+/// target (ARM64 is fixed-width, so any aligned start decodes exactly).
+pub fn backward_resync_window(arch: Architecture, count: usize) -> u64 {
+    let max_ilen = arch.max_instruction_len() as u64;
+    max_ilen * count as u64 + max_ilen
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Instruction {
     pub address: u64,
     pub bytes: Vec<u8>,
@@ -87,6 +104,18 @@ pub struct Instruction {
     pub addresses_to_symbolize: Vec<u64>, // Addresses extracted from operands for symbolization
     #[serde(default)]
     pub line_info: Option<SourceLineRef>, // Source file/line, if the module's line table is loaded
+    /// Every symbol that starts exactly at this address (offset 0). More than one
+    /// name can share an address — e.g. ntdll's `NtClose`/`ZwClose` aliases — so the
+    /// UI can render all of them as label rows. `symbol_info` still carries the single
+    /// nearest-below symbol (used for the `+offset` display and operand symbolization);
+    /// this is populated only at exact symbol starts and is otherwise empty.
+    #[serde(default)]
+    pub symbols_at_address: Vec<SymbolInfo>,
+    /// True for a synthetic 1-byte placeholder emitted where a byte could not be
+    /// decoded (rendered as `db 0xXX`). Lets the decoder continue past bad bytes
+    /// instead of truncating the whole listing (x64dbg-style).
+    #[serde(default)]
+    pub is_invalid: bool,
 }
 
 /// A source file referenced by a module's PDB line table.
@@ -229,12 +258,21 @@ pub trait DisassemblerProvider: Send + Sync {
         let mut instructions = self.disassemble(arch, data, address, count)?;
         for instruction in &mut instructions {
             instruction.symbol_info = symbol_resolver(instruction.address);
+            // At an exact symbol start, seed `symbols_at_address` with the resolved
+            // name so every decode path yields at least one label. Platforms with a
+            // richer symbol source (WindowsPlatform) overwrite this with the full
+            // alias set during enrichment.
+            if let Some(s) = instruction.symbol_info.as_ref().filter(|s| s.offset == 0) {
+                instruction.symbols_at_address = vec![s.clone()];
+            }
 
-            // Symbolize operand addresses using pre-extracted address list (no regex)
+            // Symbolize operand addresses using pre-extracted address list (no regex).
+            // Only exact symbol hits (offset 0) are substituted — a mid-symbol
+            // target keeps its raw address rather than a misleading `sym+0xNNN`.
             if !instruction.addresses_to_symbolize.is_empty() {
                 let mut op_str = instruction.op_str.clone();
                 for addr in &instruction.addresses_to_symbolize {
-                    if let Some(symbol) = symbol_resolver(*addr) {
+                    if let Some(symbol) = symbol_resolver(*addr).filter(|s| s.offset == 0) {
                         let symbol_str = symbol.format_symbol();
                         // Try direct hex replacement first (for absolute addresses)
                         let hex_lower = format!("0x{:x}", addr);
@@ -403,17 +441,18 @@ pub trait PlatformAPI: Send + Sync {
     /// wholesale, e.g. just before a section); platforms whose
     /// `query_memory_region` errors keep the unclamped start.
     fn disassemble_backward(&self, pid: u32, target: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
+        self.disassemble_backward_resync(pid, target, count, arch)
+    }
+
+    /// The plain self-resync backward decode described on `disassemble_backward`.
+    /// Split out so platform overrides that anchor on known boundaries (see
+    /// WindowsPlatform) can delegate here when no boundary is available, instead
+    /// of duplicating this window/clamp logic.
+    fn disassemble_backward_resync(&self, pid: u32, target: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
         if count == 0 || target == 0 {
             return Ok(Vec::new());
         }
-        // Max instruction length per architecture; one extra instruction of
-        // lead-in gives an x86 decode room to resynchronize before it reaches
-        // `target` (ARM64 is fixed-width, so any aligned start decodes exactly).
-        let max_ilen: u64 = match arch {
-            Architecture::X64 => 15,
-            Architecture::Arm64 => 4,
-        };
-        let back = max_ilen * count as u64 + max_ilen;
+        let back = backward_resync_window(arch, count);
         let mut start = target.saturating_sub(back);
         // Region-clamp only when the window can cross a 4K page boundary —
         // within one page it's mapped iff `target` is, and skipping the query
