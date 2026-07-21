@@ -202,6 +202,25 @@ impl OriginalModuleImage {
         }
     }
 
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// Executable spans clamped to initialized on-disk data — exactly the RVA
+    /// ranges `bytes_at` can serve, i.e. what a whole-image diff should compare
+    /// (a section's virtual tail past `SizeOfRawData` has no file bytes).
+    pub fn comparable_code_ranges(&self) -> Vec<(u32, u32)> {
+        self.code_ranges
+            .iter()
+            .filter_map(|&(start, end)| {
+                let s = section_for(&self.sections, start)?;
+                let initialized_end = s.virt_addr.saturating_add(s.raw_size.min(s.virt_size));
+                let end = end.min(initialized_end);
+                (end > start).then_some((start, end))
+            })
+            .collect()
+    }
+
     pub fn contains(&self, va: u64) -> bool {
         va >= self.base && va < self.base + self.image_size
     }
