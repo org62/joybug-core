@@ -45,10 +45,12 @@ pub(super) fn step(
             // If it's a `CALL`, `REP`, or `PUSHF`, set a one-shot (single-use) breakpoint at the instruction immediately following.
             // Otherwise, perform a `StepInto`.
             let arch = Architecture::from_native();
-            let instructions = platform.disassemble_memory(pid, thread_context.get_pc(), 1, arch)
-                .map_err(|e| PlatformError::Other(format!("Failed to disassemble instruction: {}", e)))?;
-            
-            let instruction = instructions.first().ok_or_else(|| PlatformError::Other("No instructions returned from disassembler".to_string()))?;
+            // Raw (non-symbolizing) disassembly: the step only needs size +
+            // mnemonic, and must not contend with the symbol machinery while a
+            // large PDB is parsed (that caused ~second-long step hitches).
+            let instruction = platform.disassemble_instruction_raw(pid, thread_context.get_pc(), arch)
+                .map_err(|e| PlatformError::Other(format!("Failed to disassemble instruction: {}", e)))?
+                .ok_or_else(|| PlatformError::Other("No instructions returned from disassembler".to_string()))?;
             let next_instruction_addr = instruction.address + instruction.size as u64;
 
             // Check if this is a CALL-like instruction

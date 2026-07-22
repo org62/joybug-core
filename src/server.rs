@@ -323,6 +323,13 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::TryResolveAddressesToSymbols { pid, addresses } => {
+                let p = platform.read().unwrap();
+                match p.try_resolve_addresses_to_symbols(pid, &addresses) {
+                    Ok(results) => DebuggerResponse::AddressSymbolBatch { results },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::ResolveAddressToLine { pid, address } => {
                 let p = platform.read().unwrap();
                 match p.resolve_address_to_line(pid, address) {
@@ -418,6 +425,13 @@ where
                 let p = platform.read().unwrap();
                 match p.dereference(pid, address, count, reference_base) {
                     Ok(entries) => DebuggerResponse::DereferenceResult { entries },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::DereferenceBatch { pid, addresses, count, reference_base } => {
+                let p = platform.read().unwrap();
+                match p.dereference_batch(pid, &addresses, count, reference_base) {
+                    Ok(results) => DebuggerResponse::DereferenceBatchResult { results },
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }

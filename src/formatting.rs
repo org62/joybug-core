@@ -75,6 +75,10 @@ impl std::fmt::Debug for DebuggerResponse {
             DebuggerResponse::CoverageResults { hits } => f.debug_struct("CoverageResults").field("count", &hits.len()).finish(),
             DebuggerResponse::WatchpointAccesses { accesses } => f.debug_struct("WatchpointAccesses").field("count", &accesses.len()).finish(),
             DebuggerResponse::AddressSymbol { module_path, symbol, offset } => f.debug_struct("AddressSymbol").field("module_path", module_path).field("symbol", symbol).field("offset", offset).finish(),
+            DebuggerResponse::AddressSymbolBatch { results } => f.debug_struct("AddressSymbolBatch")
+                .field("addresses", &results.len())
+                .field("resolved", &results.iter().filter(|r| r.is_some()).count())
+                .finish(),
             DebuggerResponse::AddressLine { info } => f.debug_struct("AddressLine")
                 .field("info", &info.as_ref().map(|i| format!("{}:{} (rva 0x{:X})", i.file.path, i.line_entry.line_start, i.rva)))
                 .finish(),
@@ -103,6 +107,9 @@ impl std::fmt::Debug for DebuggerResponse {
                 .finish(),
             DebuggerResponse::DereferenceResult { entries } => f.debug_struct("DereferenceResult")
                 .field("count", &entries.len())
+                .finish(),
+            DebuggerResponse::DereferenceBatchResult { results } => f.debug_struct("DereferenceBatchResult")
+                .field("addresses", &results.len())
                 .finish(),
             DebuggerResponse::MemorySearchResult { addresses, capped } => f.debug_struct("MemorySearchResult")
                 .field("matches", &addresses.len())

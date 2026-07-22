@@ -437,6 +437,14 @@ pub mod request_response {
             pid: u32,
             address: u64,
         },
+        /// Resolve many addresses to symbols in one round-trip, never waiting
+        /// on in-flight symbol loads: addresses in still-loading modules come
+        /// back `None` (re-request once symbol status settles). See
+        /// `PlatformAPI::try_resolve_addresses_to_symbols`.
+        TryResolveAddressesToSymbols {
+            pid: u32,
+            addresses: Vec<u64>,
+        },
         /// Resolve an address to a source file/line via the module's PDB line table.
         ResolveAddressToLine {
             pid: u32,
@@ -537,6 +545,14 @@ pub mod request_response {
         Dereference {
             pid: u32,
             address: u64,
+            count: usize,
+            reference_base: Option<u64>,
+        },
+        /// Telescope many addresses at once, enumerating memory regions only once
+        /// for the whole batch (see `PlatformAPI::dereference_batch`).
+        DereferenceBatch {
+            pid: u32,
+            addresses: Vec<u64>,
             count: usize,
             reference_base: Option<u64>,
         },
@@ -816,6 +832,11 @@ pub mod request_response {
             symbol: Option<crate::interfaces::ModuleSymbol>,
             offset: Option<u64>,
         },
+        /// One `(module_name, symbol, offset)` per requested address, in order;
+        /// `None` for unresolved / still-loading addresses.
+        AddressSymbolBatch {
+            results: Vec<Option<(String, crate::interfaces::ModuleSymbol, u64)>>,
+        },
         // Source line responses
         AddressLine { info: Option<AddressLineInfo> },
         SourceFileLineMap {
@@ -847,6 +868,7 @@ pub mod request_response {
         MemoryRegionInfo { info: MemoryRegionInfo },
         MemoryRegionList { regions: Vec<MemoryRegionInfo> },
         DereferenceResult { entries: Vec<DereferenceEntry> },
+        DereferenceBatchResult { results: Vec<Vec<DereferenceEntry>> },
         // Emulator responses (for non-trace modes: Basic, BasicBlock, ModuleTransition, Syscall)
         EmulationResult {
             final_pc: u64,

@@ -29,6 +29,16 @@ dbg:on_initial_breakpoint(function(pid, tid, addr)
         assert(resolved.name ~= "", "resolved name should be non-empty")
     end
 
+    -- Batch non-blocking resolve: one table per input address, in order.
+    -- LdrLoadDll's VA must resolve (its symbols are loaded — find_symbol
+    -- waited for them); an unmapped address yields an empty table, not a hole.
+    local batch = dbg:try_resolve_addresses(pid, { syms[1].va, 0x1 })
+    assert(#batch == 2, "batch should return one entry per address, got " .. #batch)
+    assert(batch[1].name and batch[1].name:find("LdrLoadDll"),
+        "batch entry 1 should resolve to LdrLoadDll")
+    assert(batch[1].offset == 0, "exact symbol VA should have offset 0")
+    assert(batch[2].name == nil, "unmapped address should stay unresolved")
+
     dbg:terminate(pid)
 end)
 

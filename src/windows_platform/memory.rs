@@ -160,6 +160,43 @@ pub(super) fn read_memory_unlocked(
     }
 }
 
+/// Minimal `PROCESS_VM_READ` handle for a run of `try_read_pointer` calls.
+/// `None` (silently — the reads are speculative) if the process can't be opened.
+pub(super) fn open_vm_read_handle(pid: u32) -> Option<super::HandleSafe> {
+    unsafe {
+        let handle = OpenProcess(PROCESS_VM_READ, 0, pid);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            None
+        } else {
+            Some(super::HandleSafe(handle))
+        }
+    }
+}
+
+/// Best-effort 8-byte pointer read: a plain `ReadProcessMemory` with NO
+/// partial-read `VirtualQueryEx` fallback and NO error logging. `None` on any
+/// failure. For SPECULATIVE reads where a miss is expected and ignored — chiefly
+/// resolving indirect jump/call targets during disassembly. When code is
+/// misdecoded (e.g. data disassembled as `call [garbage]`), the target often
+/// lands in unmapped memory; the full path would then run a wasted VirtualQueryEx
+/// and log an ERROR per instruction, spamming the log and adding tens of ms.
+/// Takes an open handle (see `open_vm_read_handle`) so a decode batch with
+/// hundreds of indirect targets pays one OpenProcess, not one per instruction.
+pub(super) fn try_read_pointer(handle: HANDLE, address: u64) -> Option<u64> {
+    unsafe {
+        let mut buf = [0u8; 8];
+        let mut bytes_read: usize = 0;
+        let ok = ReadProcessMemory(
+            handle,
+            address as *const std::ffi::c_void,
+            buf.as_mut_ptr() as *mut std::ffi::c_void,
+            8,
+            &mut bytes_read,
+        );
+        (ok != 0 && bytes_read == 8).then(|| u64::from_le_bytes(buf))
+    }
+}
+
 pub(super) fn write_memory_internal(
     handle: HANDLE,
     address: u64,

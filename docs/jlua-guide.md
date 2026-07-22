@@ -223,6 +223,13 @@ end
 local info = dbg:resolve_address(pid, addr)
 print(info.name, info.module, info.offset)
 
+-- Resolve many addresses in one round-trip WITHOUT waiting on in-flight
+-- symbol loads: an address in a still-loading module yields an empty table
+-- (re-request once get_symbol_status reports it loaded). One entry per input
+-- address, in order.
+local batch = dbg:try_resolve_addresses(pid, { addr1, addr2 })
+print(batch[1].name, batch[1].module, batch[1].offset)
+
 -- Per-module symbol load status. Each entry:
 -- {module, base, state = "loaded"|"loading"|"failed"|"not_requested",
 --  symbol_count?, error?, pdb_path?}
@@ -379,6 +386,12 @@ local regions = dbg:enumerate_regions(pid)
 ```lua
 -- Follow pointer chains (useful for examining stack values)
 local entries = dbg:dereference(pid, addr, 8)  -- 8 consecutive pointers
+
+-- Telescope many independent addresses in one round-trip (the server walks
+-- the process's memory regions once for the whole batch). Returns one entry
+-- list per input address, in order.
+local results = dbg:dereference_batch(pid, { addr1, addr2, addr3 }, 1)
+-- results[1] == dbg:dereference(pid, addr1, 1), etc.
 ```
 
 ### Function Arguments

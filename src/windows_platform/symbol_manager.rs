@@ -924,6 +924,39 @@ impl SymbolManager {
         }
     }
 
+    /// Resolve a batch of absolute addresses to raw symbols WITHOUT waiting on
+    /// in-flight symbol loads: an address whose containing module is still
+    /// loading resolves to `None` immediately instead of stalling behind the
+    /// parse (the blocking resolvers wait up to the configured timeout — seconds
+    /// for a multi-million-symbol PDB). One result per input address, in order.
+    /// Callers re-request once `get_symbol_status` reports the load settled.
+    /// `modules` must be sorted by base address.
+    pub fn try_resolve_addresses_to_symbols_raw(
+        &self,
+        modules: &[ModuleInfo],
+        addresses: &[u64],
+    ) -> Vec<Option<(String, ModuleSymbol, u64)>> {
+        addresses
+            .iter()
+            .map(|&address| {
+                let module = Self::find_module_binary_search(modules, address)?;
+                // Still loading → never enter the blocking resolvers (they wait).
+                {
+                    let pending = self.pending_loads.lock().unwrap();
+                    if pending.contains(&module.name) {
+                        return None;
+                    }
+                }
+                // Not pending, so the blocking paths below return immediately.
+                // Chain-aware resolution first (PGO fragments), then nearest-below.
+                if let Ok(Some(result)) = self.resolve_address_with_chain(modules, address) {
+                    return Some(result);
+                }
+                self.resolve_address_to_symbol_raw(modules, address).ok().flatten()
+            })
+            .collect()
+    }
+
     /// Resolve an address to a symbol by following RUNTIME_FUNCTION unwind chains.
     /// This handles PGO-split functions where cold code chunks link back to the
     /// primary function entry via UNW_FLAG_CHAININFO in the unwind info.

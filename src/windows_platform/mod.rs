@@ -757,6 +757,15 @@ impl PlatformAPI for WindowsPlatform {
         }
     }
 
+    fn try_resolve_addresses_to_symbols(&self, pid: u32, addresses: &[u64]) -> Result<Vec<Option<(String, ModuleSymbol, u64)>>, SymbolError> {
+        let Some(ref symbol_manager) = self.symbol_manager else {
+            return Err(SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()));
+        };
+        let mut modules = self.modules_for(pid);
+        modules.sort_by_key(|m| m.base);
+        Ok(symbol_manager.try_resolve_addresses_to_symbols_raw(&modules, addresses))
+    }
+
     fn get_symbol_status(&self, pid: u32) -> Result<Vec<crate::protocol::ModuleSymbolStatus>, SymbolError> {
         Ok(self.symbols()?.get_symbol_status(self.modules_for(pid)))
     }
@@ -932,30 +941,26 @@ impl PlatformAPI for WindowsPlatform {
         reference_base: Option<u64>,
     ) -> Result<Vec<crate::protocol::DereferenceEntry>, PlatformError> {
         let arch = self.arch_for(pid);
-
-        // Build symbol resolver for instruction operand symbolization
-        let mut modules = self.modules_for(pid);
-        // Sort modules by base address for binary search in symbol resolution
-        modules.sort_by_key(|m| m.base);
-        let symbol_manager = self.symbol_manager.as_ref();
-        let symbol_resolver = move |addr: u64| -> Option<crate::interfaces::SymbolInfo> {
-            if let Some(sm) = symbol_manager {
-                // Use non-blocking variant: return None immediately if symbols are still loading
-                // rather than waiting up to 5 seconds for PDB parsing to complete.
-                // This makes dereference responses instant even for large PDBs.
-                if let Ok(Some((module_path, symbol, offset))) = sm.try_resolve_address_to_symbol(&modules, addr) {
-                    let module_name = std::path::Path::new(&module_path)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(&module_path)
-                        .to_string();
-                    return Some(crate::interfaces::SymbolInfo { module_name, symbol_name: symbol.name, offset });
-                }
-            }
-            None
-        };
-
+        let symbol_resolver = self.nonblocking_symbol_resolver(pid);
         dereference::dereference(pid, address, count, reference_base, arch, Some(symbol_resolver))
+    }
+
+    fn dereference_batch(
+        &self,
+        pid: u32,
+        addresses: &[u64],
+        count: usize,
+        reference_base: Option<u64>,
+    ) -> Result<Vec<Vec<crate::protocol::DereferenceEntry>>, PlatformError> {
+        let arch = self.arch_for(pid);
+
+        // One resolver for the whole batch. `dereference::dereference_batch`
+        // enumerates the process's memory regions ONCE and reuses that snapshot
+        // across every address — the per-address `dereference` would otherwise
+        // re-walk the whole address space for each register, the dominant
+        // per-step cost on large targets.
+        let symbol_resolver = self.nonblocking_symbol_resolver(pid);
+        dereference::dereference_batch(pid, addresses, count, reference_base, arch, Some(symbol_resolver))
     }
 
     fn get_teb_address(&self, pid: u32, tid: u32) -> Result<u64, PlatformError> {
@@ -1190,36 +1195,90 @@ impl WindowsPlatform {
             .ok()
             .flatten();
 
-        let (disasm_start, disasm_count, func_start, func_end, func_name) = match bounds {
+        // `trim = Some` = decode the WHOLE function from its start and trim to
+        // [start, end). That's ideal for normal functions, but a large or
+        // MALFORMED bound (e.g. a corrupt `.pdata` reporting a multi-MB "function")
+        // would decode millions of instructions — tens of MB read, seconds of CPU
+        // on the paused command channel, and a payload the UI can't render (the
+        // observed multi-second freeze). It can also start so far below the PC that
+        // the requested address isn't even in the result. So: only take the
+        // whole-function path when it fits `max_instructions` AND actually contains
+        // the address; otherwise decode a bounded window anchored at the requested
+        // address (a known instruction boundary, always included) and let the UI
+        // scroll-extension pull in the rest.
+        let (disasm_start, disasm_count, func_start, func_end, func_name, trim) = match bounds {
             Some((start, end, name)) => {
-                // Calculate how many instructions we might need based on function size
-                // Assume average instruction size of ~2 bytes for a conservative estimate
-                // Don't cap by max_instructions here - we want the full function
-                let func_size = (end - start) as usize;
+                let func_size = end.saturating_sub(start) as usize;
                 let estimated_count = (func_size / 2).max(1);
-                (start, estimated_count, Some(start), Some(end), name)
+                let contains = address >= start && address < end;
+                if estimated_count <= max_instructions && contains {
+                    (start, estimated_count, Some(start), Some(end), name, Some((start, end)))
+                } else {
+                    (address, max_instructions, Some(start), Some(end), name, None)
+                }
             }
-            None => {
-                // No bounds found, just disassemble from the address with limit
-                (address, max_instructions, None, None, None)
-            }
+            None => (address, max_instructions, None, None, None, None),
         };
 
-        // Disassemble the function
+        // Disassemble the chosen window
         let instructions = self.disassemble_memory(pid, disasm_start, disasm_count, arch)?;
 
-        // If we have bounds, filter to only instructions within the function (no cap)
-        // If no bounds, use max_instructions as a safety limit
-        let filtered_instructions = if let (Some(start), Some(end)) = (func_start, func_end) {
+        let filtered_instructions = if let Some((start, end)) = trim {
             instructions
                 .into_iter()
                 .filter(|i| i.address >= start && i.address < end)
                 .collect()
         } else {
+            // Windowed decode from the requested address: cap the count, don't
+            // trim by bounds (the head is the requested address by construction).
             instructions.into_iter().take(max_instructions).collect()
         };
 
         Ok((filtered_instructions, func_start, func_end, func_name))
+    }
+
+    /// Non-blocking symbol resolver over a snapshot of the process's module
+    /// list: returns `None` immediately for a module whose symbols are still
+    /// loading rather than waiting (up to seconds) for the PDB parse — callers
+    /// stay instant even for large PDBs, and re-resolve once symbols land.
+    fn nonblocking_symbol_resolver(&self, pid: u32) -> impl Fn(u64) -> Option<crate::interfaces::SymbolInfo> + '_ {
+        let mut modules = self.modules_for(pid);
+        // Sort by base address for binary search in symbol resolution
+        modules.sort_by_key(|m| m.base);
+        let symbol_manager = self.symbol_manager.as_ref();
+        move |addr: u64| -> Option<crate::interfaces::SymbolInfo> {
+            let sm = symbol_manager?;
+            if let Ok(Some((module_path, symbol, offset))) = sm.try_resolve_address_to_symbol(&modules, addr) {
+                let module_name = std::path::Path::new(&module_path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&module_path)
+                    .to_string();
+                return Some(crate::interfaces::SymbolInfo { module_name, symbol_name: symbol.name, offset });
+            }
+            None
+        }
+    }
+
+    /// Disassemble a SINGLE instruction from target memory WITHOUT symbolization.
+    /// Used by the stepper, which needs only the instruction's size and mnemonic
+    /// (call/branch classification). The symbolizing decode path does per-
+    /// instruction symbol/pdata/line lookups and a module-list snapshot — all
+    /// wasted work here, and all contending with the symbol loader's locks while
+    /// a large PDB (millions of symbols) is being parsed, which showed up as
+    /// step hitches during symbol loading. This raw path never touches symbols.
+    /// Breakpoint bytes are still restored so the real opcode is decoded.
+    pub(crate) fn disassemble_instruction_raw(&self, pid: u32, address: u64, arch: Architecture) -> Result<Option<Instruction>, DisassemblerError> {
+        let Some(disasm) = self.disassembler.as_ref() else {
+            return Err(DisassemblerError::CapstoneError("Disassembler not initialized".to_string()));
+        };
+        // 16 bytes covers the longest x86 instruction (15) with slack.
+        let mut data = memory::read_memory_unlocked(pid, address, 16)
+            .map_err(|e| DisassemblerError::InvalidData(format!("Failed to read memory: {}", e)))?;
+        if let Ok(process) = self.get_process(pid) {
+            process.patch_breakpoint_bytes(address, &mut data);
+        }
+        Ok(disasm.disassemble(arch, &data, address, 1)?.into_iter().next())
     }
 
     /// Shared body of `disassemble_memory` / `disassemble_memory_bytes`:
@@ -1321,17 +1380,22 @@ impl WindowsPlatform {
         }
 
         // Resolve indirect jump/call targets (e.g., `call qword ptr [IAT_slot]`)
-        // by reading the pointer value so clicking navigates to the actual function.
+        // by reading the pointer value so clicking navigates to the actual
+        // function. This is best-effort and speculative: for misdecoded data the
+        // target is garbage/unmapped, so use the fast pointer read (no partial-
+        // read fallback, no error log) — otherwise each such instruction spends a
+        // wasted VirtualQueryEx and spams an ERROR line. One VM_READ handle is
+        // shared by every read in the batch (IAT-heavy code has hundreds).
         let mut instructions = result?;
-        let ptr_size = match arch {
-            Architecture::X64 | Architecture::Arm64 => 8usize,
-        };
-        for instr in &mut instructions {
-            if (instr.is_call || instr.is_jump) && instr.jump_target.is_some() && instr.op_str.contains('[') {
-                let ptr_addr = instr.jump_target.unwrap();
-                if let Ok(data) = memory::read_memory_unlocked(pid, ptr_addr, ptr_size) {
-                    if data.len() >= ptr_size {
-                        let actual_target = u64::from_le_bytes(data[..8].try_into().unwrap());
+        let is_indirect = |i: &Instruction| (i.is_call || i.is_jump) && i.jump_target.is_some() && i.op_str.contains('[');
+        let ptr_handle = instructions.iter().any(is_indirect)
+            .then(|| memory::open_vm_read_handle(pid))
+            .flatten();
+        if let Some(ref handle) = ptr_handle {
+            for instr in &mut instructions {
+                if is_indirect(instr) {
+                    let ptr_addr = instr.jump_target.unwrap();
+                    if let Some(actual_target) = memory::try_read_pointer(handle.0, ptr_addr) {
                         instr.jump_target = Some(actual_target);
                     }
                 }

@@ -362,6 +362,21 @@ pub trait PlatformAPI: Send + Sync {
     fn resolve_rva_to_symbol(&self, module_path: &str, rva: u32) -> Result<Option<ModuleSymbol>, SymbolError>;
     fn resolve_address_to_symbol(&self, pid: u32, address: u64) -> Result<Option<(String, ModuleSymbol, u64)>, SymbolError>; // Returns (module_path, symbol, offset_from_symbol)
 
+    /// Resolve many addresses to symbols WITHOUT waiting on in-flight symbol
+    /// loads: an address in a module whose symbols are still loading yields
+    /// `None` immediately instead of stalling behind the parse (the blocking
+    /// `resolve_address_to_symbol` waits up to the platform's timeout). One
+    /// result per input address, in order; callers re-request once
+    /// `get_symbol_status` reports the load settled. The default loops the
+    /// blocking resolver — platforms with background symbol loading should
+    /// override to guarantee the non-waiting behavior.
+    fn try_resolve_addresses_to_symbols(&self, pid: u32, addresses: &[u64]) -> Result<Vec<Option<(String, ModuleSymbol, u64)>>, SymbolError> {
+        Ok(addresses
+            .iter()
+            .map(|&address| self.resolve_address_to_symbol(pid, address).ok().flatten())
+            .collect())
+    }
+
     /// Per-module symbol load status (loaded/loading/failed/not requested).
     fn get_symbol_status(&self, _pid: u32) -> Result<Vec<crate::protocol::ModuleSymbolStatus>, SymbolError> {
         Err(SymbolError::SymbolsNotFound("Symbol status not supported by this platform".to_string()))
@@ -494,6 +509,24 @@ pub trait PlatformAPI: Send + Sync {
         count: usize,
         reference_base: Option<u64>,
     ) -> Result<Vec<crate::protocol::DereferenceEntry>, PlatformError>;
+
+    /// Telescope many independent addresses at once. The default loops
+    /// `dereference`; platforms should override to enumerate memory regions only
+    /// once for the whole batch (the enumeration dominates the cost, and the
+    /// registers panel telescopes ~16 addresses on every step). Returns one
+    /// entry list per input address, in order.
+    fn dereference_batch(
+        &self,
+        pid: u32,
+        addresses: &[u64],
+        count: usize,
+        reference_base: Option<u64>,
+    ) -> Result<Vec<Vec<crate::protocol::DereferenceEntry>>, PlatformError> {
+        addresses
+            .iter()
+            .map(|&address| self.dereference(pid, address, count, reference_base))
+            .collect()
+    }
 
     // Thread Environment Block (TEB) address - used for emulator GS segment setup
     fn get_teb_address(&self, _pid: u32, _tid: u32) -> Result<u64, PlatformError> {

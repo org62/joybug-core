@@ -753,6 +753,34 @@ impl LuaUserData for LuaDebugClient {
             }
         });
 
+        methods.add_method("try_resolve_addresses", |lua, this, (pid, addrs): (u32, Vec<u64>)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::TryResolveAddressesToSymbols {
+                pid, addresses: addrs,
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::AddressSymbolBatch { results } => {
+                    // One table per input address, in order; an unresolved (or
+                    // still-loading) address yields an EMPTY table, never a hole,
+                    // so `#table` stays the input length.
+                    let table = lua.create_table()?;
+                    for (i, result) in results.into_iter().enumerate() {
+                        let entry = match result {
+                            Some((module, sym, offset)) =>
+                                address_symbol_to_lua_table(lua, Some(module), Some(sym), Some(offset))?,
+                            None => lua.create_table()?,
+                        };
+                        table.set(i + 1, entry)?;
+                    }
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("TryResolveAddresses failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
         methods.add_method("list_symbols", |lua, this, module_path: String| {
             let mut client = this.inner.borrow_mut();
             let resp = client.send_and_receive(&DebuggerRequest::ListSymbols {
@@ -1242,6 +1270,31 @@ impl LuaUserData for LuaDebugClient {
                 }
                 DebuggerResponse::Error { message } => Err(mlua::Error::external(
                     anyhow::anyhow!("Dereference failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        methods.add_method("dereference_batch", |lua, this, (pid, addrs, count, ref_base): (u32, Vec<u64>, Option<usize>, Option<u64>)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::DereferenceBatch {
+                pid, addresses: addrs, count: count.unwrap_or(1), reference_base: ref_base,
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::DereferenceBatchResult { results } => {
+                    // One inner table (list of entries) per input address, in order.
+                    let table = lua.create_table()?;
+                    for (i, entries) in results.iter().enumerate() {
+                        let inner = lua.create_table()?;
+                        for (j, entry) in entries.iter().enumerate() {
+                            inner.set(j + 1, deref_entry_to_lua_table(lua, entry)?)?;
+                        }
+                        table.set(i + 1, inner)?;
+                    }
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("DereferenceBatch failed: {}", message),
                 )),
                 _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
             }

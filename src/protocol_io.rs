@@ -126,6 +126,7 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::CoverageResults { hits } => format!("CoverageResults ({} entries)", hits.len()),
         DebuggerResponse::WatchpointAccesses { accesses } => format!("WatchpointAccesses ({} entries)", accesses.len()),
         DebuggerResponse::AddressSymbol { .. } => "AddressSymbol".to_string(),
+        DebuggerResponse::AddressSymbolBatch { results } => format!("AddressSymbolBatch ({} addresses)", results.len()),
         DebuggerResponse::CallStack { .. } => "CallStack".to_string(),
         DebuggerResponse::FunctionArguments { .. } => "FunctionArguments".to_string(),
         DebuggerResponse::WideStringData { .. } => "WideStringData".to_string(),
@@ -133,6 +134,7 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::MemoryRegionInfo { .. } => "MemoryRegionInfo".to_string(),
         DebuggerResponse::MemoryRegionList { regions } => format!("MemoryRegionList ({} regions)", regions.len()),
         DebuggerResponse::DereferenceResult { entries } => format!("DereferenceResult ({} entries)", entries.len()),
+        DebuggerResponse::DereferenceBatchResult { results } => format!("DereferenceBatchResult ({} addresses)", results.len()),
         DebuggerResponse::FunctionDisassembly { instructions, .. } => format!("FunctionDisassembly ({} instructions)", instructions.len()),
         DebuggerResponse::EmulationResult { instructions_executed, .. } => format!("EmulationResult ({} instructions)", instructions_executed),
         DebuggerResponse::TenetTrace { trace_text, .. } => format!("TenetTrace ({} bytes)", trace_text.len()),
@@ -1271,6 +1273,29 @@ impl<S> DebugSession<S> {
         }
     }
 
+    /// Resolve many addresses to symbols in a single round-trip, never waiting
+    /// on in-flight symbol loads: addresses in still-loading modules come back
+    /// `None` (re-request once symbol status settles). One result per input
+    /// address, in order.
+    pub fn try_resolve_addresses_to_symbols(
+        &mut self,
+        pid: u32,
+        addresses: Vec<u64>,
+    ) -> anyhow::Result<Vec<Option<(String, ModuleSymbol, u64)>>> {
+        let req = DebuggerRequest::TryResolveAddressesToSymbols { pid, addresses };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::AddressSymbolBatch { results } => Ok(results),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!(
+                "Failed to resolve addresses to symbols: {}",
+                message
+            )),
+            other => Err(anyhow::anyhow!(
+                "Unexpected response to TryResolveAddressesToSymbols: {:?}",
+                other
+            )),
+        }
+    }
+
     /// Resolve an address to a source file/line via the module's PDB line table.
     pub fn resolve_address_to_line(
         &mut self,
@@ -1801,6 +1826,24 @@ impl<S> DebugSession<S> {
             DebuggerResponse::DereferenceResult { entries } => Ok(entries),
             DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to dereference: {}", message)),
             other => Err(anyhow::anyhow!("Unexpected response to Dereference: {:?}", other)),
+        }
+    }
+
+    /// Telescope many addresses in a single round-trip; the server enumerates
+    /// memory regions once for the whole batch. Returns one entry list per input
+    /// address, in order.
+    pub fn dereference_batch(
+        &mut self,
+        pid: u32,
+        addresses: Vec<u64>,
+        count: usize,
+        reference_base: Option<u64>,
+    ) -> anyhow::Result<Vec<Vec<crate::protocol::DereferenceEntry>>> {
+        let req = DebuggerRequest::DereferenceBatch { pid, addresses, count, reference_base };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::DereferenceBatchResult { results } => Ok(results),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to dereference batch: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to DereferenceBatch: {:?}", other)),
         }
     }
 

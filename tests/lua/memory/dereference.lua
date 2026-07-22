@@ -46,6 +46,20 @@ dbg:on_initial_breakpoint(function(pid, tid, addr)
             assert(entry.offset == expected_offset,
                 "Entry " .. i .. " should have offset " .. expected_offset .. ", got " .. entry.offset)
         end
+
+        -- TEST 5: Batch dereference — one entry list per address, in order,
+        -- matching the single-address results (server walks regions once).
+        local batch = dbg:dereference_batch(pid,
+            { string_sym[1].va, null_sym[1].va, main_sym[1].va }, 1)
+        assert(#batch == 3, "Batch should return one list per address")
+        assert(#batch[1] == 1 and batch[1][1].chain[1].type == "pointer",
+            "Batch g_string_ptr should match single dereference")
+        assert(batch[1][1].chain[2].value:find("Hello, Dereference!"),
+            "Batch string chain should contain 'Hello, Dereference!'")
+        assert(batch[2][1].chain[1].type == "value" and batch[2][1].chain[1].value == 0,
+            "Batch NULL should produce value 0")
+        assert(batch[3][1].chain[2].type == "instruction",
+            "Batch g_main_ptr should resolve to instruction")
     end)
 end)
 
