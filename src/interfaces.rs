@@ -391,6 +391,16 @@ pub trait PlatformAPI: Send + Sync {
     fn retry_symbol_load(&self, _pid: u32, _module_base: u64) -> Result<(), SymbolError> {
         Err(SymbolError::SymbolsNotFound("Symbol retry not supported by this platform".to_string()))
     }
+    /// Unload a module's symbols and every derived cache (line tables, type info,
+    /// pdata, failure markers), freeing their memory.
+    fn unload_module_symbols(&self, _pid: u32, _module_base: u64) -> Result<(), SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Symbol unload not supported by this platform".to_string()))
+    }
+    /// Replace the set of modules (lowercased file names) whose automatic symbol
+    /// download is suppressed.
+    fn set_symbol_deny_list(&self, _modules: Vec<String>) -> Result<(), SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Symbol deny list not supported by this platform".to_string()))
+    }
 
     // Source line methods (PDB line tables)
     /// Resolve an address to a source file/line. Lazily parses the module's line table.

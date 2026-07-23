@@ -60,6 +60,11 @@ pub struct SymbolManager {
     /// Modules whose symbol load failed (module_path -> error message).
     /// Failed modules are not retried automatically; retry is explicit.
     failed_loads: Arc<Mutex<HashMap<String, String>>>,
+    /// Modules (lowercased file names, e.g. "foo.dll") whose automatic symbol
+    /// download the client suppressed — typically because the download failed in
+    /// an earlier run. Denied modules go straight to `failed_loads` instead of
+    /// downloading; an explicit retry lifts the suppression.
+    denied_loads: Mutex<HashSet<String>>,
     /// Condvar to notify waiters when a module finishes loading
     pending_cv: Arc<Condvar>,
 
@@ -168,6 +173,7 @@ impl SymbolManager {
             type_cache: Mutex::new(HashMap::new()),
             pending_loads,
             failed_loads,
+            denied_loads: Mutex::new(HashSet::new()),
             pending_cv,
             worker_tx,
             wait_timeout: Self::read_timeout_from_env(),
@@ -211,6 +217,19 @@ impl SymbolManager {
         {
             let failed = self.failed_loads.lock().unwrap();
             if failed.contains_key(&module_path) {
+                return;
+            }
+        }
+
+        // The client suppressed auto-download for this module (it failed in an
+        // earlier run). Surface it as Failed so a UI can offer an explicit retry.
+        {
+            let denied = self.denied_loads.lock().unwrap();
+            if denied.contains(&Self::short_name_lower(&module_path)) {
+                self.failed_loads.lock().unwrap().insert(
+                    module_path,
+                    "symbol download skipped (failed in a previous run; retry to download again)".to_string(),
+                );
                 return;
             }
         }
@@ -328,6 +347,7 @@ impl SymbolManager {
             });
         }
         self.failed_loads.lock().unwrap().remove(&module.name);
+        self.denied_loads.lock().unwrap().remove(&Self::short_name_lower(&module.name));
         // The line/type tables came from the previous PDB; re-parse on demand.
         self.invalidate_line_table(&module.name);
         self.type_cache.lock().unwrap().remove(&module.name);
@@ -546,8 +566,39 @@ impl SymbolManager {
 
     /// Retry a failed (or never-attempted) symbol download for a module.
     pub fn retry_loading_symbols(&self, module: &ModuleInfo) {
+        self.denied_loads.lock().unwrap().remove(&Self::short_name_lower(&module.name));
         self.failed_loads.lock().unwrap().remove(&module.name);
         self.start_loading_symbols(module);
+    }
+
+    /// Lowercased file-name portion of a module path ("C:\\x\\Foo.DLL" -> "foo.dll").
+    /// Deny-list entries use this form so they survive path differences between runs.
+    fn short_name_lower(module_path: &str) -> String {
+        crate::formatting::module_basename_lower(module_path)
+    }
+
+    /// Replace the set of modules whose automatic symbol download is suppressed.
+    /// Entries are normalized here (see `short_name_lower`), so callers may send
+    /// any identifier — full path or bare file name, any case.
+    pub fn set_deny_list(&self, modules: Vec<String>) {
+        let mut denied = self.denied_loads.lock().unwrap();
+        denied.clear();
+        denied.extend(modules.iter().map(|m| Self::short_name_lower(m)));
+    }
+
+    /// Unload a module's symbols and every derived cache (line table, type info,
+    /// pdata, failure marker), freeing their memory. The module reports
+    /// `NotRequested` afterwards; `retry_loading_symbols` re-downloads on demand.
+    /// An in-flight background load is left alone — its result may repopulate the
+    /// cache once it settles, and can then be unloaded again.
+    pub fn unload_module_symbols(&self, module_path: &str) {
+        self.symbol_cache.lock().unwrap().remove(module_path);
+        self.pdata_cache.lock().unwrap().remove(module_path);
+        self.invalidate_line_table(module_path);
+        self.type_cache.lock().unwrap().remove(module_path);
+        self.failed_loads.lock().unwrap().remove(module_path);
+        self.denied_loads.lock().unwrap().remove(&Self::short_name_lower(module_path));
+        trace!(module_path, "Unloaded module symbols and derived caches");
     }
 
     /// Find symbols across all loaded modules, returning up to max_results matches

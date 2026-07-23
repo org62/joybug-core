@@ -1,6 +1,14 @@
 use crate::protocol::*;
 use crate::interfaces::*;
 
+/// Lowercased file-name portion of a module path ("C:\\x\\Foo.DLL" -> "foo.dll").
+/// The cross-run identity key for module matching (symbol deny lists,
+/// pointer-scan result rebinding) — keyed by name because bases change with
+/// ASLR. Accepts a full path or a bare file name.
+pub fn module_basename_lower(path: &str) -> String {
+    path.rsplit(['\\', '/']).next().unwrap_or(path).to_lowercase()
+}
+
 // Memory region formatting utilities
 #[cfg(windows)]
 pub mod memory {

@@ -663,6 +663,12 @@ fn test_lua_file_symbol_status() {
 }
 
 #[test]
+fn test_lua_file_unload_symbols() {
+    let test_exe = common::get_test_program_path("disassembly_test");
+    run_lua_test_file("modules/unload_symbols.lua", Some(&test_exe));
+}
+
+#[test]
 fn test_lua_file_load_pdb() {
     let test_exe = common::get_test_program_path("disassembly_test");
     run_lua_test_file("modules/load_pdb.lua", Some(&test_exe));

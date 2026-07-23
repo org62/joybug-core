@@ -293,6 +293,20 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::UnloadModuleSymbols { pid, module_base } => {
+                let p = platform.read().unwrap();
+                match p.unload_module_symbols(pid, module_base) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::SetSymbolDenyList { modules } => {
+                let p = platform.read().unwrap();
+                match p.set_symbol_deny_list(modules) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::ListSymbols { module_path } => {
                 let p = platform.read().unwrap();
                 match p.list_symbols(&module_path) {

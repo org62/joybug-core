@@ -248,6 +248,16 @@ end
 
 -- Retry a failed symbol download for a module
 dbg:retry_symbols(pid, module_base)
+
+-- Unload a module's symbols and every derived server-side cache (line tables,
+-- type info, pdata, failure markers), freeing their memory. The module reports
+-- not_requested afterwards; retry_symbols re-downloads on demand.
+dbg:unload_symbols(pid, module_base)
+
+-- Replace the set of modules (lowercased file names) whose automatic symbol
+-- download is suppressed. Denied modules report "failed" instead of
+-- downloading; retry_symbols lifts the suppression for its module.
+dbg:set_symbol_deny_list({ "app.exe", "third_party.dll" })
 ```
 
 ### Types (PDB TPI stream)

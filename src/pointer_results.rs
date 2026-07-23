@@ -13,6 +13,7 @@
 //! name. The caller resolves that name against the *current* module list to get
 //! the live base (handling both ASLR and module-set/order changes across runs).
 
+use crate::formatting::module_basename_lower as basename_lower;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -236,10 +237,6 @@ pub fn resolve_module_base(index: &HashMap<String, u64>, name: &str) -> Option<u
         .get(name)
         .copied()
         .or_else(|| index.get(&basename_lower(name)).copied())
-}
-
-fn basename_lower(name: &str) -> String {
-    name.rsplit(['\\', '/']).next().unwrap_or(name).to_lowercase()
 }
 
 #[cfg(test)]

@@ -781,6 +781,17 @@ impl PlatformAPI for WindowsPlatform {
         Ok(())
     }
 
+    fn unload_module_symbols(&self, pid: u32, module_base: u64) -> Result<(), SymbolError> {
+        let module = self.module_at(pid, module_base)?;
+        self.symbols()?.unload_module_symbols(&module.name);
+        Ok(())
+    }
+
+    fn set_symbol_deny_list(&self, modules: Vec<String>) -> Result<(), SymbolError> {
+        self.symbols()?.set_deny_list(modules);
+        Ok(())
+    }
+
     fn resolve_address_to_line(&self, pid: u32, address: u64) -> Result<Option<crate::protocol::AddressLineInfo>, SymbolError> {
         let symbol_manager = self.symbols()?;
         let mut modules = self.modules_for(pid);

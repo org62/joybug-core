@@ -1029,6 +1029,30 @@ impl<S> DebugSession<S> {
         }
     }
 
+    /// Unload a module's symbols and every derived server-side cache, freeing
+    /// their memory. The module reports `NotRequested` afterwards.
+    pub fn unload_module_symbols(&mut self, pid: u32, module_base: u64) -> anyhow::Result<()> {
+        match self.send_and_receive(&DebuggerRequest::UnloadModuleSymbols { pid, module_base })? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to unload module symbols: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to UnloadModuleSymbols: {:?}", other)),
+        }
+    }
+
+    /// Replace the set of modules (lowercased file names, e.g. "foo.dll") whose
+    /// automatic symbol download is suppressed.
+    pub fn set_symbol_deny_list(&mut self, modules: Vec<String>) -> anyhow::Result<()> {
+        match self.send_and_receive(&DebuggerRequest::SetSymbolDenyList { modules })? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to set symbol deny list: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to SetSymbolDenyList: {:?}", other)),
+        }
+    }
+
     /// List UDT/enum types from loaded module PDBs. `module_base = None` searches
     /// all loaded modules; `filter` is a case-insensitive substring on the name.
     pub fn list_types(

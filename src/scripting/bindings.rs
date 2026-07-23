@@ -902,6 +902,32 @@ impl LuaUserData for LuaDebugClient {
             }
         });
 
+        methods.add_method("unload_symbols", |_lua, this, (pid, module_base): (u32, u64)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::UnloadModuleSymbols { pid, module_base })
+                .map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::Ack => Ok(true),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("UnloadModuleSymbols failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        methods.add_method("set_symbol_deny_list", |_lua, this, modules: Vec<String>| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::SetSymbolDenyList { modules })
+                .map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::Ack => Ok(true),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("SetSymbolDenyList failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
         // ---- Types (PDB TPI stream) ----
 
         methods.add_method("list_types", |lua, this, (filter, pid, module_base, max_results): (Option<String>, Option<u32>, Option<u64>, Option<usize>)| {

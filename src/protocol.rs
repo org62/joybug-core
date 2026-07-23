@@ -426,6 +426,21 @@ pub mod request_response {
             pid: u32,
             module_base: u64,
         },
+        /// Unload a module's symbols and every derived server-side cache (line
+        /// tables, type info, pdata, failure markers), freeing their memory. The
+        /// module reports `NotRequested` afterwards; `RetrySymbolLoad` re-downloads.
+        UnloadModuleSymbols {
+            pid: u32,
+            module_base: u64,
+        },
+        /// Replace the set of modules (lowercased file names, e.g. "foo.dll")
+        /// whose automatic symbol download is suppressed. Suppressed modules
+        /// report `Failed` instead of downloading; `RetrySymbolLoad` lifts the
+        /// suppression for its module. Typically sent once at session start with
+        /// the modules whose downloads failed in earlier runs.
+        SetSymbolDenyList {
+            modules: Vec<String>,
+        },
         ListSymbols {
             module_path: String,
         },
