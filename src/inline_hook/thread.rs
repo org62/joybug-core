@@ -130,10 +130,16 @@ mod windows_impl {
                     if GetThreadContext(handle, &mut ctx) == 0 {
                         continue;
                     }
-                    let rip = ctx.Rip as usize;
-                    if rip >= old_ip_range.0 && rip < old_ip_range.1 {
-                        let offset = rip - old_ip_range.0;
-                        ctx.Rip = (new_ip_base + offset) as u64;
+                    #[cfg(target_arch = "x86_64")]
+                    let ip = ctx.Rip as usize;
+                    #[cfg(target_arch = "aarch64")]
+                    let ip = ctx.Pc as usize;
+                    if ip >= old_ip_range.0 && ip < old_ip_range.1 {
+                        let offset = ip - old_ip_range.0;
+                        #[cfg(target_arch = "x86_64")]
+                        { ctx.Rip = (new_ip_base + offset) as u64; }
+                        #[cfg(target_arch = "aarch64")]
+                        { ctx.Pc = (new_ip_base + offset) as u64; }
                         SetThreadContext(handle, &ctx);
                     }
                 }

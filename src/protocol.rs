@@ -301,6 +301,14 @@ pub mod request_response {
         Detach {
             pid: u32,
         },
+        /// Open a process non-invasively (OpenProcess only, no DebugActiveProcess).
+        OpenProcess {
+            pid: u32,
+        },
+        /// Release a non-invasively opened process.
+        CloseProcess {
+            pid: u32,
+        },
         Launch {
             command: String,
             #[serde(default)]
@@ -340,6 +348,46 @@ pub mod request_response {
             pid: u32,
             addr: u64,
         },
+        /// Arm code-coverage breakpoints (silent, server-side counted) at every
+        /// address in `addrs`. `limit` is the hit count after which each is
+        /// auto-removed (`0` = never, `1` = remove on first hit = pure coverage).
+        StartCodeCoverage {
+            pid: u32,
+            addrs: Vec<u64>,
+            limit: u64,
+        },
+        /// Fetch a [`CoverageHit`] (address, hit count, first-hit order, thread
+        /// ids) for every coverage breakpoint hit at least once (never-hit
+        /// addresses are omitted).
+        GetCodeCoverage {
+            pid: u32,
+        },
+        /// Remove all coverage breakpoints and clear the coverage map.
+        StopCodeCoverage {
+            pid: u32,
+        },
+        /// Arm a hardware watchpoint at `addr` in silent "access trace" mode: every
+        /// read/write is recorded server-side (the accessing instruction pointer)
+        /// and the target auto-continues instead of breaking. Reuses the DR0-DR3 /
+        /// ARM64 watchpoint machinery of `SetHardwareBreakpoint`.
+        StartWatchpointTrace {
+            pid: u32,
+            addr: u64,
+            bp_type: HardwareBreakpointType,
+            size: HardwareBreakpointSize,
+        },
+        /// Fetch a [`WatchpointAccess`] (accessing instruction pointer, hit count,
+        /// first-hit order, thread ids) for every distinct instruction that has
+        /// accessed the watched `addr` at least once.
+        GetWatchpointAccesses {
+            pid: u32,
+            addr: u64,
+        },
+        /// Remove the watchpoint at `addr` and clear its collected accesses.
+        StopWatchpointTrace {
+            pid: u32,
+            addr: u64,
+        },
         ReadMemory {
             pid: u32,
             address: u64,
@@ -364,6 +412,35 @@ pub mod request_response {
             symbol_name: String,
             max_results: usize,
         },
+        GetSymbolStatus {
+            pid: u32,
+        },
+        LoadPdbFromPath {
+            pid: u32,
+            module_base: u64,
+            pdb_path: String,
+            #[serde(default)]
+            force: bool,
+        },
+        RetrySymbolLoad {
+            pid: u32,
+            module_base: u64,
+        },
+        /// Unload a module's symbols and every derived server-side cache (line
+        /// tables, type info, pdata, failure markers), freeing their memory. The
+        /// module reports `NotRequested` afterwards; `RetrySymbolLoad` re-downloads.
+        UnloadModuleSymbols {
+            pid: u32,
+            module_base: u64,
+        },
+        /// Replace the set of modules (lowercased file names, e.g. "foo.dll")
+        /// whose automatic symbol download is suppressed. Suppressed modules
+        /// report `Failed` instead of downloading; `RetrySymbolLoad` lifts the
+        /// suppression for its module. Typically sent once at session start with
+        /// the modules whose downloads failed in earlier runs.
+        SetSymbolDenyList {
+            modules: Vec<String>,
+        },
         ListSymbols {
             module_path: String,
         },
@@ -374,6 +451,69 @@ pub mod request_response {
         ResolveAddressToSymbol {
             pid: u32,
             address: u64,
+        },
+        /// Resolve many addresses to symbols in one round-trip, never waiting
+        /// on in-flight symbol loads: addresses in still-loading modules come
+        /// back `None` (re-request once symbol status settles). See
+        /// `PlatformAPI::try_resolve_addresses_to_symbols`.
+        TryResolveAddressesToSymbols {
+            pid: u32,
+            addresses: Vec<u64>,
+        },
+        /// Resolve an address to a source file/line via the module's PDB line table.
+        ResolveAddressToLine {
+            pid: u32,
+            address: u64,
+        },
+        /// All line→address entries for one source file of a module. When
+        /// `start_line`/`end_line` are set, only entries whose `line_start` falls
+        /// in that inclusive range are returned — bounding the response for very
+        /// large files (windowed source view). `None` = whole file.
+        GetSourceFileLineMap {
+            pid: u32,
+            module_base: u64,
+            file_path: String,
+            #[serde(default)]
+            start_line: Option<u32>,
+            #[serde(default)]
+            end_line: Option<u32>,
+        },
+        /// All source files referenced by a module's PDB line table.
+        ListSourceFiles {
+            pid: u32,
+            module_base: u64,
+        },
+        /// List UDT/enum types from loaded module PDBs. `module_base = None` searches
+        /// all loaded modules; `filter` is a case-insensitive substring on the name.
+        ListTypes {
+            pid: u32,
+            #[serde(default)]
+            module_base: Option<u64>,
+            #[serde(default)]
+            filter: Option<String>,
+            max_results: usize,
+        },
+        /// Resolve a named type's layout. `module_base = None` searches all modules.
+        GetType {
+            pid: u32,
+            #[serde(default)]
+            module_base: Option<u64>,
+            name: String,
+        },
+        /// Resolve a type by its TPI index within a specific module (nested expansion).
+        GetTypeByIndex {
+            pid: u32,
+            module_base: u64,
+            index: u32,
+        },
+        /// TEB base address of thread `tid` — anchor for overlaying `_TEB`.
+        GetTebAddress {
+            pid: u32,
+            tid: u32,
+        },
+        /// PEB base address of a process — anchor for overlaying `_PEB`.
+        GetPebAddress {
+            pid: u32,
         },
         DisassembleMemory {
             pid: u32,
@@ -423,11 +563,28 @@ pub mod request_response {
             count: usize,
             reference_base: Option<u64>,
         },
+        /// Telescope many addresses at once, enumerating memory regions only once
+        /// for the whole batch (see `PlatformAPI::dereference_batch`).
+        DereferenceBatch {
+            pid: u32,
+            addresses: Vec<u64>,
+            count: usize,
+            reference_base: Option<u64>,
+        },
         /// Disassemble a function with bounds detection using exception directory
         DisassembleFunction {
             pid: u32,
             address: u64,
             max_instructions: usize,
+            arch: crate::interfaces::Architecture,
+        },
+        /// Backward disassembly: up to `count` instructions ending immediately
+        /// before `target` (x64dbg-style self-resynchronizing decode). Reuses the
+        /// `Instructions` response.
+        DisassembleBackward {
+            pid: u32,
+            target: u64,
+            count: usize,
             arch: crate::interfaces::Architecture,
         },
         // Emulator requests (one-shot: create, emulate, destroy in single call)
@@ -470,12 +627,19 @@ pub mod request_response {
             /// If true (default), only scan writable memory regions.
             #[serde(default)]
             writable_only: Option<bool>,
+            /// Number of threads to use for the scan. `None`/`Some(0)` = all cores.
+            #[serde(default)]
+            thread_count: Option<usize>,
         },
         ScanMemoryNext {
             scan_id: u64,
             compare_type: ScanCompareType,
             value: Option<ScanValue>,
             value2: Option<ScanValue>,
+            /// Absolute epsilon for float exact-match (see ScanMemoryStart). When
+            /// omitted, the tolerance from the initial scan is reused.
+            #[serde(default)]
+            float_tolerance: Option<f64>,
         },
         ScanMemoryGetResults {
             scan_id: u64,
@@ -485,11 +649,169 @@ pub mod request_response {
         ScanMemoryReset {
             scan_id: u64,
         },
+        // Pointer scan: find static pointer paths leading to a target address
+        PointerScanStart {
+            pid: u32,
+            target_address: u64,
+            /// Max offset window scanned at each level (struct size). Default 0x1000.
+            max_offset: u64,
+            /// Max pointer chain depth (number of indirections). Default 5.
+            max_depth: u32,
+            /// Slot alignment when scanning memory. `None` = pointer size (8).
+            #[serde(default)]
+            alignment: Option<usize>,
+            /// Cap on the number of returned paths. `None` = engine default.
+            #[serde(default)]
+            max_results: Option<u64>,
+            /// Restrict static bases to modules with these base addresses.
+            /// `None` (or empty) considers every loaded module.
+            #[serde(default)]
+            modules: Option<Vec<u64>>,
+            /// Number of threads to use. `None`/`Some(0)` = all cores.
+            #[serde(default)]
+            thread_count: Option<usize>,
+            /// If true, only scan writable regions (heap/stack/.data) for pointer
+            /// slots — faster, but misses static roots in read-only sections.
+            #[serde(default)]
+            writable_only: bool,
+        },
+        PointerScanGetResults {
+            pid: u32,
+            results_path: String,
+            offset: u64,
+            count: u64,
+            /// Quick filter: keep only paths whose chain offsets contain *every*
+            /// value listed here (order-independent). Empty = no filter. `offset`/
+            /// `count` then page over the filtered set, and `total_count` in the
+            /// response reflects the number of matches.
+            #[serde(default)]
+            offset_filter: Vec<u64>,
+        },
+        PointerScanReset {
+            results_path: String,
+        },
+        /// Reduce a prior scan to only the paths whose chain offsets contain every
+        /// value in `offset_filter`. Writes the survivors to a new file and returns
+        /// its path (the old file is deleted) — i.e. commit a quick filter.
+        PointerScanApplyFilter {
+            results_path: String,
+            offset_filter: Vec<u64>,
+        },
+        /// Re-resolve a prior scan's paths against the live process and keep only
+        /// those that still resolve to `target_address`. Writes the survivors to a
+        /// new file and returns its path (the old file is deleted).
+        PointerScanRescan {
+            pid: u32,
+            results_path: String,
+            target_address: u64,
+        },
+        // String scan: find printable ASCII/UTF-16 strings in a memory span
+        StringScanStart {
+            pid: u32,
+            /// Start of the span to scan (e.g. a module base).
+            start_address: u64,
+            /// Length of the span in bytes (e.g. a module size).
+            size: u64,
+            /// Minimum string length in characters (clamped to 2..=128).
+            min_length: u32,
+            /// Cap on stored hits. `None` = engine default (1,000,000).
+            #[serde(default)]
+            max_results: Option<u64>,
+            /// Number of threads to use. `None`/`Some(0)` = all cores.
+            #[serde(default)]
+            thread_count: Option<usize>,
+            /// Which memory regions inside the span to scan.
+            #[serde(default)]
+            region_filter: ScanRegionFilter,
+            /// Which string encodings to detect.
+            #[serde(default)]
+            encodings: StringEncodingFilter,
+            /// Case-insensitive substring a string must contain to be stored.
+            /// Empty = keep every string.
+            #[serde(default)]
+            contains: String,
+        },
+        StringScanGetResults {
+            results_path: String,
+            offset: u64,
+            count: u64,
+            /// Case-insensitive substring filter. Empty = no filter. `offset`/
+            /// `count` page over the filtered set; `total_count` is the match count.
+            #[serde(default)]
+            filter: String,
+            #[serde(default)]
+            sort: StringSortKey,
+            #[serde(default = "default_true")]
+            ascending: bool,
+        },
+        StringScanReset {
+            results_path: String,
+        },
         // Anti-anti-debug
         HidePeb {
             pid: u32,
             options: crate::anti_anti_debug::PebHideOptions,
         },
+        // Value freeze: a server-side thread continuously writes `data` to `address`
+        // so the client doesn't have to stream repeated writes over the protocol.
+        FreezeValueStart {
+            pid: u32,
+            address: u64,
+            data: Vec<u8>,
+            /// Write interval in milliseconds. `None` = engine default (~30ms).
+            #[serde(default)]
+            interval_ms: Option<u64>,
+            /// Optional pointer chain. When non-empty, `address` is the *static
+            /// base* and the freeze re-resolves the target each tick as
+            /// `addr = base; for off in offsets { addr = read_u64(addr) + off }`
+            /// before writing — so the lock follows the value even when the chain
+            /// repoints (e.g. a level reload). Empty = freeze the fixed `address`.
+            #[serde(default)]
+            offsets: Vec<u64>,
+        },
+        /// Change the value written by an active freeze without re-registering it.
+        FreezeValueUpdate {
+            freeze_id: u64,
+            data: Vec<u8>,
+        },
+        FreezeValueStop {
+            freeze_id: u64,
+        },
+    }
+
+    /// One code-coverage breakpoint that has been hit at least once.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct CoverageHit {
+        pub address: u64,
+        pub hit_count: u64,
+        /// 1-based first-execution order across the whole coverage run (1 = the
+        /// first covered address executed). Assigned once on the first hit and
+        /// never changed; reset by `StopCodeCoverage`.
+        pub first_hit_seq: u64,
+        /// Distinct thread ids that hit this address, in first-hit order (the
+        /// first element is the thread that executed it first).
+        pub thread_ids: Vec<u32>,
+    }
+
+    /// One distinct instruction that has accessed a watched address at least once
+    /// (produced by a hardware access trace).
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct WatchpointAccess {
+        /// The attributed accessing instruction. On x86 the hardware traps *after*
+        /// the access, so the server back-steps from the trap RIP to attribute it;
+        /// on ARM64 it is the exact faulting PC. Equals `accessor_raw_rip` when
+        /// attribution is not possible.
+        pub accessor: u64,
+        /// The raw trap instruction pointer (the instruction *following* the access
+        /// on x86; equal to `accessor` on ARM64).
+        pub accessor_raw_rip: u64,
+        pub hit_count: u64,
+        /// 1-based first-access order across the whole trace run (1 = the first
+        /// instruction that touched the watched address).
+        pub first_seq: u64,
+        /// Distinct thread ids whose instruction accessed the address, in first-hit
+        /// order.
+        pub thread_ids: Vec<u32>,
     }
 
     #[derive(Serialize, Deserialize, Clone)]
@@ -506,14 +828,42 @@ pub mod request_response {
         ThreadList { threads: Vec<ThreadInfo> },
         ProcessList { processes: Vec<ProcessInfo> },
         // Symbol-related responses
+        SymbolStatusList { statuses: Vec<ModuleSymbolStatus> },
+        PdbLoaded { symbol_count: usize },
+        /// Returned by LoadPdbFromPath when the PDB's GUID/age doesn't match the PE
+        /// and `force` was not set. The client may retry with `force: true`.
+        PdbMismatch(PdbMismatchInfo),
         Symbol { symbol: Option<crate::interfaces::ModuleSymbol> },
         SymbolList { symbols: Vec<crate::interfaces::ModuleSymbol> },
         ResolvedSymbolList { symbols: Vec<crate::interfaces::ResolvedSymbol> },
+        /// Code-coverage results: one [`CoverageHit`] per coverage breakpoint
+        /// hit at least once.
+        CoverageResults { hits: Vec<CoverageHit> },
+        /// Access-trace results: one [`WatchpointAccess`] per distinct instruction
+        /// that touched the watched address at least once.
+        WatchpointAccesses { accesses: Vec<WatchpointAccess> },
         AddressSymbol {
             module_path: Option<String>,
             symbol: Option<crate::interfaces::ModuleSymbol>,
             offset: Option<u64>,
         },
+        /// One `(module_name, symbol, offset)` per requested address, in order;
+        /// `None` for unresolved / still-loading addresses.
+        AddressSymbolBatch {
+            results: Vec<Option<(String, crate::interfaces::ModuleSymbol, u64)>>,
+        },
+        // Source line responses
+        AddressLine { info: Option<AddressLineInfo> },
+        SourceFileLineMap {
+            file: Option<crate::interfaces::SourceFileEntry>,
+            entries: Vec<crate::interfaces::LineEntry>,
+        },
+        SourceFileList { files: Vec<crate::interfaces::SourceFileEntry> },
+        // Type system responses
+        TypeList { types: Vec<TypeSummary> },
+        TypeResult { layout: Option<TypeLayout> },
+        TebAddress { address: u64 },
+        PebAddress { address: u64 },
         // Disassembly responses
         Instructions { instructions: Vec<crate::interfaces::Instruction> },
         /// Function disassembly with bounds from exception directory
@@ -533,6 +883,7 @@ pub mod request_response {
         MemoryRegionInfo { info: MemoryRegionInfo },
         MemoryRegionList { regions: Vec<MemoryRegionInfo> },
         DereferenceResult { entries: Vec<DereferenceEntry> },
+        DereferenceBatchResult { results: Vec<Vec<DereferenceEntry>> },
         // Emulator responses (for non-trace modes: Basic, BasicBlock, ModuleTransition, Syscall)
         EmulationResult {
             final_pc: u64,
@@ -564,6 +915,29 @@ pub mod request_response {
             values: Vec<ScanValue>,
             total_count: u64,
         },
+        PointerScanResult {
+            /// Path of the disk file holding this scan's results.
+            results_path: String,
+            match_count: u64,
+            scan_time_us: u64,
+        },
+        PointerScanResults {
+            paths: Vec<PointerPath>,
+            total_count: u64,
+        },
+        StringScanResult {
+            /// Path of the disk file holding this scan's results.
+            results_path: String,
+            match_count: u64,
+            scan_time_us: u64,
+            /// True if more strings were found than the cap; only the first
+            /// `match_count` (in address order) are stored.
+            capped: bool,
+        },
+        StringScanResults {
+            strings: Vec<StringHit>,
+            total_count: u64,
+        },
         /// Tenet format trace result (for TraceInstructions and EmulateInstructions with InstructionTrace mode)
         TenetTrace {
             trace_text: String,
@@ -575,6 +949,10 @@ pub mod request_response {
         // Anti-anti-debug
         PebHideResult {
             report: crate::anti_anti_debug::PebHideReport,
+        },
+        // Value freeze
+        FreezeValueStarted {
+            freeze_id: u64,
         },
     }
 
@@ -725,6 +1103,157 @@ pub mod request_response {
         pub size: Option<u64>,
     }
 
+    /// Symbol load state for a single module.
+    #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+    pub enum SymbolLoadState {
+        Loaded { symbol_count: usize },
+        Loading,
+        Failed { error: String },
+        NotRequested,
+    }
+
+    /// Per-module symbol load status, as reported by `GetSymbolStatus`.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct ModuleSymbolStatus {
+        pub module_path: String,
+        pub module_base: u64,
+        pub state: SymbolLoadState,
+        /// Path of the PDB the symbols were loaded from, when loaded.
+        pub pdb_path: Option<String>,
+    }
+
+    /// A resolved address → source line mapping, as returned by `ResolveAddressToLine`.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct AddressLineInfo {
+        pub module_path: String,
+        pub module_base: u64,
+        pub rva: u32,
+        pub file: crate::interfaces::SourceFileEntry,
+        pub line_entry: crate::interfaces::LineEntry,
+    }
+
+    /// PE vs PDB identity (GUID + age) details for a rejected PDB load.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct PdbMismatchInfo {
+        pub pe_guid: String,
+        pub pe_age: u32,
+        pub pdb_guid: String,
+        pub pdb_age: u32,
+    }
+
+    /// Outcome of a `LoadPdbFromPath` request: symbols loaded, or the PDB rejected
+    /// because its identity doesn't match the PE (retry with `force` to load anyway).
+    #[derive(Debug, Clone)]
+    pub enum PdbLoadOutcome {
+        Loaded { symbol_count: usize },
+        Mismatch(PdbMismatchInfo),
+    }
+
+    // ---------------------------------------------------------------------
+    // Type system (parsed from the PDB TPI stream)
+    // ---------------------------------------------------------------------
+
+    /// Struct/class/union/enum discriminator.
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+    pub enum UdtKind {
+        Struct,
+        Class,
+        Union,
+        Enum,
+    }
+
+    /// Broad value category of a type — enough for the UI to render raw bytes and
+    /// decide whether a member is expandable. Recursive for pointers/arrays.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub enum TypeClass {
+        /// Signed integer of the ref's `size` bytes.
+        Int,
+        /// Unsigned integer.
+        UInt,
+        /// IEEE floating point (2/4/8/10/16 bytes).
+        Float,
+        /// Boolean.
+        Bool,
+        /// Narrow character (1 byte).
+        Char,
+        /// Wide character (2 bytes).
+        WChar,
+        /// `void` / uncharacterized — rendered as raw bytes.
+        Void,
+        /// Pointer to `pointee` (ref `size` is the pointer width, usually 8).
+        Pointer { pointee: Box<TypeRef> },
+        /// Fixed-length array of `element` with `count` elements.
+        Array { element: Box<TypeRef>, count: u32 },
+        /// Named struct/class/union; `index` is the TPI type index in the owning
+        /// module's PDB, for lazy layout expansion via `GetTypeByIndex`.
+        Udt { index: u32 },
+        /// Enumeration; `index` for value→name lookup via `GetTypeByIndex`.
+        Enum { index: u32 },
+        /// Anything not modeled yet — rendered as raw bytes.
+        Unknown,
+    }
+
+    /// A reference to a type: display name, byte size, and value class.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct TypeRef {
+        /// Human-readable type name, e.g. "unsigned long", "_PEB *", "wchar_t[16]".
+        pub name: String,
+        /// Size in bytes (0 if unknown).
+        pub size: u32,
+        pub class: TypeClass,
+    }
+
+    /// One field of a struct/class/union type.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct TypeMember {
+        pub name: String,
+        /// Byte offset from the start of the containing type.
+        pub offset: u32,
+        pub type_ref: TypeRef,
+        /// Bit offset within the field, for a bitfield member.
+        #[serde(default)]
+        pub bit_position: Option<u8>,
+        /// Bit width, for a bitfield member.
+        #[serde(default)]
+        pub bit_length: Option<u8>,
+    }
+
+    /// An enumerator (name/value pair) of an enum type.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct TypeEnumValue {
+        pub name: String,
+        pub value: i64,
+    }
+
+    /// A fully resolved type layout, one level deep: nested UDT members are
+    /// referenced by index in their `type_ref` and expanded on demand.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct TypeLayout {
+        pub name: String,
+        pub size: u32,
+        pub kind: UdtKind,
+        /// TPI type index of this type within the owning module's PDB.
+        pub index: u32,
+        /// Base address of the module whose PDB defines this type.
+        pub module_base: u64,
+        pub members: Vec<TypeMember>,
+        /// For enums: the enumerator (name, value) pairs.
+        #[serde(default)]
+        pub enum_values: Vec<TypeEnumValue>,
+    }
+
+    /// Lightweight type descriptor for browsing/listing.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct TypeSummary {
+        pub name: String,
+        pub size: u32,
+        pub kind: UdtKind,
+        pub index: u32,
+        pub module_base: u64,
+        /// Owning module file name (for display/grouping).
+        pub module_name: String,
+    }
+
     #[derive(Debug, Serialize, Deserialize, Clone)]
     pub struct MemoryRegionInfo {
         pub base_address: u64,
@@ -734,6 +1263,144 @@ pub mod request_response {
         pub state: u32,          // MEM_COMMIT=0x1000, MEM_RESERVE=0x2000, MEM_FREE=0x10000
         pub protect: u32,        // PAGE_* flags
         pub region_type: u32,    // MEM_PRIVATE=0x20000, MEM_MAPPED=0x40000, MEM_IMAGE=0x1000000
+    }
+
+    /// A single pointer path found by the pointer scanner. Resolves to the scan
+    /// target via: `addr = module_base + base_offset; for off in offsets { addr = read_u64(addr) + off }`.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct PointerPath {
+        /// Index into the module list at scan time, or -1 if the base is non-static.
+        pub module_index: i32,
+        /// Base address of the module the static base lives in.
+        pub module_base: u64,
+        /// Offset of the static pointer within its module (`static_addr - module_base`).
+        pub base_offset: u64,
+        /// Offset chain, ordered from base toward the target (applied per indirection).
+        pub offsets: Vec<u64>,
+        /// Address this path resolves to (equals the scan target at scan time).
+        pub resolved: u64,
+    }
+
+    fn default_true() -> bool {
+        true
+    }
+
+    /// Encoding of a discovered string.
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+    pub enum StringEncoding {
+        Ascii,
+        Utf16,
+    }
+
+    impl StringEncoding {
+        /// Canonical lowercase name used by every string-facing surface (UI, Lua).
+        pub fn as_str(self) -> &'static str {
+            match self {
+                StringEncoding::Ascii => "ascii",
+                StringEncoding::Utf16 => "utf16",
+            }
+        }
+    }
+
+    /// Sort key for paging string-scan results.
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum StringSortKey {
+        /// Ascending memory address (the file's natural order).
+        #[default]
+        Address,
+        /// Lexicographic by string value (case-insensitive).
+        Value,
+        /// By string length in characters (ties stay address-ordered).
+        Length,
+    }
+
+    impl std::str::FromStr for StringSortKey {
+        type Err = String;
+
+        /// Parses the canonical lowercase names "address" / "value" / "length".
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s {
+                "address" => Ok(StringSortKey::Address),
+                "value" => Ok(StringSortKey::Value),
+                "length" => Ok(StringSortKey::Length),
+                _ => Err(format!("unknown string sort key '{}'", s)),
+            }
+        }
+    }
+
+    /// Which memory regions a scan should visit. Every variant implies the base
+    /// requirements (committed, not NOACCESS, not guard); the protection/type
+    /// variants narrow further.
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum ScanRegionFilter {
+        /// Any readable committed memory (the base filter alone).
+        #[default]
+        Readable,
+        /// Writable pages only.
+        Writable,
+        /// Executable pages only.
+        Executable,
+        /// Image-backed regions (loaded modules, MEM_IMAGE).
+        Image,
+        /// Mapped-file regions (MEM_MAPPED).
+        Mapped,
+        /// Private regions — heaps, stacks, VirtualAlloc'd memory (MEM_PRIVATE).
+        Private,
+    }
+
+    impl std::str::FromStr for ScanRegionFilter {
+        type Err = String;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s {
+                "readable" => Ok(ScanRegionFilter::Readable),
+                "writable" => Ok(ScanRegionFilter::Writable),
+                "executable" => Ok(ScanRegionFilter::Executable),
+                "image" => Ok(ScanRegionFilter::Image),
+                "mapped" => Ok(ScanRegionFilter::Mapped),
+                "private" => Ok(ScanRegionFilter::Private),
+                _ => Err(format!("unknown region filter '{}'", s)),
+            }
+        }
+    }
+
+    /// Which string encodings a string scan detects.
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum StringEncodingFilter {
+        /// Detect both ASCII and UTF-16 strings.
+        #[default]
+        Both,
+        /// Detect ASCII strings only.
+        Ascii,
+        /// Detect UTF-16 strings only.
+        Utf16,
+    }
+
+    impl std::str::FromStr for StringEncodingFilter {
+        type Err = String;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s {
+                "both" => Ok(StringEncodingFilter::Both),
+                "ascii" => Ok(StringEncodingFilter::Ascii),
+                "utf16" => Ok(StringEncodingFilter::Utf16),
+                _ => Err(format!("unknown encoding filter '{}'", s)),
+            }
+        }
+    }
+
+    /// A single string found by the string scanner.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct StringHit {
+        /// Address of the first byte of the string.
+        pub address: u64,
+        pub encoding: StringEncoding,
+        /// True length in characters (may exceed the stored `text` length).
+        pub length: u32,
+        /// The string text, truncated to a fixed cap of characters.
+        pub text: String,
+        /// True if `text` was truncated (i.e. `length` exceeds the stored cap).
+        pub truncated: bool,
     }
 
     /// Entry for a single address in a dereference chain

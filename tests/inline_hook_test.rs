@@ -5,8 +5,29 @@ use joybug2::inline_hook::thread::NoopThreadFreezer;
 use joybug2::inline_hook::{HookEngine, LuaHookEngine};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-// Target function to hook.
+type BinOp = extern "C" fn(i32, i32) -> i32;
+
+/// Call `f` through an opaque function pointer.
+///
+/// These tests only mean anything if the call actually executes the machine code
+/// at the target's address — the code the hook patches. In a release build the
+/// optimizer will otherwise inline these one-line targets into the caller and
+/// constant-fold the result, so every assertion sees the *unhooked* answer no
+/// matter what the hook did.
+///
+/// `black_box(test_add)(2, 3)` does NOT prevent that: a fn item is a zero-sized
+/// type, so the barrier has no runtime value to obscure and the callee stays
+/// statically known. Passing it as a `BinOp` function pointer first gives
+/// `black_box` a real value to launder, which forces an indirect call.
+fn call_opaque(f: BinOp, a: i32, b: i32) -> i32 {
+    let f = std::hint::black_box(f);
+    std::hint::black_box(f(std::hint::black_box(a), std::hint::black_box(b)))
+}
+
+// Target function to hook. `inline(never)` keeps a real, patchable body in
+// release; see `call_opaque` for why the call sites matter too.
 #[unsafe(no_mangle)]
+#[inline(never)]
 extern "C" fn test_add(a: i32, b: i32) -> i32 {
     a + b
 }
@@ -29,7 +50,7 @@ fn test_basic_hook_and_unhook() {
     let mut engine = HookEngine::new(allocator, freezer);
 
     // Before hooking.
-    assert_eq!(test_add(2, 3), 5);
+    assert_eq!(call_opaque(test_add, 2, 3), 5);
 
     // Create hook.
     let (handle, trampoline) = engine
@@ -39,23 +60,23 @@ fn test_basic_hook_and_unhook() {
     ORIGINAL_ADD.store(trampoline as *mut u8, Ordering::SeqCst);
 
     // Still not enabled.
-    assert_eq!(test_add(2, 3), 5);
+    assert_eq!(call_opaque(test_add, 2, 3), 5);
 
     // Enable.
     engine.enable(&handle).expect("enable hook");
-    assert_eq!(test_add(2, 3), 50); // (2+3) * 10
+    assert_eq!(call_opaque(test_add, 2, 3), 50); // (2+3) * 10
 
     // Disable.
     engine.disable(&handle).expect("disable hook");
-    assert_eq!(test_add(2, 3), 5);
+    assert_eq!(call_opaque(test_add, 2, 3), 5);
 
     // Re-enable.
     engine.enable(&handle).expect("re-enable hook");
-    assert_eq!(test_add(2, 3), 50);
+    assert_eq!(call_opaque(test_add, 2, 3), 50);
 
     // Remove.
     engine.remove(handle).expect("remove hook");
-    assert_eq!(test_add(2, 3), 5);
+    assert_eq!(call_opaque(test_add, 2, 3), 5);
 }
 
 #[test]
@@ -88,11 +109,13 @@ static LUA_HOOK_LOCK: Mutex<()> = Mutex::new(());
 
 // Separate targets for each Lua hook test.
 #[unsafe(no_mangle)]
+#[inline(never)]
 extern "C" fn test_multiply(a: i32, b: i32) -> i32 {
     a * b
 }
 
 #[unsafe(no_mangle)]
+#[inline(never)]
 extern "C" fn test_sub(a: i32, b: i32) -> i32 {
     a - b
 }
@@ -105,15 +128,16 @@ fn test_lua_hook_basic() {
     let mut engine = LuaHookEngine::new();
 
     // Before hook.
-    assert_eq!(std::hint::black_box(test_multiply)(3, 4), 12);
+    assert_eq!(call_opaque(test_multiply, 3, 4), 12);
 
     // Hook with a Lua callback that doubles the first argument.
+    // First integer arg register: RCX on Win64, X0 on AArch64.
+    #[cfg(target_arch = "x86_64")]
+    let callback_src = r#"function(ctx) ctx.rcx = ctx.rcx * 2 end"#;
+    #[cfg(target_arch = "aarch64")]
+    let callback_src = r#"function(ctx) ctx.x0 = ctx.x0 * 2 end"#;
     let callback = lua
-        .load(r#"
-            function(ctx)
-                ctx.rcx = ctx.rcx * 2
-            end
-        "#)
+        .load(callback_src)
         .eval::<mlua::Function>()
         .expect("parse lua callback");
 
@@ -125,7 +149,7 @@ fn test_lua_hook_basic() {
 
     // Now test_multiply(3, 4) should act like test_multiply(6, 4) = 24
     // because the Lua callback doubles RCX (first arg in Windows x64 fastcall).
-    assert_eq!(std::hint::black_box(test_multiply)(3, 4), 24);
+    assert_eq!(call_opaque(test_multiply, 3, 4), 24);
 
     // Unhook.
     engine
@@ -133,7 +157,7 @@ fn test_lua_hook_basic() {
         .expect("unhook");
 
     // Original behavior restored.
-    assert_eq!(std::hint::black_box(test_multiply)(3, 4), 12);
+    assert_eq!(call_opaque(test_multiply, 3, 4), 12);
 }
 
 #[test]
@@ -145,12 +169,13 @@ fn test_lua_hook_read_only() {
     // Register a global for the Lua callback to write into.
     lua.globals().set("captured", 0u64).unwrap();
 
+    // First integer arg register: RCX on Win64, X0 on AArch64.
+    #[cfg(target_arch = "x86_64")]
+    let callback_src = r#"function(ctx) captured = ctx.rcx end"#;
+    #[cfg(target_arch = "aarch64")]
+    let callback_src = r#"function(ctx) captured = ctx.x0 end"#;
     let callback = lua
-        .load(r#"
-            function(ctx)
-                captured = ctx.rcx
-            end
-        "#)
+        .load(callback_src)
         .eval::<mlua::Function>()
         .expect("parse callback");
 
@@ -158,8 +183,8 @@ fn test_lua_hook_read_only() {
         .hook(test_sub as *const u8, &lua, callback)
         .expect("hook");
 
-    // Call the function — the hook should capture RCX (first arg = 100).
-    let result = std::hint::black_box(test_sub)(100, 30);
+    // Call the function — the hook should capture the first arg (= 100).
+    let result = call_opaque(test_sub, 100, 30);
     assert_eq!(result, 70); // original behavior unchanged
 
     let captured: u64 = lua.globals().get("captured").unwrap();
@@ -197,7 +222,7 @@ fn test_lua_hook_memory_access() {
         .expect("hook");
 
     // Call the hooked function — the callback reads from the global address.
-    let result = std::hint::black_box(test_sub)(100, 30);
+    let result = call_opaque(test_sub, 100, 30);
     assert_eq!(result, 70);
 
     let read_val: u64 = lua.globals().get("read_val").unwrap();

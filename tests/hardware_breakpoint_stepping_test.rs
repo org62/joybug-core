@@ -1,4 +1,6 @@
 #![cfg(windows)]
+// This test exercises x86_64 DR-register-based hardware breakpoint stepping.
+#![cfg(not(target_arch = "aarch64"))]
 
 mod common;
 
@@ -36,7 +38,6 @@ impl TestState {
 /// exception, causing the step to be silently swallowed. Execution continues
 /// freely until the HW BP fires again at the same address.
 #[test]
-#[cfg(not(target_arch = "aarch64"))]
 fn hardware_breakpoint_step_over() {
     joybug2::init_tracing();
 

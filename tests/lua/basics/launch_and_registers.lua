@@ -9,8 +9,8 @@ dbg:on_initial_breakpoint(function(pid, tid, addr)
     got_addr = addr
 
     local ctx = dbg:get_context(pid, tid)
-    assert(ctx.rip > 0, "rip should be nonzero")
-    assert(ctx.rsp > 0, "rsp should be nonzero")
+    assert(ipof(ctx) > 0, "instruction pointer should be nonzero")
+    assert(spof(ctx) > 0, "stack pointer should be nonzero")
 
     dbg:terminate(pid)
 end)

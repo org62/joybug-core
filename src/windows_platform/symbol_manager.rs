@@ -1,11 +1,14 @@
-use crate::interfaces::{ModuleSymbol, ResolvedSymbol, SymbolError, SymbolProvider};
-use crate::protocol::ModuleInfo;
+use crate::interfaces::{LineEntry, ModuleSymbol, ResolvedSymbol, SourceFileEntry, SourceLineRef, SymbolConfig, SymbolError, SymbolProvider};
+use crate::protocol::{ModuleInfo, ModuleSymbolStatus, PdbLoadOutcome, SymbolLoadState};
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::{Arc, Mutex, Condvar, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{trace, warn, error};
-use crate::windows_platform::symbol_provider::WindowsSymbolProvider;
+use crate::windows_platform::symbol_provider::{WindowsSymbolProvider, ModuleLineTable, parse_pdb_to_symbols, parse_pdb_matching_pe, parse_pdb_to_lines};
+use crate::windows_platform::type_provider::{ModuleTypeInfo, parse_pdb_to_types};
+use crate::protocol::{TypeLayout, TypeSummary};
 use pelite::pe64::{Pe, PeFile};
 use pelite::image::{RUNTIME_FUNCTION, UNWIND_INFO, UNW_FLAG_CHAININFO};
 
@@ -14,6 +17,14 @@ use pelite::image::{RUNTIME_FUNCTION, UNWIND_INFO, UNW_FLAG_CHAININFO};
 pub struct ModuleSymbols {
     pub module_base: u64, // Base address where the module is loaded
     pub symbols: Vec<ModuleSymbol>, // All symbols stored as RVAs
+    pub pdb_path: Option<String>, // PDB file the symbols were loaded from
+}
+
+/// Result of a lazy per-module PDB parse (line table, type info), cached by
+/// module path.
+enum PdbArtifactState<T> {
+    Ready(Arc<T>),
+    Failed(String),
 }
 
 /// Cached PE exception data for chain resolution
@@ -34,8 +45,26 @@ pub struct SymbolManager {
     /// Cached .pdata + PE bytes per module for chain resolution
     pdata_cache: Mutex<HashMap<String, Option<PdataCache>>>,
 
+    /// Lazily parsed PDB line tables per module (module_path -> state).
+    /// Populated on the first source-level request, never during the
+    /// background symbol load.
+    line_cache: Mutex<HashMap<String, PdbArtifactState<ModuleLineTable>>>,
+
+    /// Lazily parsed PDB type information per module (module_path -> state).
+    /// Populated on the first type-level request, never during the background
+    /// symbol load.
+    type_cache: Mutex<HashMap<String, PdbArtifactState<ModuleTypeInfo>>>,
+
     /// Set of modules currently being loaded
     pending_loads: Arc<Mutex<HashSet<String>>>,
+    /// Modules whose symbol load failed (module_path -> error message).
+    /// Failed modules are not retried automatically; retry is explicit.
+    failed_loads: Arc<Mutex<HashMap<String, String>>>,
+    /// Modules (lowercased file names, e.g. "foo.dll") whose automatic symbol
+    /// download the client suppressed — typically because the download failed in
+    /// an earlier run. Denied modules go straight to `failed_loads` instead of
+    /// downloading; an explicit retry lifts the suppression.
+    denied_loads: Mutex<HashSet<String>>,
     /// Condvar to notify waiters when a module finishes loading
     pending_cv: Arc<Condvar>,
 
@@ -47,15 +76,16 @@ pub struct SymbolManager {
 }
 
 impl SymbolManager {
-    pub fn new() -> Result<Self, SymbolError> {
+    pub fn new_with_config(cfg: SymbolConfig) -> Result<Self, SymbolError> {
         let symbol_cache = Arc::new(Mutex::new(HashMap::new()));
         let pending_loads = Arc::new(Mutex::new(HashSet::new()));
+        let failed_loads = Arc::new(Mutex::new(HashMap::new()));
         let pending_cv = Arc::new(Condvar::new());
-        
+
         let (worker_tx, worker_rx) = mpsc::channel::<ModuleInfo>();
         // Wrap receiver in Arc<Mutex> to share among multiple worker threads
         let worker_rx = Arc::new(Mutex::new(worker_rx));
-        
+
         let worker_count = Self::read_worker_count_from_env();
         trace!(worker_count, "Starting symbol worker threads");
 
@@ -63,13 +93,15 @@ impl SymbolManager {
             let rx = worker_rx.clone();
             let cache_clone = symbol_cache.clone();
             let pending_clone = pending_loads.clone();
+            let failed_clone = failed_loads.clone();
             let cv_clone = pending_cv.clone();
-            
+            let cfg_clone = cfg.clone();
+
             thread::spawn(move || {
                 trace!(worker_id = i, "Symbol worker thread started");
-                
+
                 // Create the provider (and its Runtime) ONCE per thread
-                let mut provider = match WindowsSymbolProvider::new() {
+                let mut provider = match WindowsSymbolProvider::with_config(&cfg_clone) {
                     Ok(p) => p,
                     Err(e) => {
                         error!(worker_id = i, error = %e, "Failed to create WindowsSymbolProvider in worker thread");
@@ -106,15 +138,19 @@ impl SymbolManager {
                             if let Ok(mut symbols) = provider.list_symbols(&module_path) {
                                 // Sort symbols by RVA for binary search
                                 symbols.sort_by_key(|s| s.rva);
+                                let pdb_path = provider.pdb_path_for(&module_path);
                                 let mut cache = cache_clone.lock().unwrap();
-                                cache.insert(module_path.clone(), ModuleSymbols {
+                                // or_insert: never clobber symbols a user loaded manually meanwhile
+                                cache.entry(module_path.clone()).or_insert(ModuleSymbols {
                                     module_base,
                                     symbols,
+                                    pdb_path,
                                 });
                             }
                         },
                         Err(e) => {
                             warn!(worker_id = i, module_path = %module_path, error = %e, "Symbol loading failed");
+                            failed_clone.lock().unwrap().insert(module_path.clone(), e.to_string());
                         }
                     }
                     
@@ -133,7 +169,11 @@ impl SymbolManager {
         Ok(Self {
             symbol_cache,
             pdata_cache: Mutex::new(HashMap::new()),
+            line_cache: Mutex::new(HashMap::new()),
+            type_cache: Mutex::new(HashMap::new()),
             pending_loads,
+            failed_loads,
+            denied_loads: Mutex::new(HashSet::new()),
             pending_cv,
             worker_tx,
             wait_timeout: Self::read_timeout_from_env(),
@@ -164,7 +204,7 @@ impl SymbolManager {
     /// Start loading symbols for a module in the background
     pub fn start_loading_symbols(&self, module: &ModuleInfo) {
         let module_path = module.name.clone();
-        
+
         // Check if already loaded
         {
             let cache = self.symbol_cache.lock().unwrap();
@@ -172,7 +212,28 @@ impl SymbolManager {
                 return;
             }
         }
-        
+
+        // A previous attempt failed: don't retry automatically (retry is explicit)
+        {
+            let failed = self.failed_loads.lock().unwrap();
+            if failed.contains_key(&module_path) {
+                return;
+            }
+        }
+
+        // The client suppressed auto-download for this module (it failed in an
+        // earlier run). Surface it as Failed so a UI can offer an explicit retry.
+        {
+            let denied = self.denied_loads.lock().unwrap();
+            if denied.contains(&Self::short_name_lower(&module_path)) {
+                self.failed_loads.lock().unwrap().insert(
+                    module_path,
+                    "symbol download skipped (failed in a previous run; retry to download again)".to_string(),
+                );
+                return;
+            }
+        }
+
         // Check if already pending
         {
             let mut pending = self.pending_loads.lock().unwrap();
@@ -233,6 +294,311 @@ impl SymbolManager {
                 break;
             }
         }
+    }
+
+    /// Report the symbol load state for each of the given modules.
+    /// Non-blocking: reads the cache/pending/failed sets as they are right now.
+    pub fn get_symbol_status(&self, modules: Vec<ModuleInfo>) -> Vec<ModuleSymbolStatus> {
+        let cache = self.symbol_cache.lock().unwrap();
+        let pending = self.pending_loads.lock().unwrap();
+        let failed = self.failed_loads.lock().unwrap();
+
+        modules.into_iter().map(|module| {
+            let (state, pdb_path) = if let Some(cached) = cache.get(&module.name) {
+                (SymbolLoadState::Loaded { symbol_count: cached.symbols.len() }, cached.pdb_path.clone())
+            } else if pending.contains(&module.name) {
+                (SymbolLoadState::Loading, None)
+            } else if let Some(error) = failed.get(&module.name) {
+                (SymbolLoadState::Failed { error: error.clone() }, None)
+            } else {
+                (SymbolLoadState::NotRequested, None)
+            };
+            ModuleSymbolStatus {
+                module_path: module.name,
+                module_base: module.base,
+                state,
+                pdb_path,
+            }
+        }).collect()
+    }
+
+    /// Load symbols for a module from a user-supplied PDB file.
+    /// Unless `force`, the PDB's GUID/age must match the module's PE debug directory;
+    /// a mismatch is returned as `PdbLoadOutcome::Mismatch`, not an error.
+    /// A user-loaded PDB replaces any previously cached symbols for the module.
+    pub fn load_pdb_from_path(&self, module: &ModuleInfo, pdb_path: &Path, force: bool) -> Result<PdbLoadOutcome, SymbolError> {
+        let mut symbols = if force {
+            parse_pdb_to_symbols(pdb_path)?
+        } else {
+            match parse_pdb_matching_pe(Path::new(&module.name), pdb_path)? {
+                Ok(symbols) => symbols,
+                Err(mismatch) => return Ok(PdbLoadOutcome::Mismatch(mismatch)),
+            }
+        };
+        symbols.sort_by_key(|s| s.rva);
+        let symbol_count = symbols.len();
+
+        {
+            let mut cache = self.symbol_cache.lock().unwrap();
+            cache.insert(module.name.clone(), ModuleSymbols {
+                module_base: module.base,
+                symbols,
+                pdb_path: Some(pdb_path.display().to_string()),
+            });
+        }
+        self.failed_loads.lock().unwrap().remove(&module.name);
+        self.denied_loads.lock().unwrap().remove(&Self::short_name_lower(&module.name));
+        // The line/type tables came from the previous PDB; re-parse on demand.
+        self.invalidate_line_table(&module.name);
+        self.type_cache.lock().unwrap().remove(&module.name);
+
+        trace!(module_path = %module.name, pdb_path = %pdb_path.display(), symbol_count, force, "Loaded user-supplied PDB");
+        Ok(PdbLoadOutcome::Loaded { symbol_count })
+    }
+
+    /// Get (lazily parsing) a per-module PDB artifact from `cache` — shared body
+    /// of `get_line_table` and `get_type_info`.
+    /// Returns `Ok(None)` without blocking while the module's symbols are still
+    /// loading (the client re-requests once symbols finish), and when no PDB is
+    /// available. A failed parse is cached and returned as an error.
+    fn get_pdb_artifact<T>(
+        &self,
+        cache: &Mutex<HashMap<String, PdbArtifactState<T>>>,
+        module_path: &str,
+        what: &str,
+        parse: impl FnOnce(&Path) -> Result<T, SymbolError>,
+    ) -> Result<Option<Arc<T>>, SymbolError> {
+        {
+            let cache = cache.lock().unwrap();
+            match cache.get(module_path) {
+                Some(PdbArtifactState::Ready(v)) => return Ok(Some(v.clone())),
+                Some(PdbArtifactState::Failed(msg)) => {
+                    return Err(SymbolError::PdbParsingFailed(msg.clone()));
+                }
+                None => {}
+            }
+        }
+
+        // Symbols (and therefore the PDB download) still in flight: don't block.
+        {
+            let pending = self.pending_loads.lock().unwrap();
+            if pending.contains(module_path) {
+                return Ok(None);
+            }
+        }
+
+        let pdb_path = {
+            let symbols = self.symbol_cache.lock().unwrap();
+            match symbols.get(module_path).and_then(|m| m.pdb_path.clone()) {
+                Some(path) => path,
+                None => return Ok(None), // no PDB (load failed / not requested / no path)
+            }
+        };
+
+        // Parse outside all locks; a rare duplicate parse under concurrency is fine.
+        let state = match parse(Path::new(&pdb_path)) {
+            Ok(v) => PdbArtifactState::Ready(Arc::new(v)),
+            Err(e) => {
+                warn!(module_path, pdb_path = %pdb_path, error = %e, "Failed to parse PDB {}", what);
+                PdbArtifactState::Failed(e.to_string())
+            }
+        };
+        let mut cache = cache.lock().unwrap();
+        let state = cache.entry(module_path.to_string()).or_insert(state);
+        match state {
+            PdbArtifactState::Ready(v) => Ok(Some(v.clone())),
+            PdbArtifactState::Failed(msg) => Err(SymbolError::PdbParsingFailed(msg.clone())),
+        }
+    }
+
+    /// Get (lazily parsing) the PDB line table for a module. See `get_pdb_artifact`
+    /// for the caching/non-blocking contract.
+    pub fn get_line_table(&self, module_path: &str) -> Result<Option<Arc<ModuleLineTable>>, SymbolError> {
+        self.get_pdb_artifact(&self.line_cache, module_path, "line table", parse_pdb_to_lines)
+    }
+
+    /// Drop a module's cached line table (e.g. after a user loads a different PDB).
+    pub fn invalidate_line_table(&self, module_path: &str) {
+        self.line_cache.lock().unwrap().remove(module_path);
+    }
+
+    /// Resolve an RVA against an already-parsed line table.
+    /// Picks the entry covering `[rva, rva+length)`; for zero-length entries the
+    /// nearest entry at or below the RVA wins (entries are RVA-sorted).
+    fn resolve_rva_in_table(table: &ModuleLineTable, rva: u32) -> Option<(SourceFileEntry, LineEntry)> {
+        let idx = table.lines.partition_point(|l| l.rva <= rva);
+        if idx == 0 {
+            return None;
+        }
+        let entry = &table.lines[idx - 1];
+        if entry.length > 0 && rva >= entry.rva + entry.length {
+            return None; // in the gap past this entry's covered range
+        }
+        let file = table.files.get(entry.file_index as usize)?.clone();
+        Some((file, entry.clone()))
+    }
+
+    /// Resolve an RVA to a source line, lazily parsing the module's line table.
+    pub fn resolve_rva_to_line(&self, module_path: &str, rva: u32) -> Result<Option<(SourceFileEntry, LineEntry)>, SymbolError> {
+        match self.get_line_table(module_path)? {
+            Some(table) => Ok(Self::resolve_rva_in_table(&table, rva)),
+            None => Ok(None),
+        }
+    }
+
+    /// Resolve an absolute address to a source line from ALREADY-CACHED line
+    /// tables only — never triggers a parse. Used by the bulk disassembly
+    /// symbolizer so it can annotate instructions without ever stalling.
+    pub fn try_resolve_address_to_line_cached(&self, modules: &[ModuleInfo], address: u64) -> Option<SourceLineRef> {
+        let module = Self::find_module_binary_search(modules, address)?;
+        let rva = (address - module.base) as u32;
+        let table = {
+            let cache = self.line_cache.lock().unwrap();
+            match cache.get(&module.name) {
+                Some(PdbArtifactState::Ready(table)) => table.clone(),
+                _ => return None,
+            }
+        };
+        let (file, entry) = Self::resolve_rva_in_table(&table, rva)?;
+        Some(SourceLineRef { file_path: file.path, line: entry.line_start })
+    }
+
+    /// All line entries for one source file of a module (case-insensitive path
+    /// match), plus the matched file record. Lazily parses the line table.
+    /// `start_line`/`end_line` (inclusive, 1-based) bound the returned entries by
+    /// `line_start` so the response stays small for very large files.
+    pub fn file_line_map(&self, module_path: &str, file_path: &str, start_line: Option<u32>, end_line: Option<u32>) -> Result<(Option<SourceFileEntry>, Vec<LineEntry>), SymbolError> {
+        let table = match self.get_line_table(module_path)? {
+            Some(table) => table,
+            None => return Ok((None, Vec::new())),
+        };
+        let wanted = file_path.to_lowercase();
+        let file_index = table.files.iter().position(|f| f.path.to_lowercase() == wanted);
+        let Some(file_index) = file_index else {
+            return Ok((None, Vec::new()));
+        };
+        let lo = start_line.unwrap_or(0);
+        let hi = end_line.unwrap_or(u32::MAX);
+        // `by_file` indices are sorted by line_start, so this is a cheap filter.
+        let entries = table
+            .by_file
+            .get(&(file_index as u32))
+            .map(|indices| {
+                indices
+                    .iter()
+                    .map(|&i| &table.lines[i as usize])
+                    .filter(|e| e.line_start >= lo && e.line_start <= hi)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok((Some(table.files[file_index].clone()), entries))
+    }
+
+    /// All source files referenced by a module's line table. Lazily parses it.
+    pub fn list_source_files(&self, module_path: &str) -> Result<Vec<SourceFileEntry>, SymbolError> {
+        match self.get_line_table(module_path)? {
+            Some(table) => Ok(table.files.clone()),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Get (lazily parsing) the PDB type information for a module. See
+    /// `get_pdb_artifact` for the caching/non-blocking contract.
+    fn get_type_info(&self, module_path: &str) -> Result<Option<Arc<ModuleTypeInfo>>, SymbolError> {
+        self.get_pdb_artifact(&self.type_cache, module_path, "type info", parse_pdb_to_types)
+    }
+
+    /// List UDT/enum type summaries across the given modules, optionally filtered by
+    /// a case-insensitive name substring, capped at `max_results`. Skips modules
+    /// whose PDB isn't parsed yet (they contribute nothing rather than blocking).
+    pub fn list_types(&self, modules: &[ModuleInfo], filter: Option<&str>, max_results: usize) -> Vec<TypeSummary> {
+        let mut out: Vec<TypeSummary> = Vec::new();
+        for module in modules {
+            let info = match self.get_type_info(&module.name) {
+                Ok(Some(info)) => info,
+                _ => continue,
+            };
+            let module_name = extract_module_name(&module.name);
+            // Filter before building the outgoing summaries, so a narrow query
+            // against a large catalog doesn't allocate for the misses.
+            for entry in info.summaries() {
+                if let Some(f) = filter {
+                    if !crate::string_results::contains_ascii_ci(entry.name.as_bytes(), f.as_bytes()) {
+                        continue;
+                    }
+                }
+                out.push(TypeSummary {
+                    name: entry.name.clone(),
+                    size: entry.size,
+                    kind: entry.kind,
+                    index: entry.index,
+                    module_base: module.base,
+                    module_name: module_name.clone(),
+                });
+                if out.len() >= max_results {
+                    return out;
+                }
+            }
+        }
+        out
+    }
+
+    /// Resolve a named type's layout, searching the given modules in order.
+    pub fn get_type(&self, modules: &[ModuleInfo], name: &str) -> Result<Option<TypeLayout>, SymbolError> {
+        for module in modules {
+            if let Some(info) = self.get_type_info(&module.name)? {
+                if let Some(layout) = info.resolve_by_name(name, module.base) {
+                    return Ok(Some(layout));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resolve a type by its TPI index within a specific module (nested expansion).
+    pub fn get_type_by_index(&self, module: &ModuleInfo, index: u32) -> Result<Option<TypeLayout>, SymbolError> {
+        match self.get_type_info(&module.name)? {
+            Some(info) => Ok(info.resolve(index, module.base)),
+            None => Ok(None),
+        }
+    }
+
+    /// Retry a failed (or never-attempted) symbol download for a module.
+    pub fn retry_loading_symbols(&self, module: &ModuleInfo) {
+        self.denied_loads.lock().unwrap().remove(&Self::short_name_lower(&module.name));
+        self.failed_loads.lock().unwrap().remove(&module.name);
+        self.start_loading_symbols(module);
+    }
+
+    /// Lowercased file-name portion of a module path ("C:\\x\\Foo.DLL" -> "foo.dll").
+    /// Deny-list entries use this form so they survive path differences between runs.
+    fn short_name_lower(module_path: &str) -> String {
+        crate::formatting::module_basename_lower(module_path)
+    }
+
+    /// Replace the set of modules whose automatic symbol download is suppressed.
+    /// Entries are normalized here (see `short_name_lower`), so callers may send
+    /// any identifier — full path or bare file name, any case.
+    pub fn set_deny_list(&self, modules: Vec<String>) {
+        let mut denied = self.denied_loads.lock().unwrap();
+        denied.clear();
+        denied.extend(modules.iter().map(|m| Self::short_name_lower(m)));
+    }
+
+    /// Unload a module's symbols and every derived cache (line table, type info,
+    /// pdata, failure marker), freeing their memory. The module reports
+    /// `NotRequested` afterwards; `retry_loading_symbols` re-downloads on demand.
+    /// An in-flight background load is left alone — its result may repopulate the
+    /// cache once it settles, and can then be unloaded again.
+    pub fn unload_module_symbols(&self, module_path: &str) {
+        self.symbol_cache.lock().unwrap().remove(module_path);
+        self.pdata_cache.lock().unwrap().remove(module_path);
+        self.invalidate_line_table(module_path);
+        self.type_cache.lock().unwrap().remove(module_path);
+        self.failed_loads.lock().unwrap().remove(module_path);
+        self.denied_loads.lock().unwrap().remove(&Self::short_name_lower(module_path));
+        trace!(module_path, "Unloaded module symbols and derived caches");
     }
 
     /// Find symbols across all loaded modules, returning up to max_results matches
@@ -341,13 +707,6 @@ impl SymbolManager {
         Ok(found_symbols)
     }
 
-    /// Resolve an RVA to a symbol, waiting for loading to complete if necessary
-    /// This method works directly with RVAs since symbols are stored as RVAs
-    pub fn resolve_rva_to_symbol(&self, module_path: &str, rva: u32) -> Result<Option<ResolvedSymbol>, SymbolError> {
-        self.wait_for_loading(module_path)?;
-        self.resolve_rva_to_symbol_from_cache(module_path, rva)
-    }
-
     /// Resolve an RVA to a symbol without waiting for loading to complete.
     /// Returns None immediately if the module's symbols are still loading.
     pub fn try_resolve_rva_to_symbol(&self, module_path: &str, rva: u32) -> Result<Option<ResolvedSymbol>, SymbolError> {
@@ -408,15 +767,8 @@ impl SymbolManager {
     /// Resolve an absolute address to a symbol by finding the appropriate module.
     /// Follows RUNTIME_FUNCTION unwind chains for PGO-split function fragments,
     /// then falls back to nearest-below symbol search.
-    pub fn resolve_address_to_symbol(&self, modules: &[ModuleInfo], address: u64) -> Result<Option<(String, ResolvedSymbol, u64)>, SymbolError> {
-        self.resolve_address_impl(modules, address, |module_path, rva| {
-            self.resolve_rva_to_symbol(module_path, rva)
-        })
-    }
-
-    /// Non-blocking variant of `resolve_address_to_symbol`.
-    /// Returns None immediately if the module's symbols are still loading,
-    /// instead of waiting up to the timeout duration.
+    /// Non-blocking: returns None immediately if the module's symbols are still
+    /// loading, instead of waiting up to the timeout duration.
     pub fn try_resolve_address_to_symbol(&self, modules: &[ModuleInfo], address: u64) -> Result<Option<(String, ResolvedSymbol, u64)>, SymbolError> {
         self.resolve_address_impl(modules, address, |module_path, rva| {
             self.try_resolve_rva_to_symbol(module_path, rva)
@@ -479,7 +831,7 @@ impl SymbolManager {
 
     /// Binary search to find the module containing an address
     /// Much faster than linear scan for large module lists
-    fn find_module_binary_search(modules: &[ModuleInfo], address: u64) -> Option<&ModuleInfo> {
+    pub(crate) fn find_module_binary_search(modules: &[ModuleInfo], address: u64) -> Option<&ModuleInfo> {
         if modules.is_empty() {
             return None;
         }
@@ -502,6 +854,51 @@ impl SymbolManager {
         }
     }
     
+    /// Every symbol that starts exactly at `address` (offset 0), across the module
+    /// that contains it. Multiple distinct names can share one RVA (e.g. ntdll's
+    /// `NtClose`/`ZwClose` aliases); the nearest-below resolvers surface only one,
+    /// so this exists to list them all for the disassembly label rows. Names are
+    /// sorted for a stable UI. Non-blocking: returns empty while the module's
+    /// symbols are still loading.
+    pub fn resolve_all_at_exact_address(
+        &self,
+        modules: &[ModuleInfo],
+        address: u64,
+    ) -> Vec<crate::interfaces::SymbolInfo> {
+        let Some(module) = Self::find_module_binary_search(modules, address) else {
+            return Vec::new();
+        };
+        {
+            let pending = self.pending_loads.lock().unwrap();
+            if pending.contains(module.name.as_str()) {
+                return Vec::new();
+            }
+        }
+        let rva = (address - module.base) as u32;
+        let cache = self.symbol_cache.lock().unwrap();
+        let Some(module_symbols) = cache.get(&module.name) else {
+            return Vec::new();
+        };
+        // symbols are sorted by RVA; collect the contiguous run with rva == target.
+        let symbols = &module_symbols.symbols;
+        let start = symbols.partition_point(|s| s.rva < rva);
+        let module_name = extract_module_name(&module.name);
+        let mut names: Vec<String> = symbols[start..]
+            .iter()
+            .take_while(|s| s.rva == rva)
+            .map(|s| s.name.clone())
+            .collect();
+        names.sort();
+        names
+            .into_iter()
+            .map(|symbol_name| crate::interfaces::SymbolInfo {
+                module_name: module_name.clone(),
+                symbol_name,
+                offset: 0,
+            })
+            .collect()
+    }
+
     /// List all symbols in the specified module as raw ModuleSymbols (without VA calculation)
     pub fn list_symbols_raw(&self, module_path: &str) -> Result<Vec<ModuleSymbol>, SymbolError> {
         self.wait_for_loading(module_path)?;
@@ -576,6 +973,39 @@ impl SymbolManager {
         } else {
             Ok(None)
         }
+    }
+
+    /// Resolve a batch of absolute addresses to raw symbols WITHOUT waiting on
+    /// in-flight symbol loads: an address whose containing module is still
+    /// loading resolves to `None` immediately instead of stalling behind the
+    /// parse (the blocking resolvers wait up to the configured timeout — seconds
+    /// for a multi-million-symbol PDB). One result per input address, in order.
+    /// Callers re-request once `get_symbol_status` reports the load settled.
+    /// `modules` must be sorted by base address.
+    pub fn try_resolve_addresses_to_symbols_raw(
+        &self,
+        modules: &[ModuleInfo],
+        addresses: &[u64],
+    ) -> Vec<Option<(String, ModuleSymbol, u64)>> {
+        addresses
+            .iter()
+            .map(|&address| {
+                let module = Self::find_module_binary_search(modules, address)?;
+                // Still loading → never enter the blocking resolvers (they wait).
+                {
+                    let pending = self.pending_loads.lock().unwrap();
+                    if pending.contains(&module.name) {
+                        return None;
+                    }
+                }
+                // Not pending, so the blocking paths below return immediately.
+                // Chain-aware resolution first (PGO fragments), then nearest-below.
+                if let Ok(Some(result)) = self.resolve_address_with_chain(modules, address) {
+                    return Some(result);
+                }
+                self.resolve_address_to_symbol_raw(modules, address).ok().flatten()
+            })
+            .collect()
     }
 
     /// Resolve an address to a symbol by following RUNTIME_FUNCTION unwind chains.
@@ -708,3 +1138,4 @@ fn extract_module_name(module_path: &str) -> String {
         .unwrap_or(module_path)
         .to_string()
 }
+

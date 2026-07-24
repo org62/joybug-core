@@ -33,6 +33,16 @@ pub enum SymbolError {
     ModuleNotLoaded(String),
 }
 
+/// Configuration for symbol resolution, plumbed from the embedding application.
+#[derive(Debug, Clone, Default)]
+pub struct SymbolConfig {
+    /// Overrides the `_NT_SYMBOL_PATH` environment variable when set.
+    pub symbol_path: Option<String>,
+    /// When true, remote symbol-server URLs are stripped so nothing is downloaded;
+    /// local caches and directories still resolve.
+    pub offline: bool,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModuleSymbol {
     pub name: String,
@@ -59,9 +69,26 @@ impl Architecture {
     pub fn from_native() -> Self {
         if cfg!(target_arch = "x86_64") { Architecture::X64 } else { Architecture::Arm64 }
     }
+
+    /// Longest possible instruction encoding, in bytes (ARM64 is fixed-width).
+    pub fn max_instruction_len(self) -> usize {
+        match self {
+            Architecture::X64 => 15,
+            Architecture::Arm64 => 4,
+        }
+    }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Byte window for a self-resync backward decode of `count` instructions:
+/// one max-length instruction per row plus one extra instruction of lead-in,
+/// which gives an x86 decode room to resynchronize before it reaches the
+/// target (ARM64 is fixed-width, so any aligned start decodes exactly).
+pub fn backward_resync_window(arch: Architecture, count: usize) -> u64 {
+    let max_ilen = arch.max_instruction_len() as u64;
+    max_ilen * count as u64 + max_ilen
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Instruction {
     pub address: u64,
     pub bytes: Vec<u8>,
@@ -75,6 +102,52 @@ pub struct Instruction {
     pub is_ret: bool,            // ret instruction
     pub jump_target: Option<u64>, // Target address if resolvable (for jumps/calls)
     pub addresses_to_symbolize: Vec<u64>, // Addresses extracted from operands for symbolization
+    #[serde(default)]
+    pub line_info: Option<SourceLineRef>, // Source file/line, if the module's line table is loaded
+    /// Every symbol that starts exactly at this address (offset 0). More than one
+    /// name can share an address — e.g. ntdll's `NtClose`/`ZwClose` aliases — so the
+    /// UI can render all of them as label rows. `symbol_info` still carries the single
+    /// nearest-below symbol (used for the `+offset` display and operand symbolization);
+    /// this is populated only at exact symbol starts and is otherwise empty.
+    #[serde(default)]
+    pub symbols_at_address: Vec<SymbolInfo>,
+    /// True for a synthetic 1-byte placeholder emitted where a byte could not be
+    /// decoded (rendered as `db 0xXX`). Lets the decoder continue past bad bytes
+    /// instead of truncating the whole listing (x64dbg-style).
+    #[serde(default)]
+    pub is_invalid: bool,
+}
+
+/// A source file referenced by a module's PDB line table.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SourceFileEntry {
+    /// File path as recorded in the PDB (compile-time path).
+    pub path: String,
+    /// Checksum algorithm: "md5" | "sha1" | "sha256" | "none".
+    pub checksum_kind: String,
+    /// Hex-encoded checksum of the file contents; empty when kind is "none".
+    pub checksum: String,
+}
+
+/// One address-range → source-line mapping from a PDB line table.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LineEntry {
+    pub rva: u32,
+    /// Byte length of the covered code; 0 if unknown.
+    pub length: u32,
+    /// Index into the module's deduplicated source file list.
+    pub file_index: u32,
+    pub line_start: u32,
+    pub line_end: u32,
+    pub col_start: Option<u32>,
+    pub col_end: Option<u32>,
+}
+
+/// A resolved source location attached to an instruction.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SourceLineRef {
+    pub file_path: String,
+    pub line: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -185,12 +258,21 @@ pub trait DisassemblerProvider: Send + Sync {
         let mut instructions = self.disassemble(arch, data, address, count)?;
         for instruction in &mut instructions {
             instruction.symbol_info = symbol_resolver(instruction.address);
+            // At an exact symbol start, seed `symbols_at_address` with the resolved
+            // name so every decode path yields at least one label. Platforms with a
+            // richer symbol source (WindowsPlatform) overwrite this with the full
+            // alias set during enrichment.
+            if let Some(s) = instruction.symbol_info.as_ref().filter(|s| s.offset == 0) {
+                instruction.symbols_at_address = vec![s.clone()];
+            }
 
-            // Symbolize operand addresses using pre-extracted address list (no regex)
+            // Symbolize operand addresses using pre-extracted address list (no regex).
+            // Only exact symbol hits (offset 0) are substituted — a mid-symbol
+            // target keeps its raw address rather than a misleading `sym+0xNNN`.
             if !instruction.addresses_to_symbolize.is_empty() {
                 let mut op_str = instruction.op_str.clone();
                 for addr in &instruction.addresses_to_symbolize {
-                    if let Some(symbol) = symbol_resolver(*addr) {
+                    if let Some(symbol) = symbol_resolver(*addr).filter(|s| s.offset == 0) {
                         let symbol_str = symbol.format_symbol();
                         // Try direct hex replacement first (for absolute addresses)
                         let hex_lower = format!("0x{:x}", addr);
@@ -228,12 +310,41 @@ pub trait Stepper: Send + Sync {
 pub trait PlatformAPI: Send + Sync {
     fn attach(&mut self, pid: u32) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>;
     fn detach(&mut self, pid: u32) -> Result<(), PlatformError>;
+    /// Open a process non-invasively (OpenProcess only, no debugger attach) so
+    /// read-only capabilities work without a debug loop.
+    fn open_process(&mut self, _pid: u32) -> Result<(), PlatformError> { Err(PlatformError::NotImplemented) }
+    /// Release a non-invasively opened process.
+    fn close_process(&mut self, _pid: u32) -> Result<(), PlatformError> { Err(PlatformError::NotImplemented) }
     fn continue_exec(&mut self, pid: u32, tid: u32) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>;
     fn set_breakpoint(&mut self, pid: u32, addr: u64, tid: Option<u32>) -> Result<(), PlatformError>;
     fn remove_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError>;
     fn set_single_shot_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError>;
     fn set_hardware_breakpoint(&mut self, pid: u32, addr: u64, bp_type: crate::protocol::HardwareBreakpointType, size: crate::protocol::HardwareBreakpointSize) -> Result<u8, PlatformError>;
     fn remove_hardware_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError>;
+
+    // Code-coverage: silent, server-side-counted software breakpoints. Hits are
+    // counted in the server and the debuggee auto-continues without notifying the
+    // client (see `handle_exception_event`). `limit` is the hit count after which
+    // each breakpoint is auto-removed (`0` = never, `1` = remove on first hit).
+    fn start_code_coverage(&mut self, _pid: u32, _addrs: &[u64], _limit: u64) -> Result<(), PlatformError> { Err(PlatformError::NotImplemented) }
+    /// Fetch a [`crate::protocol::CoverageHit`] (address, hit count, first-hit
+    /// order, thread ids) for every coverage breakpoint hit at least once
+    /// (never-hit addresses are omitted; the client knows the armed set).
+    fn get_code_coverage(&self, _pid: u32) -> Result<Vec<crate::protocol::CoverageHit>, PlatformError> { Err(PlatformError::NotImplemented) }
+    /// Remove all coverage breakpoints and clear coverage state.
+    fn stop_code_coverage(&mut self, _pid: u32) -> Result<(), PlatformError> { Err(PlatformError::NotImplemented) }
+
+    // Hardware access trace: a hardware watchpoint (Write / ReadWrite) run in
+    // silent "find what accesses this address" mode. Each read/write is recorded
+    // server-side (the accessing instruction pointer) and the target auto-continues
+    // without notifying the client (see `handle_exception_event`).
+    /// Arm a watchpoint at `addr` and start collecting accessors.
+    fn start_watchpoint_trace(&mut self, _pid: u32, _addr: u64, _bp_type: crate::protocol::HardwareBreakpointType, _size: crate::protocol::HardwareBreakpointSize) -> Result<(), PlatformError> { Err(PlatformError::NotImplemented) }
+    /// Fetch a [`crate::protocol::WatchpointAccess`] for every distinct instruction
+    /// that has accessed the watched `addr` at least once.
+    fn get_watchpoint_accesses(&self, _pid: u32, _addr: u64) -> Result<Vec<crate::protocol::WatchpointAccess>, PlatformError> { Err(PlatformError::NotImplemented) }
+    /// Remove the watchpoint at `addr` and clear its collected accesses.
+    fn stop_watchpoint_trace(&mut self, _pid: u32, _addr: u64) -> Result<(), PlatformError> { Err(PlatformError::NotImplemented) }
     fn launch(&mut self, command: &str, debug_children: bool, working_directory: Option<&str>) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>;
     fn read_memory(&self, pid: u32, address: u64, size: usize) -> Result<Vec<u8>, PlatformError>;
     fn write_memory(&self, pid: u32, address: u64, data: &[u8]) -> Result<(), PlatformError>;
@@ -250,10 +361,142 @@ pub trait PlatformAPI: Send + Sync {
     fn list_symbols(&self, module_path: &str) -> Result<Vec<ModuleSymbol>, SymbolError>;
     fn resolve_rva_to_symbol(&self, module_path: &str, rva: u32) -> Result<Option<ModuleSymbol>, SymbolError>;
     fn resolve_address_to_symbol(&self, pid: u32, address: u64) -> Result<Option<(String, ModuleSymbol, u64)>, SymbolError>; // Returns (module_path, symbol, offset_from_symbol)
-    
+
+    /// Resolve many addresses to symbols WITHOUT waiting on in-flight symbol
+    /// loads: an address in a module whose symbols are still loading yields
+    /// `None` immediately instead of stalling behind the parse (the blocking
+    /// `resolve_address_to_symbol` waits up to the platform's timeout). One
+    /// result per input address, in order; callers re-request once
+    /// `get_symbol_status` reports the load settled. The default loops the
+    /// blocking resolver — platforms with background symbol loading should
+    /// override to guarantee the non-waiting behavior.
+    fn try_resolve_addresses_to_symbols(&self, pid: u32, addresses: &[u64]) -> Result<Vec<Option<(String, ModuleSymbol, u64)>>, SymbolError> {
+        Ok(addresses
+            .iter()
+            .map(|&address| self.resolve_address_to_symbol(pid, address).ok().flatten())
+            .collect())
+    }
+
+    /// Per-module symbol load status (loaded/loading/failed/not requested).
+    fn get_symbol_status(&self, _pid: u32) -> Result<Vec<crate::protocol::ModuleSymbolStatus>, SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Symbol status not supported by this platform".to_string()))
+    }
+    /// Load symbols for a module from a user-supplied PDB file.
+    /// Unless `force`, the PDB's GUID/age must match the module's PE debug directory;
+    /// a mismatch is a negotiable outcome (`PdbLoadOutcome::Mismatch`), not an error.
+    fn load_pdb_from_path(&self, _pid: u32, _module_base: u64, _pdb_path: &str, _force: bool) -> Result<crate::protocol::PdbLoadOutcome, SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Loading PDB from path not supported by this platform".to_string()))
+    }
+    /// Retry a failed symbol download for a module.
+    fn retry_symbol_load(&self, _pid: u32, _module_base: u64) -> Result<(), SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Symbol retry not supported by this platform".to_string()))
+    }
+    /// Unload a module's symbols and every derived cache (line tables, type info,
+    /// pdata, failure markers), freeing their memory.
+    fn unload_module_symbols(&self, _pid: u32, _module_base: u64) -> Result<(), SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Symbol unload not supported by this platform".to_string()))
+    }
+    /// Replace the set of modules (lowercased file names) whose automatic symbol
+    /// download is suppressed.
+    fn set_symbol_deny_list(&self, _modules: Vec<String>) -> Result<(), SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Symbol deny list not supported by this platform".to_string()))
+    }
+
+    // Source line methods (PDB line tables)
+    /// Resolve an address to a source file/line. Lazily parses the module's line table.
+    fn resolve_address_to_line(&self, _pid: u32, _address: u64) -> Result<Option<crate::protocol::AddressLineInfo>, SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Source line resolution not supported by this platform".to_string()))
+    }
+    /// All line→address entries for one source file of a module, plus the matched
+    /// file record. `start_line`/`end_line` (inclusive, 1-based) bound the returned
+    /// entries by `line_start`; `None` = whole file.
+    fn get_source_file_line_map(&self, _pid: u32, _module_base: u64, _file_path: &str, _start_line: Option<u32>, _end_line: Option<u32>) -> Result<(Option<SourceFileEntry>, Vec<LineEntry>), SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Source line maps not supported by this platform".to_string()))
+    }
+    /// All source files referenced by a module's PDB line table.
+    fn list_source_files(&self, _pid: u32, _module_base: u64) -> Result<Vec<SourceFileEntry>, SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Source file listing not supported by this platform".to_string()))
+    }
+
+    // Type system methods (PDB TPI stream)
+    /// List UDT/enum type summaries from loaded module PDBs. `module_base = None`
+    /// searches all loaded modules; `filter` is a case-insensitive name substring.
+    fn list_types(&self, _pid: u32, _module_base: Option<u64>, _filter: Option<&str>, _max_results: usize) -> Result<Vec<crate::protocol::TypeSummary>, SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Type listing not supported by this platform".to_string()))
+    }
+    /// Resolve a named type's layout. `module_base = None` searches all modules.
+    fn get_type(&self, _pid: u32, _module_base: Option<u64>, _name: &str) -> Result<Option<crate::protocol::TypeLayout>, SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Type resolution not supported by this platform".to_string()))
+    }
+    /// Resolve a type by its TPI index within a specific module (nested expansion).
+    fn get_type_by_index(&self, _pid: u32, _module_base: u64, _index: u32) -> Result<Option<crate::protocol::TypeLayout>, SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Type resolution not supported by this platform".to_string()))
+    }
+
     // Symbolized disassembly methods
     fn disassemble_memory(&self, pid: u32, address: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError>;
-    
+
+    /// Like `disassemble_memory`, but bounded by bytes instead of instruction
+    /// count: decodes only instructions contained entirely within
+    /// `[address, address + byte_len)`. The default trims a plain
+    /// `disassemble_memory` decode; platforms should override it to also bound
+    /// the underlying read (`disassemble_memory` reads `count * 16` bytes and
+    /// decodes past the window, wasting reads/symbolization and risking a
+    /// wholesale read failure if the over-read straddles an unmapped page).
+    fn disassemble_memory_bytes(&self, pid: u32, address: u64, byte_len: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
+        let end = address.saturating_add(byte_len as u64);
+        let instructions = self.disassemble_memory(pid, address, byte_len, arch)?;
+        Ok(instructions
+            .into_iter()
+            .take_while(|i| i.address + i.size as u64 <= end)
+            .collect())
+    }
+
+    /// Disassemble up to `count` instructions ending immediately before `target`
+    /// ("backward disassembly", x64dbg-style). Decodes forward from a point safely
+    /// before `target` and exploits x86 self-resynchronization: a linear decode
+    /// started at a slightly-wrong offset re-aligns to the true instruction stream
+    /// within a few instructions. `target` is expected to be a real instruction
+    /// boundary (it is when scrolling up: the address of an already-decoded row, or
+    /// the trap RIP after a retired instruction). Used to let the UI scroll up past
+    /// functions with no `.pdata` bounds, and to attribute HW-watchpoint accesses.
+    ///
+    /// The backward read is clamped to the containing memory region's base so
+    /// [start, target) never touches an unmapped page (such a read fails
+    /// wholesale, e.g. just before a section); platforms whose
+    /// `query_memory_region` errors keep the unclamped start.
+    fn disassemble_backward(&self, pid: u32, target: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
+        self.disassemble_backward_resync(pid, target, count, arch)
+    }
+
+    /// The plain self-resync backward decode described on `disassemble_backward`.
+    /// Split out so platform overrides that anchor on known boundaries (see
+    /// WindowsPlatform) can delegate here when no boundary is available, instead
+    /// of duplicating this window/clamp logic.
+    fn disassemble_backward_resync(&self, pid: u32, target: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
+        if count == 0 || target == 0 {
+            return Ok(Vec::new());
+        }
+        let back = backward_resync_window(arch, count);
+        let mut start = target.saturating_sub(back);
+        // Region-clamp only when the window can cross a 4K page boundary —
+        // within one page it's mapped iff `target` is, and skipping the query
+        // matters on the per-access watchpoint hot path.
+        if start >> 12 != (target - 1) >> 12 {
+            if let Ok(region) = self.query_memory_region(pid, target - 1) {
+                if region.base_address > start && region.base_address <= target {
+                    start = region.base_address;
+                }
+            }
+        }
+        if start >= target {
+            return Ok(Vec::new());
+        }
+        let window = (target - start) as usize;
+        let instructions = self.disassemble_memory_bytes(pid, start, window, arch)?;
+        Ok(align_backward_instructions(instructions, target, count))
+    }
+
     // Call stack methods
     fn get_call_stack(&self, pid: u32, tid: u32) -> Result<Vec<CallFrame>, PlatformError>;
     // Process control
@@ -276,6 +519,24 @@ pub trait PlatformAPI: Send + Sync {
         count: usize,
         reference_base: Option<u64>,
     ) -> Result<Vec<crate::protocol::DereferenceEntry>, PlatformError>;
+
+    /// Telescope many independent addresses at once. The default loops
+    /// `dereference`; platforms should override to enumerate memory regions only
+    /// once for the whole batch (the enumeration dominates the cost, and the
+    /// registers panel telescopes ~16 addresses on every step). Returns one
+    /// entry list per input address, in order.
+    fn dereference_batch(
+        &self,
+        pid: u32,
+        addresses: &[u64],
+        count: usize,
+        reference_base: Option<u64>,
+    ) -> Result<Vec<Vec<crate::protocol::DereferenceEntry>>, PlatformError> {
+        addresses
+            .iter()
+            .map(|&address| self.dereference(pid, address, count, reference_base))
+            .collect()
+    }
 
     // Thread Environment Block (TEB) address - used for emulator GS segment setup
     fn get_teb_address(&self, _pid: u32, _tid: u32) -> Result<u64, PlatformError> {
@@ -476,6 +737,26 @@ pub trait PlatformAPI: Send + Sync {
             "disassemble_function not supported by this platform".into(),
         ))
     }
+}
+
+/// From a forward linear decode `ins` (ascending addresses) that was started before
+/// `target` and runs past it, return up to `count` instructions immediately preceding
+/// `target` — the aligned predecessors. Relies on x86 self-resynchronization: by the
+/// time the decode reaches `target` it has realigned to the true instruction stream,
+/// so keeping only instructions that end at or before `target` yields the correct
+/// predecessors (the last one ends exactly at `target` for well-formed code). Never
+/// keeps an instruction that straddles `target`, so the result can't contradict the
+/// anchor row.
+pub fn align_backward_instructions(ins: Vec<Instruction>, target: u64, count: usize) -> Vec<Instruction> {
+    let mut v: Vec<Instruction> = ins
+        .into_iter()
+        .filter(|i| i.address < target && i.address + i.size as u64 <= target)
+        .collect();
+    let n = v.len();
+    if n > count {
+        v.drain(0..n - count);
+    }
+    v
 }
 
 impl SymbolInfo {

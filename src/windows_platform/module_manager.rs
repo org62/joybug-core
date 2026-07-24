@@ -41,4 +41,12 @@ impl ModuleManager {
     pub fn get_extra_info(&self, base_address: u64) -> Option<ModuleExtraInfo> {
         self.extra_info.get(&base_address).cloned()
     }
-} 
+
+    /// Run `f` against the cached extra info by reference. Unlike
+    /// `get_extra_info` this avoids deep-cloning the whole `ModuleExtraInfo`
+    /// (export/import tables, runtime functions) — use it for hot lookups that
+    /// only need to read a slice of the cached data.
+    pub fn with_extra_info<R>(&self, base_address: u64, f: impl FnOnce(&ModuleExtraInfo) -> R) -> Option<R> {
+        self.extra_info.get(&base_address).map(f)
+    }
+}

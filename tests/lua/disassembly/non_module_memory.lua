@@ -30,12 +30,19 @@ dbg:on_initial_breakpoint(function(pid, tid, addr)
         assert(result["end"] == nil, "Function end should be nil for non-module memory")
         assert(result.name == nil, "Function name should be nil for non-module memory")
 
-        -- Verify the disassembly matches known shellcode (x64)
-        -- mov eax, ecx / add eax, edx / ret
-        assert(instrs[1].mnemonic:lower() == "mov", "First instruction should be 'mov'")
-        assert(instrs[2].mnemonic:lower() == "add", "Second instruction should be 'add'")
-        assert(instrs[3].mnemonic:lower() == "ret", "Third instruction should be 'ret'")
-        assert(instrs[3].is_ret, "ret instruction should have is_ret=true")
+        -- Verify the disassembly matches the known shellcode (see disassembly_test.c).
+        if ARCH == 'aarch64' then
+            -- add w0, w0, w1 / ret / nop ...
+            assert(instrs[1].mnemonic:lower() == "add", "First instruction should be 'add'")
+            assert(instrs[2].mnemonic:lower() == "ret", "Second instruction should be 'ret'")
+            assert(instrs[2].is_ret, "ret instruction should have is_ret=true")
+        else
+            -- mov eax, ecx / add eax, edx / ret
+            assert(instrs[1].mnemonic:lower() == "mov", "First instruction should be 'mov'")
+            assert(instrs[2].mnemonic:lower() == "add", "Second instruction should be 'add'")
+            assert(instrs[3].mnemonic:lower() == "ret", "Third instruction should be 'ret'")
+            assert(instrs[3].is_ret, "ret instruction should have is_ret=true")
+        end
     end)
 end)
 

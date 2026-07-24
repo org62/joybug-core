@@ -1,9 +1,13 @@
 use crate::interfaces::{Architecture, Instruction, ModuleSymbol};
 use crate::pe_types::ModuleExtraInfo;
 pub use crate::protocol::{
-    DebuggerRequest, DebuggerResponse, DebugEvent, EmulationMode, HardwareBreakpointSize,
-    HardwareBreakpointType, ModuleInfo, ProcessInfo, ScanCompareType, ScanValue, ScanValueType,
-    StepAction, StepKind, ThreadContext, ThreadInfo, TraceExitCondition,
+    AddressLineInfo, DebuggerRequest, DebuggerResponse, DebugEvent, EmulationMode,
+    HardwareBreakpointSize, HardwareBreakpointType, ModuleInfo, ModuleSymbolStatus,
+    PdbLoadOutcome, PdbMismatchInfo, ProcessInfo, ScanCompareType, ScanRegionFilter, ScanValue,
+    ScanValueType, StepAction, StepKind, StringEncodingFilter, StringHit, StringSortKey,
+    SymbolLoadState, ThreadContext, ThreadInfo,
+    TraceExitCondition, TypeClass, TypeEnumValue, TypeLayout, TypeMember, TypeRef, TypeSummary,
+    UdtKind,
 };
 
 /// Result from trace_instructions()
@@ -119,7 +123,10 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::Symbol { .. } => "Symbol".to_string(),
         DebuggerResponse::SymbolList { .. } => "SymbolList".to_string(),
         DebuggerResponse::ResolvedSymbolList { .. } => "ResolvedSymbolList".to_string(),
+        DebuggerResponse::CoverageResults { hits } => format!("CoverageResults ({} entries)", hits.len()),
+        DebuggerResponse::WatchpointAccesses { accesses } => format!("WatchpointAccesses ({} entries)", accesses.len()),
         DebuggerResponse::AddressSymbol { .. } => "AddressSymbol".to_string(),
+        DebuggerResponse::AddressSymbolBatch { results } => format!("AddressSymbolBatch ({} addresses)", results.len()),
         DebuggerResponse::CallStack { .. } => "CallStack".to_string(),
         DebuggerResponse::FunctionArguments { .. } => "FunctionArguments".to_string(),
         DebuggerResponse::WideStringData { .. } => "WideStringData".to_string(),
@@ -127,16 +134,32 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::MemoryRegionInfo { .. } => "MemoryRegionInfo".to_string(),
         DebuggerResponse::MemoryRegionList { regions } => format!("MemoryRegionList ({} regions)", regions.len()),
         DebuggerResponse::DereferenceResult { entries } => format!("DereferenceResult ({} entries)", entries.len()),
+        DebuggerResponse::DereferenceBatchResult { results } => format!("DereferenceBatchResult ({} addresses)", results.len()),
         DebuggerResponse::FunctionDisassembly { instructions, .. } => format!("FunctionDisassembly ({} instructions)", instructions.len()),
         DebuggerResponse::EmulationResult { instructions_executed, .. } => format!("EmulationResult ({} instructions)", instructions_executed),
         DebuggerResponse::TenetTrace { trace_text, .. } => format!("TenetTrace ({} bytes)", trace_text.len()),
         DebuggerResponse::MemorySearchResult { addresses, capped } => format!("MemorySearchResult ({} matches, capped={})", addresses.len(), capped),
         DebuggerResponse::ScanMemoryResult { match_count, .. } => format!("ScanMemoryResult ({} matches)", match_count),
         DebuggerResponse::ScanMemoryResults { addresses, total_count, .. } => format!("ScanMemoryResults ({}/{} returned)", addresses.len(), total_count),
+        DebuggerResponse::PointerScanResult { match_count, .. } => format!("PointerScanResult ({} paths)", match_count),
+        DebuggerResponse::PointerScanResults { paths, total_count } => format!("PointerScanResults ({}/{} returned)", paths.len(), total_count),
+        DebuggerResponse::StringScanResult { match_count, capped, .. } => format!("StringScanResult ({} strings{})", match_count, if *capped { ", capped" } else { "" }),
+        DebuggerResponse::StringScanResults { strings, total_count } => format!("StringScanResults ({}/{} returned)", strings.len(), total_count),
         DebuggerResponse::PebHideResult { report } => format!(
             "PebHideResult (peb=0x{:X}, applied={}, failed={}, wow64_skipped={})",
             report.peb_address, report.applied.len(), report.failures.len(), report.wow64_skipped,
         ),
+        DebuggerResponse::FreezeValueStarted { freeze_id } => format!("FreezeValueStarted (id={})", freeze_id),
+        DebuggerResponse::SymbolStatusList { statuses } => format!("SymbolStatusList ({} modules)", statuses.len()),
+        DebuggerResponse::PdbLoaded { symbol_count } => format!("PdbLoaded ({} symbols)", symbol_count),
+        DebuggerResponse::PdbMismatch(_) => "PdbMismatch".to_string(),
+        DebuggerResponse::AddressLine { .. } => "AddressLine".to_string(),
+        DebuggerResponse::SourceFileLineMap { entries, .. } => format!("SourceFileLineMap ({} entries)", entries.len()),
+        DebuggerResponse::SourceFileList { files } => format!("SourceFileList ({} files)", files.len()),
+        DebuggerResponse::TypeList { types } => format!("TypeList ({} types)", types.len()),
+        DebuggerResponse::TypeResult { layout } => format!("TypeResult ({})", layout.as_ref().map(|l| l.name.as_str()).unwrap_or("none")),
+        DebuggerResponse::TebAddress { .. } => "TebAddress".to_string(),
+        DebuggerResponse::PebAddress { .. } => "PebAddress".to_string(),
     };
     debug!("Received response: {}", summary);
     Ok(resp)
@@ -188,10 +211,18 @@ pub struct DebugSession<S> {
     root_pid: Option<u32>,
 }
 
+/// TCP keepalive idle: proactively detect a silently-dropped connection (NAT /
+/// firewall idle-eviction, server host gone) instead of only noticing on the
+/// next request. Safe on every connection — a live server's TCP stack ACKs the
+/// probes regardless of application state, so an idle debug-loop connection
+/// waiting for the next event is never torn down while the server is alive.
+const KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl<S> DebugSession<S> {
     pub fn new(state: S, addr: Option<&str>) -> anyhow::Result<Self> {
         let addr = addr.unwrap_or("127.0.0.1:9000");
         let stream = TcpStream::connect(addr)?;
+        Self::configure_socket(&stream);
         let framed_stream = FramedJsonStream::new(stream);
         Ok(Self {
             stream: Mutex::new(framed_stream),
@@ -212,6 +243,26 @@ impl<S> DebugSession<S> {
             root_pid: None,
         })
     }
+
+    /// Enable TCP keepalive on the connection. Applied to every client so a
+    /// silently-dropped connection is detected rather than hanging forever.
+    fn configure_socket(stream: &TcpStream) {
+        let ka = socket2::TcpKeepalive::new().with_time(KEEPALIVE_IDLE);
+        let sock = socket2::SockRef::from(stream);
+        if let Err(e) = sock.set_tcp_keepalive(&ka) {
+            warn!("Failed to enable TCP keepalive: {}", e);
+        }
+    }
+
+    /// Bound how long a single request waits for its response. Intended for
+    /// request/response (OOB) clients — NOT the debug-loop connection, which
+    /// legitimately blocks for arbitrarily long between debug events. `None`
+    /// restores blocking reads.
+    pub fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> anyhow::Result<()> {
+        self.stream.lock().unwrap().set_read_timeout(dur)?;
+        Ok(())
+    }
+
     /// Handle the initial process breakpoint
     /// Callback receives: (session, pid, tid, address)
     pub fn on_initial_breakpoint<F>(mut self, handler: F) -> Self
@@ -749,6 +800,27 @@ impl<S> DebugSession<S> {
         }
     }
 
+    /// Open a process non-invasively (no debugger attach) so read-only features
+    /// (memory, modules, threads, disassembly, symbols, call stacks) work.
+    pub fn open_process(&mut self, pid: u32) -> anyhow::Result<()> {
+        let resp = self.send_and_receive(&DebuggerRequest::OpenProcess { pid })?;
+        match resp {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("OpenProcess failed: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to OpenProcess: {:?}", other)),
+        }
+    }
+
+    /// Release a non-invasively opened process.
+    pub fn close_process(&mut self, pid: u32) -> anyhow::Result<()> {
+        let resp = self.send_and_receive(&DebuggerRequest::CloseProcess { pid })?;
+        match resp {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("CloseProcess failed: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to CloseProcess: {:?}", other)),
+        }
+    }
+
     pub fn send_and_receive(
         &mut self,
         req: &crate::protocol::DebuggerRequest,
@@ -810,6 +882,269 @@ impl<S> DebugSession<S> {
                 other
             )),
         }
+    }
+
+    /// List every symbol in a loaded module (raw RVAs, no VA calculation).
+    /// `module_path` is the module's full path (`ModuleInfo.name`). Unlike
+    /// `find_symbols`, this enumerates the whole module without a pattern/limit.
+    pub fn list_symbols(
+        &mut self,
+        module_path: &str,
+    ) -> anyhow::Result<Vec<crate::interfaces::ModuleSymbol>> {
+        let req = DebuggerRequest::ListSymbols { module_path: module_path.to_string() };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::SymbolList { symbols } => Ok(symbols),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!(
+                "Failed to list symbols for '{}': {}",
+                module_path,
+                message
+            )),
+            other => Err(anyhow::anyhow!("Unexpected response to ListSymbols: {:?}", other)),
+        }
+    }
+
+    /// Arm code-coverage breakpoints on every address in `addrs`. Hits are counted
+    /// server-side and the debuggee auto-continues silently; poll with
+    /// [`get_coverage`]. `limit` is the hit count after which each is auto-removed
+    /// (`0` = never, `1` = remove on first hit = pure coverage).
+    pub fn start_coverage(&mut self, pid: u32, addrs: Vec<u64>, limit: u64) -> anyhow::Result<()> {
+        match self.send_and_receive(&DebuggerRequest::StartCodeCoverage { pid, addrs, limit })? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to start code coverage: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to StartCodeCoverage: {:?}", other)),
+        }
+    }
+
+    /// Fetch a [`crate::protocol::CoverageHit`] (address, hit count, first-hit
+    /// order, thread ids) for every coverage breakpoint hit at least once
+    /// (never-hit addresses are omitted; the caller knows the armed set).
+    pub fn get_coverage(&mut self, pid: u32) -> anyhow::Result<Vec<crate::protocol::CoverageHit>> {
+        match self.send_and_receive(&DebuggerRequest::GetCodeCoverage { pid })? {
+            DebuggerResponse::CoverageResults { hits } => Ok(hits),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to get code coverage: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to GetCodeCoverage: {:?}", other)),
+        }
+    }
+
+    /// Remove all coverage breakpoints and clear coverage state.
+    pub fn stop_coverage(&mut self, pid: u32) -> anyhow::Result<()> {
+        match self.send_and_receive(&DebuggerRequest::StopCodeCoverage { pid })? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to stop code coverage: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to StopCodeCoverage: {:?}", other)),
+        }
+    }
+
+    /// Arm a hardware watchpoint at `addr` in silent "access trace" mode: every
+    /// read/write is recorded server-side (the accessing instruction) and the target
+    /// auto-continues instead of breaking. Poll with [`get_watchpoint_accesses`] and
+    /// tear down with [`stop_watchpoint_trace`]. `bp_type` should be `Write` or
+    /// `ReadWrite` (x86 hardware cannot trap read-only).
+    pub fn start_watchpoint_trace(&mut self, pid: u32, addr: u64, bp_type: crate::protocol::HardwareBreakpointType, size: crate::protocol::HardwareBreakpointSize) -> anyhow::Result<()> {
+        match self.send_and_receive(&DebuggerRequest::StartWatchpointTrace { pid, addr, bp_type, size })? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to start watchpoint trace: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to StartWatchpointTrace: {:?}", other)),
+        }
+    }
+
+    /// Fetch a [`crate::protocol::WatchpointAccess`] (accessing instruction pointer,
+    /// hit count, first-access order, thread ids) for every distinct instruction
+    /// that has accessed the watched `addr` at least once.
+    pub fn get_watchpoint_accesses(&mut self, pid: u32, addr: u64) -> anyhow::Result<Vec<crate::protocol::WatchpointAccess>> {
+        match self.send_and_receive(&DebuggerRequest::GetWatchpointAccesses { pid, addr })? {
+            DebuggerResponse::WatchpointAccesses { accesses } => Ok(accesses),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to get watchpoint accesses: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to GetWatchpointAccesses: {:?}", other)),
+        }
+    }
+
+    /// Remove the watchpoint at `addr` and clear its collected accesses.
+    pub fn stop_watchpoint_trace(&mut self, pid: u32, addr: u64) -> anyhow::Result<()> {
+        match self.send_and_receive(&DebuggerRequest::StopWatchpointTrace { pid, addr })? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to stop watchpoint trace: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to StopWatchpointTrace: {:?}", other)),
+        }
+    }
+
+    /// Per-module symbol load status (loaded/loading/failed/not requested).
+    pub fn get_symbol_status(&mut self, pid: u32) -> anyhow::Result<Vec<ModuleSymbolStatus>> {
+        match self.send_and_receive(&DebuggerRequest::GetSymbolStatus { pid })? {
+            DebuggerResponse::SymbolStatusList { statuses } => Ok(statuses),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to get symbol status: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to GetSymbolStatus: {:?}", other)),
+        }
+    }
+
+    /// Load symbols for a module from a user-supplied PDB file.
+    /// Returns `Mismatch` (not an error) when the PDB doesn't match the PE and `force` is false.
+    pub fn load_pdb_from_path(
+        &mut self,
+        pid: u32,
+        module_base: u64,
+        pdb_path: &str,
+        force: bool,
+    ) -> anyhow::Result<PdbLoadOutcome> {
+        let req = DebuggerRequest::LoadPdbFromPath {
+            pid,
+            module_base,
+            pdb_path: pdb_path.to_string(),
+            force,
+        };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::PdbLoaded { symbol_count } => {
+                Ok(PdbLoadOutcome::Loaded { symbol_count })
+            }
+            DebuggerResponse::PdbMismatch(info) => Ok(PdbLoadOutcome::Mismatch(info)),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to load PDB '{}': {}", pdb_path, message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to LoadPdbFromPath: {:?}", other)),
+        }
+    }
+
+    /// Retry a failed symbol download for a module.
+    pub fn retry_symbol_load(&mut self, pid: u32, module_base: u64) -> anyhow::Result<()> {
+        match self.send_and_receive(&DebuggerRequest::RetrySymbolLoad { pid, module_base })? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to retry symbol load: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to RetrySymbolLoad: {:?}", other)),
+        }
+    }
+
+    /// Unload a module's symbols and every derived server-side cache, freeing
+    /// their memory. The module reports `NotRequested` afterwards.
+    pub fn unload_module_symbols(&mut self, pid: u32, module_base: u64) -> anyhow::Result<()> {
+        match self.send_and_receive(&DebuggerRequest::UnloadModuleSymbols { pid, module_base })? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to unload module symbols: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to UnloadModuleSymbols: {:?}", other)),
+        }
+    }
+
+    /// Replace the set of modules (lowercased file names, e.g. "foo.dll") whose
+    /// automatic symbol download is suppressed.
+    pub fn set_symbol_deny_list(&mut self, modules: Vec<String>) -> anyhow::Result<()> {
+        match self.send_and_receive(&DebuggerRequest::SetSymbolDenyList { modules })? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to set symbol deny list: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to SetSymbolDenyList: {:?}", other)),
+        }
+    }
+
+    /// List UDT/enum types from loaded module PDBs. `module_base = None` searches
+    /// all loaded modules; `filter` is a case-insensitive substring on the name.
+    pub fn list_types(
+        &mut self,
+        pid: u32,
+        module_base: Option<u64>,
+        filter: Option<&str>,
+        max_results: usize,
+    ) -> anyhow::Result<Vec<TypeSummary>> {
+        let req = DebuggerRequest::ListTypes {
+            pid,
+            module_base,
+            filter: filter.map(|s| s.to_string()),
+            max_results,
+        };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::TypeList { types } => Ok(types),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to list types: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to ListTypes: {:?}", other)),
+        }
+    }
+
+    /// Resolve a named type's layout. `module_base = None` searches all modules.
+    pub fn get_type(
+        &mut self,
+        pid: u32,
+        module_base: Option<u64>,
+        name: &str,
+    ) -> anyhow::Result<Option<TypeLayout>> {
+        let req = DebuggerRequest::GetType {
+            pid,
+            module_base,
+            name: name.to_string(),
+        };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::TypeResult { layout } => Ok(layout),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to get type '{}': {}", name, message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to GetType: {:?}", other)),
+        }
+    }
+
+    /// Resolve a type by its TPI index within a specific module (nested expansion).
+    pub fn get_type_by_index(
+        &mut self,
+        pid: u32,
+        module_base: u64,
+        index: u32,
+    ) -> anyhow::Result<Option<TypeLayout>> {
+        let req = DebuggerRequest::GetTypeByIndex { pid, module_base, index };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::TypeResult { layout } => Ok(layout),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to get type by index {}: {}", index, message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to GetTypeByIndex: {:?}", other)),
+        }
+    }
+
+    /// TEB base address of thread `tid`.
+    pub fn get_teb_address(&mut self, pid: u32, tid: u32) -> anyhow::Result<u64> {
+        match self.send_and_receive(&DebuggerRequest::GetTebAddress { pid, tid })? {
+            DebuggerResponse::TebAddress { address } => Ok(address),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to get TEB address: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to GetTebAddress: {:?}", other)),
+        }
+    }
+
+    /// PEB base address of a process.
+    pub fn get_peb_address(&mut self, pid: u32) -> anyhow::Result<u64> {
+        match self.send_and_receive(&DebuggerRequest::GetPebAddress { pid })? {
+            DebuggerResponse::PebAddress { address } => Ok(address),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to get PEB address: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to GetPebAddress: {:?}", other)),
+        }
+    }
+
+    /// Convenience: TEB (for `tid`) and PEB base addresses, with `None` for an
+    /// address that fails to resolve (e.g. a platform without TEB support).
+    pub fn get_teb_peb_addresses(
+        &mut self,
+        pid: u32,
+        tid: u32,
+    ) -> anyhow::Result<(Option<u64>, Option<u64>)> {
+        Ok((self.get_teb_address(pid, tid).ok(), self.get_peb_address(pid).ok()))
     }
 
     // removed older helper to avoid duplicate names; use set_breakpoint_by_symbol with handler below
@@ -962,6 +1297,99 @@ impl<S> DebugSession<S> {
         }
     }
 
+    /// Resolve many addresses to symbols in a single round-trip, never waiting
+    /// on in-flight symbol loads: addresses in still-loading modules come back
+    /// `None` (re-request once symbol status settles). One result per input
+    /// address, in order.
+    pub fn try_resolve_addresses_to_symbols(
+        &mut self,
+        pid: u32,
+        addresses: Vec<u64>,
+    ) -> anyhow::Result<Vec<Option<(String, ModuleSymbol, u64)>>> {
+        let req = DebuggerRequest::TryResolveAddressesToSymbols { pid, addresses };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::AddressSymbolBatch { results } => Ok(results),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!(
+                "Failed to resolve addresses to symbols: {}",
+                message
+            )),
+            other => Err(anyhow::anyhow!(
+                "Unexpected response to TryResolveAddressesToSymbols: {:?}",
+                other
+            )),
+        }
+    }
+
+    /// Resolve an address to a source file/line via the module's PDB line table.
+    pub fn resolve_address_to_line(
+        &mut self,
+        pid: u32,
+        address: u64,
+    ) -> anyhow::Result<Option<crate::protocol::AddressLineInfo>> {
+        let req = DebuggerRequest::ResolveAddressToLine { pid, address };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::AddressLine { info } => Ok(info),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!(
+                "Failed to resolve address to line: {}",
+                message
+            )),
+            other => Err(anyhow::anyhow!(
+                "Unexpected response to ResolveAddressToLine: {:?}",
+                other
+            )),
+        }
+    }
+
+    /// All line→address entries for one source file of a module. `start_line`/
+    /// `end_line` (inclusive, 1-based) bound the response; `None` = whole file.
+    pub fn get_source_file_line_map(
+        &mut self,
+        pid: u32,
+        module_base: u64,
+        file_path: &str,
+        start_line: Option<u32>,
+        end_line: Option<u32>,
+    ) -> anyhow::Result<(Option<crate::interfaces::SourceFileEntry>, Vec<crate::interfaces::LineEntry>)> {
+        let req = DebuggerRequest::GetSourceFileLineMap {
+            pid,
+            module_base,
+            file_path: file_path.to_string(),
+            start_line,
+            end_line,
+        };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::SourceFileLineMap { file, entries } => Ok((file, entries)),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!(
+                "Failed to get source file line map: {}",
+                message
+            )),
+            other => Err(anyhow::anyhow!(
+                "Unexpected response to GetSourceFileLineMap: {:?}",
+                other
+            )),
+        }
+    }
+
+    /// All source files referenced by a module's PDB line table.
+    pub fn list_source_files(
+        &mut self,
+        pid: u32,
+        module_base: u64,
+    ) -> anyhow::Result<Vec<crate::interfaces::SourceFileEntry>> {
+        let req = DebuggerRequest::ListSourceFiles { pid, module_base };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::SourceFileList { files } => Ok(files),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!(
+                "Failed to list source files: {}",
+                message
+            )),
+            other => Err(anyhow::anyhow!(
+                "Unexpected response to ListSourceFiles: {:?}",
+                other
+            )),
+        }
+    }
+
     pub fn disassemble_memory(
         &mut self,
         pid: u32,
@@ -1013,6 +1441,33 @@ impl<S> DebugSession<S> {
             }
             other => Err(anyhow::anyhow!(
                 "Unexpected response to DisassembleFunction: {:?}",
+                other
+            )),
+        }
+    }
+
+    /// Backward disassembly: up to `count` instructions ending immediately before
+    /// `target` (x64dbg-style self-resynchronizing decode).
+    pub fn disassemble_backward(
+        &mut self,
+        pid: u32,
+        target: u64,
+        count: usize,
+        arch: Architecture,
+    ) -> anyhow::Result<Vec<Instruction>> {
+        let req = DebuggerRequest::DisassembleBackward {
+            pid,
+            target,
+            count,
+            arch,
+        };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::Instructions { instructions } => Ok(instructions),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to disassemble backward: {}", message))
+            }
+            other => Err(anyhow::anyhow!(
+                "Unexpected response to DisassembleBackward: {:?}",
                 other
             )),
         }
@@ -1087,6 +1542,54 @@ impl<S> DebugSession<S> {
         }
     }
 
+    /// Register a server-side value freeze: a thread on the server continuously
+    /// writes `data` to the target (every `interval_ms`, default ~30ms) until
+    /// stopped, returning the freeze id used to update/stop it. With an empty
+    /// `offsets` the fixed `address` is locked; otherwise `address` is a static
+    /// base and the server re-follows the pointer chain each tick so the lock
+    /// tracks a moving target (e.g. a level reload).
+    pub fn freeze_value(
+        &mut self,
+        pid: u32,
+        address: u64,
+        data: Vec<u8>,
+        interval_ms: Option<u64>,
+        offsets: Vec<u64>,
+    ) -> anyhow::Result<u64> {
+        let req = DebuggerRequest::FreezeValueStart { pid, address, data, interval_ms, offsets };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::FreezeValueStarted { freeze_id } => Ok(freeze_id),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to start freeze: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to FreezeValueStart: {:?}", other)),
+        }
+    }
+
+    /// Change the value written by an active freeze without re-registering it.
+    pub fn update_freeze_value(&mut self, freeze_id: u64, data: Vec<u8>) -> anyhow::Result<()> {
+        let req = DebuggerRequest::FreezeValueUpdate { freeze_id, data };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to update freeze: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to FreezeValueUpdate: {:?}", other)),
+        }
+    }
+
+    /// Stop an active value freeze.
+    pub fn unfreeze_value(&mut self, freeze_id: u64) -> anyhow::Result<()> {
+        let req = DebuggerRequest::FreezeValueStop { freeze_id };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to stop freeze: {}", message))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to FreezeValueStop: {:?}", other)),
+        }
+    }
+
     /// Apply anti-anti-debug PEB patches to the target process. See
     /// [`crate::anti_anti_debug::peb::hide_peb`] for the field-by-field semantics.
     pub fn hide_peb(
@@ -1155,8 +1658,9 @@ impl<S> DebugSession<S> {
         alignment: Option<usize>,
         float_tolerance: Option<f64>,
         writable_only: bool,
+        thread_count: Option<usize>,
     ) -> anyhow::Result<(u64, u64, u64)> {
-        let req = DebuggerRequest::ScanMemoryStart { pid, value_type, compare_type, value, value2, alignment, float_tolerance, writable_only: Some(writable_only) };
+        let req = DebuggerRequest::ScanMemoryStart { pid, value_type, compare_type, value, value2, alignment, float_tolerance, writable_only: Some(writable_only), thread_count };
         match self.send_and_receive(&req)? {
             DebuggerResponse::ScanMemoryResult { scan_id, match_count, scan_time_us } => Ok((scan_id, match_count, scan_time_us)),
             DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to start scan: {}", message)),
@@ -1170,8 +1674,9 @@ impl<S> DebugSession<S> {
         compare_type: ScanCompareType,
         value: Option<ScanValue>,
         value2: Option<ScanValue>,
+        float_tolerance: Option<f64>,
     ) -> anyhow::Result<(u64, u64)> {
-        let req = DebuggerRequest::ScanMemoryNext { scan_id, compare_type, value, value2 };
+        let req = DebuggerRequest::ScanMemoryNext { scan_id, compare_type, value, value2, float_tolerance };
         match self.send_and_receive(&req)? {
             DebuggerResponse::ScanMemoryResult { scan_id: _, match_count, scan_time_us } => Ok((match_count, scan_time_us)),
             DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to next scan: {}", message)),
@@ -1202,6 +1707,130 @@ impl<S> DebugSession<S> {
         }
     }
 
+    /// Start a pointer scan: find static pointer paths that resolve to `target_address`.
+    /// Returns `(scan_id, match_count, scan_time_us)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pointer_scan_start(
+        &mut self,
+        pid: u32,
+        target_address: u64,
+        max_offset: u64,
+        max_depth: u32,
+        alignment: Option<usize>,
+        max_results: Option<u64>,
+        modules: Option<Vec<u64>>,
+        thread_count: Option<usize>,
+        writable_only: bool,
+    ) -> anyhow::Result<(String, u64, u64)> {
+        let req = DebuggerRequest::PointerScanStart {
+            pid, target_address, max_offset, max_depth, alignment, max_results, modules, thread_count, writable_only,
+        };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::PointerScanResult { results_path, match_count, scan_time_us } => Ok((results_path, match_count, scan_time_us)),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to start pointer scan: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to PointerScanStart: {:?}", other)),
+        }
+    }
+
+    pub fn pointer_scan_get_results(
+        &mut self,
+        pid: u32,
+        results_path: String,
+        offset: u64,
+        count: u64,
+        offset_filter: Vec<u64>,
+    ) -> anyhow::Result<(Vec<crate::protocol::PointerPath>, u64)> {
+        let req = DebuggerRequest::PointerScanGetResults { pid, results_path, offset, count, offset_filter };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::PointerScanResults { paths, total_count } => Ok((paths, total_count)),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to get pointer scan results: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to PointerScanGetResults: {:?}", other)),
+        }
+    }
+
+    /// Re-resolve `results_path`'s paths and keep only those that still resolve to
+    /// `target_address`. Returns `(new_results_path, match_count, scan_time_us)`.
+    pub fn pointer_scan_rescan(&mut self, pid: u32, results_path: String, target_address: u64) -> anyhow::Result<(String, u64, u64)> {
+        let req = DebuggerRequest::PointerScanRescan { pid, results_path, target_address };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::PointerScanResult { results_path, match_count, scan_time_us } => Ok((results_path, match_count, scan_time_us)),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to rescan pointers: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to PointerScanRescan: {:?}", other)),
+        }
+    }
+
+    /// Reduce `results_path` to only the paths whose chain offsets contain every
+    /// value in `offset_filter`. Returns `(new_results_path, match_count, us)`.
+    pub fn pointer_scan_apply_filter(&mut self, results_path: String, offset_filter: Vec<u64>) -> anyhow::Result<(String, u64, u64)> {
+        let req = DebuggerRequest::PointerScanApplyFilter { results_path, offset_filter };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::PointerScanResult { results_path, match_count, scan_time_us } => Ok((results_path, match_count, scan_time_us)),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to apply pointer-scan filter: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to PointerScanApplyFilter: {:?}", other)),
+        }
+    }
+
+    pub fn pointer_scan_reset(&mut self, results_path: String) -> anyhow::Result<()> {
+        let req = DebuggerRequest::PointerScanReset { results_path };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to reset pointer scan: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to PointerScanReset: {:?}", other)),
+        }
+    }
+
+    /// Start a string scan over `[start_address, start_address+size)`, visiting
+    /// only regions matching `region_filter`, detecting only `encodings`, and
+    /// (when `contains` is non-empty) storing only strings containing it.
+    /// Returns `(results_path, match_count, scan_time_us, capped)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn string_scan_start(
+        &mut self,
+        pid: u32,
+        start_address: u64,
+        size: u64,
+        min_length: u32,
+        max_results: Option<u64>,
+        thread_count: Option<usize>,
+        region_filter: ScanRegionFilter,
+        encodings: StringEncodingFilter,
+        contains: String,
+    ) -> anyhow::Result<(String, u64, u64, bool)> {
+        let req = DebuggerRequest::StringScanStart { pid, start_address, size, min_length, max_results, thread_count, region_filter, encodings, contains };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::StringScanResult { results_path, match_count, scan_time_us, capped } => Ok((results_path, match_count, scan_time_us, capped)),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to start string scan: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to StringScanStart: {:?}", other)),
+        }
+    }
+
+    /// Read a page of string-scan results, filtered and sorted server-side.
+    pub fn string_scan_get_results(
+        &mut self,
+        results_path: String,
+        offset: u64,
+        count: u64,
+        filter: String,
+        sort: StringSortKey,
+        ascending: bool,
+    ) -> anyhow::Result<(Vec<StringHit>, u64)> {
+        let req = DebuggerRequest::StringScanGetResults { results_path, offset, count, filter, sort, ascending };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::StringScanResults { strings, total_count } => Ok((strings, total_count)),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to get string scan results: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to StringScanGetResults: {:?}", other)),
+        }
+    }
+
+    pub fn string_scan_reset(&mut self, results_path: String) -> anyhow::Result<()> {
+        let req = DebuggerRequest::StringScanReset { results_path };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::Ack => Ok(()),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to reset string scan: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to StringScanReset: {:?}", other)),
+        }
+    }
+
     /// Dereference memory addresses, following pointer chains (telescope/dereference command).
     ///
     /// # Arguments
@@ -1221,6 +1850,24 @@ impl<S> DebugSession<S> {
             DebuggerResponse::DereferenceResult { entries } => Ok(entries),
             DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to dereference: {}", message)),
             other => Err(anyhow::anyhow!("Unexpected response to Dereference: {:?}", other)),
+        }
+    }
+
+    /// Telescope many addresses in a single round-trip; the server enumerates
+    /// memory regions once for the whole batch. Returns one entry list per input
+    /// address, in order.
+    pub fn dereference_batch(
+        &mut self,
+        pid: u32,
+        addresses: Vec<u64>,
+        count: usize,
+        reference_base: Option<u64>,
+    ) -> anyhow::Result<Vec<Vec<crate::protocol::DereferenceEntry>>> {
+        let req = DebuggerRequest::DereferenceBatch { pid, addresses, count, reference_base };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::DereferenceBatchResult { results } => Ok(results),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to dereference batch: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to DereferenceBatch: {:?}", other)),
         }
     }
 

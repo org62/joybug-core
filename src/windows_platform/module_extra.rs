@@ -9,18 +9,28 @@ use windows_sys::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_ARM64;
 impl WindowsPlatform {
 
     pub(crate) fn parse_module_extra_info(&self, pid: u32, module_base: u64) -> Result<ModuleExtraInfo, PlatformError> {
-        let process = self.get_process(pid)?;
         // Resolve module path from our manager
-        let modules = process.module_manager().list_modules();
+        let modules = self.modules_for(pid);
         let module_path = modules.iter().find(|m| m.base == module_base).map(|m| m.name.clone())
             .ok_or_else(|| PlatformError::Other("Module not found at base".to_string()))?;
 
-        // Read file bytes and parse with pelite
+        // Read file bytes and delegate to the byte-based parser
         let file_bytes = std::fs::read(&module_path)
             .map_err(|e| PlatformError::Other(format!("Failed to read module file '{}': {}", module_path, e)))?;
-        let pe = PeFile::from_bytes(&file_bytes)
-            .map_err(|e| PlatformError::Other(format!("pelite failed to parse '{}': {:?}", module_path, e)))?;
         trace!({module_path, file_size = file_bytes.len()}, "Reading module extra info");
+        parse_module_extra_info_from_bytes(&file_bytes)
+    }
+}
+
+/// Parse a PE image (64-bit) from raw file bytes into serializable extra info.
+///
+/// This is the session-independent core of [`WindowsPlatform::parse_module_extra_info`]:
+/// it maps pelite headers/sections/imports/exports/exception-directory into our
+/// `ModuleExtraInfo` without requiring a debug session or loaded module. Only
+/// 64-bit PE images are supported (pelite `pe64`).
+pub fn parse_module_extra_info_from_bytes(file_bytes: &[u8]) -> Result<ModuleExtraInfo, PlatformError> {
+        let pe = PeFile::from_bytes(file_bytes)
+            .map_err(|e| PlatformError::Other(format!("pelite failed to parse PE: {:?}", e)))?;
 
         // Map pelite headers into our serializable types
         let dos = pe.dos_header();
@@ -258,10 +268,20 @@ impl WindowsPlatform {
             }
         };
 
-        // Return dos + complete nt headers + sections + imports + exports + runtime functions
-        let info = ModuleExtraInfo { dos_header, nt_headers, sections, imports, exports, runtime_functions };
+        // Parse TLS callbacks (data directory 9). pelite returns each callback as an
+        // absolute VA at the file's preferred ImageBase; store RVAs so they rebase onto
+        // the actual (ASLR) load base at the call site. `va_to_rva` rejects null and
+        // out-of-image VAs. Absent/empty TLS => no callbacks.
+        let tls_callbacks: Vec<u32> = pe.tls()
+            .and_then(|tls| tls.callbacks())
+            .map(|cbs| cbs.iter()
+                .filter_map(|&va| pe.va_to_rva(va).ok())
+                .collect())
+            .unwrap_or_default();
+
+        // Return dos + complete nt headers + sections + imports + exports + runtime functions + tls
+        let info = ModuleExtraInfo { dos_header, nt_headers, sections, imports, exports, runtime_functions, tls_callbacks };
         Ok(info)
-    }
 }
 
 

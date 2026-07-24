@@ -94,13 +94,56 @@ pub(super) fn dereference<F>(
 where
     F: Fn(u64) -> Option<SymbolInfo>,
 {
+    // Query all memory regions once upfront, then telescope against that snapshot.
+    let regions = super::memory::enumerate_memory_regions_unlocked(pid)?;
+    dereference_with_regions(pid, address, count, reference_base, arch, &symbol_resolver, &regions)
+}
+
+/// Dereference many independent addresses in one go, enumerating the process's
+/// memory regions ONCE and reusing that snapshot for every address.
+///
+/// The region enumeration walks the whole address space (a VirtualQuery loop)
+/// and is by far the dominant cost — for a large target it's tens of ms. The
+/// registers panel telescopes ~16 registers on every step; doing this per
+/// address means ~16 full address-space walks per step. Enumerating once here
+/// collapses that to a single walk. Regions are stable while the target is
+/// paused, so the shared snapshot is correct for all addresses.
+pub(super) fn dereference_batch<F>(
+    pid: u32,
+    addresses: &[u64],
+    count: usize,
+    reference_base: Option<u64>,
+    arch: Architecture,
+    symbol_resolver: Option<F>,
+) -> Result<Vec<Vec<DereferenceEntry>>, PlatformError>
+where
+    F: Fn(u64) -> Option<SymbolInfo>,
+{
+    let regions = super::memory::enumerate_memory_regions_unlocked(pid)?;
+    addresses
+        .iter()
+        .map(|&address| dereference_with_regions(pid, address, count, reference_base, arch, &symbol_resolver, &regions))
+        .collect()
+}
+
+/// Core telescoping over a pre-enumerated region snapshot (no memory-region
+/// query — the caller supplies `regions`). Shared by the single and batch paths.
+fn dereference_with_regions<F>(
+    pid: u32,
+    address: u64,
+    count: usize,
+    reference_base: Option<u64>,
+    arch: Architecture,
+    symbol_resolver: &Option<F>,
+    regions: &[MemoryRegionInfo],
+) -> Result<Vec<DereferenceEntry>, PlatformError>
+where
+    F: Fn(u64) -> Option<SymbolInfo>,
+{
     let pointer_size: usize = match arch {
         Architecture::X64 | Architecture::Arm64 => 8,
     };
     let base = reference_base.unwrap_or(address);
-
-    // Query all memory regions once upfront
-    let regions = super::memory::enumerate_memory_regions_unlocked(pid)?;
 
     let mut entries = Vec::with_capacity(count);
 
@@ -108,7 +151,7 @@ where
         let slot_addr = address.wrapping_add((i * pointer_size) as u64);
         let offset = (slot_addr as i64).wrapping_sub(base as i64);
 
-        let chain = build_dereference_chain(pid, slot_addr, arch, &symbol_resolver, &regions)?;
+        let chain = build_dereference_chain(pid, slot_addr, arch, symbol_resolver, regions)?;
 
         entries.push(DereferenceEntry {
             address: slot_addr,
@@ -335,10 +378,7 @@ where
     }
 
     // Read enough bytes for one instruction (max instruction size)
-    let max_instr_size = match arch {
-        Architecture::X64 => 15,  // x86-64 max instruction length
-        Architecture::Arm64 => 4, // ARM64 fixed instruction size
-    };
+    let max_instr_size = arch.max_instruction_len();
 
     let data = super::memory::read_memory_unlocked(pid, address, max_instr_size).ok()?;
     if data.is_empty() {

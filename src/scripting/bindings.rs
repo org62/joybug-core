@@ -446,24 +446,8 @@ impl LuaUserData for LuaDebugClient {
         methods.add_method("set_hw_breakpoint", |lua, this, (pid, addr, bp_type_str, size_str, handler): (u32, u64, String, Option<String>, Option<LuaFunction>)| {
             let mut client = this.inner.borrow_mut();
 
-            let bp_type = match bp_type_str.as_str() {
-                "execute" | "x" => HardwareBreakpointType::Execute,
-                "write" | "w" => HardwareBreakpointType::Write,
-                "readwrite" | "rw" => HardwareBreakpointType::ReadWrite,
-                _ => return Err(mlua::Error::external(
-                    anyhow::anyhow!("Invalid bp_type: '{}'. Use 'execute'/'x', 'write'/'w', or 'readwrite'/'rw'", bp_type_str),
-                )),
-            };
-
-            let size = match size_str.as_deref().unwrap_or("1") {
-                "1" => HardwareBreakpointSize::Byte1,
-                "2" => HardwareBreakpointSize::Byte2,
-                "4" => HardwareBreakpointSize::Byte4,
-                "8" => HardwareBreakpointSize::Byte8,
-                s => return Err(mlua::Error::external(
-                    anyhow::anyhow!("Invalid size: '{}'. Use '1', '2', '4', or '8'", s),
-                )),
-            };
+            let bp_type = parse_hw_type_str(&bp_type_str, true)?;
+            let size = parse_hw_size_str(size_str.as_deref().unwrap_or("1"))?;
 
             let resp = client.send_and_receive(&DebuggerRequest::SetHardwareBreakpoint {
                 pid, addr, bp_type, size,
@@ -516,6 +500,18 @@ impl LuaUserData for LuaDebugClient {
             client.step_and_wait(pid, tid, StepKind::Out)
         });
 
+        // Step by one source line. `dir` is "into" (default) or "over".
+        methods.add_method("step_line", |_lua, this, (dir, pid, tid): (Option<String>, Option<u32>, Option<u32>)| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let tid = tid.or(client.current_tid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current tid")))?;
+            let kind = match dir.as_deref() {
+                Some("over") => StepKind::Over,
+                _ => StepKind::Into,
+            };
+            client.step_source_line_and_wait(pid, tid, kind)
+        });
+
         // ---- Memory ----
 
         methods.add_method("read_memory", |lua, this, (pid, addr, size): (u32, u64, usize)| {
@@ -544,6 +540,62 @@ impl LuaUserData for LuaDebugClient {
                 )),
                 _ => Ok(()),
             }
+        });
+
+        // ---- Value freeze (server-side continuous write) ----
+
+        // dbg:freeze_value(pid, addr, data[, interval_ms][, offsets]) -> freeze_id
+        // With `offsets` (a pointer chain), `addr` is the static base and the freeze
+        // re-follows the chain each tick so it tracks a moving target.
+        methods.add_method("freeze_value", |_lua, this, (pid, addr, data, interval_ms, offsets): (u32, u64, LuaString, Option<u64>, Option<Vec<u64>>)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::FreezeValueStart {
+                pid, address: addr, data: data.as_bytes().to_vec(), interval_ms,
+                offsets: offsets.unwrap_or_default(),
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::FreezeValueStarted { freeze_id } => Ok(freeze_id),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("FreezeValueStart failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // dbg:update_freeze_value(freeze_id, data)
+        methods.add_method("update_freeze_value", |_lua, this, (freeze_id, data): (u64, LuaString)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::FreezeValueUpdate {
+                freeze_id, data: data.as_bytes().to_vec(),
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::Ack => Ok(()),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("FreezeValueUpdate failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // dbg:unfreeze_value(freeze_id)
+        methods.add_method("unfreeze_value", |_lua, this, freeze_id: u64| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::FreezeValueStop {
+                freeze_id,
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::Ack => Ok(()),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("FreezeValueStop failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // dbg:sleep(ms) — pause the script (useful e.g. to let a freeze thread tick).
+        methods.add_method("sleep", |_lua, _this, ms: u64| {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            Ok(())
         });
 
         methods.add_method("read_string", |_lua, this, (pid, addr, max_len): (u32, u64, Option<usize>)| {
@@ -701,6 +753,34 @@ impl LuaUserData for LuaDebugClient {
             }
         });
 
+        methods.add_method("try_resolve_addresses", |lua, this, (pid, addrs): (u32, Vec<u64>)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::TryResolveAddressesToSymbols {
+                pid, addresses: addrs,
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::AddressSymbolBatch { results } => {
+                    // One table per input address, in order; an unresolved (or
+                    // still-loading) address yields an EMPTY table, never a hole,
+                    // so `#table` stays the input length.
+                    let table = lua.create_table()?;
+                    for (i, result) in results.into_iter().enumerate() {
+                        let entry = match result {
+                            Some((module, sym, offset)) =>
+                                address_symbol_to_lua_table(lua, Some(module), Some(sym), Some(offset))?,
+                            None => lua.create_table()?,
+                        };
+                        table.set(i + 1, entry)?;
+                    }
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("TryResolveAddresses failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
         methods.add_method("list_symbols", |lua, this, module_path: String| {
             let mut client = this.inner.borrow_mut();
             let resp = client.send_and_receive(&DebuggerRequest::ListSymbols {
@@ -741,13 +821,276 @@ impl LuaUserData for LuaDebugClient {
             }
         });
 
+        methods.add_method("symbol_status", |lua, this, pid: Option<u32>| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::GetSymbolStatus { pid })
+                .map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::SymbolStatusList { statuses } => {
+                    let table = lua.create_table()?;
+                    for (i, status) in statuses.iter().enumerate() {
+                        let st = lua.create_table()?;
+                        st.set("module", status.module_path.as_str())?;
+                        st.set("base", status.module_base)?;
+                        match &status.state {
+                            SymbolLoadState::Loaded { symbol_count } => {
+                                st.set("state", "loaded")?;
+                                st.set("symbol_count", *symbol_count)?;
+                            }
+                            SymbolLoadState::Loading => st.set("state", "loading")?,
+                            SymbolLoadState::Failed { error } => {
+                                st.set("state", "failed")?;
+                                st.set("error", error.as_str())?;
+                            }
+                            SymbolLoadState::NotRequested => st.set("state", "not_requested")?,
+                        }
+                        if let Some(pdb_path) = &status.pdb_path {
+                            st.set("pdb_path", pdb_path.as_str())?;
+                        }
+                        table.set(i + 1, st)?;
+                    }
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("GetSymbolStatus failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        methods.add_method("load_pdb", |lua, this, (pid, module_base, pdb_path, force): (u32, u64, String, Option<bool>)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::LoadPdbFromPath {
+                pid, module_base, pdb_path, force: force.unwrap_or(false),
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::PdbLoaded { symbol_count, .. } => {
+                    let table = lua.create_table()?;
+                    table.set("loaded", true)?;
+                    table.set("symbol_count", symbol_count)?;
+                    Ok(table)
+                }
+                DebuggerResponse::PdbMismatch(info) => {
+                    let table = lua.create_table()?;
+                    table.set("loaded", false)?;
+                    let mismatch = lua.create_table()?;
+                    mismatch.set("pe_guid", info.pe_guid)?;
+                    mismatch.set("pe_age", info.pe_age)?;
+                    mismatch.set("pdb_guid", info.pdb_guid)?;
+                    mismatch.set("pdb_age", info.pdb_age)?;
+                    table.set("mismatch", mismatch)?;
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("LoadPdbFromPath failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        methods.add_method("retry_symbols", |_lua, this, (pid, module_base): (u32, u64)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::RetrySymbolLoad { pid, module_base })
+                .map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::Ack => Ok(true),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("RetrySymbolLoad failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        methods.add_method("unload_symbols", |_lua, this, (pid, module_base): (u32, u64)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::UnloadModuleSymbols { pid, module_base })
+                .map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::Ack => Ok(true),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("UnloadModuleSymbols failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        methods.add_method("set_symbol_deny_list", |_lua, this, modules: Vec<String>| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::SetSymbolDenyList { modules })
+                .map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::Ack => Ok(true),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("SetSymbolDenyList failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // ---- Types (PDB TPI stream) ----
+
+        methods.add_method("list_types", |lua, this, (filter, pid, module_base, max_results): (Option<String>, Option<u32>, Option<u64>, Option<usize>)| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::ListTypes {
+                pid, module_base, filter, max_results: max_results.unwrap_or(1000),
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::TypeList { types } => {
+                    let table = lua.create_table()?;
+                    for (i, t) in types.iter().enumerate() {
+                        let st = lua.create_table()?;
+                        st.set("name", t.name.as_str())?;
+                        st.set("size", t.size as u64)?;
+                        st.set("index", t.index as u64)?;
+                        st.set("module_base", t.module_base)?;
+                        st.set("module", t.module_name.as_str())?;
+                        table.set(i + 1, st)?;
+                    }
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("ListTypes failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        methods.add_method("get_type", |lua, this, (name, pid, module_base): (String, Option<u32>, Option<u64>)| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::GetType {
+                pid, module_base, name,
+            }).map_err(|e| mlua::Error::external(e))?;
+            type_result_to_lua(lua, resp, "GetType")
+        });
+
+        methods.add_method("get_type_by_index", |lua, this, (module_base, index, pid): (u64, u32, Option<u32>)| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::GetTypeByIndex {
+                pid, module_base, index,
+            }).map_err(|e| mlua::Error::external(e))?;
+            type_result_to_lua(lua, resp, "GetTypeByIndex")
+        });
+
+        methods.add_method("get_teb_address", |_lua, this, (tid, pid): (u32, Option<u32>)| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::GetTebAddress { pid, tid })
+                .map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::TebAddress { address } => Ok(address),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("GetTebAddress failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        methods.add_method("get_peb_address", |_lua, this, pid: Option<u32>| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::GetPebAddress { pid })
+                .map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::PebAddress { address } => Ok(address),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("GetPebAddress failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // ---- Source lines (PDB line tables) ----
+
+        methods.add_method("resolve_line", |lua, this, (pid, addr): (u32, u64)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::ResolveAddressToLine {
+                pid, address: addr,
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::AddressLine { info } => {
+                    match info {
+                        Some(info) => {
+                            let table = lua.create_table()?;
+                            table.set("module", info.module_path.as_str())?;
+                            table.set("module_base", info.module_base)?;
+                            table.set("rva", info.rva as u64)?;
+                            table.set("file", info.file.path.as_str())?;
+                            table.set("checksum_kind", info.file.checksum_kind.as_str())?;
+                            table.set("checksum", info.file.checksum.as_str())?;
+                            table.set("line", info.line_entry.line_start)?;
+                            table.set("line_end", info.line_entry.line_end)?;
+                            table.set("length", info.line_entry.length as u64)?;
+                            Ok(mlua::Value::Table(table))
+                        }
+                        None => Ok(mlua::Value::Nil),
+                    }
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("ResolveAddressToLine failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        methods.add_method("line_map", |lua, this, (pid, module_base, file_path, start_line, end_line): (u32, u64, String, Option<u32>, Option<u32>)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::GetSourceFileLineMap {
+                pid, module_base, file_path, start_line, end_line,
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::SourceFileLineMap { file: _, entries } => {
+                    let table = lua.create_table()?;
+                    for (i, entry) in entries.iter().enumerate() {
+                        let et = lua.create_table()?;
+                        et.set("rva", entry.rva as u64)?;
+                        et.set("length", entry.length as u64)?;
+                        et.set("line", entry.line_start)?;
+                        et.set("line_end", entry.line_end)?;
+                        table.set(i + 1, et)?;
+                    }
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("GetSourceFileLineMap failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        methods.add_method("source_files", |lua, this, (pid, module_base): (u32, u64)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::ListSourceFiles { pid, module_base })
+                .map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::SourceFileList { files } => {
+                    let table = lua.create_table()?;
+                    for (i, file) in files.iter().enumerate() {
+                        let ft = lua.create_table()?;
+                        ft.set("path", file.path.as_str())?;
+                        ft.set("checksum_kind", file.checksum_kind.as_str())?;
+                        ft.set("checksum", file.checksum.as_str())?;
+                        table.set(i + 1, ft)?;
+                    }
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("ListSourceFiles failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
         // ---- Disassembly ----
 
         methods.add_method("disassemble", |lua, this, (pid, addr, count): (u32, u64, Option<usize>)| {
             let mut client = this.inner.borrow_mut();
             let resp = client.send_and_receive(&DebuggerRequest::DisassembleMemory {
                 pid, address: addr, count: count.unwrap_or(10),
-                arch: Architecture::X64, // TODO: detect
+                arch: Architecture::from_native(),
             }).map_err(|e| mlua::Error::external(e))?;
             match resp {
                 DebuggerResponse::Instructions { instructions } => {
@@ -768,7 +1111,7 @@ impl LuaUserData for LuaDebugClient {
             let mut client = this.inner.borrow_mut();
             let resp = client.send_and_receive(&DebuggerRequest::DisassembleFunction {
                 pid, address: addr, max_instructions: max.unwrap_or(1000),
-                arch: Architecture::X64, // TODO: detect
+                arch: Architecture::from_native(),
             }).map_err(|e| mlua::Error::external(e))?;
             match resp {
                 DebuggerResponse::FunctionDisassembly { instructions, function_start, function_end, function_name } => {
@@ -785,6 +1128,27 @@ impl LuaUserData for LuaDebugClient {
                 }
                 DebuggerResponse::Error { message } => Err(mlua::Error::external(
                     anyhow::anyhow!("DisassembleFunction failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        methods.add_method("disassemble_backward", |lua, this, (pid, target, count): (u32, u64, Option<usize>)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::DisassembleBackward {
+                pid, target, count: count.unwrap_or(10),
+                arch: Architecture::from_native(),
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::Instructions { instructions } => {
+                    let table = lua.create_table()?;
+                    for (i, inst) in instructions.iter().enumerate() {
+                        table.set(i + 1, instruction_to_lua_table(lua, inst)?)?;
+                    }
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("DisassembleBackward failed: {}", message),
                 )),
                 _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
             }
@@ -937,6 +1301,31 @@ impl LuaUserData for LuaDebugClient {
             }
         });
 
+        methods.add_method("dereference_batch", |lua, this, (pid, addrs, count, ref_base): (u32, Vec<u64>, Option<usize>, Option<u64>)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::DereferenceBatch {
+                pid, addresses: addrs, count: count.unwrap_or(1), reference_base: ref_base,
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::DereferenceBatchResult { results } => {
+                    // One inner table (list of entries) per input address, in order.
+                    let table = lua.create_table()?;
+                    for (i, entries) in results.iter().enumerate() {
+                        let inner = lua.create_table()?;
+                        for (j, entry) in entries.iter().enumerate() {
+                            inner.set(j + 1, deref_entry_to_lua_table(lua, entry)?)?;
+                        }
+                        table.set(i + 1, inner)?;
+                    }
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("DereferenceBatch failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
         // ---- Module extra info ----
 
         methods.add_method("get_module_info", |lua, this, (pid, base): (u32, u64)| {
@@ -962,6 +1351,12 @@ impl LuaUserData for LuaDebugClient {
                         sections.set(i + 1, st)?;
                     }
                     table.set("sections", sections)?;
+                    // TLS callbacks (RVAs)
+                    let tls = lua.create_table()?;
+                    for (i, rva) in info.tls_callbacks.iter().enumerate() {
+                        tls.set(i + 1, *rva as u64)?;
+                    }
+                    table.set("tls_callbacks", tls)?;
                     // Runtime functions (Exception Directory)
                     if let Some(ref rfs) = info.runtime_functions {
                         let rf_table = lua.create_table()?;
@@ -1103,6 +1498,7 @@ impl LuaUserData for LuaDebugClient {
             let resp = client.send_and_receive(&DebuggerRequest::ScanMemoryStart {
                 pid, value_type, compare_type, value, value2: None,
                 alignment: None, float_tolerance: None, writable_only: Some(true),
+                thread_count: None,
             }).map_err(|e| mlua::Error::external(e))?;
             scan_result_to_lua(lua, resp, "ScanMemoryStart")
         });
@@ -1114,7 +1510,7 @@ impl LuaUserData for LuaDebugClient {
             let value = value_str.as_deref().map(|v| parse_scan_value(&value_type, v)).transpose()?;
 
             let resp = client.send_and_receive(&DebuggerRequest::ScanMemoryNext {
-                scan_id, compare_type, value, value2: None,
+                scan_id, compare_type, value, value2: None, float_tolerance: None,
             }).map_err(|e| mlua::Error::external(e))?;
             scan_result_to_lua(lua, resp, "ScanMemoryNext")
         });
@@ -1148,6 +1544,350 @@ impl LuaUserData for LuaDebugClient {
             Ok(())
         });
 
+        // ---- Pointer scanning ----
+
+        // ptr_scan_start(pid, target_address, [max_offset=0x1000], [max_depth=5], [modules])
+        // `modules` is an optional list of base module addresses to restrict the
+        // static base of returned paths to. -> { results_path, match_count, scan_time_us }
+        methods.add_method("ptr_scan_start", |lua, this, (pid, target_address, max_offset, max_depth, modules, writable_only): (u32, u64, Option<u64>, Option<u32>, Option<Vec<u64>>, Option<bool>)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::PointerScanStart {
+                pid,
+                target_address,
+                max_offset: max_offset.unwrap_or(0x1000),
+                max_depth: max_depth.unwrap_or(5),
+                alignment: None,
+                max_results: None,
+                modules,
+                thread_count: None,
+                writable_only: writable_only.unwrap_or(false),
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::PointerScanResult { results_path, match_count, scan_time_us } => {
+                    let table = lua.create_table()?;
+                    table.set("results_path", results_path)?;
+                    table.set("match_count", match_count)?;
+                    table.set("scan_time_us", scan_time_us)?;
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("PointerScanStart failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // ptr_scan_results(pid, results_path, [offset=0], [count=100], [offset_filter])
+        // `offset_filter` is an optional list of chain offsets; only paths whose
+        // offsets contain ALL of them are returned (and total_count reflects that).
+        // -> { total_count, paths = { { module_index, module_base, base_offset, offsets={..}, resolved }, .. } }
+        methods.add_method("ptr_scan_results", |lua, this, (pid, results_path, offset, count, offset_filter): (u32, String, Option<u64>, Option<u64>, Option<Vec<u64>>)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::PointerScanGetResults {
+                pid, results_path, offset: offset.unwrap_or(0), count: count.unwrap_or(100),
+                offset_filter: offset_filter.unwrap_or_default(),
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::PointerScanResults { paths, total_count } => {
+                    let table = lua.create_table()?;
+                    let path_list = lua.create_table()?;
+                    for (i, p) in paths.iter().enumerate() {
+                        let pt = lua.create_table()?;
+                        pt.set("module_index", p.module_index)?;
+                        pt.set("module_base", p.module_base)?;
+                        pt.set("base_offset", p.base_offset)?;
+                        pt.set("resolved", p.resolved)?;
+                        let offs = lua.create_table()?;
+                        for (j, o) in p.offsets.iter().enumerate() {
+                            offs.set(j + 1, *o)?;
+                        }
+                        pt.set("offsets", offs)?;
+                        path_list.set(i + 1, pt)?;
+                    }
+                    table.set("paths", path_list)?;
+                    table.set("total_count", total_count)?;
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("PointerScanGetResults failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        methods.add_method("ptr_scan_reset", |_lua, this, results_path: String| {
+            let mut client = this.inner.borrow_mut();
+            let _ = client.send_and_receive(&DebuggerRequest::PointerScanReset { results_path });
+            Ok(())
+        });
+
+        // ptr_scan_apply_filter(results_path, offset_filter)
+        // Reduce the file to only paths containing ALL listed offsets; writes a new
+        // file (old deleted). -> { results_path, match_count, scan_time_us }
+        methods.add_method("ptr_scan_apply_filter", |lua, this, (results_path, offset_filter): (String, Vec<u64>)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::PointerScanApplyFilter {
+                results_path, offset_filter,
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::PointerScanResult { results_path, match_count, scan_time_us } => {
+                    let table = lua.create_table()?;
+                    table.set("results_path", results_path)?;
+                    table.set("match_count", match_count)?;
+                    table.set("scan_time_us", scan_time_us)?;
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("PointerScanApplyFilter failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // ptr_scan_rescan(pid, results_path, target_address)
+        // Keep only paths that still resolve to target_address. -> { results_path, match_count, scan_time_us }
+        methods.add_method("ptr_scan_rescan", |lua, this, (pid, results_path, target_address): (u32, String, u64)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::PointerScanRescan {
+                pid, results_path, target_address,
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::PointerScanResult { results_path, match_count, scan_time_us } => {
+                    let table = lua.create_table()?;
+                    table.set("results_path", results_path)?;
+                    table.set("match_count", match_count)?;
+                    table.set("scan_time_us", scan_time_us)?;
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("PointerScanRescan failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // ---- String scanning ----
+
+        // string_scan_start(pid, start_address, size, [min_length=5], [region_filter="readable"], [encodings="both"], [contains=""])
+        // Scan [start_address, start_address+size) for printable ASCII/UTF-16
+        // strings. `region_filter` is "readable"|"writable"|"executable"|"image"|
+        // "mapped"|"private"; `encodings` is "both"|"ascii"|"utf16"; `contains`
+        // keeps only strings containing the substring (case-insensitive).
+        // -> { results_path, match_count, scan_time_us, capped }
+        methods.add_method("string_scan_start", |lua, this, (pid, start_address, size, min_length, region_filter, encodings, contains): (u32, u64, u64, Option<u32>, Option<String>, Option<String>, Option<String>)| {
+            let region_filter = region_filter
+                .map(|s| s.parse().map_err(mlua::Error::external))
+                .transpose()?
+                .unwrap_or_default();
+            let encodings = encodings
+                .map(|s| s.parse().map_err(mlua::Error::external))
+                .transpose()?
+                .unwrap_or_default();
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::StringScanStart {
+                pid, start_address, size,
+                min_length: min_length.unwrap_or(5),
+                max_results: None,
+                thread_count: None,
+                region_filter,
+                encodings,
+                contains: contains.unwrap_or_default(),
+            }).map_err(mlua::Error::external)?;
+            match resp {
+                DebuggerResponse::StringScanResult { results_path, match_count, scan_time_us, capped } => {
+                    let table = lua.create_table()?;
+                    table.set("results_path", results_path)?;
+                    table.set("match_count", match_count)?;
+                    table.set("scan_time_us", scan_time_us)?;
+                    table.set("capped", capped)?;
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("StringScanStart failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // string_scan_results(results_path, [offset=0], [count=100], [filter=""], [sort="address"], [ascending=true])
+        // `sort` is "address", "value", or "length". -> { total_count, strings = { { address, encoding, length, text, truncated }, .. } }
+        methods.add_method("string_scan_results", |lua, this, (results_path, offset, count, filter, sort, ascending): (String, Option<u64>, Option<u64>, Option<String>, Option<String>, Option<bool>)| {
+            let sort: StringSortKey = sort.as_deref().and_then(|s| s.parse().ok()).unwrap_or_default();
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::StringScanGetResults {
+                results_path, offset: offset.unwrap_or(0), count: count.unwrap_or(100),
+                filter: filter.unwrap_or_default(), sort, ascending: ascending.unwrap_or(true),
+            }).map_err(mlua::Error::external)?;
+            match resp {
+                DebuggerResponse::StringScanResults { strings, total_count } => {
+                    let table = lua.create_table()?;
+                    let list = lua.create_table()?;
+                    for (i, s) in strings.iter().enumerate() {
+                        let st = lua.create_table()?;
+                        st.set("address", s.address)?;
+                        st.set("encoding", s.encoding.as_str())?;
+                        st.set("length", s.length)?;
+                        st.set("text", s.text.clone())?;
+                        st.set("truncated", s.truncated)?;
+                        list.set(i + 1, st)?;
+                    }
+                    table.set("strings", list)?;
+                    table.set("total_count", total_count)?;
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("StringScanGetResults failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        methods.add_method("string_scan_reset", |_lua, this, results_path: String| {
+            let mut client = this.inner.borrow_mut();
+            let _ = client.send_and_receive(&DebuggerRequest::StringScanReset { results_path });
+            Ok(())
+        });
+
+        // ---- Code Coverage ----
+
+        // start_coverage([pid], addrs, [limit=1])
+        // Arm silent, server-side-counted coverage breakpoints on every address in
+        // `addrs`. Hits are counted in the server and the debuggee auto-continues
+        // without a client event; poll counts with `get_coverage`. `limit` is the
+        // hit count after which each breakpoint auto-removes (1 = remove on first
+        // hit = pure coverage, >1 = heat map, 0 = never remove).
+        methods.add_method("start_coverage", |_lua, this, (pid, addrs, limit): (Option<u32>, Vec<u64>, Option<u64>)| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::StartCodeCoverage {
+                pid, addrs, limit: limit.unwrap_or(1),
+            }).map_err(mlua::Error::external)?;
+            match resp {
+                DebuggerResponse::Ack => Ok(()),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("StartCodeCoverage failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // get_coverage([pid]) -> { { address, hit_count, first_hit_seq, thread_ids }, .. }
+        // One entry per coverage breakpoint hit at least once (never-hit addresses
+        // are omitted; the caller knows the armed set). `first_hit_seq` is the
+        // 1-based first-execution order across the run (reset by stop_coverage);
+        // `thread_ids` lists the distinct threads that hit it, in first-hit order.
+        methods.add_method("get_coverage", |lua, this, pid: Option<u32>| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::GetCodeCoverage { pid })
+                .map_err(mlua::Error::external)?;
+            match resp {
+                DebuggerResponse::CoverageResults { hits } => {
+                    let table = lua.create_table()?;
+                    for (i, hit) in hits.iter().enumerate() {
+                        let entry = lua.create_table()?;
+                        entry.set("address", hit.address)?;
+                        entry.set("hit_count", hit.hit_count)?;
+                        entry.set("first_hit_seq", hit.first_hit_seq)?;
+                        entry.set("thread_ids", hit.thread_ids.clone())?;
+                        table.set(i + 1, entry)?;
+                    }
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("GetCodeCoverage failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // stop_coverage([pid])
+        // Remove all coverage breakpoints and clear the coverage map.
+        methods.add_method("stop_coverage", |_lua, this, pid: Option<u32>| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::StopCodeCoverage { pid })
+                .map_err(mlua::Error::external)?;
+            match resp {
+                DebuggerResponse::Ack => Ok(()),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("StopCodeCoverage failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // ---- Hardware access trace ("find what reads/writes an address") ----
+
+        // start_watchpoint_trace([pid], addr, type, [size="1"])
+        // Arm a hardware watchpoint at `addr` in silent "collect accessors" mode:
+        // every access is recorded server-side (the accessing instruction) and the
+        // target auto-continues instead of breaking. `type` is 'write'/'w' or
+        // 'readwrite'/'rw' (x86 cannot trap read-only). Poll with
+        // `get_watchpoint_accesses`; tear down with `stop_watchpoint_trace`.
+        methods.add_method("start_watchpoint_trace", |_lua, this, (pid, addr, bp_type_str, size_str): (Option<u32>, u64, String, Option<String>)| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let bp_type = parse_hw_type_str(&bp_type_str, false)?;
+            let size = parse_hw_size_str(size_str.as_deref().unwrap_or("1"))?;
+            let resp = client.send_and_receive(&DebuggerRequest::StartWatchpointTrace { pid, addr, bp_type, size })
+                .map_err(mlua::Error::external)?;
+            match resp {
+                DebuggerResponse::Ack => Ok(()),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("StartWatchpointTrace failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // get_watchpoint_accesses([pid], addr) -> { { accessor, accessor_raw_rip, hit_count, first_seq, thread_ids }, .. }
+        // One entry per distinct instruction that has accessed `addr`. `accessor`
+        // is the attributed accessing instruction (on x86 the hardware traps
+        // *after* the access; the server back-steps to attribute it);
+        // `accessor_raw_rip` is the raw trap PC.
+        methods.add_method("get_watchpoint_accesses", |lua, this, (pid, addr): (Option<u32>, u64)| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::GetWatchpointAccesses { pid, addr })
+                .map_err(mlua::Error::external)?;
+            match resp {
+                DebuggerResponse::WatchpointAccesses { accesses } => {
+                    let table = lua.create_table()?;
+                    for (i, acc) in accesses.iter().enumerate() {
+                        let entry = lua.create_table()?;
+                        entry.set("accessor", acc.accessor)?;
+                        entry.set("accessor_raw_rip", acc.accessor_raw_rip)?;
+                        entry.set("hit_count", acc.hit_count)?;
+                        entry.set("first_seq", acc.first_seq)?;
+                        entry.set("thread_ids", acc.thread_ids.clone())?;
+                        table.set(i + 1, entry)?;
+                    }
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("GetWatchpointAccesses failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
+        // stop_watchpoint_trace([pid], addr)
+        // Remove the watchpoint at `addr` and clear its collected accesses.
+        methods.add_method("stop_watchpoint_trace", |_lua, this, (pid, addr): (Option<u32>, u64)| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let resp = client.send_and_receive(&DebuggerRequest::StopWatchpointTrace { pid, addr })
+                .map_err(mlua::Error::external)?;
+            match resp {
+                DebuggerResponse::Ack => Ok(()),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("StopWatchpointTrace failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
         // ---- Utility: current state ----
 
         methods.add_method("pid", |_lua, this, ()| {
@@ -1173,7 +1913,7 @@ impl LuaUserData for LuaDebugClient {
 
         methods.add_method("assemble", |lua, _this, (code, address): (String, Option<u64>)| {
             let addr = address.unwrap_or(0);
-            let arch = Architecture::X64; // TODO: detect from target
+            let arch = Architecture::from_native();
             let result = crate::assembler::assemble(arch, &code, addr)
                 .map_err(|e| mlua::Error::external(anyhow::anyhow!("Assemble failed: {}", e)))?;
             let table = lua.create_table()?;
@@ -1187,7 +1927,7 @@ impl LuaUserData for LuaDebugClient {
         // ---- Assemble and write to memory ----
 
         methods.add_method("assemble_to", |lua, this, (pid, address, code): (u32, u64, String)| {
-            let arch = Architecture::X64; // TODO: detect from target
+            let arch = Architecture::from_native();
             let result = crate::assembler::assemble(arch, &code, address)
                 .map_err(|e| mlua::Error::external(anyhow::anyhow!("Assemble failed: {}", e)))?;
             let mut client = this.inner.borrow_mut();
@@ -1498,6 +2238,34 @@ fn resolve_addr_or_sym(client: &mut DebugClient, val: LuaValue) -> mlua::Result<
     }
 }
 
+/// Parse a Lua hardware-breakpoint type string. `allow_execute` is false for
+/// watchpoint traces (data access only).
+fn parse_hw_type_str(s: &str, allow_execute: bool) -> mlua::Result<HardwareBreakpointType> {
+    match s {
+        "execute" | "x" if allow_execute => Ok(HardwareBreakpointType::Execute),
+        "write" | "w" => Ok(HardwareBreakpointType::Write),
+        "readwrite" | "rw" => Ok(HardwareBreakpointType::ReadWrite),
+        _ => Err(mlua::Error::external(anyhow::anyhow!(
+            "Invalid type: '{}'. Use {}'write'/'w' or 'readwrite'/'rw'",
+            s,
+            if allow_execute { "'execute'/'x', " } else { "" },
+        ))),
+    }
+}
+
+/// Parse a Lua hardware-breakpoint size string ("1" | "2" | "4" | "8").
+fn parse_hw_size_str(s: &str) -> mlua::Result<HardwareBreakpointSize> {
+    match s {
+        "1" => Ok(HardwareBreakpointSize::Byte1),
+        "2" => Ok(HardwareBreakpointSize::Byte2),
+        "4" => Ok(HardwareBreakpointSize::Byte4),
+        "8" => Ok(HardwareBreakpointSize::Byte8),
+        _ => Err(mlua::Error::external(
+            anyhow::anyhow!("Invalid size: '{}'. Use '1', '2', '4', or '8'", s),
+        )),
+    }
+}
+
 /// Read N bytes from process memory and decode as a little-endian unsigned integer.
 fn read_memory_uint(client: &mut DebugClient, pid: u32, addr: u64, size: usize) -> mlua::Result<u64> {
     let resp = client.send_and_receive(&DebuggerRequest::ReadMemory {
@@ -1529,6 +2297,123 @@ fn address_symbol_to_lua_table(lua: &Lua, module_path: Option<String>, symbol: O
         table.set("offset", off)?;
     }
     Ok(table)
+}
+
+/// Convert a resolved `TypeLayout` into a Lua table:
+/// `{ name, size, kind, index, module_base, members = { {name, offset, type, size, kind,
+///    [type_index], [pointee], [element], [count], [bit_position], [bit_length]} },
+///    values = { {name, value} } }`.
+/// `type_index` (for udt/enum members) feeds `dbg:get_type_by_index`; `pointee`/
+/// `element` are nested `{type, size, kind, [type_index], ...}` tables.
+fn type_layout_to_lua_table(lua: &Lua, layout: &TypeLayout) -> mlua::Result<LuaTable> {
+    let table = lua.create_table()?;
+    table.set("name", layout.name.as_str())?;
+    table.set("size", layout.size as u64)?;
+    table.set("index", layout.index as u64)?;
+    table.set("module_base", layout.module_base)?;
+    table.set("kind", type_kind_str(layout.kind))?;
+
+    let members = lua.create_table()?;
+    for (i, m) in layout.members.iter().enumerate() {
+        let mt = lua.create_table()?;
+        mt.set("name", m.name.as_str())?;
+        mt.set("offset", m.offset as u64)?;
+        mt.set("type", m.type_ref.name.as_str())?;
+        mt.set("size", m.type_ref.size as u64)?;
+        mt.set("kind", type_class_str(&m.type_ref.class))?;
+        set_type_class_fields(lua, &mt, &m.type_ref.class)?;
+        if let Some(bp) = m.bit_position {
+            mt.set("bit_position", bp as u64)?;
+        }
+        if let Some(bl) = m.bit_length {
+            mt.set("bit_length", bl as u64)?;
+        }
+        members.set(i + 1, mt)?;
+    }
+    table.set("members", members)?;
+
+    if !layout.enum_values.is_empty() {
+        let values = lua.create_table()?;
+        for (i, v) in layout.enum_values.iter().enumerate() {
+            let vt = lua.create_table()?;
+            vt.set("name", v.name.as_str())?;
+            vt.set("value", v.value)?;
+            values.set(i + 1, vt)?;
+        }
+        table.set("values", values)?;
+    }
+    Ok(table)
+}
+
+fn type_kind_str(kind: UdtKind) -> &'static str {
+    match kind {
+        UdtKind::Struct => "struct",
+        UdtKind::Class => "class",
+        UdtKind::Union => "union",
+        UdtKind::Enum => "enum",
+    }
+}
+
+fn type_class_str(class: &TypeClass) -> &'static str {
+    match class {
+        TypeClass::Int => "int",
+        TypeClass::UInt => "uint",
+        TypeClass::Float => "float",
+        TypeClass::Bool => "bool",
+        TypeClass::Char => "char",
+        TypeClass::WChar => "wchar",
+        TypeClass::Void => "void",
+        TypeClass::Pointer { .. } => "pointer",
+        TypeClass::Array { .. } => "array",
+        TypeClass::Udt { .. } => "udt",
+        TypeClass::Enum { .. } => "enum",
+        TypeClass::Unknown => "unknown",
+    }
+}
+
+/// Structured fields for a type class, mirroring what the protocol carries:
+/// the TPI `type_index` for udt/enum (feeds `get_type_by_index`), and nested
+/// `pointee`/`element` (+ `count`) tables for pointers/arrays.
+fn set_type_class_fields(lua: &Lua, table: &LuaTable, class: &TypeClass) -> mlua::Result<()> {
+    match class {
+        TypeClass::Udt { index } | TypeClass::Enum { index } => {
+            table.set("type_index", *index as u64)?;
+        }
+        TypeClass::Pointer { pointee } => {
+            table.set("pointee", type_ref_to_lua(lua, pointee)?)?;
+        }
+        TypeClass::Array { element, count } => {
+            table.set("element", type_ref_to_lua(lua, element)?)?;
+            table.set("count", *count as u64)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Convert a `TypeRef` (a pointer's pointee / an array's element) to a Lua table.
+fn type_ref_to_lua(lua: &Lua, r: &TypeRef) -> mlua::Result<LuaTable> {
+    let table = lua.create_table()?;
+    table.set("type", r.name.as_str())?;
+    table.set("size", r.size as u64)?;
+    table.set("kind", type_class_str(&r.class))?;
+    set_type_class_fields(lua, &table, &r.class)?;
+    Ok(table)
+}
+
+/// Convert a TypeResult response (from GetType / GetTypeByIndex) to a Lua value:
+/// the layout table, or nil when the type wasn't found.
+fn type_result_to_lua(lua: &Lua, resp: DebuggerResponse, op_name: &str) -> mlua::Result<LuaValue> {
+    match resp {
+        DebuggerResponse::TypeResult { layout } => match layout {
+            Some(layout) => Ok(LuaValue::Table(type_layout_to_lua_table(lua, &layout)?)),
+            None => Ok(LuaValue::Nil),
+        },
+        DebuggerResponse::Error { message } => Err(mlua::Error::external(
+            anyhow::anyhow!("{} failed: {}", op_name, message),
+        )),
+        _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+    }
 }
 
 /// Convert a ScanMemoryResult response to a Lua table.

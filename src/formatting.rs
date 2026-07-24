@@ -1,6 +1,14 @@
 use crate::protocol::*;
 use crate::interfaces::*;
 
+/// Lowercased file-name portion of a module path ("C:\\x\\Foo.DLL" -> "foo.dll").
+/// The cross-run identity key for module matching (symbol deny lists,
+/// pointer-scan result rebinding) — keyed by name because bases change with
+/// ASLR. Accepts a full path or a bare file name.
+pub fn module_basename_lower(path: &str) -> String {
+    path.rsplit(['\\', '/']).next().unwrap_or(path).to_lowercase()
+}
+
 // Memory region formatting utilities
 #[cfg(windows)]
 pub mod memory {
@@ -72,7 +80,23 @@ impl std::fmt::Debug for DebuggerResponse {
             DebuggerResponse::Symbol { symbol } => f.debug_struct("Symbol").field("symbol", symbol).finish(),
             DebuggerResponse::SymbolList { symbols } => f.debug_struct("SymbolList").field("symbols", symbols).finish(),
             DebuggerResponse::ResolvedSymbolList { symbols } => f.debug_struct("ResolvedSymbolList").field("symbols", symbols).finish(),
+            DebuggerResponse::CoverageResults { hits } => f.debug_struct("CoverageResults").field("count", &hits.len()).finish(),
+            DebuggerResponse::WatchpointAccesses { accesses } => f.debug_struct("WatchpointAccesses").field("count", &accesses.len()).finish(),
             DebuggerResponse::AddressSymbol { module_path, symbol, offset } => f.debug_struct("AddressSymbol").field("module_path", module_path).field("symbol", symbol).field("offset", offset).finish(),
+            DebuggerResponse::AddressSymbolBatch { results } => f.debug_struct("AddressSymbolBatch")
+                .field("addresses", &results.len())
+                .field("resolved", &results.iter().filter(|r| r.is_some()).count())
+                .finish(),
+            DebuggerResponse::AddressLine { info } => f.debug_struct("AddressLine")
+                .field("info", &info.as_ref().map(|i| format!("{}:{} (rva 0x{:X})", i.file.path, i.line_entry.line_start, i.rva)))
+                .finish(),
+            DebuggerResponse::SourceFileLineMap { file, entries } => f.debug_struct("SourceFileLineMap")
+                .field("file", &file.as_ref().map(|f| f.path.as_str()))
+                .field("entries", &entries.len())
+                .finish(),
+            DebuggerResponse::SourceFileList { files } => f.debug_struct("SourceFileList")
+                .field("count", &files.len())
+                .finish(),
             DebuggerResponse::Instructions { instructions } => f.debug_struct("Instructions").field("instructions", instructions).finish(),
             DebuggerResponse::FunctionArguments { arguments } => f.debug_struct("FunctionArguments").field("arguments", arguments).finish(),
             DebuggerResponse::WideStringData { data } => f.debug_struct("WideStringData").field("data", data).finish(),
@@ -92,9 +116,25 @@ impl std::fmt::Debug for DebuggerResponse {
             DebuggerResponse::DereferenceResult { entries } => f.debug_struct("DereferenceResult")
                 .field("count", &entries.len())
                 .finish(),
+            DebuggerResponse::DereferenceBatchResult { results } => f.debug_struct("DereferenceBatchResult")
+                .field("addresses", &results.len())
+                .finish(),
             DebuggerResponse::MemorySearchResult { addresses, capped } => f.debug_struct("MemorySearchResult")
                 .field("matches", &addresses.len())
                 .field("capped", capped)
+                .finish(),
+            DebuggerResponse::TypeList { types } => f.debug_struct("TypeList")
+                .field("count", &types.len())
+                .finish(),
+            DebuggerResponse::TypeResult { layout } => f.debug_struct("TypeResult")
+                .field("name", &layout.as_ref().map(|l| &l.name))
+                .field("members", &layout.as_ref().map(|l| l.members.len()))
+                .finish(),
+            DebuggerResponse::TebAddress { address } => f.debug_struct("TebAddress")
+                .field("address", &format_args!("0x{:X}", address))
+                .finish(),
+            DebuggerResponse::PebAddress { address } => f.debug_struct("PebAddress")
+                .field("address", &format_args!("0x{:X}", address))
                 .finish(),
             DebuggerResponse::FunctionDisassembly { instructions, function_start, function_end, function_name } => {
                 f.debug_struct("FunctionDisassembly")
@@ -134,6 +174,33 @@ impl std::fmt::Debug for DebuggerResponse {
                     .field("total_count", total_count)
                     .finish()
             }
+            DebuggerResponse::PointerScanResult { results_path, match_count, scan_time_us } => {
+                f.debug_struct("PointerScanResult")
+                    .field("results_path", results_path)
+                    .field("match_count", match_count)
+                    .field("scan_time_us", scan_time_us)
+                    .finish()
+            }
+            DebuggerResponse::PointerScanResults { paths, total_count } => {
+                f.debug_struct("PointerScanResults")
+                    .field("returned", &paths.len())
+                    .field("total_count", total_count)
+                    .finish()
+            }
+            DebuggerResponse::StringScanResult { results_path, match_count, scan_time_us, capped } => {
+                f.debug_struct("StringScanResult")
+                    .field("results_path", results_path)
+                    .field("match_count", match_count)
+                    .field("scan_time_us", scan_time_us)
+                    .field("capped", capped)
+                    .finish()
+            }
+            DebuggerResponse::StringScanResults { strings, total_count } => {
+                f.debug_struct("StringScanResults")
+                    .field("returned", &strings.len())
+                    .field("total_count", total_count)
+                    .finish()
+            }
             DebuggerResponse::PebHideResult { report } => {
                 f.debug_struct("PebHideResult")
                     .field("peb_address", &format_args!("0x{:X}", report.peb_address))
@@ -141,6 +208,24 @@ impl std::fmt::Debug for DebuggerResponse {
                     .field("failures", &report.failures)
                     .field("wow64_skipped", &report.wow64_skipped)
                     .finish()
+            }
+            DebuggerResponse::FreezeValueStarted { freeze_id } => {
+                f.debug_struct("FreezeValueStarted")
+                    .field("freeze_id", freeze_id)
+                    .finish()
+            }
+            DebuggerResponse::SymbolStatusList { statuses } => {
+                f.debug_struct("SymbolStatusList")
+                    .field("count", &statuses.len())
+                    .finish()
+            }
+            DebuggerResponse::PdbLoaded { symbol_count } => {
+                f.debug_struct("PdbLoaded")
+                    .field("symbol_count", symbol_count)
+                    .finish()
+            }
+            DebuggerResponse::PdbMismatch(info) => {
+                f.debug_tuple("PdbMismatch").field(info).finish()
             }
         }
     }

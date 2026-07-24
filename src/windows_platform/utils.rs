@@ -1,4 +1,5 @@
-use crate::protocol::ModuleInfo;
+use crate::protocol::{ModuleInfo, ThreadInfo};
+use crate::interfaces::PlatformError;
 use tracing::{error, trace, warn};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, MAX_PATH,
@@ -9,8 +10,8 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     FORMAT_MESSAGE_IGNORE_INSERTS,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W, TH32CS_SNAPMODULE,
-    TH32CS_SNAPMODULE32,
+    CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, Thread32First, Thread32Next,
+    MODULEENTRY32W, THREADENTRY32, TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPTHREAD,
 };
 use windows_sys::Win32::System::SystemServices::{
     IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_SIGNATURE,
@@ -209,7 +210,9 @@ pub fn get_module_size_from_address(process_handle: HANDLE, module_base: usize) 
     Some(size_of_image)
 }
 
-pub fn _get_modules(pid: u32) -> Result<Vec<ModuleInfo>, String> {
+/// Enumerate a process's loaded modules via a Toolhelp snapshot, with no debug
+/// attach required. Used as the non-invasive fallback for `list_modules`.
+pub fn get_modules(pid: u32) -> Result<Vec<ModuleInfo>, String> {
     let mut modules = Vec::new();
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
 
@@ -270,4 +273,45 @@ pub fn _get_modules(pid: u32) -> Result<Vec<ModuleInfo>, String> {
 
     unsafe { CloseHandle(snapshot) };
     Ok(modules)
+}
+
+/// Enumerate a process's threads via a Toolhelp snapshot, with no debug attach
+/// required. Used as the non-invasive fallback for `list_threads`. `THREADENTRY32`
+/// carries no start address, so `start_address` is reported as 0.
+pub fn list_threads_toolhelp(pid: u32) -> Result<Vec<ThreadInfo>, PlatformError> {
+    let mut threads = Vec::new();
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(PlatformError::OsError(format!(
+            "CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD) failed: {}",
+            unsafe { GetLastError() }
+        )));
+    }
+
+    let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+
+    if unsafe { Thread32First(snapshot, &mut entry) } == 0 {
+        let err = unsafe { GetLastError() };
+        unsafe { CloseHandle(snapshot) };
+        if err == ERROR_NO_MORE_FILES {
+            return Ok(threads);
+        }
+        return Err(PlatformError::OsError(format!("Thread32First failed: {}", err)));
+    }
+
+    loop {
+        if entry.th32OwnerProcessID == pid {
+            threads.push(ThreadInfo {
+                tid: entry.th32ThreadID,
+                start_address: 0,
+            });
+        }
+        if unsafe { Thread32Next(snapshot, &mut entry) } == 0 {
+            break;
+        }
+    }
+
+    unsafe { CloseHandle(snapshot) };
+    Ok(threads)
 }

@@ -183,10 +183,13 @@ pub(super) fn apply_single_hw_bp_to_thread(
 }
 
 /// Clear a hardware breakpoint from a thread by getting/setting its context.
+/// `_bp_type` is unused on x86 (single shared DR bank) but kept for a uniform
+/// cross-arch signature; on ARM64 it selects the breakpoint vs watchpoint bank.
 #[cfg(target_arch = "x86_64")]
 pub(super) fn clear_hw_bp_from_thread(
     thread_handle: HANDLE,
     dr_index: u8,
+    _bp_type: HardwareBreakpointType,
 ) -> Result<(), PlatformError> {
     let mut aligned = AlignedContext {
         context: unsafe { std::mem::zeroed() },
@@ -292,44 +295,209 @@ pub(super) fn apply_hw_bps_dr_only(
     Ok(())
 }
 
+// ============================================================================
+// ARM64 (AArch64) hardware breakpoints and watchpoints
+//
+// ARM64 has two SEPARATE banks of debug registers, exposed in the Windows
+// ARM64 CONTEXT structure:
+//   - Bvr[8]/Bcr[8] — breakpoint value/control registers (instruction/execute)
+//   - Wvr[2]/Wcr[2] — watchpoint value/control registers (data read/write)
+//
+// We map HardwareBreakpointType::Execute onto the breakpoint bank and
+// Write/ReadWrite onto the watchpoint bank. `dr_index` is the slot WITHIN the
+// relevant bank (0..8 for breakpoints, 0..2 for watchpoints). Because the two
+// banks are independent, a breakpoint slot N and a watchpoint slot N can both
+// be in use simultaneously; ARM64 hit detection is done by address match, not
+// by slot index, so this overlap is harmless.
+// ============================================================================
 #[cfg(target_arch = "aarch64")]
-pub(super) fn apply_hw_bps_dr_only(
-    _thread_handle: windows_sys::Win32::Foundation::HANDLE,
-    _bps: &[InternalHardwareBreakpoint],
-) -> Result<(), PlatformError> {
-    if _bps.is_empty() {
-        return Ok(());
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    CONTEXT, GetThreadContext, SetThreadContext, CONTEXT_DEBUG_REGISTERS_ARM64,
+};
+#[cfg(target_arch = "aarch64")]
+use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
+#[cfg(target_arch = "aarch64")]
+use super::{AlignedContext, utils};
+
+/// Number of bytes covered by a watchpoint size.
+#[cfg(target_arch = "aarch64")]
+fn bp_size_bytes(size: HardwareBreakpointSize) -> u32 {
+    match size {
+        HardwareBreakpointSize::Byte1 => 1,
+        HardwareBreakpointSize::Byte2 => 2,
+        HardwareBreakpointSize::Byte4 => 4,
+        HardwareBreakpointSize::Byte8 => 8,
     }
-    Err(PlatformError::NotImplemented)
 }
 
-// ARM64 stubs
+/// Program one hardware breakpoint/watchpoint into an ARM64 CONTEXT.
+///
+/// Execute -> Bvr/Bcr (DBGBVR/DBGBCR), data -> Wvr/Wcr (DBGWVR/DBGWCR).
+/// Control register fields used (EL0 user-mode debug):
+///   DBGBCR: E=bit0, PMC=bits[2:1]=0b10 (EL0), BAS=bits[8:5]=0b1111 (4-byte instr)
+///   DBGWCR: E=bit0, PAC=bits[2:1]=0b10 (EL0), LSC=bits[4:3], BAS=bits[12:5]
+///     LSC: 0b01=load, 0b10=store, 0b11=load+store
+#[cfg(target_arch = "aarch64")]
+pub(super) fn set_hw_bp_in_context(
+    ctx: &mut CONTEXT,
+    dr_index: u8,
+    address: u64,
+    bp_type: HardwareBreakpointType,
+    size: HardwareBreakpointSize,
+) {
+    let i = dr_index as usize;
+    match bp_type {
+        HardwareBreakpointType::Execute => {
+            if i >= ctx.Bvr.len() {
+                return;
+            }
+            // Instruction address must be word-aligned.
+            ctx.Bvr[i] = address & !0x3;
+            // E=1, PMC=0b10 (EL0), BAS=0b1111 → 0x1 | 0x4 | 0x1E0 = 0x1E5
+            ctx.Bcr[i] = 0b1 | (0b10 << 1) | (0b1111 << 5);
+        }
+        HardwareBreakpointType::Write | HardwareBreakpointType::ReadWrite => {
+            if i >= ctx.Wvr.len() {
+                return;
+            }
+            let lsc: u32 = match bp_type {
+                HardwareBreakpointType::Write => 0b10,      // store only
+                HardwareBreakpointType::ReadWrite => 0b11,  // load + store
+                HardwareBreakpointType::Execute => unreachable!(),
+            };
+            // WVR holds a doubleword-aligned base; BAS selects bytes within it.
+            let aligned = address & !0x7u64;
+            let byte_offset = (address & 0x7) as u32;
+            let nbytes = bp_size_bytes(size);
+            let bas = (((1u32 << nbytes) - 1) << byte_offset) & 0xFF;
+            ctx.Wvr[i] = aligned;
+            ctx.Wcr[i] = 0b1 | (0b10 << 1) | (lsc << 3) | (bas << 5);
+        }
+    }
+}
+
+/// Clear one hardware breakpoint/watchpoint from an ARM64 CONTEXT.
+#[cfg(target_arch = "aarch64")]
+pub(super) fn clear_hw_bp_in_context(
+    ctx: &mut CONTEXT,
+    dr_index: u8,
+    bp_type: HardwareBreakpointType,
+) {
+    let i = dr_index as usize;
+    match bp_type {
+        HardwareBreakpointType::Execute => {
+            if i < ctx.Bvr.len() {
+                ctx.Bvr[i] = 0;
+                ctx.Bcr[i] = 0;
+            }
+        }
+        _ => {
+            if i < ctx.Wvr.len() {
+                ctx.Wvr[i] = 0;
+                ctx.Wcr[i] = 0;
+            }
+        }
+    }
+}
+
+/// Fetch an ARM64 thread CONTEXT with only the debug-register group.
+#[cfg(target_arch = "aarch64")]
+fn get_debug_context(thread_handle: HANDLE) -> Result<AlignedContext, PlatformError> {
+    let mut aligned = AlignedContext {
+        context: unsafe { std::mem::zeroed() },
+    };
+    aligned.context.ContextFlags = CONTEXT_DEBUG_REGISTERS_ARM64;
+    if unsafe { GetThreadContext(thread_handle, &mut aligned.context) } == 0 {
+        let err = unsafe { GetLastError() };
+        return Err(PlatformError::OsError(format!(
+            "GetThreadContext(DEBUG_ARM64) failed: {}",
+            utils::error_message(err)
+        )));
+    }
+    Ok(aligned)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn set_debug_context(thread_handle: HANDLE, aligned: &AlignedContext) -> Result<(), PlatformError> {
+    if unsafe { SetThreadContext(thread_handle, &aligned.context) } == 0 {
+        let err = unsafe { GetLastError() };
+        return Err(PlatformError::OsError(format!(
+            "SetThreadContext(DEBUG_ARM64) failed: {}",
+            utils::error_message(err)
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(target_arch = "aarch64")]
 pub(super) fn apply_single_hw_bp_to_thread(
-    _thread_handle: windows_sys::Win32::Foundation::HANDLE,
-    _dr_index: u8,
-    _address: u64,
-    _bp_type: HardwareBreakpointType,
-    _size: HardwareBreakpointSize,
+    thread_handle: HANDLE,
+    dr_index: u8,
+    address: u64,
+    bp_type: HardwareBreakpointType,
+    size: HardwareBreakpointSize,
 ) -> Result<(), PlatformError> {
-    Err(PlatformError::NotImplemented)
+    let mut aligned = get_debug_context(thread_handle)?;
+    set_hw_bp_in_context(&mut aligned.context, dr_index, address, bp_type, size);
+    trace!(
+        "apply_single_hw_bp(arm64): slot={} addr=0x{:X} type={:?}",
+        dr_index, address, bp_type
+    );
+    set_debug_context(thread_handle, &aligned)
 }
 
 #[cfg(target_arch = "aarch64")]
 pub(super) fn clear_hw_bp_from_thread(
-    _thread_handle: windows_sys::Win32::Foundation::HANDLE,
-    _dr_index: u8,
+    thread_handle: HANDLE,
+    dr_index: u8,
+    bp_type: HardwareBreakpointType,
 ) -> Result<(), PlatformError> {
-    Err(PlatformError::NotImplemented)
+    let mut aligned = get_debug_context(thread_handle)?;
+    clear_hw_bp_in_context(&mut aligned.context, dr_index, bp_type);
+    set_debug_context(thread_handle, &aligned)
+}
+
+/// Zero every ARM64 hardware breakpoint/watchpoint register so no stale bits
+/// linger in unused slots before (re-)applying the active set or stepping past one.
+#[cfg(target_arch = "aarch64")]
+pub(super) fn clear_all_hw_bp_in_context(ctx: &mut CONTEXT) {
+    for i in 0..ctx.Bcr.len() {
+        ctx.Bcr[i] = 0;
+        ctx.Bvr[i] = 0;
+    }
+    for i in 0..ctx.Wcr.len() {
+        ctx.Wcr[i] = 0;
+        ctx.Wvr[i] = 0;
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
 pub(super) fn apply_all_hw_bps_to_thread(
-    _thread_handle: windows_sys::Win32::Foundation::HANDLE,
-    _bps: &[InternalHardwareBreakpoint],
+    thread_handle: HANDLE,
+    bps: &[InternalHardwareBreakpoint],
 ) -> Result<(), PlatformError> {
-    if _bps.is_empty() {
+    if bps.is_empty() {
         return Ok(());
     }
-    Err(PlatformError::NotImplemented)
+    let mut aligned = get_debug_context(thread_handle)?;
+    // Start from a clean slate so no stale bits linger in unused slots.
+    clear_all_hw_bp_in_context(&mut aligned.context);
+    for bp in bps {
+        set_hw_bp_in_context(&mut aligned.context, bp.dr_index, bp.address, bp.bp_type, bp.size);
+    }
+    set_debug_context(thread_handle, &aligned)?;
+    trace!("Applied {} ARM64 hardware breakpoints to thread", bps.len());
+    Ok(())
+}
+
+/// Re-arm all active hardware breakpoints/watchpoints on a thread (used after
+/// single-stepping past a hit). Equivalent to apply_all but kept separate to
+/// mirror the x86 API surface.
+#[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
+pub(super) fn apply_hw_bps_dr_only(
+    thread_handle: HANDLE,
+    bps: &[InternalHardwareBreakpoint],
+) -> Result<(), PlatformError> {
+    apply_all_hw_bps_to_thread(thread_handle, bps)
 }

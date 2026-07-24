@@ -59,6 +59,13 @@ impl FramedJsonStream {
         }
     }
 
+    /// Set the read timeout on the underlying socket (see
+    /// `TcpStream::set_read_timeout`). A timed-out read leaves the frame stream
+    /// desynchronized, so callers must discard the connection on timeout.
+    pub fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> std::io::Result<()> {
+        self.stream.set_read_timeout(dur)
+    }
+
     pub fn send<T: Serialize>(&mut self, message: &T) -> anyhow::Result<()> {
         // Serialize with bincode
         let start = Instant::now();

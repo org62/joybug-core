@@ -333,10 +333,17 @@ impl DebugClient {
             _ => {}
         }
 
-        // 2. Send Continue to resume execution, wait for StepComplete event
+        // 2. Send Continue to resume execution, wait for StepComplete event.
+        // Intermediate events (DLL loads, thread create/exit, etc.) may fire on a
+        // *different* thread than the one we're stepping. ContinueDebugEvent must be
+        // called with the thread that actually reported the event, otherwise the OS
+        // returns ERROR_INVALID_PARAMETER (87). Track the continue target and update
+        // it from each event's own pid/tid.
+        let mut cont_pid = pid;
+        let mut cont_tid = tid;
         loop {
             let resp = self.send_and_receive(&DebuggerRequest::Continue {
-                pid, tid, pass_exception: false,
+                pid: cont_pid, tid: cont_tid, pass_exception: false,
             }).map_err(|e| mlua::Error::external(e))?;
 
             match resp {
@@ -358,8 +365,12 @@ impl DebugClient {
                                 anyhow::anyhow!("Process {} exited (code {}) during step", ep, exit_code),
                             ));
                         }
-                        // Intermediate events (DLL loads, etc.) — continue again
-                        _ => {}
+                        // Intermediate events (DLL loads, etc.) — continue the thread
+                        // that reported this event, not the one we're stepping.
+                        _ => {
+                            cont_pid = event.pid();
+                            cont_tid = event.tid();
+                        }
                     }
                 }
                 DebuggerResponse::Error { message } => {
@@ -370,6 +381,34 @@ impl DebugClient {
                 _ => {}
             }
         }
+    }
+
+    /// Resolve an address to its (file, line) via the module's PDB line table.
+    fn resolve_line(&mut self, pid: u32, address: u64) -> Option<(String, u32)> {
+        match self.send_and_receive(&DebuggerRequest::ResolveAddressToLine { pid, address }).ok()? {
+            DebuggerResponse::AddressLine { info: Some(info) } => {
+                Some((info.file.path, info.line_entry.line_start))
+            }
+            _ => None,
+        }
+    }
+
+    /// Step by one source line: repeatedly `step_and_wait` until the PC leaves
+    /// the starting source line (or leaves mapped source). `kind` chooses Into vs
+    /// Over granularity. Degrades to a single step when the start has no line info.
+    pub fn step_source_line_and_wait(&mut self, pid: u32, tid: u32, kind: StepKind) -> mlua::Result<u64> {
+        const MAX_STEPS: u32 = 50_000;
+        let start = self.current_address.and_then(|pc| self.resolve_line(pid, pc));
+        let mut last = self.current_address.unwrap_or(0);
+        for _ in 0..MAX_STEPS {
+            last = self.step_and_wait(pid, tid, kind)?;
+            let Some(ref start) = start else { break }; // no start line info → single step
+            match self.resolve_line(pid, last) {
+                Some(ref cur) if cur == start => continue,
+                _ => break,
+            }
+        }
+        Ok(last)
     }
 }
 
@@ -491,6 +530,14 @@ pub fn instruction_to_lua_table(lua: &Lua, inst: &Instruction) -> mlua::Result<L
     }
     if let Some(ref sym) = inst.symbol_info {
         table.set("symbol", sym.format_symbol())?;
+    }
+    // Every name starting exactly at this address (aliases like NtClose/ZwClose).
+    if !inst.symbols_at_address.is_empty() {
+        let names = lua.create_table()?;
+        for (i, sym) in inst.symbols_at_address.iter().enumerate() {
+            names.set(i + 1, sym.format_symbol())?;
+        }
+        table.set("symbols", names)?;
     }
     // Raw bytes as Lua string
     table.set("bytes", lua.create_string(&inst.bytes)?)?;

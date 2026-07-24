@@ -3,24 +3,26 @@ use super::utils;
 use super::debug_events;
 use crate::interfaces::{PlatformError, Architecture};
 use crate::protocol::{ProcessInfo};
-use std::ffi::OsStr;
+use std::ffi::{CString, OsStr};
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
-use tracing::{trace, error};
+use tracing::{trace, error, warn};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, FALSE, DBG_CONTINUE, INVALID_HANDLE_VALUE
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    ContinueDebugEvent, WaitForDebugEvent,
+    ContinueDebugEvent, WaitForDebugEvent, SymLoadModule64,
     CREATE_PROCESS_DEBUG_EVENT, DEBUG_EVENT,
-    DebugActiveProcess,
+    DebugActiveProcess, DebugActiveProcessStop,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, IsWow64Process2,
-    DEBUG_PROCESS, DEBUG_ONLY_THIS_PROCESS, INFINITE, PROCESS_INFORMATION, STARTUPINFOW, OpenProcess, TerminateProcess, PROCESS_TERMINATE, PROCESS_ALL_ACCESS,
+    CreateProcessW, IsWow64Process2, OpenThread,
+    DEBUG_PROCESS, DEBUG_ONLY_THIS_PROCESS, INFINITE, PROCESS_INFORMATION, STARTUPINFOW, OpenProcess, TerminateProcess,
+    PROCESS_TERMINATE, PROCESS_ALL_ACCESS, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, PROCESS_VM_WRITE, PROCESS_VM_OPERATION,
+    THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION,
 };
 use windows_sys::Win32::System::SystemInformation::{
     IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_UNKNOWN
@@ -168,6 +170,113 @@ pub(super) fn attach(platform: &mut WindowsPlatform, pid: u32) -> Result<Option<
         unsafe { ContinueDebugEvent(debug_event.dwProcessId, debug_event.dwThreadId, DBG_CONTINUE); }
         Err(PlatformError::Other("Unexpected debug event after attach".to_string()))
     }
+}
+
+pub(super) fn detach(platform: &mut WindowsPlatform, pid: u32) -> Result<(), PlatformError> {
+    trace!(pid, "WindowsPlatform::detach called");
+
+    // Undo debugger-injected side effects first: restore original bytes for
+    // software breakpoints (so the target does not execute leftover int3/brk
+    // instructions once we're gone) and lift any step-over thread suspensions
+    // (DebugActiveProcessStop does not undo explicit SuspendThread calls).
+    let proc = platform.get_process_mut(pid)?;
+    proc.restore_all_software_breakpoints();
+    proc.resume_all_step_over_suspensions();
+
+    // DebugActiveProcessStop cleanly ends the debug relationship: it flushes any
+    // pending debug event, resumes the target, and lets it keep running without
+    // a debugger attached.
+    if unsafe { DebugActiveProcessStop(pid) } == 0 {
+        let error = unsafe { GetLastError() };
+        let error_str = utils::error_message(error);
+        error!(error, error_str, "DebugActiveProcessStop failed");
+        return Err(PlatformError::OsError(format!(
+            "DebugActiveProcessStop failed: {} ({})",
+            error, error_str
+        )));
+    }
+
+    platform.remove_process(pid);
+    Ok(())
+}
+
+/// Open a process non-invasively: obtain a handle via `OpenProcess` (no
+/// `DebugActiveProcess`), register it, and populate its module/thread lists and
+/// symbols from Toolhelp snapshots. This makes every read-only capability that
+/// normally needs an attached process — disassembly, symbol resolution, PE info,
+/// dereference, thread context, and call stacks — work without debugging the
+/// target. The process keeps running the whole time; it is never suspended.
+pub(super) fn open_non_invasive(platform: &mut WindowsPlatform, pid: u32) -> Result<(), PlatformError> {
+    trace!(pid, "WindowsPlatform::open_non_invasive called");
+
+    // Idempotent: if this pid is already tracked (attached or previously opened),
+    // there is nothing to do.
+    if platform.process_handle(pid).is_ok() {
+        return Ok(());
+    }
+
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
+            0,
+            pid,
+        )
+    };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        let error = unsafe { GetLastError() };
+        let error_str = utils::error_message(error);
+        error!(error, error_str, "OpenProcess failed in open_non_invasive");
+        return Err(PlatformError::OsError(format!("OpenProcess failed: {} ({})", error, error_str)));
+    }
+
+    let architecture = determine_process_architecture(handle).unwrap_or(Architecture::X64);
+
+    // add_process runs SymInitialize on the handle (needed for symbols/StackWalk).
+    platform.add_process(pid, handle, architecture)?;
+
+    // Populate modules (Toolhelp), register each with DbgHelp for stack walking,
+    // and kick off background symbol loading. Best-effort per module.
+    for module in utils::get_modules(pid).unwrap_or_default() {
+        if let Ok(cname) = CString::new(module.name.as_str()) {
+            let _lock = super::dbghelp::DBGHELP_LOCK.lock().unwrap();
+            let ok = unsafe {
+                SymLoadModule64(handle, ptr::null_mut(), cname.as_ptr() as *const u8, ptr::null(),
+                    module.base, module.size.unwrap_or(0) as u32)
+            };
+            if ok == 0 {
+                warn!(pid, module = %module.name, "SymLoadModule64 failed in open_non_invasive: 0x{:x}", unsafe { GetLastError() });
+            }
+        }
+        if let Some(ref symbol_manager) = platform.symbol_manager {
+            symbol_manager.start_loading_symbols(&module);
+        }
+        if let Ok(process) = platform.get_process_mut(pid) {
+            process.module_manager_mut().add_module(module);
+        }
+    }
+
+    // Populate threads (Toolhelp) with per-thread handles for context/stack walks.
+    for thread in utils::list_threads_toolhelp(pid).unwrap_or_default() {
+        let thandle = unsafe { OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, thread.tid) };
+        if thandle.is_null() {
+            warn!(pid, tid = thread.tid, "OpenThread failed in open_non_invasive");
+            continue;
+        }
+        if let Ok(process) = platform.get_process_mut(pid) {
+            process.thread_manager_mut().add_thread(thread.tid, thread.start_address, thandle);
+        }
+    }
+
+    trace!(pid, "Process opened non-invasively");
+    Ok(())
+}
+
+/// Release a non-invasively opened process: drop the tracked handle, symbols, and
+/// thread handles. The target is unaffected (it was never attached).
+pub(super) fn close_non_invasive(platform: &mut WindowsPlatform, pid: u32) -> Result<(), PlatformError> {
+    trace!(pid, "WindowsPlatform::close_non_invasive called");
+    platform.remove_process(pid);
+    Ok(())
 }
 
 pub(super) fn list_processes() -> Result<Vec<ProcessInfo>, PlatformError> {

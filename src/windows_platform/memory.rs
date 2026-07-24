@@ -2,9 +2,9 @@ use super::{utils, WindowsPlatform};
 use crate::interfaces::{PlatformAPI, PlatformError};
 use tracing::{error, trace, warn, debug};
 use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE, HANDLE};
-use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
+use windows_sys::Win32::System::Diagnostics::Debug::{FlushInstructionCache, ReadProcessMemory, WriteProcessMemory};
 use windows_sys::Win32::System::Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION};
-use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_VM_READ, PROCESS_QUERY_INFORMATION};
+use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, PROCESS_QUERY_INFORMATION};
 
 pub(super) fn read_memory_internal(
     handle: HANDLE,
@@ -160,6 +160,43 @@ pub(super) fn read_memory_unlocked(
     }
 }
 
+/// Minimal `PROCESS_VM_READ` handle for a run of `try_read_pointer` calls.
+/// `None` (silently — the reads are speculative) if the process can't be opened.
+pub(super) fn open_vm_read_handle(pid: u32) -> Option<super::HandleSafe> {
+    unsafe {
+        let handle = OpenProcess(PROCESS_VM_READ, 0, pid);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            None
+        } else {
+            Some(super::HandleSafe(handle))
+        }
+    }
+}
+
+/// Best-effort 8-byte pointer read: a plain `ReadProcessMemory` with NO
+/// partial-read `VirtualQueryEx` fallback and NO error logging. `None` on any
+/// failure. For SPECULATIVE reads where a miss is expected and ignored — chiefly
+/// resolving indirect jump/call targets during disassembly. When code is
+/// misdecoded (e.g. data disassembled as `call [garbage]`), the target often
+/// lands in unmapped memory; the full path would then run a wasted VirtualQueryEx
+/// and log an ERROR per instruction, spamming the log and adding tens of ms.
+/// Takes an open handle (see `open_vm_read_handle`) so a decode batch with
+/// hundreds of indirect targets pays one OpenProcess, not one per instruction.
+pub(super) fn try_read_pointer(handle: HANDLE, address: u64) -> Option<u64> {
+    unsafe {
+        let mut buf = [0u8; 8];
+        let mut bytes_read: usize = 0;
+        let ok = ReadProcessMemory(
+            handle,
+            address as *const std::ffi::c_void,
+            buf.as_mut_ptr() as *mut std::ffi::c_void,
+            8,
+            &mut bytes_read,
+        );
+        (ok != 0 && bytes_read == 8).then(|| u64::from_le_bytes(buf))
+    }
+}
+
 pub(super) fn write_memory_internal(
     handle: HANDLE,
     address: u64,
@@ -202,9 +239,39 @@ pub(super) fn write_memory(
     data: &[u8],
 ) -> Result<(), PlatformError> {
     trace!(pid, address = %format!("0x{:X}", address), data_len = data.len(), "WindowsPlatform::write_memory called");
-    let process = platform.get_process(pid)?;
-    let handle = process.handle();
-    write_memory_internal(handle, address, data)
+    match platform.get_process(pid) {
+        Ok(process) => write_memory_internal(process.handle(), address, data),
+        Err(_) => write_memory_unlocked(pid, address, data),
+    }
+}
+
+/// Write memory using an on-demand `OpenProcess` handle (no debug attach required).
+/// Mirrors `read_memory_unlocked`.
+pub(super) fn write_memory_unlocked(
+    pid: u32,
+    address: u64,
+    data: &[u8],
+) -> Result<(), PlatformError> {
+    trace!(pid, address = %format!("0x{:X}", address), data_len = data.len(), "write_memory_unlocked called");
+    unsafe {
+        let handle = OpenProcess(PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_VM_READ, 0, pid);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            let error = GetLastError();
+            let error_str = utils::error_message(error);
+            error!(error, error_str, "OpenProcess(PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_VM_READ) failed");
+            return Err(PlatformError::OsError(format!(
+                "OpenProcess(PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_VM_READ) failed: {} ({})",
+                error, error_str
+            )));
+        }
+        let res = write_memory_internal(handle, address, data);
+        if res.is_ok() {
+            // Best-effort: keep code caches coherent after patching executable memory.
+            FlushInstructionCache(handle, address as *const std::ffi::c_void, data.len());
+        }
+        windows_sys::Win32::Foundation::CloseHandle(handle);
+        res
+    }
 }
 
 pub(super) fn read_wide_string(

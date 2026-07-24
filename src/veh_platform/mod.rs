@@ -98,17 +98,25 @@ impl VEHPlatform {
             }
         }
 
-        // Look relative to current exe
+        // Look relative to the current exe, walking up a few directories.
+        // For test binaries the exe lives in `target/<profile>/deps/`, while the
+        // cdylib is emitted one level up in `target/<profile>/`. Walking ancestors
+        // covers both that case and the plain `target/<profile>/` exe location,
+        // regardless of how the workspace target dir is nested (e.g. when joybug2
+        // is a submodule the target dir lives at the outer workspace root).
         if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(dir) = exe_path.parent() {
-                let dll_path = dir.join("joybug2_veh_dll.dll");
+            let mut dir = exe_path.parent();
+            for _ in 0..3 {
+                let Some(d) = dir else { break };
+                let dll_path = d.join("joybug2_veh_dll.dll");
                 if dll_path.exists() {
                     return Ok(dll_path.to_string_lossy().into_owned());
                 }
+                dir = d.parent();
             }
         }
 
-        // Look in target/debug (workspace build)
+        // Look in target/debug (single-crate workspace build, manifest-relative)
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         for profile in &["debug", "release"] {
             let candidate =
@@ -356,9 +364,14 @@ impl VEHPlatform {
             let shared = unsafe { &mut *proc.shared_mem };
             shared.continue_status = VEH_CONTINUE_EXECUTION;
 
-            // Windows reports the exception address AT the int3; skip past it
-            // (1 byte) so we don't re-execute the trap on continue.
-            shared.context_rip = address + 1;
+            // The exception address is AT the breakpoint instruction; skip past
+            // it so we don't re-execute the trap on continue. int3 is 1 byte on
+            // x86; brk is a 4-byte instruction on AArch64 (advancing by 1 would
+            // land mid-instruction and fault with STATUS_ILLEGAL_INSTRUCTION).
+            #[cfg(target_arch = "x86_64")]
+            { shared.context_rip = address + 1; }
+            #[cfg(target_arch = "aarch64")]
+            { shared.context_rip = address + 4; }
 
             if !proc.has_hit_initial_breakpoint {
                 proc.has_hit_initial_breakpoint = true;

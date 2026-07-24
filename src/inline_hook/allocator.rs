@@ -20,8 +20,13 @@ mod windows_impl {
 
     const PAGE_SIZE: usize = 4096;
     const DEFAULT_SLOT_SIZE: usize = 64;
-    /// Maximum distance for a 32-bit relative jump (slightly under 2GB to be safe).
+    /// Maximum distance for the patch branch to reach the relay.
+    /// x86: 32-bit relative JMP (slightly under 2GB). ARM64: `B` reaches ±128MB
+    /// (imm26 << 2), so stay slightly under 128MB.
+    #[cfg(target_arch = "x86_64")]
     const MAX_RANGE: usize = 0x7FFF_0000;
+    #[cfg(target_arch = "aarch64")]
+    const MAX_RANGE: usize = 0x07FF_0000;
 
     struct PageInfo {
         base: *mut u8,

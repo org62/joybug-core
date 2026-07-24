@@ -3,6 +3,7 @@ pub mod formatting;
 pub mod protocol_io;
 pub mod interfaces;
 pub mod pe_types;
+pub mod pe_image;
 pub mod windows_platform;
 pub mod server;
 pub mod framed_json_stream;
@@ -12,6 +13,12 @@ pub mod tenet_format;
 pub mod local_server;
 pub mod assembler;
 pub mod memory_scanner;
+pub mod pointer_scanner;
+pub mod pointer_results;
+pub mod string_scanner;
+pub mod string_results;
+pub mod scan_results;
+pub mod freeze_manager;
 pub mod scripting;
 pub mod inline_hook;
 pub mod veh_platform;
@@ -19,6 +26,8 @@ pub mod anti_anti_debug;
 
 #[cfg(windows)]
 pub type PlatformImpl = windows_platform::WindowsPlatform;
+
+pub use interfaces::SymbolConfig;
 
 pub async fn run() -> anyhow::Result<()> {
     server::run_server().await

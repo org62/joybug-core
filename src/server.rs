@@ -40,6 +40,10 @@ where
 {
     let mut framed_stream = FramedJsonStream::new(stream);
     let mut scanner = crate::memory_scanner::MemoryScanner::new();
+    let mut pointer_scanner = crate::pointer_scanner::PointerScanner::new();
+    let mut string_scanner = crate::string_scanner::StringScanner::new();
+    // Per-connection value freezes; dropped (which stops all threads) on disconnect.
+    let mut freeze_manager = crate::freeze_manager::FreezeManager::new();
     loop {
         let recv_start = Instant::now();
         let req: DebuggerRequest = match framed_stream.receive() {
@@ -98,6 +102,20 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::OpenProcess { pid } => {
+                let mut p = platform.write().unwrap();
+                match p.open_process(pid) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::CloseProcess { pid } => {
+                let mut p = platform.write().unwrap();
+                match p.close_process(pid) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::SetBreakpoint { pid, addr, tid } => {
                 let mut p = platform.write().unwrap();
                 match p.set_breakpoint(pid, addr, tid) {
@@ -115,6 +133,48 @@ where
             DebuggerRequest::RemoveBreakpoint { pid, addr } => {
                 let mut p = platform.write().unwrap();
                 match p.remove_breakpoint(pid, addr) {
+                    Ok(_) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::StartCodeCoverage { pid, addrs, limit } => {
+                let mut p = platform.write().unwrap();
+                match p.start_code_coverage(pid, &addrs, limit) {
+                    Ok(_) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::GetCodeCoverage { pid } => {
+                let p = platform.read().unwrap();
+                match p.get_code_coverage(pid) {
+                    Ok(hits) => DebuggerResponse::CoverageResults { hits },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::StopCodeCoverage { pid } => {
+                let mut p = platform.write().unwrap();
+                match p.stop_code_coverage(pid) {
+                    Ok(_) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::StartWatchpointTrace { pid, addr, bp_type, size } => {
+                let mut p = platform.write().unwrap();
+                match p.start_watchpoint_trace(pid, addr, bp_type, size) {
+                    Ok(_) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::GetWatchpointAccesses { pid, addr } => {
+                let p = platform.read().unwrap();
+                match p.get_watchpoint_accesses(pid, addr) {
+                    Ok(accesses) => DebuggerResponse::WatchpointAccesses { accesses },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::StopWatchpointTrace { pid, addr } => {
+                let mut p = platform.write().unwrap();
+                match p.stop_watchpoint_trace(pid, addr) {
                     Ok(_) => DebuggerResponse::Ack,
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
@@ -211,6 +271,42 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::GetSymbolStatus { pid } => {
+                let p = platform.read().unwrap();
+                match p.get_symbol_status(pid) {
+                    Ok(statuses) => DebuggerResponse::SymbolStatusList { statuses },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::LoadPdbFromPath { pid, module_base, pdb_path, force } => {
+                let p = platform.read().unwrap();
+                match p.load_pdb_from_path(pid, module_base, &pdb_path, force) {
+                    Ok(crate::protocol::PdbLoadOutcome::Loaded { symbol_count }) => DebuggerResponse::PdbLoaded { symbol_count },
+                    Ok(crate::protocol::PdbLoadOutcome::Mismatch(info)) => DebuggerResponse::PdbMismatch(info),
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::RetrySymbolLoad { pid, module_base } => {
+                let p = platform.read().unwrap();
+                match p.retry_symbol_load(pid, module_base) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::UnloadModuleSymbols { pid, module_base } => {
+                let p = platform.read().unwrap();
+                match p.unload_module_symbols(pid, module_base) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::SetSymbolDenyList { modules } => {
+                let p = platform.read().unwrap();
+                match p.set_symbol_deny_list(modules) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::ListSymbols { module_path } => {
                 let p = platform.read().unwrap();
                 match p.list_symbols(&module_path) {
@@ -238,6 +334,69 @@ where
                         symbol: None,
                         offset: None,
                     },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::TryResolveAddressesToSymbols { pid, addresses } => {
+                let p = platform.read().unwrap();
+                match p.try_resolve_addresses_to_symbols(pid, &addresses) {
+                    Ok(results) => DebuggerResponse::AddressSymbolBatch { results },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::ResolveAddressToLine { pid, address } => {
+                let p = platform.read().unwrap();
+                match p.resolve_address_to_line(pid, address) {
+                    Ok(info) => DebuggerResponse::AddressLine { info },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::GetSourceFileLineMap { pid, module_base, file_path, start_line, end_line } => {
+                let p = platform.read().unwrap();
+                match p.get_source_file_line_map(pid, module_base, &file_path, start_line, end_line) {
+                    Ok((file, entries)) => DebuggerResponse::SourceFileLineMap { file, entries },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::ListSourceFiles { pid, module_base } => {
+                let p = platform.read().unwrap();
+                match p.list_source_files(pid, module_base) {
+                    Ok(files) => DebuggerResponse::SourceFileList { files },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::ListTypes { pid, module_base, filter, max_results } => {
+                let p = platform.read().unwrap();
+                match p.list_types(pid, module_base, filter.as_deref(), max_results) {
+                    Ok(types) => DebuggerResponse::TypeList { types },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::GetType { pid, module_base, name } => {
+                let p = platform.read().unwrap();
+                match p.get_type(pid, module_base, &name) {
+                    Ok(layout) => DebuggerResponse::TypeResult { layout },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::GetTypeByIndex { pid, module_base, index } => {
+                let p = platform.read().unwrap();
+                match p.get_type_by_index(pid, module_base, index) {
+                    Ok(layout) => DebuggerResponse::TypeResult { layout },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::GetTebAddress { pid, tid } => {
+                let p = platform.read().unwrap();
+                match p.get_teb_address(pid, tid) {
+                    Ok(address) => DebuggerResponse::TebAddress { address },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::GetPebAddress { pid } => {
+                let p = platform.read().unwrap();
+                match p.get_peb_address(pid) {
+                    Ok(address) => DebuggerResponse::PebAddress { address },
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
@@ -283,6 +442,13 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::DereferenceBatch { pid, addresses, count, reference_base } => {
+                let p = platform.read().unwrap();
+                match p.dereference_batch(pid, &addresses, count, reference_base) {
+                    Ok(results) => DebuggerResponse::DereferenceBatchResult { results },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::SearchMemory { pid, pattern, max_results } => {
                 let p = platform.read().unwrap();
                 match p.search_memory(pid, &pattern, max_results) {
@@ -301,6 +467,13 @@ where
                             function_name,
                         }
                     }
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::DisassembleBackward { pid, target, count, arch } => {
+                let p = platform.read().unwrap();
+                match p.disassemble_backward(pid, target, count, arch) {
+                    Ok(instructions) => DebuggerResponse::Instructions { instructions },
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
@@ -348,16 +521,16 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
-            DebuggerRequest::ScanMemoryStart { pid, value_type, compare_type, value, value2, alignment, float_tolerance, writable_only } => {
+            DebuggerRequest::ScanMemoryStart { pid, value_type, compare_type, value, value2, alignment, float_tolerance, writable_only, thread_count } => {
                 let p = platform.read().unwrap();
-                match scanner.start_scan(&*p, pid, value_type, compare_type, value, value2, alignment, float_tolerance, writable_only.unwrap_or(true)) {
+                match scanner.start_scan(&*p, pid, value_type, compare_type, value, value2, alignment, float_tolerance, writable_only.unwrap_or(true), thread_count) {
                     Ok((scan_id, match_count, scan_time_us)) => DebuggerResponse::ScanMemoryResult { scan_id, match_count, scan_time_us },
                     Err(e) => DebuggerResponse::Error { message: e },
                 }
             }
-            DebuggerRequest::ScanMemoryNext { scan_id, compare_type, value, value2 } => {
+            DebuggerRequest::ScanMemoryNext { scan_id, compare_type, value, value2, float_tolerance } => {
                 let p = platform.read().unwrap();
-                match scanner.next_scan(&*p, scan_id, compare_type, value, value2) {
+                match scanner.next_scan(&*p, scan_id, compare_type, value, value2, float_tolerance) {
                     Ok((match_count, scan_time_us)) => DebuggerResponse::ScanMemoryResult { scan_id, match_count, scan_time_us },
                     Err(e) => DebuggerResponse::Error { message: e },
                 }
@@ -371,6 +544,58 @@ where
             }
             DebuggerRequest::ScanMemoryReset { scan_id } => {
                 match scanner.reset_scan(scan_id) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::PointerScanStart { pid, target_address, max_offset, max_depth, alignment, max_results, modules, thread_count, writable_only } => {
+                let p = platform.read().unwrap();
+                match pointer_scanner.start_scan(&*p, pid, target_address, max_offset, max_depth, alignment, max_results, modules, thread_count, writable_only) {
+                    Ok((results_path, match_count, scan_time_us)) => DebuggerResponse::PointerScanResult { results_path, match_count, scan_time_us },
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::PointerScanGetResults { pid, results_path, offset, count, offset_filter } => {
+                let p = platform.read().unwrap();
+                match pointer_scanner.get_results(&*p, pid, &results_path, offset, count, &offset_filter) {
+                    Ok((paths, total_count)) => DebuggerResponse::PointerScanResults { paths, total_count },
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::PointerScanReset { results_path } => {
+                match pointer_scanner.reset_scan(&results_path) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::PointerScanApplyFilter { results_path, offset_filter } => {
+                match pointer_scanner.apply_filter(&results_path, &offset_filter) {
+                    Ok((results_path, match_count, scan_time_us)) => DebuggerResponse::PointerScanResult { results_path, match_count, scan_time_us },
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::PointerScanRescan { pid, results_path, target_address } => {
+                let p = platform.read().unwrap();
+                match pointer_scanner.rescan(&*p, pid, &results_path, target_address) {
+                    Ok((results_path, match_count, scan_time_us)) => DebuggerResponse::PointerScanResult { results_path, match_count, scan_time_us },
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::StringScanStart { pid, start_address, size, min_length, max_results, thread_count, region_filter, encodings, contains } => {
+                let p = platform.read().unwrap();
+                match string_scanner.start_scan(&*p, pid, start_address, size, min_length, max_results, thread_count, region_filter, encodings, &contains) {
+                    Ok((results_path, match_count, scan_time_us, capped)) => DebuggerResponse::StringScanResult { results_path, match_count, scan_time_us, capped },
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::StringScanGetResults { results_path, offset, count, filter, sort, ascending } => {
+                match string_scanner.get_results(&results_path, offset, count, &filter, sort, ascending) {
+                    Ok((strings, total_count)) => DebuggerResponse::StringScanResults { strings, total_count },
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::StringScanReset { results_path } => {
+                match string_scanner.reset_scan(&results_path) {
                     Ok(()) => DebuggerResponse::Ack,
                     Err(e) => DebuggerResponse::Error { message: e },
                 }
@@ -399,6 +624,22 @@ where
                 match crate::anti_anti_debug::peb::hide_peb(&*p, pid, &options) {
                     Ok(report) => DebuggerResponse::PebHideResult { report },
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::FreezeValueStart { pid, address, data, interval_ms, offsets } => {
+                let freeze_id = freeze_manager.start(platform.clone(), pid, address, data, interval_ms, offsets);
+                DebuggerResponse::FreezeValueStarted { freeze_id }
+            }
+            DebuggerRequest::FreezeValueUpdate { freeze_id, data } => {
+                match freeze_manager.update(freeze_id, data) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e },
+                }
+            }
+            DebuggerRequest::FreezeValueStop { freeze_id } => {
+                match freeze_manager.stop(freeze_id) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e },
                 }
             }
         };

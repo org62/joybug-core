@@ -90,6 +90,7 @@ pub extern "C" fn hook_dispatch(context: *mut HookContext, hook_id: u64) {
 }
 
 /// Convert a HookContext to a Lua table with named register fields.
+#[cfg(target_arch = "x86_64")]
 fn context_to_lua_table(lua: &Lua, ctx: &HookContext) -> LuaResult<LuaTable> {
     let t = lua.create_table()?;
     t.set("rax", ctx.rax)?;
@@ -113,6 +114,7 @@ fn context_to_lua_table(lua: &Lua, ctx: &HookContext) -> LuaResult<LuaTable> {
 
 /// Write back register values from a Lua table into the HookContext struct.
 /// Only writes fields that are present in the table (allows partial updates).
+#[cfg(target_arch = "x86_64")]
 fn write_back_context(_lua: &Lua, table: &LuaTable, ctx: &mut HookContext) -> LuaResult<()> {
     if let Ok(v) = table.get::<u64>("rax") { ctx.rax = v; }
     if let Ok(v) = table.get::<u64>("rcx") { ctx.rcx = v; }
@@ -130,5 +132,26 @@ fn write_back_context(_lua: &Lua, table: &LuaTable, ctx: &mut HookContext) -> Lu
     if let Ok(v) = table.get::<u64>("r14") { ctx.r14 = v; }
     if let Ok(v) = table.get::<u64>("r15") { ctx.r15 = v; }
     if let Ok(v) = table.get::<u64>("rflags") { ctx.rflags = v; }
+    Ok(())
+}
+
+/// Convert an AArch64 HookContext to a Lua table with `x0`..`x30` fields.
+#[cfg(target_arch = "aarch64")]
+fn context_to_lua_table(lua: &Lua, ctx: &HookContext) -> LuaResult<LuaTable> {
+    let t = lua.create_table()?;
+    for (i, v) in ctx.x.iter().enumerate() {
+        t.set(format!("x{i}"), *v)?;
+    }
+    Ok(t)
+}
+
+/// Write back `x0`..`x30` from a Lua table into the AArch64 HookContext.
+#[cfg(target_arch = "aarch64")]
+fn write_back_context(_lua: &Lua, table: &LuaTable, ctx: &mut HookContext) -> LuaResult<()> {
+    for i in 0..31usize {
+        if let Ok(v) = table.get::<u64>(format!("x{i}")) {
+            ctx.x[i] = v;
+        }
+    }
     Ok(())
 }

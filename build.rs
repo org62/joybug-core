@@ -5,10 +5,15 @@ use std::path::Path;
 /// Returns true if compilation succeeded, false if skipped (cl.exe not available)
 /// If fixed_base is Some, the executable will be linked with that base address
 fn compile_test_program(manifest_dir: &str, out_dir: &str, name: &str, fixed_base: Option<u64>) -> bool {
-    let test_program_src = Path::new(manifest_dir)
-        .join("tests")
-        .join("test_programs")
-        .join(format!("{}.c", name));
+    // Prefer a C++ source (.cpp) if present, else fall back to C (.c).
+    let programs_dir = Path::new(manifest_dir).join("tests").join("test_programs");
+    let cpp_src = programs_dir.join(format!("{}.cpp", name));
+    let is_cpp = cpp_src.exists();
+    let test_program_src = if is_cpp {
+        cpp_src
+    } else {
+        programs_dir.join(format!("{}.c", name))
+    };
 
     // Skip if the source file doesn't exist
     if !test_program_src.exists() {
@@ -40,6 +45,10 @@ fn compile_test_program(manifest_dir: &str, out_dir: &str, name: &str, fixed_bas
 
     // Use the compiler's command with proper environment variables set
     let mut cmd = compiler.to_command();
+    // C++ sources need exception handling and the C++ standard flag.
+    if is_cpp {
+        cmd.args(&["/EHsc", "/std:c++17"]);
+    }
     cmd.args(&[
         "/Od",                                              // Disable optimization
         "/Zi",                                              // Generate debug info
@@ -95,6 +104,14 @@ fn compile_test_program(manifest_dir: &str, out_dir: &str, name: &str, fixed_bas
 }
 
 fn main() {
+    // keystone-engine builds with /MTd (static debug CRT) while Rust uses /MD (dynamic CRT).
+    // Suppress the conflicting default lib and link ucrtd to provide _CrtDbgReport symbols.
+    #[cfg(windows)]
+    if env::var("PROFILE").unwrap_or_default() == "debug" {
+        println!("cargo:rustc-link-arg=/NODEFAULTLIB:LIBCMTD");
+        println!("cargo:rustc-link-lib=ucrtd");
+    }
+
     // Require LIBCLANG_PATH to be set (needed for bindgen in dependencies like capstone-sys)
     if env::var("LIBCLANG_PATH").is_err() {
         panic!(
@@ -117,12 +134,19 @@ fn main() {
         let _ = compile_test_program(&manifest_dir, &out_dir, "xtea_test", Some(0x140000000));
         let _ = compile_test_program(&manifest_dir, &out_dir, "emulator_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "exception_test", None);
+        let _ = compile_test_program(&manifest_dir, &out_dir, "single_step_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "hardware_bp_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "memory_search_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "assembler_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "memory_scan_test", None);
+        let _ = compile_test_program(&manifest_dir, &out_dir, "pointer_scan_test", None);
+        let _ = compile_test_program(&manifest_dir, &out_dir, "freeze_value_test", None);
+        let _ = compile_test_program(&manifest_dir, &out_dir, "freeze_chain_test", None);
+        let _ = compile_test_program(&manifest_dir, &out_dir, "pointer_bench_target", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "parent_child_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "veh_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "anti_debug_test", None);
+        let _ = compile_test_program(&manifest_dir, &out_dir, "bp_race_test", None);
+        let _ = compile_test_program(&manifest_dir, &out_dir, "tls_test", None);
     }
 }

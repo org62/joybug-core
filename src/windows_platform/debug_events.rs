@@ -1,8 +1,10 @@
 use super::{utils, WindowsPlatform, stepper};
 use crate::interfaces::PlatformError;
 use crate::protocol::ModuleInfo;
+#[cfg(target_arch = "aarch64")]
+use super::debugged_process::InternalHardwareBreakpoint;
 use tracing::{error, trace, warn};
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, FALSE, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, DUPLICATE_SAME_ACCESS, HANDLE, DuplicateHandle, STATUS_SINGLE_STEP, MAX_PATH};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, FALSE, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, DBG_REPLY_LATER, DUPLICATE_SAME_ACCESS, HANDLE, DuplicateHandle, NTSTATUS, STATUS_SINGLE_STEP, MAX_PATH};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, INFINITE};
 use windows_sys::Win32::System::Diagnostics::Debug::{
     ContinueDebugEvent, WaitForDebugEvent, DEBUG_EVENT, EXCEPTION_DEBUG_EVENT,
@@ -15,6 +17,20 @@ use std::ptr;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 
 // Non-locking helpers to minimize lock holding in server
+fn continue_with_status(pid: u32, tid: u32, status: NTSTATUS, label: &str) -> Result<(), PlatformError> {
+    let cont_res = unsafe { ContinueDebugEvent(pid, tid, status) };
+    if cont_res == FALSE {
+        let error = unsafe { GetLastError() };
+        let error_str = utils::error_message(error);
+        error!(error, error_str, "{} failed", label);
+        return Err(PlatformError::OsError(format!(
+            "{} failed: {} ({})",
+            label, error, error_str
+        )));
+    }
+    Ok(())
+}
+
 pub fn continue_debug_event(pid: u32, tid: u32, pass_exception: bool) -> Result<(), PlatformError> {
     let status = if pass_exception {
         DBG_EXCEPTION_NOT_HANDLED
@@ -22,22 +38,36 @@ pub fn continue_debug_event(pid: u32, tid: u32, pass_exception: bool) -> Result<
         DBG_CONTINUE
     };
     trace!(pid, tid, pass_exception, "ContinueDebugEvent");
-    let cont_res = unsafe { ContinueDebugEvent(pid, tid, status) };
-    if cont_res == FALSE {
-        let error = unsafe { GetLastError() };
-        let error_str = utils::error_message(error);
-        error!(error, error_str, "ContinueDebugEvent failed");
-        return Err(PlatformError::OsError(format!(
-            "ContinueDebugEvent failed: {} ({})",
-            error, error_str
-        )));
-    }
-    Ok(())
+    continue_with_status(pid, tid, status, "ContinueDebugEvent")
 }
 
 /// Convenience wrapper that always uses DBG_CONTINUE
 pub fn continue_only(pid: u32, tid: u32) -> Result<(), PlatformError> {
     continue_debug_event(pid, tid, false)
+}
+
+/// Continue a debug event with DBG_REPLY_LATER (Windows 10 1507+): the event is
+/// re-queued and the reporting thread stays suspended, to be delivered again on a
+/// later WaitForDebugEvent. Used to defer another thread's exception while a
+/// software-breakpoint step-over is in flight, so it is not processed until the
+/// breakpoint has been re-armed. This is the same mechanism x64dbg/TitanEngine
+/// use for their multi-threaded "safe step".
+pub fn continue_reply_later(pid: u32, tid: u32) -> Result<(), PlatformError> {
+    trace!(pid, tid, "ContinueDebugEvent (DBG_REPLY_LATER)");
+    continue_with_status(pid, tid, DBG_REPLY_LATER, "ContinueDebugEvent(DBG_REPLY_LATER)")
+}
+
+/// Whether `debug_event` must be deferred with [`continue_reply_later`] instead
+/// of dispatched: another thread of the same process is mid software-breakpoint
+/// step-over (INT3 removed), so the event must not be processed until the
+/// breakpoint is re-armed. Every event pump that dispatches exceptions while
+/// step-overs may be in flight should consult this before `handle_debug_event`.
+pub(super) fn should_defer_event(platform: &WindowsPlatform, debug_event: &DEBUG_EVENT) -> bool {
+    debug_event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT
+        && platform
+            .get_process(debug_event.dwProcessId)
+            .map(|proc| proc.is_stepping_over_other_thread(debug_event.dwThreadId))
+            .unwrap_or(false)
 }
 
 pub fn wait_for_debug_event_blocking() -> Result<DEBUG_EVENT, PlatformError> {
@@ -285,6 +315,64 @@ fn get_module_path_from_handle(h_module: *mut core::ffi::c_void) -> Option<Strin
     String::from_utf16(&buf).ok()
 }
 
+/// ARM64: prepare to single-step past a hardware breakpoint/watchpoint hit.
+///
+/// The faulting instruction's PC is unchanged, so resuming would re-trigger
+/// forever. We disable ALL hardware debug registers (so the step itself can't
+/// re-trigger), set the CPSR single-step (SS) flag, and mark the thread for
+/// re-arm. The subsequent STATUS_SINGLE_STEP event re-applies every active
+/// breakpoint/watchpoint and clears SS.
+#[cfg(target_arch = "aarch64")]
+fn arm64_begin_step_over_hw_bp(
+    platform: &mut WindowsPlatform,
+    pid: u32,
+    tid: u32,
+) -> Result<(), PlatformError> {
+    let mut context = {
+        let process = platform.get_process(pid)?;
+        match super::thread_context::get_thread_context(process, pid, tid)? {
+            crate::protocol::ThreadContext::Win32RawContext(ctx) => ctx,
+        }
+    };
+    // Disable all breakpoint and watchpoint registers for the step.
+    super::hardware_breakpoints::clear_all_hw_bp_in_context(&mut context);
+    stepper::set_single_step_flag_native(&mut context)?;
+    super::thread_context::set_thread_context(
+        platform.get_process(pid)?,
+        pid,
+        tid,
+        crate::protocol::ThreadContext::Win32RawContext(context),
+    )?;
+    // dr_index is unused on ARM64 (we re-arm all active bps); pass 0 as a marker.
+    platform.get_process_mut(pid)?.schedule_hw_bp_rearm(tid, 0);
+    Ok(())
+}
+
+/// Rewind `tid`'s instruction pointer to `address` (the software breakpoint
+/// whose INT3/BRK byte was just restored) and, when `single_step` is set, also
+/// set the CPU single-step flag — one GetThreadContext/SetThreadContext round
+/// trip for both. Shared by the single-shot, coverage, and persistent
+/// breakpoint paths.
+fn reset_ip_after_breakpoint(
+    process: &super::debugged_process::DebuggedProcess,
+    pid: u32,
+    tid: u32,
+    address: u64,
+    single_step: bool,
+) -> Result<(), PlatformError> {
+    let mut context = match super::thread_context::get_thread_context(process, pid, tid)? {
+        crate::protocol::ThreadContext::Win32RawContext(ctx) => ctx,
+    };
+    #[cfg(target_arch = "x86_64")]
+    { context.Rip = address; }
+    #[cfg(target_arch = "aarch64")]
+    { context.Pc = address; }
+    if single_step {
+        stepper::set_single_step_flag_native(&mut context)?;
+    }
+    super::thread_context::set_thread_context(process, pid, tid, crate::protocol::ThreadContext::Win32RawContext(context))
+}
+
 // Handle EXCEPTION_DEBUG_EVENT in a dedicated function to keep continue_exec simpler.
 pub(super) fn handle_exception_event(
     platform: &mut WindowsPlatform,
@@ -300,6 +388,59 @@ pub(super) fn handle_exception_event(
         let address = ex_record.ExceptionAddress as u64;
         trace!(pid = pid, tid = tid, address = %format!("0x{:X}", address), "Breakpoint event");
 
+        // ARM64 hardware breakpoints and watchpoints are both delivered as
+        // EXCEPTION_BREAKPOINT (there is no DR6-equivalent). Distinguish them:
+        //   - Watchpoint: NumberParameters == 2, ExceptionInformation[1] is the
+        //     accessed data address (matches a Write/ReadWrite watchpoint).
+        //   - Execute HW breakpoint: PC matches an active Execute breakpoint and
+        //     is not one of our software breakpoints.
+        // In both cases the PC stays at the faulting instruction, so we must
+        // single-step past it (with the registers disabled) and re-arm.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let hw_hit: Option<InternalHardwareBreakpoint> = {
+                let wp = if ex_record.NumberParameters >= 2 {
+                    let data_addr = ex_record.ExceptionInformation[1] as u64;
+                    process.active_hw_bp_for_access(data_addr, true)
+                } else {
+                    None
+                };
+                wp.or_else(|| {
+                    if process.has_single_shot_breakpoint(address)
+                        || process.is_persistent_breakpoint(address)
+                    {
+                        None
+                    } else {
+                        process.active_hw_bp_for_access(address, false)
+                    }
+                })
+            };
+
+            if let Some(bp) = hw_hit {
+                trace!(
+                    address = %format!("0x{:X}", bp.address),
+                    dr = bp.dr_index,
+                    ?bp.bp_type,
+                    "ARM64 hardware breakpoint/watchpoint hit"
+                );
+                // `process` borrow ends here; step over with HW debug disabled.
+                arm64_begin_step_over_hw_bp(platform, pid, tid)?;
+                // Silent access-trace path: ARM64 reports the exact faulting PC
+                // (`address`), so no client-side back-step is needed. If the watched
+                // address is being traced, record and auto-continue silently.
+                if platform.get_process_mut(pid)?.record_watchpoint_access(bp.address, address, tid) {
+                    return Ok(None);
+                }
+                return Ok(Some(crate::protocol::DebugEvent::HardwareBreakpoint {
+                    pid,
+                    tid,
+                    address: bp.address,
+                    dr_index: bp.dr_index,
+                    bp_type: bp.bp_type,
+                }));
+            }
+        }
+
         // Gather single-shot removal and possible step-over removal in one borrow
         let (single_shot_original_opt, step_over_hit_opt) = {
             let ss = process.remove_single_shot_breakpoint(address);
@@ -309,18 +450,9 @@ pub(super) fn handle_exception_event(
         if let Some(original_bytes) = single_shot_original_opt {
             trace!(address = %format!("0x{:X}", address), "Single-shot breakpoint hit. Restoring original bytes.");
 
-            // Restore the original byte
+            // Restore the original byte and set IP back to the original instruction
             process.restore_original_bytes(address, &original_bytes)?;
-
-            // Set IP back to the original instruction's address
-            let mut context = match super::thread_context::get_thread_context(process, pid, tid)? {
-                crate::protocol::ThreadContext::Win32RawContext(ctx) => ctx,
-            };
-            #[cfg(target_arch = "x86_64")]
-            { context.Rip = address; }
-            #[cfg(target_arch = "aarch64")]
-            { context.Pc = address; }
-            super::thread_context::set_thread_context(process, pid, tid, crate::protocol::ThreadContext::Win32RawContext(context.clone()))?;
+            reset_ip_after_breakpoint(process, pid, tid, address, false)?;
 
             // If this was a step-over breakpoint, we already removed it above
             if let Some((tid_hit, kind)) = step_over_hit_opt {
@@ -335,34 +467,47 @@ pub(super) fn handle_exception_event(
             }
         }
 
+        // Code-coverage breakpoint path: count the hit server-side and
+        // auto-continue *silently* (never forwarded to the client). Reuses the
+        // same restore / reset-IP / step-over-re-arm machinery as the persistent
+        // path below. Checked before the persistent path because coverage INT3s
+        // are also stored in `persistent_breakpoints`.
+        if let Some((count, limit)) = process.record_coverage_hit(address, tid) {
+            trace!(address = %format!("0x{:X}", address), count, limit, "Coverage breakpoint hit");
+
+            // Restore the original instruction bytes so the real instruction runs.
+            process.restore_persistent_original(address)?;
+
+            if limit != 0 && count >= limit {
+                // Limit reached: leave the original byte in place (INT3 gone) and
+                // drop the persistent entry. The instruction runs normally on the
+                // auto-continue; no single-step / re-arm needed.
+                process.deactivate_coverage(address);
+                reset_ip_after_breakpoint(process, pid, tid, address, false)?;
+            } else {
+                // Keep counting: single-step over the restored instruction and
+                // re-arm the INT3 afterwards, freezing other threads while it is
+                // temporarily removed (multi-threaded software-breakpoint race —
+                // `begin_step_over` skips the freeze for blocking syscalls).
+                process.schedule_rearm_after_single_step(tid, address, false);
+                process.begin_step_over(pid, tid, address, "coverage");
+                reset_ip_after_breakpoint(process, pid, tid, address, true)?;
+            }
+
+            // Silent: the server auto-continues without exposing this to the client.
+            return Ok(None);
+        }
+
         // Persistent breakpoint path
         if process.is_persistent_breakpoint(address)
         {
             trace!(address = %format!("0x{:X}", address), "Persistent breakpoint hit. Restoring original bytes and handling re-arm or step-out.");
 
-            // Collect data needed with minimal borrows
-            let (is_thread_match, original_bytes_opt, is_step_out_hit) = {
-                (
-                    process.persistent_allowed_for_tid(address, tid),
-                    process.persistent_original_bytes(address),
-                    process.has_step_out_breakpoint(address),
-                )
-            };
+            let is_thread_match = process.persistent_allowed_for_tid(address, tid);
+            let is_step_out_hit = process.has_step_out_breakpoint(address);
 
             // Restore original instruction bytes
-            if let Some(original_bytes) = original_bytes_opt {
-                process.restore_original_bytes(address, &original_bytes)?;
-            }
-
-            // Reset IP to original instruction
-            let mut context = match super::thread_context::get_thread_context(process, pid, tid)? {
-                crate::protocol::ThreadContext::Win32RawContext(ctx) => ctx,
-            };
-            #[cfg(target_arch = "x86_64")]
-            { context.Rip = address; }
-            #[cfg(target_arch = "aarch64")]
-            { context.Pc = address; }
-            super::thread_context::set_thread_context(process, pid, tid, crate::protocol::ThreadContext::Win32RawContext(context.clone()))?;
+            process.restore_persistent_original(address)?;
 
             // Is this a step-out completion?
             if is_thread_match && is_step_out_hit {
@@ -370,6 +515,7 @@ pub(super) fn handle_exception_event(
                     process.remove_step_out_breakpoint(address)
                 };
                 if let Some((tid2, original_return_address)) = step_out_info {
+                    reset_ip_after_breakpoint(process, pid, tid, address, false)?;
                     let _ = process.remove_breakpoint(address);
                     return Ok(Some(crate::protocol::DebugEvent::StepComplete {
                         pid,
@@ -382,11 +528,15 @@ pub(super) fn handle_exception_event(
 
             // Not a step-out: schedule SS to pass and re-arm
             process.schedule_rearm_after_single_step(tid, address, false);
-            let mut ctx2 = match super::thread_context::get_thread_context(process, pid, tid)? {
-                crate::protocol::ThreadContext::Win32RawContext(ctx) => ctx,
-            };
-            super::stepper::set_single_step_flag_native(&mut ctx2)?;
-            super::thread_context::set_thread_context(process, pid, tid, crate::protocol::ThreadContext::Win32RawContext(ctx2))?;
+            // Freeze all other threads for the duration of the single-step so no
+            // other thread can execute through `address` while its INT3 is
+            // temporarily removed (multi-threaded software-breakpoint race). They
+            // are resumed once every stepper's breakpoint is re-armed.
+            // `begin_step_over` skips the freeze for blocking syscalls.
+            process.begin_step_over(pid, tid, address, "breakpoint");
+            // Reset IP to the original instruction and set the single-step flag
+            // in one context round trip.
+            reset_ip_after_breakpoint(process, pid, tid, address, true)?;
 
             if is_thread_match {
                 return Ok(Some(crate::protocol::DebugEvent::Breakpoint { pid, tid, address }));
@@ -429,8 +579,13 @@ pub(super) fn handle_exception_event(
             trace!(pid = pid, tid = tid, rearm_addr = %format!("0x{:X}", rearm_addr), "SS used for persistent breakpoint re-arm");
             if let Err(e) = stepper::clear_single_step_flag_native2(platform, pid, tid) { error!("Failed to clear single-step flag: {}", e); }
             {
-                let process = platform.get_process(pid)?;
-                let _ = process.rearm_persistent_breakpoint_if_matches_original(rearm_addr);
+                let process = platform.get_process_mut(pid)?;
+                // This thread finished stepping over its breakpoint: re-arm the
+                // INT3 and, once no step-over remains, resume the frozen threads.
+                let resumed = process.complete_step_over(tid);
+                if resumed > 0 {
+                    trace!(pid, tid, resumed, "Resumed other threads after breakpoint step-over");
+                }
             }
             return Ok(None);
         }
@@ -452,6 +607,22 @@ pub(super) fn handle_exception_event(
                     // Clear trap flag
                     aligned.context.EFlags &= !(0x100u32);
                     let _ = unsafe { windows_sys::Win32::System::Diagnostics::Debug::SetThreadContext(thread_handle, &aligned.context) };
+                }
+            }
+            // ARM64: we disabled all HW debug registers before the step. Clear the
+            // single-step (SS) flag and re-arm every active breakpoint/watchpoint.
+            #[cfg(target_arch = "aarch64")]
+            {
+                let _ = rearm_dr_index;
+                if let Err(e) = stepper::clear_single_step_flag_native2(platform, pid, tid) {
+                    error!("Failed to clear single-step flag during HW BP re-arm: {}", e);
+                }
+                let proc = platform.get_process(pid)?;
+                let active = proc.active_hardware_breakpoints();
+                if let Some(handle) = proc.thread_manager().get_thread_handle(tid) {
+                    if let Err(e) = super::hardware_breakpoints::apply_all_hw_bps_to_thread(handle, &active) {
+                        error!("Failed to re-arm ARM64 HW breakpoints: {}", e);
+                    }
                 }
             }
             return Ok(None);
@@ -488,8 +659,16 @@ pub(super) fn handle_exception_event(
                 if let Err(e) = stepper::clear_single_step_flag_native2(platform, pid, tid) { error!("Failed to clear single-step flag: {}", e); }
             }
             {
-                let process = platform.get_process(pid)?;
+                let process = platform.get_process_mut(pid)?;
                 let _ = process.rearm_persistent_breakpoint_if_matches_original(rearm_addr);
+                // If this step was an explicit user step that took over an
+                // in-flight software-breakpoint step-over, the other threads were
+                // frozen at the breakpoint hit; re-arm that breakpoint and release
+                // them. No-op if this thread was not mid-step-over.
+                let resumed = process.complete_step_over(tid);
+                if resumed > 0 {
+                    trace!(pid, tid, resumed, "Resumed other threads after breakpoint step-over (explicit step)");
+                }
             }
             return Ok(Some(crate::protocol::DebugEvent::StepComplete { pid, tid, kind: step_state.kind, address: ex_record.ExceptionAddress as u64 }));
         }
@@ -517,6 +696,15 @@ pub(super) fn handle_exception_event(
 
                         // Schedule re-arm after the single step completes
                         process.schedule_hw_bp_rearm(tid, dr_index);
+
+                        // Silent access-trace path: if this watched address is being
+                        // traced, record the accessing instruction (raw RIP; x86
+                        // traps *after* the access, so this is the following
+                        // instruction — attributed back at snapshot time) and
+                        // auto-continue without forwarding a HardwareBreakpoint event.
+                        if process.record_watchpoint_access(bp_address, aligned.context.Rip, tid) {
+                            return Ok(None);
+                        }
 
                         return Ok(Some(crate::protocol::DebugEvent::HardwareBreakpoint {
                             pid, tid, address: bp_address, dr_index, bp_type,
