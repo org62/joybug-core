@@ -101,6 +101,57 @@ fn is_ret_mnemonic(mnemonic: &str, arch: Architecture) -> bool {
 /// X86 RIP register ID in Capstone
 const X86_REG_RIP: u16 = 41;
 
+/// Whether it is safe *and* useful to ask Capstone for this ARM64 instruction's
+/// operands.
+///
+/// capstone-rs builds `Arm64OperandType` by transmuting Capstone's raw
+/// system-register, PSTATE, prefetch and barrier encodings into closed Rust
+/// enums. Those enums name only a small fraction of the encodings Capstone can
+/// emit — for system registers, ~700 of 32768 — so reading the operands of a
+/// system instruction transmutes an invalid discriminant. That is a
+/// non-unwinding panic: it aborts the process and cannot be caught.
+///
+/// Every ARM64 form that can carry a code address is a branch, a PC-relative
+/// address, or a literal load, and none of those is a system instruction. So we
+/// allowlist the forms we want rather than denylist the hazardous ones — a
+/// denylist would abort the debugger the first time it missed an encoding.
+fn arm64_may_have_address_operand(mnemonic: &str) -> bool {
+    is_jump_mnemonic(mnemonic, Architecture::Arm64)
+        || is_call_mnemonic(mnemonic, Architecture::Arm64)
+        // PC-relative address materialization
+        || mnemonic.eq_ignore_ascii_case("adr")
+        || mnemonic.eq_ignore_ascii_case("adrp")
+        // Literal (PC-relative) loads
+        || mnemonic.eq_ignore_ascii_case("ldr")
+        || mnemonic.eq_ignore_ascii_case("ldrsw")
+}
+
+/// The single sanctioned reader of ARM64 operand details: returns the
+/// address-sized immediates of `insn`, or nothing when the instruction isn't an
+/// address-bearing form. Owns the `arm64_may_have_address_operand` gate so the
+/// transmute-hazardous `Arm64OperandType` access happens in exactly one place —
+/// a new caller cannot forget the gate and reintroduce the process abort.
+fn arm64_address_imms(engine: &Capstone, insn: &capstone::Insn) -> Vec<u64> {
+    let mut addresses = Vec::new();
+    if !arm64_may_have_address_operand(insn.mnemonic().unwrap_or("")) {
+        return addresses;
+    }
+    let Ok(detail) = engine.insn_detail(insn) else {
+        return addresses;
+    };
+    if let ArchDetail::Arm64Detail(arm64) = detail.arch_detail() {
+        for op in arm64.operands() {
+            if let capstone::arch::arm64::Arm64OperandType::Imm(value) = op.op_type {
+                let addr = value as u64;
+                if addr > 0x10000 {
+                    addresses.push(addr);
+                }
+            }
+        }
+    }
+    addresses
+}
+
 /// Extract all addresses that should be symbolized from instruction operands
 /// Uses Capstone's structured operand data instead of text parsing
 fn extract_addresses_from_operands(
@@ -110,13 +161,12 @@ fn extract_addresses_from_operands(
 ) -> Vec<u64> {
     let mut addresses = Vec::new();
 
-    let detail = match engine.insn_detail(insn) {
-        Ok(d) => d,
-        Err(_) => return addresses,
-    };
-
     match arch {
         Architecture::X64 => {
+            let detail = match engine.insn_detail(insn) {
+                Ok(d) => d,
+                Err(_) => return addresses,
+            };
             if let ArchDetail::X86Detail(x86) = detail.arch_detail() {
                 for op in x86.operands() {
                     match op.op_type {
@@ -151,17 +201,7 @@ fn extract_addresses_from_operands(
             }
         }
         Architecture::Arm64 => {
-            // ARM64 handling - immediates in branch instructions
-            if let ArchDetail::Arm64Detail(arm64) = detail.arch_detail() {
-                for op in arm64.operands() {
-                    if let capstone::arch::arm64::Arm64OperandType::Imm(value) = op.op_type {
-                        let addr = value as u64;
-                        if addr > 0x10000 {
-                            addresses.push(addr);
-                        }
-                    }
-                }
-            }
+            addresses = arm64_address_imms(engine, insn);
         }
     }
 
@@ -174,10 +214,9 @@ fn extract_jump_target_from_operands(
     insn: &capstone::Insn,
     arch: Architecture,
 ) -> Option<u64> {
-    let detail = engine.insn_detail(insn).ok()?;
-
     match arch {
         Architecture::X64 => {
+            let detail = engine.insn_detail(insn).ok()?;
             if let ArchDetail::X86Detail(x86) = detail.arch_detail() {
                 for op in x86.operands() {
                     match op.op_type {
@@ -203,16 +242,7 @@ fn extract_jump_target_from_operands(
             }
         }
         Architecture::Arm64 => {
-            if let ArchDetail::Arm64Detail(arm64) = detail.arch_detail() {
-                for op in arm64.operands() {
-                    if let capstone::arch::arm64::Arm64OperandType::Imm(value) = op.op_type {
-                        let addr = value as u64;
-                        if addr > 0x10000 {
-                            return Some(addr);
-                        }
-                    }
-                }
-            }
+            return arm64_address_imms(engine, insn).into_iter().next();
         }
     }
 
@@ -397,5 +427,57 @@ mod tests {
 
         // All 22 bytes accounted for: NOP + db + 20 NOPs.
         assert_eq!(instrs.len(), 22);
+    }
+
+    // capstone-rs builds `Arm64OperandType` by transmuting capstone's raw
+    // system-register encoding into the `arm64_sysreg` enum. That enum only
+    // names ~700 of the 32768 well-formed encodings, so every MRS/MSR on an
+    // unnamed sysreg transmutes to an invalid discriminant — a non-unwinding
+    // panic that aborts the process, uncatchable. Same hazard for the SYS /
+    // PSTATE / PREFETCH / BARRIER operand kinds. We must therefore never ask
+    // capstone for ARM64 operands on a system instruction.
+    //
+    // If this regresses, the test binary aborts rather than failing cleanly.
+    #[test]
+    fn arm64_unnamed_sysreg_does_not_abort() {
+        // mrs x0, S3_0_C0_C0_1 — well-formed, absent from capstone's enum.
+        let bytes = [0x20u8, 0x00, 0x38, 0xD5];
+        let base = 0x140001000u64;
+
+        let disasm = CapstoneDisassembler::new().unwrap();
+        let instrs = disasm.disassemble(Architecture::Arm64, &bytes, base, 1).unwrap();
+
+        assert_eq!(instrs.len(), 1);
+        assert_eq!(instrs[0].mnemonic, "mrs");
+        // A system register is never a code address worth symbolizing.
+        assert!(instrs[0].addresses_to_symbolize.is_empty());
+        assert_eq!(instrs[0].jump_target, None);
+    }
+
+    // The address-bearing ARM64 forms must still yield their targets.
+    #[test]
+    fn arm64_branch_and_pcrel_targets_still_extracted() {
+        let base = 0x140001000u64;
+        let disasm = CapstoneDisassembler::new().unwrap();
+
+        // bl #0x1000 -> 0x140002000
+        let bl = disasm
+            .disassemble(Architecture::Arm64, &[0x00u8, 0x04, 0x00, 0x94], base, 1)
+            .unwrap();
+        assert_eq!(bl[0].mnemonic, "bl");
+        assert!(bl[0].is_call);
+        assert_eq!(bl[0].jump_target, Some(0x140002000));
+        assert!(bl[0].addresses_to_symbolize.contains(&0x140002000));
+
+        // adrp x0, #0x141001000 — pc-relative page address
+        let adrp = disasm
+            .disassemble(Architecture::Arm64, &[0x00u8, 0x80, 0x00, 0xB0], base, 1)
+            .unwrap();
+        assert_eq!(adrp[0].mnemonic, "adrp");
+        assert!(
+            adrp[0].addresses_to_symbolize.iter().any(|a| *a > 0x10000),
+            "adrp should surface its page address, got {:?}",
+            adrp[0].addresses_to_symbolize
+        );
     }
 }
