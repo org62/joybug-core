@@ -11,6 +11,10 @@ local test_exe = TEST_EXE -- injected by Rust test harness
 local PROGRAM_VALUE = 1000
 local SENTINEL = 0xAABBCCDD
 
+-- Freeze ticks every ~30ms; poll for up to 3s so a loaded machine can't fail us.
+local POLL_INTERVAL_MS = 20
+local POLL_ATTEMPTS = 150
+
 dbg:on_initial_breakpoint(function(pid, tid, addr)
     dbg:set_single_shot_breakpoint(pid, "freeze_value_test!pause_here", function(pid, tid, addr)
         -- Resolve &g_value.
@@ -26,10 +30,18 @@ dbg:on_initial_breakpoint(function(pid, tid, addr)
         local data = string.char(0xDD, 0xCC, 0xBB, 0xAA)
         local freeze_id = dbg:freeze_value(pid, value_addr, data)
 
-        -- While stopped, only the freeze thread writes. Let it tick, then verify.
-        dbg:sleep(200)
-        assert(dbg:read_u32(pid, value_addr) == SENTINEL,
-            "freeze should hold the sentinel value while stopped")
+        -- While stopped, only the freeze thread writes. Poll until its first tick
+        -- lands rather than sleeping a fixed amount: under parallel test load the
+        -- freeze thread can take well over 200ms to get its first write in.
+        local last = nil
+        for _ = 1, POLL_ATTEMPTS do
+            last = dbg:read_u32(pid, value_addr)
+            if last == SENTINEL then break end
+            dbg:sleep(POLL_INTERVAL_MS)
+        end
+        assert(last == SENTINEL,
+            string.format("freeze should hold the sentinel value while stopped (last read 0x%X after %dms)",
+                last, POLL_ATTEMPTS * POLL_INTERVAL_MS))
 
         -- After unfreeze nothing overwrites the address while stopped.
         dbg:unfreeze_value(freeze_id)

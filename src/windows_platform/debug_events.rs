@@ -487,12 +487,10 @@ pub(super) fn handle_exception_event(
             } else {
                 // Keep counting: single-step over the restored instruction and
                 // re-arm the INT3 afterwards, freezing other threads while it is
-                // temporarily removed (multi-threaded software-breakpoint race).
+                // temporarily removed (multi-threaded software-breakpoint race —
+                // `begin_step_over` skips the freeze for blocking syscalls).
                 process.schedule_rearm_after_single_step(tid, address, false);
-                let frozen = process.begin_step_over(tid, address);
-                if frozen > 0 {
-                    trace!(pid, tid, address = %format!("0x{:X}", address), frozen, "Froze other threads for coverage step-over");
-                }
+                process.begin_step_over(pid, tid, address, "coverage");
                 reset_ip_after_breakpoint(process, pid, tid, address, true)?;
             }
 
@@ -534,10 +532,8 @@ pub(super) fn handle_exception_event(
             // other thread can execute through `address` while its INT3 is
             // temporarily removed (multi-threaded software-breakpoint race). They
             // are resumed once every stepper's breakpoint is re-armed.
-            let frozen = process.begin_step_over(tid, address);
-            if frozen > 0 {
-                trace!(pid, tid, address = %format!("0x{:X}", address), frozen, "Froze other threads for breakpoint step-over");
-            }
+            // `begin_step_over` skips the freeze for blocking syscalls.
+            process.begin_step_over(pid, tid, address, "breakpoint");
             // Reset IP to the original instruction and set the single-step flag
             // in one context round trip.
             reset_ip_after_breakpoint(process, pid, tid, address, true)?;

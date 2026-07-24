@@ -5,6 +5,31 @@ use windows_sys::Win32::Foundation::{FALSE, GetLastError, HANDLE};
 use windows_sys::Win32::System::Diagnostics::Debug::{SymCleanup, SymInitialize};
 use windows_sys::Win32::System::Threading::{ResumeThread, SuspendThread};
 
+// Kernel-transition ("syscall") instruction encodings, used by
+// `DebuggedProcess::instruction_is_syscall` to recognise an ntdll stub.
+//
+// x64 — two-byte opcodes, no operands:
+/// `syscall` — the AMD64 fast system call used by every modern ntdll stub.
+const X64_SYSCALL: [u8; 2] = [0x0F, 0x05];
+/// `sysenter` — the Intel equivalent, still reachable in WOW64/legacy stubs.
+const X64_SYSENTER: [u8; 2] = [0x0F, 0x34];
+/// `int 2Eh` — the pre-XP system call gate, kept as a fallback in some stubs.
+const X64_INT_2E: [u8; 2] = [0xCD, 0x2E];
+
+// ARM64 — fixed-width 32-bit instruction. `svc #imm16` encodes as
+//   31                 21 20            5 4   0
+//   1 1 0 1 0 1 0 0 0 0 0 | i(16 bits)   | 0 0 0 0 1
+// so mask off the immediate and compare the fixed bits.
+/// Bits of an ARM64 instruction word that are fixed for `svc` (the immediate is masked out).
+const ARM64_SVC_MASK: u32 = 0xFFE0_001F;
+/// Value those fixed bits must have for the instruction to be `svc #imm16`.
+const ARM64_SVC_OPCODE: u32 = 0xD400_0001;
+
+/// True when `word` (a little-endian ARM64 instruction) is `svc #imm16`.
+fn arm64_word_is_svc(word: u32) -> bool {
+    word & ARM64_SVC_MASK == ARM64_SVC_OPCODE
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct InternalHardwareBreakpoint {
     pub address: u64,
@@ -76,9 +101,12 @@ pub(crate) struct DebuggedProcess {
     pending_rearm_breakpoints: std::collections::HashMap<u32, (u64, bool)>,
     /// Threads currently stepping over a temporarily-removed software breakpoint
     /// (INT3 removed, awaiting the single-step that re-arms it), mapped to the
-    /// breakpoint address they are stepping over. Such a thread must be allowed to
-    /// run and must never be frozen by another thread's step-over.
-    stepping_over_threads: std::collections::HashMap<u32, u64>,
+    /// breakpoint address they are stepping over and whether the step-over is
+    /// *exclusive* (other threads frozen + their events deferred). Such a thread
+    /// must be allowed to run and must never be frozen by another thread's
+    /// step-over. Non-exclusive step-overs are used for instructions that can block
+    /// (see [`Self::instruction_is_syscall`]).
+    stepping_over_threads: std::collections::HashMap<u32, (u64, bool)>,
     /// Threads we have `SuspendThread`'d (exactly once each) to keep them out of
     /// a software breakpoint while its INT3 is removed. Resumed once no step-over
     /// remains in flight.
@@ -256,22 +284,37 @@ impl DebuggedProcess {
     /// thread, so without this freeze another thread could run straight through
     /// the now-INT3-less address and its hit would be silently lost.
     ///
-    /// Only one step-over is ever in flight at a time: the debug loop defers any
-    /// other thread's exception with `DBG_REPLY_LATER` (see `server_continue`)
-    /// until the step-over completes, so a second thread that also hit the same
-    /// breakpoint is not processed concurrently. The stepping thread itself is
-    /// never frozen (it must run to deliver its single-step); a defensive thaw is
-    /// kept in case an earlier step-over had frozen it.
+    /// Only one *exclusive* step-over is ever in flight at a time: the debug loop
+    /// defers any other thread's exception with `DBG_REPLY_LATER` (see
+    /// `server_continue`) until the step-over completes, so a second thread that
+    /// also hit the same breakpoint is not processed concurrently. The stepping
+    /// thread itself is never frozen (it must run to deliver its single-step); a
+    /// defensive thaw is kept in case an earlier step-over had frozen it.
     ///
-    /// Returns the number of threads newly frozen.
-    pub(super) fn begin_step_over(&mut self, tid: u32, address: u64) -> usize {
-        self.stepping_over_threads.insert(tid, address);
+    /// A step-over of an instruction that can block indefinitely (a syscall — see
+    /// [`Self::instruction_is_syscall`]) is *non-exclusive*: nothing is frozen or
+    /// deferred, the step-over is only registered so the single-step still re-arms
+    /// the breakpoint. Freezing the threads that would unblock such an instruction
+    /// deadlocks the whole process. The cost is the original race: another thread
+    /// may run through the disarmed address and its hit is lost. The decision is
+    /// made here, not by callers, so no call site can reintroduce the deadlock.
+    /// Call this *after* the original bytes have been restored.
+    ///
+    /// `context` labels the trace output (e.g. "coverage", "breakpoint").
+    pub(super) fn begin_step_over(&mut self, pid: u32, tid: u32, address: u64, context: &'static str) {
+        let exclusive = !self.instruction_is_syscall(address);
+        self.stepping_over_threads.insert(tid, (address, exclusive));
 
         // The stepping thread must run; thaw it if an earlier step-over froze it.
         if self.frozen_threads.remove(&tid) {
             if let Some(handle) = self.thread_manager.get_thread_handle(tid) {
                 unsafe { ResumeThread(handle); }
             }
+        }
+
+        if !exclusive {
+            trace!(pid, tid, address = %format!("0x{:X}", address), context, "Step-over of a syscall: not freezing other threads");
+            return;
         }
 
         let mut newly_frozen = 0;
@@ -295,35 +338,52 @@ impl DebuggedProcess {
                 newly_frozen += 1;
             }
         }
-        newly_frozen
+        if newly_frozen > 0 {
+            trace!(pid, tid, address = %format!("0x{:X}", address), frozen = newly_frozen, context, "Froze other threads for step-over");
+        }
     }
 
-    /// Whether some *other* thread is currently mid software-breakpoint step-over
-    /// (INT3 removed) — i.e. an event for `tid` should be deferred via
+    /// The thread whose *exclusive* step-over is in flight, if any — the only kind
+    /// that freezes threads and defers events, and so the only kind that may gate
+    /// the thaw. At most one exists at a time (`DBG_REPLY_LATER` serializes them).
+    /// A non-exclusive step-over must never gate anything: it can sit in a blocking
+    /// syscall for an unbounded time (an idle worker thread parked in
+    /// `NtWaitForWorkViaWorkerFactory` never returns), which would leave another
+    /// stepper's frozen threads suspended forever.
+    fn exclusive_stepper(&self) -> Option<u32> {
+        self.stepping_over_threads
+            .iter()
+            .find_map(|(&tid, &(_, exclusive))| exclusive.then_some(tid))
+    }
+
+    /// Whether some *other* thread is currently mid exclusive software-breakpoint
+    /// step-over (INT3 removed) — i.e. an event for `tid` should be deferred via
     /// `DBG_REPLY_LATER` rather than processed now. False for the stepping thread's
-    /// own single-step event.
+    /// own single-step event, and false for non-exclusive step-overs: deferring an
+    /// event blocks that thread just like freezing it would, which is exactly what
+    /// deadlocks a blocking instruction's step-over.
     pub(super) fn is_stepping_over_other_thread(&self, tid: u32) -> bool {
-        self.stepping_over_threads.keys().any(|&stepper| stepper != tid)
+        self.exclusive_stepper().is_some_and(|stepper| stepper != tid)
     }
 
     /// Complete the step-over for `tid` (its single-step has delivered): re-arm
-    /// the INT3 it was stepping over and, once no step-over remains in flight,
-    /// resume the threads frozen by [`begin_step_over`]. The order is the safety
-    /// contract — frozen threads may only run again after the INT3 is back in
-    /// place.
+    /// the INT3 it was stepping over and, once no exclusive step-over remains in
+    /// flight, resume the threads frozen by [`begin_step_over`]. The order is the
+    /// safety contract — frozen threads may only run again after the INT3 is back
+    /// in place.
     ///
-    /// `DBG_REPLY_LATER` guarantees at most one thread is ever mid-step-over at a
-    /// time (another thread's breakpoint event is deferred, not processed
-    /// concurrently), so no per-address deferral is needed here.
+    /// `DBG_REPLY_LATER` guarantees at most one thread is ever mid-*exclusive*
+    /// step-over at a time (another thread's breakpoint event is deferred, not
+    /// processed concurrently), so no per-address deferral is needed here.
     ///
     /// No-op returning 0 if `tid` was not mid-step-over. Returns the number of
     /// threads resumed.
     pub(super) fn complete_step_over(&mut self, tid: u32) -> usize {
-        let Some(addr) = self.stepping_over_threads.remove(&tid) else {
+        let Some((addr, _exclusive)) = self.stepping_over_threads.remove(&tid) else {
             return 0;
         };
         let _ = self.rearm_persistent_breakpoint_if_matches_original(addr);
-        if self.stepping_over_threads.is_empty() {
+        if self.exclusive_stepper().is_none() {
             self.resume_frozen_threads()
         } else {
             0
@@ -348,11 +408,12 @@ impl DebuggedProcess {
     }
 
     /// Drop `tid` from all step-over bookkeeping (used when a thread exits). If it
-    /// was the last stepper in flight, remaining frozen threads are resumed.
+    /// was the last *exclusive* stepper in flight, remaining frozen threads are
+    /// resumed.
     pub(super) fn forget_thread_step_over(&mut self, tid: u32) {
         self.frozen_threads.remove(&tid);
         self.stepping_over_threads.remove(&tid);
-        if self.stepping_over_threads.is_empty() {
+        if self.exclusive_stepper().is_none() {
             self.resume_frozen_threads();
         }
     }
@@ -382,6 +443,60 @@ impl DebuggedProcess {
         match self.architecture {
             Architecture::X64 => vec![0xCC],
             Architecture::Arm64 => vec![0x00, 0x00, 0x3e, 0xD4],
+        }
+    }
+
+    /// Whether the instruction currently at `address` is a kernel transition
+    /// (`svc` on ARM64, `syscall`/`sysenter`/`int 2Eh` on x64). Call this *after*
+    /// the original bytes have been restored.
+    ///
+    /// Such an instruction can block for an unbounded time — an ntdll syscall stub
+    /// like `NtWaitForAlertByThreadId` sleeps until another thread wakes it — so
+    /// its step-over must not freeze (or defer the events of) the other threads:
+    /// the thread that would wake it is one of them, and the single-step that
+    /// thaws everyone can only arrive after the syscall returns. On ARM64 this is
+    /// not a corner case: an ntdll syscall stub is literally `svc #n; ret`, so the
+    /// function entry that coverage arms *is* the syscall (493 of ntdll's 7859
+    /// `RUNTIME_FUNCTION` entries). On x64 the stub prologue sits at the entry and
+    /// the `syscall` is a few instructions in, so it is only reachable by a
+    /// breakpoint set directly on it.
+    ///
+    /// This runs on every software-breakpoint hit, so it must stay cheap: on ARM64
+    /// the saved original word classifies with no debuggee read at all; on x64 the
+    /// single saved byte prefilters (almost no instruction starts with 0x0F/0xCD),
+    /// so the cross-process read for the second opcode byte is almost always
+    /// skipped. If richer classification is ever needed, route through
+    /// `WindowsPlatform::disassemble_instruction_raw` instead of extending the
+    /// byte matching.
+    fn instruction_is_syscall(&self, address: u64) -> bool {
+        let saved = self.persistent_breakpoints.get(&address);
+        match self.architecture {
+            Architecture::Arm64 => {
+                // The 4 original bytes are already saved, so no read is needed.
+                let word = match saved.and_then(|original| original.first_chunk::<4>()) {
+                    Some(&bytes) => u32::from_le_bytes(bytes),
+                    None => {
+                        let read = super::memory::read_memory_internal(self.process_handle.0, address, 4)
+                            .unwrap_or_default();
+                        let Some(&bytes) = read.first_chunk::<4>() else {
+                            return false;
+                        };
+                        u32::from_le_bytes(bytes)
+                    }
+                };
+                arm64_word_is_svc(word)
+            }
+            Architecture::X64 => {
+                // Only the first byte is saved (0xCC overwrote exactly one byte).
+                if let Some(original) = saved {
+                    if !matches!(original.first(), Some(0x0F | 0xCD)) {
+                        return false;
+                    }
+                }
+                let opcode = super::memory::read_memory_internal(self.process_handle.0, address, 2)
+                    .unwrap_or_default();
+                opcode == X64_SYSCALL || opcode == X64_SYSENTER || opcode == X64_INT_2E
+            }
         }
     }
 
@@ -726,3 +841,34 @@ impl Drop for DebuggedProcess {
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real encodings taken from ARM64 ntdll syscall stubs, which are literally
+    /// `svc #n; ret` — this is why a coverage breakpoint on a function entry can
+    /// land on a blocking syscall (see `instruction_is_syscall`).
+    #[test]
+    fn recognizes_arm64_svc_stub_encodings() {
+        // ntdll!NtWaitForAlertByThreadId: svc #0x1E3
+        assert!(arm64_word_is_svc(0xD400_3C61));
+        // ntdll!NtWaitForWorkViaWorkerFactory: svc #0x1E6
+        assert!(arm64_word_is_svc(0xD400_3CC1));
+        // First stub in the table: svc #0
+        assert!(arm64_word_is_svc(0xD400_0001));
+    }
+
+    #[test]
+    fn rejects_non_svc_arm64_instructions() {
+        // ret (the instruction right after every syscall stub)
+        assert!(!arm64_word_is_svc(0xD65F_03C0));
+        // brk #0x3e — our own breakpoint instruction, same encoding family as svc
+        assert!(!arm64_word_is_svc(0xD43E_0000));
+        // hvc #0 / smc #0 — sibling exception-generating instructions
+        assert!(!arm64_word_is_svc(0xD400_0002));
+        assert!(!arm64_word_is_svc(0xD400_0003));
+        // nop
+        assert!(!arm64_word_is_svc(0xD503_201F));
+    }
+}
