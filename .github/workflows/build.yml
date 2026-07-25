@@ -2,9 +2,9 @@ name: Build
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ "main", "develop" ]
   pull_request:
-    branches: [ "master" ]
+    branches: [ "main", "develop" ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,7 +19,7 @@ jobs:
       - Windows
       - ${{ matrix.arch }}
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Build
       run: cargo build
     - name: Run tests
