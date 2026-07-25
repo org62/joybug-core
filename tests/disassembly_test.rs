@@ -3,8 +3,8 @@
 mod common;
 
 use common::{TestServer, get_test_program_path, find_symbol, find_module};
-use joybug2::interfaces::Architecture;
-use joybug2::protocol_io::DebugSession;
+use joybug_core::interfaces::Architecture;
+use joybug_core::protocol_io::DebugSession;
 use std::io::Write;
 use std::time::Instant;
 
@@ -545,7 +545,7 @@ fn test_disassembly_speed_kernelbase() {
             func_start: u64,
             func_end: u64,
             func_size: usize,
-            instructions: Vec<joybug2::interfaces::Instruction>,
+            instructions: Vec<joybug_core::interfaces::Instruction>,
             error: Option<String>,
         }
         let mut results: Vec<FuncResult> = Vec::with_capacity(MAX_FUNCTIONS);
@@ -642,7 +642,7 @@ fn test_disassembly_speed_kernelbase() {
         println!("Total instructions: {}", total_instructions);
         println!("Errors: {}", errors);
         println!("Time taken: {:.2}ms", elapsed.as_secs_f64() * 1000.0);
-        joybug2::framed_json_stream::print_serialization_stats();
+        joybug_core::framed_json_stream::print_serialization_stats();
 
         if functions_disassembled > 0 {
             let funcs_per_sec = functions_disassembled as f64 / elapsed.as_secs_f64();

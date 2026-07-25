@@ -3,9 +3,9 @@
 mod common;
 
 use common::get_test_program_path;
-use joybug2::local_server::LocalServer;
-use joybug2::protocol_io::DebugSession;
-use joybug2::veh_platform::VEHPlatform;
+use joybug_core::local_server::LocalServer;
+use joybug_core::protocol_io::DebugSession;
+use joybug_core::veh_platform::VEHPlatform;
 
 fn veh_server() -> LocalServer {
     LocalServer::spawn_with(VEHPlatform::new())
@@ -13,7 +13,7 @@ fn veh_server() -> LocalServer {
 
 #[test]
 fn test_veh_launch_initial_breakpoint() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = veh_server();
     let addr = server.address().to_string();
@@ -47,7 +47,7 @@ fn test_veh_launch_initial_breakpoint() {
 
 #[test]
 fn test_veh_launch_run_to_exit() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = veh_server();
     let addr = server.address().to_string();

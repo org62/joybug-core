@@ -3,8 +3,8 @@
 mod common;
 
 use common::{TestServer, find_symbol, get_test_program_path};
-use joybug2::interfaces::Architecture;
-use joybug2::protocol_io::{BreakpointDecision, DebugSession};
+use joybug_core::interfaces::Architecture;
+use joybug_core::protocol_io::{BreakpointDecision, DebugSession};
 
 struct AssemblerTestState {
     exit_code: u32,
@@ -12,7 +12,7 @@ struct AssemblerTestState {
 
 #[test]
 fn test_assembler_patch() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();
@@ -45,7 +45,7 @@ fn test_assembler_patch() {
                 } else {
                     "mov w0, #2\nret"
                 };
-                let result = joybug2::assembler::assemble(arch, asm_code, get_value_sym.va)
+                let result = joybug_core::assembler::assemble(arch, asm_code, get_value_sym.va)
                     .map_err(|e| anyhow::anyhow!("Assembly failed: {}", e))?;
                 println!(
                     "  Assembled {} bytes ({} instructions): {:02X?}",
@@ -70,7 +70,7 @@ fn test_assembler_patch() {
 
                     let asm_code = format!("mov eax, [0x{:x}]\nret", g_value_b_sym.va);
                     let result =
-                        joybug2::assembler::assemble(arch, &asm_code, get_global_sym.va)
+                        joybug_core::assembler::assemble(arch, &asm_code, get_global_sym.va)
                             .map_err(|e| anyhow::anyhow!("Assembly failed: {}", e))?;
                     println!(
                         "  Assembled {} bytes ({} instructions): {:02X?}",

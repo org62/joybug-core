@@ -3,7 +3,7 @@
 mod common;
 
 use common::get_test_program_path;
-use joybug2::windows_platform::parse_module_extra_info_from_bytes;
+use joybug_core::windows_platform::parse_module_extra_info_from_bytes;
 
 #[test]
 fn tls_test_exposes_entry_point_and_tls_callbacks() {

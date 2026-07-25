@@ -3,8 +3,8 @@
 mod common;
 
 use common::{TestServer, get_test_program_path, find_symbol};
-use joybug2::protocol::{DereferenceEntry, DereferenceValue};
-use joybug2::protocol_io::DebugSession;
+use joybug_core::protocol::{DereferenceEntry, DereferenceValue};
+use joybug_core::protocol_io::DebugSession;
 
 /// Format a dereference entry in GEF-style output
 fn format_entry(entry: &DereferenceEntry) -> String {
@@ -385,14 +385,14 @@ fn test_dereference_basic() {
             #[cfg(target_arch = "x86_64")]
             let sp = {
                 match ctx {
-                    joybug2::protocol::ThreadContext::Win32RawContext(ref c) => c.Rsp,
+                    joybug_core::protocol::ThreadContext::Win32RawContext(ref c) => c.Rsp,
                 }
             };
 
             #[cfg(target_arch = "aarch64")]
             let sp = {
                 match ctx {
-                    joybug2::protocol::ThreadContext::Win32RawContext(ref c) => c.Sp,
+                    joybug_core::protocol::ThreadContext::Win32RawContext(ref c) => c.Sp,
                 }
             };
 

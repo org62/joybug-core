@@ -15,7 +15,7 @@
 mod common;
 
 use common::{get_test_program_path, TestServer};
-use joybug2::protocol_io::{
+use joybug_core::protocol_io::{
     BreakpointDecision, DebugSession, ScanCompareType, ScanValue, ScanValueType,
 };
 
@@ -73,7 +73,7 @@ struct Run2 {
 
 #[test]
 fn pointer_scan_survives_process_restart() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();

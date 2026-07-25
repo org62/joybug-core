@@ -3,7 +3,7 @@
 mod common;
 
 use common::{TestServer, get_test_program_path};
-use joybug2::protocol_io::{DebugSession, ExceptionAction};
+use joybug_core::protocol_io::{DebugSession, ExceptionAction};
 
 // EXCEPTION_SINGLE_STEP / STATUS_SINGLE_STEP.
 const SINGLE_STEP_CODE: u32 = 0x80000004;

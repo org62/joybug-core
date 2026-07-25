@@ -4,7 +4,7 @@
 /// If someone changed this to count=1, tracing would be 10-100x slower.
 
 use crate::helpers::EmulatorTestState;
-use joybug2::protocol_io::{DebugSession, EmulateResult, EmulationMode, TraceExitCondition};
+use joybug_core::protocol_io::{DebugSession, EmulateResult, EmulationMode, TraceExitCondition};
 
 pub fn test_performance(
     session: &mut DebugSession<EmulatorTestState>,

@@ -1,21 +1,21 @@
 [workspace]
 members = [".", "veh_shared", "veh_dll"]
 # Build/test all members by default. Without this, plain `cargo build`/`cargo test`
-# only operate on the root package (joybug2) and skip the `veh_dll` cdylib, so the
-# VEH integration tests can't find joybug2_veh_dll.dll. See VehPlatform::find_veh_dll.
+# only operate on the root package (joybug-core) and skip the `veh_dll` cdylib, so the
+# VEH integration tests can't find joybug_core_veh_dll.dll. See VehPlatform::find_veh_dll.
 default-members = [".", "veh_shared", "veh_dll"]
 
 [package]
-name = "joybug2"
+name = "joybug-core"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "joybug2"
+name = "joybug_core"
 path = "src/lib.rs"
 
 [[bin]]
-name = "joybug2"
+name = "joybug-core"
 path = "src/main.rs"
 
 [[bin]]
@@ -65,7 +65,7 @@ unicorn-engine = { git = "https://github.com/expend20/unicorn", branch = "AVX2-p
 keystone-engine = "0.1"
 mlua = { version = "0.10", features = ["lua54", "send", "vendored"] }
 rustyline = "15"
-joybug2-veh-shared = { path = "veh_shared" }
+joybug-core-veh-shared = { path = "veh_shared" }
 
 [build-dependencies]
 cc = "1.0"

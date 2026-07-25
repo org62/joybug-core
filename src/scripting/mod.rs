@@ -1,4 +1,4 @@
-//! Lua scripting engine for joybug2 debugger.
+//! Lua scripting engine for joybug-core debugger.
 //!
 //! Provides an embedded Lua 5.4 scripting interface over the debugger's TCP protocol,
 //! with an interactive REPL and script file execution.

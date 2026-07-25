@@ -2,7 +2,7 @@
 //!
 //! A scan can produce millions of paths, so results are streamed to a file of
 //! fixed-size records (no in-RAM cap) and read back via a read-only mmap for
-//! paging. The file is identified by its path — joybug2 keeps no per-connection
+//! paging. The file is identified by its path — joybug-core keeps no per-connection
 //! state — so results survive a target restart.
 //!
 //! Crucially, a path's static base must be re-identified across runs by something

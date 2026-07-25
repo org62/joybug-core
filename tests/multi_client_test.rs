@@ -3,13 +3,13 @@
 mod common;
 
 use common::TestServer;
-use joybug2::protocol::DebugEvent;
-use joybug2::protocol_io::DebugSession;
+use joybug_core::protocol::DebugEvent;
+use joybug_core::protocol_io::DebugSession;
 use std::thread;
 
 #[test]
 fn test_multi_client_sessions() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();
 

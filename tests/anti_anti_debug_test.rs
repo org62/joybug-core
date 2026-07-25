@@ -3,8 +3,8 @@
 mod common;
 
 use common::TestServer;
-use joybug2::anti_anti_debug::PebHideOptions;
-use joybug2::protocol_io::DebugSession;
+use joybug_core::anti_anti_debug::PebHideOptions;
+use joybug_core::protocol_io::DebugSession;
 
 // PEB / sub-struct field offsets (x64 native layout). These are intentionally
 // hardcoded here, independent of the implementation's own constants, so that a
@@ -77,7 +77,7 @@ fn read_u64(session: &mut DebugSession<State>, pid: u32, addr: u64) -> u64 {
 
 #[test]
 fn test_hide_peb_zeroes_anti_debug_fields() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();
 
@@ -166,7 +166,7 @@ impl ExitState {
 
 #[test]
 fn test_anti_debug_sample_defeated_by_hide_peb() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();
     let exe = common::get_test_program_path("anti_debug_test");
@@ -195,7 +195,7 @@ fn test_anti_debug_sample_defeated_by_hide_peb() {
 
 #[test]
 fn test_anti_debug_sample_detects_without_hiding() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();
     let exe = common::get_test_program_path("anti_debug_test");

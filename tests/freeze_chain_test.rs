@@ -13,7 +13,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use common::{find_symbol, get_test_program_path, TestServer};
-use joybug2::protocol_io::{BreakpointDecision, DebugSession};
+use joybug_core::protocol_io::{BreakpointDecision, DebugSession};
 
 const SENTINEL: u32 = 0xAABB_CCDD;
 /// Leave the debuggee stopped long enough for the freeze thread to tick.
@@ -46,7 +46,7 @@ fn read_u32(session: &mut DebugSession<State>, pid: u32, addr: u64) -> anyhow::R
 
 #[test]
 fn freeze_follows_pointer_chain_after_repoint() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();

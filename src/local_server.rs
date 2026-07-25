@@ -8,7 +8,7 @@ use tracing::{error, info};
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:0";
 
-/// Handle for managing a local joybug2 debug server running in a background thread.
+/// Handle for managing a local joybug-core debug server running in a background thread.
 pub struct LocalServer {
     port: u16,
     address: String,

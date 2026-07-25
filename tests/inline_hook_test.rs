@@ -1,8 +1,8 @@
 #![cfg(windows)]
 
-use joybug2::inline_hook::allocator::{CodeAllocator, WindowsCodeAllocator};
-use joybug2::inline_hook::thread::NoopThreadFreezer;
-use joybug2::inline_hook::{HookEngine, LuaHookEngine};
+use joybug_core::inline_hook::allocator::{CodeAllocator, WindowsCodeAllocator};
+use joybug_core::inline_hook::thread::NoopThreadFreezer;
+use joybug_core::inline_hook::{HookEngine, LuaHookEngine};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 type BinOp = extern "C" fn(i32, i32) -> i32;
@@ -123,7 +123,7 @@ extern "C" fn test_sub(a: i32, b: i32) -> i32 {
 #[test]
 fn test_lua_hook_basic() {
     let _guard = LUA_HOOK_LOCK.lock().unwrap();
-    let lua = joybug2::scripting::create_lua().expect("create lua");
+    let lua = joybug_core::scripting::create_lua().expect("create lua");
 
     let mut engine = LuaHookEngine::new();
 
@@ -163,7 +163,7 @@ fn test_lua_hook_basic() {
 #[test]
 fn test_lua_hook_read_only() {
     let _guard = LUA_HOOK_LOCK.lock().unwrap();
-    let lua = joybug2::scripting::create_lua().expect("create lua");
+    let lua = joybug_core::scripting::create_lua().expect("create lua");
     let mut engine = LuaHookEngine::new();
 
     // Register a global for the Lua callback to write into.
@@ -196,7 +196,7 @@ fn test_lua_hook_read_only() {
 #[test]
 fn test_lua_hook_memory_access() {
     let _guard = LUA_HOOK_LOCK.lock().unwrap();
-    let lua = joybug2::scripting::create_lua().expect("create lua");
+    let lua = joybug_core::scripting::create_lua().expect("create lua");
     let mut engine = LuaHookEngine::new();
 
     lua.globals().set("read_val", 0u64).unwrap();

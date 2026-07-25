@@ -3,7 +3,7 @@
 mod common;
 
 use common::TestServer;
-use joybug2::protocol_io::DebugSession;
+use joybug_core::protocol_io::DebugSession;
 
 struct TestState {
     parent_pid: Option<u32>,
@@ -25,7 +25,7 @@ impl TestState {
 
 #[test]
 fn test_parent_child_debugging() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();

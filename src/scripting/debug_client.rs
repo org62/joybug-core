@@ -88,7 +88,7 @@ pub struct DebugClient {
 }
 
 impl DebugClient {
-    /// Connect to a joybug2 server.
+    /// Connect to a joybug-core server.
     pub fn connect(addr: &str) -> anyhow::Result<Self> {
         let stream = TcpStream::connect(addr)?;
         let framed = FramedJsonStream::new(stream);

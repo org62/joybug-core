@@ -904,7 +904,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
 
 [[package]]
-name = "joybug2"
+name = "joybug-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -913,7 +913,7 @@ dependencies = [
  "cc",
  "clap",
  "dirs 5.0.1",
- "joybug2-veh-shared",
+ "joybug-core-veh-shared",
  "keystone-engine",
  "memmap2",
  "mlua",
@@ -936,15 +936,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "joybug2-veh-dll"
+name = "joybug-core-veh-dll"
 version = "0.1.0"
 dependencies = [
- "joybug2-veh-shared",
+ "joybug-core-veh-shared",
  "windows-sys 0.59.0",
 ]
 
 [[package]]
-name = "joybug2-veh-shared"
+name = "joybug-core-veh-shared"
 version = "0.1.0"
 
 [[package]]

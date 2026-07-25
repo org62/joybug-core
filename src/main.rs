@@ -1,14 +1,14 @@
-use joybug2;
+use joybug_core;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing for logging
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
     
-    println!("Starting joybug2 server...");
+    println!("Starting joybug-core server...");
     
     // Run the server on the default port
-    joybug2::server::run_server().await?;
+    joybug_core::server::run_server().await?;
     
     Ok(())
 } 

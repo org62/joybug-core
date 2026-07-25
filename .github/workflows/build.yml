@@ -1,7 +1,7 @@
 name: Build
 
 on:
-  # joybug2 has a single long-lived branch. Feature branches aren't listed under
+  # joybug-core has a single long-lived branch. Feature branches aren't listed under
   # `push`, so a PR gets exactly one run (the merge preview) instead of two.
   push:
     branches: [ "main" ]

@@ -3,7 +3,7 @@
 mod common;
 
 use common::{module_file_name_matches, runtime_function_entry_vas, TestServer};
-use joybug2::protocol_io::DebugSession;
+use joybug_core::protocol_io::DebugSession;
 use std::path::Path;
 
 /// Per-module breakpoint stats
@@ -98,7 +98,7 @@ fn set_breakpoints_for_module(
 
 #[test]
 fn test_mass_breakpoint_cmd() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();

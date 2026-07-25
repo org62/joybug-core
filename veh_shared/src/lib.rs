@@ -1,5 +1,5 @@
 //! Shared types and constants for VEH debugging IPC between the injected DLL
-//! and the joybug2 debugger process.
+//! and the joybug-core debugger process.
 
 pub const VEH_VERSION: u32 = 1;
 

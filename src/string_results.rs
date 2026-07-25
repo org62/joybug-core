@@ -2,7 +2,7 @@
 //!
 //! A module scan can yield hundreds of thousands of strings, so hits are streamed
 //! to a file of variable-length records and read back via a read-only mmap for
-//! paging, filtering, and sorting. The file is identified by its path — joybug2
+//! paging, filtering, and sorting. The file is identified by its path — joybug-core
 //! keeps no per-connection state — mirroring [`crate::pointer_results`].
 //!
 //! Record layout (little-endian): `address(u64) + full_len(u32) + flags(u8) +

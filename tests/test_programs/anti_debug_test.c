@@ -1,7 +1,7 @@
 // anti_debug_test.c
 //
 // A minimal "protected" program that looks for a debugger using only the
-// indicators that live inside the PEB -- exactly the ones the joybug2
+// indicators that live inside the PEB -- exactly the ones the joybug-core
 // anti-anti-debug (hide_peb) feature neutralizes. It prints every value it
 // observes and returns a detection bitmask as its process exit code:
 //

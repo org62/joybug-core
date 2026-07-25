@@ -12,8 +12,8 @@
 mod common;
 
 use common::{module_file_name_matches, runtime_function_entry_vas, TestServer};
-use joybug2::protocol::CoverageHit;
-use joybug2::protocol_io::DebugSession;
+use joybug_core::protocol::CoverageHit;
+use joybug_core::protocol_io::DebugSession;
 
 struct CovState {
     /// (name, base) for ntdll, captured from process-create / dll-load events.
@@ -93,7 +93,7 @@ fn assert_hit_metadata(hits: &[CoverageHit]) {
 /// and auto-removal.
 #[test]
 fn test_code_coverage_removes_after_first_hit() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let (armed, hits) = run_coverage(1);
     let hit_fns = hits.iter().filter(|h| h.hit_count > 0).count();
@@ -111,7 +111,7 @@ fn test_code_coverage_removes_after_first_hit() {
 /// that the per-address cap is honored.
 #[test]
 fn test_code_coverage_counts_and_caps_repeated_hits() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let (armed, hits) = run_coverage(3);
     let hit_fns = hits.iter().filter(|h| h.hit_count > 0).count();

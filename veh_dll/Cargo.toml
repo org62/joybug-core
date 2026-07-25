@@ -1,5 +1,5 @@
 [package]
-name = "joybug2-veh-dll"
+name = "joybug-core-veh-dll"
 version = "0.1.0"
 edition = "2024"
 
@@ -7,7 +7,7 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-joybug2-veh-shared = { path = "../veh_shared" }
+joybug-core-veh-shared = { path = "../veh_shared" }
 windows-sys = { version = "0.59.0", features = [
     "Win32_Foundation",
     "Win32_System_Kernel",

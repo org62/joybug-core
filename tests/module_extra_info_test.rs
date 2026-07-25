@@ -3,14 +3,14 @@
 mod common;
 
 use common::TestServer;
-use joybug2::protocol_io::DebugSession;
-use joybug2::pe_types::{ExportKind, ImportItem, ImportKind};
+use joybug_core::protocol_io::DebugSession;
+use joybug_core::pe_types::{ExportKind, ImportItem, ImportKind};
 use pelite::pe64::image::IMAGE_NT_HEADERS_SIGNATURE;
 use std::path::Path;
 
 #[test]
 fn test_module_extra_info_print() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();

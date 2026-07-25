@@ -3,7 +3,7 @@
 mod common;
 
 use common::{TestServer, get_test_program_path};
-use joybug2::protocol_io::{DebugSession, ExceptionAction};
+use joybug_core::protocol_io::{DebugSession, ExceptionAction};
 
 fn test_exe_path() -> String {
     get_test_program_path("exception_test")

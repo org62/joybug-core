@@ -14,7 +14,7 @@ mod common;
 use std::time::Instant;
 
 use common::{find_symbol, get_test_program_path, TestServer};
-use joybug2::protocol_io::DebugSession;
+use joybug_core::protocol_io::DebugSession;
 
 struct BenchState {
     done: bool,
@@ -23,7 +23,7 @@ struct BenchState {
 #[test]
 #[ignore = "heavy: allocates a multi-GB target process"]
 fn pointer_scan_benchmark() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
     // SAFETY: set before any threads read the env in this test process.
     unsafe { std::env::set_var("JOYBUG_PTRSCAN_TIMING", "1") };
 
