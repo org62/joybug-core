@@ -1,10 +1,16 @@
 name: Build
 
 on:
+  # joybug2 has a single long-lived branch. Feature branches aren't listed under
+  # `push`, so a PR gets exactly one run (the merge preview) instead of two.
   push:
-    branches: [ "master" ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ "master" ]
+    branches: [ "main" ]
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,6 +18,8 @@ env:
 jobs:
   build_github_actions:
     strategy:
+      # Both arches always report; one failing arch shouldn't mask the other.
+      fail-fast: false
       matrix:
         arch: [ARM64, X64]
     runs-on:
@@ -19,7 +27,7 @@ jobs:
       - Windows
       - ${{ matrix.arch }}
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Build
       run: cargo build
     - name: Run tests
