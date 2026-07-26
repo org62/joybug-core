@@ -17,6 +17,15 @@ env:
 
 jobs:
   build_github_actions:
+    # A PR is built before merge as the merge preview (refs/pull/N/merge). When
+    # nothing has landed on main in between - the normal case here - merging
+    # produces an identical tree, so the push run would rebuild the same code.
+    # Skip it for merge commits; direct pushes to main still build. If the merge
+    # message ever differs (squash/rebase merge, edited message) this just runs,
+    # so the failure mode is a redundant build, never a skipped one.
+    if: >-
+      github.event_name != 'push' ||
+      !startsWith(github.event.head_commit.message, 'Merge pull request ')
     strategy:
       # Both arches always report; one failing arch shouldn't mask the other.
       fail-fast: false
