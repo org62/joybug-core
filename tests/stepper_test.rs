@@ -3,10 +3,10 @@
 mod common;
 
 use common::{TestServer, print_disassembly_and_callstack};
-use joybug2::interfaces::Architecture;
+use joybug_core::interfaces::Architecture;
 use std::collections::VecDeque;
-use joybug2::protocol::{StepKind, StepAction};
-use joybug2::protocol_io::DebugSession;
+use joybug_core::protocol::{StepKind, StepAction};
+use joybug_core::protocol_io::DebugSession;
 
 /// Clean, simple test state for tracking events
 struct TestState {
@@ -47,7 +47,7 @@ fn assert_disasm_symbol_prefix(session: &mut DebugSession<TestState>, pid: u32, 
 
 #[test]
 fn test_stepper_test() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
     
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();

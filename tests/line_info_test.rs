@@ -3,8 +3,8 @@
 mod common;
 
 use common::{TestServer, get_test_program_path, find_symbol, find_module};
-use joybug2::interfaces::Architecture;
-use joybug2::protocol_io::DebugSession;
+use joybug_core::interfaces::Architecture;
+use joybug_core::protocol_io::DebugSession;
 
 /// End-to-end test of the PDB line-table protocol surface:
 /// ResolveAddressToLine, GetSourceFileLineMap, ListSourceFiles, and the
@@ -139,7 +139,7 @@ fn test_source_line_info() {
 /// `session/dispatch.rs::advance_source_line_step` + `runner::on_event`.
 #[test]
 fn test_source_line_step_via_on_event() {
-    use joybug2::protocol_io::{DebugEvent, StepAction, StepKind};
+    use joybug_core::protocol_io::{DebugEvent, StepAction, StepKind};
 
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();
@@ -163,7 +163,7 @@ fn test_source_line_step_via_on_event() {
         let main = find_symbol(session, "xtea_test!main", "xtea_test")?.va;
         session.set_breakpoint_at(pid, main, None, |session, pid, tid, addr| {
             if session.state.started {
-                return Ok(joybug2::protocol_io::BreakpointDecision::Keep);
+                return Ok(joybug_core::protocol_io::BreakpointDecision::Keep);
             }
             let start = session
                 .resolve_address_to_line(pid, addr)
@@ -175,7 +175,7 @@ fn test_source_line_step_via_on_event() {
             session.state.start = start;
             session.state.started = true;
             session.step(pid, tid, StepKind::Over, |_s, _p, _t, _a, _k| Ok(StepAction::Stop))?;
-            Ok(joybug2::protocol_io::BreakpointDecision::Keep)
+            Ok(joybug_core::protocol_io::BreakpointDecision::Keep)
         })?;
         Ok(())
     })

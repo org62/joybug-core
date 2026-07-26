@@ -1,7 +1,7 @@
 /// Test InstructionTrace with exit condition: stop at a specific address.
 
 use crate::helpers::EmulatorTestState;
-use joybug2::protocol_io::{DebugSession, EmulateResult, EmulationMode, TraceExitCondition};
+use joybug_core::protocol_io::{DebugSession, EmulateResult, EmulationMode, TraceExitCondition};
 
 pub fn test_instruction_trace_exit_condition(
     session: &mut DebugSession<EmulatorTestState>,

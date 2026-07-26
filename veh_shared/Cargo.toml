@@ -1,4 +1,4 @@
 [package]
-name = "joybug2-veh-shared"
+name = "joybug-core-veh-shared"
 version = "0.1.0"
 edition = "2024"

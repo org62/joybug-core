@@ -25,12 +25,12 @@ mod timeout;
 
 use common::{TestServer, find_symbol, find_module};
 use helpers::{EmulatorTestState, get_xtea_test_path, get_emulator_test_path};
-use joybug2::interfaces::Architecture;
-use joybug2::protocol_io::{BreakpointDecision, DebugSession};
+use joybug_core::interfaces::Architecture;
+use joybug_core::protocol_io::{BreakpointDecision, DebugSession};
 
 #[test]
 fn test_emulator_integration() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();
@@ -165,7 +165,7 @@ fn test_emulator_integration() {
 /// Reads g_counter from emulated memory to verify the loop ran many iterations.
 #[test]
 fn test_emulator_timeout() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();

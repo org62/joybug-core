@@ -1,7 +1,7 @@
 /// Test ModuleTransition: emulate from entry point, detect CRT → ucrtbase transition.
 
 use crate::helpers::EmulatorTestState;
-use joybug2::protocol_io::{DebugSession, EmulateResult, EmulationMode};
+use joybug_core::protocol_io::{DebugSession, EmulateResult, EmulationMode};
 
 pub fn test_module_transition(
     session: &mut DebugSession<EmulatorTestState>,

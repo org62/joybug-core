@@ -6,7 +6,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use common::{find_symbol, get_test_program_path, TestServer};
-use joybug2::protocol_io::{BreakpointDecision, DebugSession};
+use joybug_core::protocol_io::{BreakpointDecision, DebugSession};
 
 const PROGRAM_VALUE: u32 = 1000;
 const SENTINEL: u32 = 0xAABB_CCDD;
@@ -46,7 +46,7 @@ fn read_u32(session: &mut DebugSession<FreezeState>, pid: u32, addr: u64) -> any
 /// unfreeze the program's own writes take effect again.
 #[test]
 fn freeze_value_holds_and_releases() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();

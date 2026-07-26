@@ -2,8 +2,8 @@
 /// This goes through kernel32 → ntdll → NtClose → SVC/SYSCALL.
 
 use crate::helpers::EmulatorTestState;
-use joybug2::interfaces::Architecture;
-use joybug2::protocol_io::{DebugSession, EmulateResult, EmulationMode};
+use joybug_core::interfaces::Architecture;
+use joybug_core::protocol_io::{DebugSession, EmulateResult, EmulationMode};
 
 pub fn test_syscall(
     session: &mut DebugSession<EmulatorTestState>,

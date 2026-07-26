@@ -3,8 +3,8 @@
 mod common;
 
 use common::TestServer;
-use joybug2::formatting::memory::{protect_to_str, state_to_str, type_to_str};
-use joybug2::protocol_io::DebugSession;
+use joybug_core::formatting::memory::{protect_to_str, state_to_str, type_to_str};
+use joybug_core::protocol_io::DebugSession;
 use std::path::Path;
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, PAGE_READONLY, PAGE_READWRITE,
@@ -12,7 +12,7 @@ use windows_sys::Win32::System::Memory::{
 
 #[test]
 fn test_memory_regions() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();

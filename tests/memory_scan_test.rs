@@ -3,7 +3,7 @@
 mod common;
 
 use common::{get_test_program_path, TestServer};
-use joybug2::protocol_io::{
+use joybug_core::protocol_io::{
     BreakpointDecision, DebugSession, ScanCompareType, ScanValue, ScanValueType,
 };
 
@@ -75,7 +75,7 @@ fn print_timing_table(name: &str, type_name: &str, counts: &[u64], times: &[u64]
 
 #[test]
 fn memory_scan_exact_value() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();
@@ -296,7 +296,7 @@ impl UnknownValueState {
 
 #[test]
 fn memory_scan_unknown_initial() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();

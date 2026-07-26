@@ -1,7 +1,7 @@
 /// Test InstructionTrace stops on syscall: emulate from syscall_marker with InstructionTrace.
 
 use crate::helpers::EmulatorTestState;
-use joybug2::protocol_io::{DebugSession, EmulateResult, EmulationMode};
+use joybug_core::protocol_io::{DebugSession, EmulateResult, EmulationMode};
 
 pub fn test_instruction_trace_syscall(
     session: &mut DebugSession<EmulatorTestState>,

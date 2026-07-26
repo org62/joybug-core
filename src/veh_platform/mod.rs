@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 
-use joybug2_veh_shared::{
+use joybug_core_veh_shared::{
     VehSharedMem, INIT_BREAKPOINT_TIMEOUT_MS, VEH_CONTINUE_EXECUTION, VEH_CONTINUE_SEARCH,
     VEH_VERSION,
 };
@@ -88,7 +88,7 @@ impl VEHPlatform {
         }
     }
 
-    /// Find the VEH DLL path. Looks next to the joybug2 executable in the
+    /// Find the VEH DLL path. Looks next to the joybug-core executable in the
     /// target directory, or uses VEH_DLL_PATH env var.
     fn find_veh_dll() -> Result<String, PlatformError> {
         // Check env var first
@@ -102,13 +102,13 @@ impl VEHPlatform {
         // For test binaries the exe lives in `target/<profile>/deps/`, while the
         // cdylib is emitted one level up in `target/<profile>/`. Walking ancestors
         // covers both that case and the plain `target/<profile>/` exe location,
-        // regardless of how the workspace target dir is nested (e.g. when joybug2
+        // regardless of how the workspace target dir is nested (e.g. when joybug-core
         // is a submodule the target dir lives at the outer workspace root).
         if let Ok(exe_path) = std::env::current_exe() {
             let mut dir = exe_path.parent();
             for _ in 0..3 {
                 let Some(d) = dir else { break };
-                let dll_path = d.join("joybug2_veh_dll.dll");
+                let dll_path = d.join("joybug_core_veh_dll.dll");
                 if dll_path.exists() {
                     return Ok(dll_path.to_string_lossy().into_owned());
                 }
@@ -120,14 +120,14 @@ impl VEHPlatform {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         for profile in &["debug", "release"] {
             let candidate =
-                format!("{}/target/{}/joybug2_veh_dll.dll", manifest_dir, profile);
+                format!("{}/target/{}/joybug_core_veh_dll.dll", manifest_dir, profile);
             if std::path::Path::new(&candidate).exists() {
                 return Ok(candidate);
             }
         }
 
         Err(PlatformError::OsError(
-            "Could not find joybug2_veh_dll.dll. Set VEH_DLL_PATH env var.".into(),
+            "Could not find joybug_core_veh_dll.dll. Set VEH_DLL_PATH env var.".into(),
         ))
     }
 
@@ -156,7 +156,7 @@ impl VEHPlatform {
         let nonce = Self::generate_nonce();
 
         // Create named shared memory
-        let mapping_name = to_wide(&joybug2_veh_shared::shared_mem_name(pid));
+        let mapping_name = to_wide(&joybug_core_veh_shared::shared_mem_name(pid));
         let mapping_size = std::mem::size_of::<VehSharedMem>() as u32;
         let mapping: HANDLE = unsafe {
             CreateFileMappingW(
@@ -193,9 +193,9 @@ impl VEHPlatform {
 
         // Create named events with nonce (auto-reset: bManualReset = FALSE)
         let has_event_name_w =
-            to_wide(&joybug2_veh_shared::has_event_name(pid, nonce));
+            to_wide(&joybug_core_veh_shared::has_event_name(pid, nonce));
         let handled_event_name_w =
-            to_wide(&joybug2_veh_shared::handled_event_name(pid, nonce));
+            to_wide(&joybug_core_veh_shared::handled_event_name(pid, nonce));
 
         let has_event: HANDLE =
             unsafe { CreateEventW(std::ptr::null(), FALSE, FALSE, has_event_name_w.as_ptr()) };

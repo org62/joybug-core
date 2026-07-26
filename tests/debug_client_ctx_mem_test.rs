@@ -3,9 +3,9 @@
 mod common;
 
 use common::TestServer;
-use joybug2::protocol::ThreadContext;
-use joybug2::protocol_io::DebugSession;
-use joybug2::interfaces::{Architecture, InstructionFormatter};
+use joybug_core::protocol::ThreadContext;
+use joybug_core::protocol_io::DebugSession;
+use joybug_core::interfaces::{Architecture, InstructionFormatter};
 
 /// Clean, simple test state for tracking events
 struct TestState {
@@ -22,7 +22,7 @@ impl TestState {
 
 #[test]
 fn test_debug_client_ctx_mem_test() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();
 
@@ -52,7 +52,7 @@ fn test_debug_client_ctx_mem_test() {
             // Request thread context
             let context = session.get_thread_context(pid, tid).unwrap();
             match context {
-                joybug2::protocol::ThreadContext::Win32RawContext(ctx) => {
+                joybug_core::protocol::ThreadContext::Win32RawContext(ctx) => {
                     // Try round-trip: set the same context back
                     session.set_thread_context(pid, tid, ThreadContext::Win32RawContext(ctx.clone())).unwrap();
                 }

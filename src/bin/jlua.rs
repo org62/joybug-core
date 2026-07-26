@@ -1,4 +1,4 @@
-//! jlua — Joybug2 Lua scripting debugger CLI.
+//! jlua — joybug-core Lua scripting debugger CLI.
 //!
 //! Usage:
 //!   jlua                              # Interactive REPL
@@ -11,14 +11,14 @@ use std::process::exit;
 
 use clap::Parser;
 
-use joybug2::local_server::LocalServer;
-use joybug2::scripting::bindings::LuaDebugClient;
-use joybug2::scripting::debug_client::DebugClient;
-use joybug2::scripting::repl::Repl;
-use joybug2::scripting;
+use joybug_core::local_server::LocalServer;
+use joybug_core::scripting::bindings::LuaDebugClient;
+use joybug_core::scripting::debug_client::DebugClient;
+use joybug_core::scripting::repl::Repl;
+use joybug_core::scripting;
 
 #[derive(Parser, Debug)]
-#[command(name = "jlua", about = "Joybug2 Lua scripting debugger")]
+#[command(name = "jlua", about = "joybug-core Lua scripting debugger")]
 struct Args {
     /// Lua script file to execute
     #[arg(short = 's', long)]
@@ -46,7 +46,7 @@ struct Args {
 }
 
 fn main() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let args = Args::parse();
     let script = args.script.or(args.script_pos);

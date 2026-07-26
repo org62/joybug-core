@@ -332,7 +332,7 @@ impl Repl {
     /// Run the top-level REPL loop (no debug session required).
     pub fn run_top_level(&mut self, lua: &Lua) {
                 sync_color(lua);
-        eprintln!("joybug2 Lua REPL. Type 'help' for commands, 'quit' to exit.");
+        eprintln!("joybug-core Lua REPL. Type 'help' for commands, 'quit' to exit.");
         loop {
             let prompt = &colors::prompt_top();
             match self.editor.readline(prompt) {

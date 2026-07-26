@@ -23,12 +23,12 @@
 //! lines ≈ ~8 GB line table. The joybug-tauri Source *view* reads the file text
 //! in bounded windows (open_source_file + read_source_window), so the webview
 //! stays bounded regardless of file size — this test targets the remaining
-//! backend cost, the uncapped joybug2 line-table parse.
+//! backend cost, the uncapped joybug-core line-table parse.
 
 mod common;
 
 use common::{TestServer, find_symbol, find_module};
-use joybug2::protocol_io::DebugSession;
+use joybug_core::protocol_io::DebugSession;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};

@@ -3,7 +3,7 @@
 mod common;
 
 use common::{TestServer, get_test_program_path};
-use joybug2::protocol_io::DebugSession;
+use joybug_core::protocol_io::DebugSession;
 
 struct SearchTestState {
     string_search_done: bool,
@@ -27,7 +27,7 @@ impl SearchTestState {
 
 #[test]
 fn memory_search() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();

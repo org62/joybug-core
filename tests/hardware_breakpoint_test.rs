@@ -3,7 +3,7 @@
 mod common;
 
 use common::{TestServer, get_test_program_path};
-use joybug2::protocol_io::{
+use joybug_core::protocol_io::{
     BreakpointDecision, DebugSession, HardwareBreakpointSize,
     HardwareBreakpointType,
 };
@@ -40,7 +40,7 @@ impl HwBpTestState {
 #[test]
 #[cfg(target_arch = "aarch64")]
 fn hardware_breakpoint_all_types() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();
@@ -168,7 +168,7 @@ struct HwBpConcurrentState {
 #[test]
 #[cfg(target_arch = "aarch64")]
 fn hardware_breakpoint_max_concurrent() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();
@@ -265,7 +265,7 @@ fn hardware_breakpoint_max_concurrent() {
 #[test]
 #[cfg(not(target_arch = "aarch64"))]
 fn hardware_breakpoint_all_types() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();

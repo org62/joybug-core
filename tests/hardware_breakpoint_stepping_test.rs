@@ -5,8 +5,8 @@
 mod common;
 
 use common::{TestServer, get_test_program_path};
-use joybug2::protocol::{StepAction, StepKind};
-use joybug2::protocol_io::{
+use joybug_core::protocol::{StepAction, StepKind};
+use joybug_core::protocol_io::{
     BreakpointDecision, DebugSession, HardwareBreakpointSize,
     HardwareBreakpointType,
 };
@@ -39,7 +39,7 @@ impl TestState {
 /// freely until the HW BP fires again at the same address.
 #[test]
 fn hardware_breakpoint_step_over() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();

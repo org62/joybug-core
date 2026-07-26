@@ -3,9 +3,9 @@
 mod common;
 
 use common::TestServer;
-use joybug2::scripting;
-use joybug2::scripting::bindings::LuaDebugClient;
-use joybug2::scripting::debug_client::DebugClient;
+use joybug_core::scripting;
+use joybug_core::scripting::bindings::LuaDebugClient;
+use joybug_core::scripting::debug_client::DebugClient;
 
 /// Helper: create a Lua state connected to a test server, with `dbg` global registered.
 fn setup_lua_with_server(server: &TestServer) -> mlua::Lua {
@@ -40,7 +40,7 @@ fn set_arch_global(lua: &mlua::Lua) {
 /// Helper: run a Lua test script from a file path.
 /// If `test_exe` is provided, it's injected as the global `TEST_EXE`.
 fn run_lua_test_file(lua_path: &str, test_exe: Option<&str>) {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
     let server = TestServer::spawn();
     let lua = setup_lua_with_server(&server);
 
@@ -123,7 +123,7 @@ fn test_lua_helpers() {
 
 #[test]
 fn test_script_launch_and_registers() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
     let server = TestServer::spawn();
     let lua = setup_lua_with_server(&server);
 
@@ -175,7 +175,7 @@ fn test_script_launch_and_registers() {
 
 #[test]
 fn test_script_modules_and_symbols() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
     let server = TestServer::spawn();
     let lua = setup_lua_with_server(&server);
 
@@ -248,7 +248,7 @@ fn test_script_modules_and_symbols() {
 
 #[test]
 fn test_script_memory_operations() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
     let server = TestServer::spawn();
     let lua = setup_lua_with_server(&server);
 
@@ -311,7 +311,7 @@ fn test_script_memory_operations() {
 
 #[test]
 fn test_script_disassembly_and_callstack() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
     let server = TestServer::spawn();
     let lua = setup_lua_with_server(&server);
 
@@ -377,7 +377,7 @@ fn test_script_disassembly_and_callstack() {
 
 #[test]
 fn test_script_breakpoint_handler() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
     let server = TestServer::spawn();
     let lua = setup_lua_with_server(&server);
 
@@ -445,7 +445,7 @@ fn test_script_breakpoint_handler() {
 
 #[test]
 fn test_script_dll_handler_and_regions() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
     let server = TestServer::spawn();
     let lua = setup_lua_with_server(&server);
 
@@ -504,7 +504,7 @@ fn test_script_dll_handler_and_regions() {
 
 #[test]
 fn test_script_stepping() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
     let server = TestServer::spawn();
     let lua = setup_lua_with_server(&server);
 
@@ -548,7 +548,7 @@ fn test_script_stepping() {
 
 #[test]
 fn test_repl_stepping_and_register_globals() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
     let server = TestServer::spawn();
     let lua = setup_lua_with_server(&server);
 

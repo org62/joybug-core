@@ -1,7 +1,7 @@
 /// Test InstructionTrace mode: verify trace quality and register snapshots.
 
 use crate::helpers::EmulatorTestState;
-use joybug2::protocol_io::{DebugSession, EmulateResult, EmulationMode};
+use joybug_core::protocol_io::{DebugSession, EmulateResult, EmulationMode};
 
 pub fn test_instruction_trace(
     session: &mut DebugSession<EmulatorTestState>,

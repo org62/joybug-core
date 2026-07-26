@@ -3,9 +3,9 @@
 mod common;
 
 use common::{TestServer, print_disassembly_and_callstack};
-use joybug2::interfaces::CallFrame;
-use joybug2::protocol::{StepKind, StepAction};
-use joybug2::protocol_io::DebugSession;
+use joybug_core::interfaces::CallFrame;
+use joybug_core::protocol::{StepKind, StepAction};
+use joybug_core::protocol_io::DebugSession;
 
 /// Clean, simple test state for tracking events
 struct TestState {
@@ -66,7 +66,7 @@ fn test_symbol_search(session: &mut DebugSession<TestState>) {
 
 #[test]
 fn test_debug_client_event_collection() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
     
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();
@@ -82,9 +82,9 @@ fn test_debug_client_event_collection() {
             session.set_breakpoint_by_symbol(pid, "ntdll!NtClose", None, |session, _pid, _tid, _addr| {
                 session.state.ntclose_bp_hits += 1;
                 if session.state.ntclose_bp_hits >= 3 {
-                    Ok(joybug2::protocol_io::BreakpointDecision::Remove)
+                    Ok(joybug_core::protocol_io::BreakpointDecision::Remove)
                 } else {
-                    Ok(joybug2::protocol_io::BreakpointDecision::Keep)
+                    Ok(joybug_core::protocol_io::BreakpointDecision::Keep)
                 }
             })?;
 

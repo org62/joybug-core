@@ -3,8 +3,8 @@
 mod common;
 
 use common::TestServer;
-use joybug2::protocol::{DebugEvent, ModuleInfo};
-use joybug2::protocol_io::DebugSession;
+use joybug_core::protocol::{DebugEvent, ModuleInfo};
+use joybug_core::protocol_io::DebugSession;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
 };
@@ -19,7 +19,7 @@ fn to_wide(s: &str) -> Vec<u16> {
 
 #[test]
 fn test_attach_and_list_modules() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();
 

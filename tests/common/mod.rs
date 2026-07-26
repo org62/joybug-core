@@ -1,10 +1,10 @@
 #![cfg(windows)]
 
 #[allow(unused_imports)]
-pub use joybug2::local_server::LocalServer as TestServer;
-use joybug2::interfaces::{Architecture, InstructionFormatter, ResolvedSymbol};
-use joybug2::protocol::ModuleInfo;
-use joybug2::protocol_io::DebugSession;
+pub use joybug_core::local_server::LocalServer as TestServer;
+use joybug_core::interfaces::{Architecture, InstructionFormatter, ResolvedSymbol};
+use joybug_core::protocol::ModuleInfo;
+use joybug_core::protocol_io::DebugSession;
 
 /// Get the path to a compiled test program exe built by build.rs.
 #[allow(dead_code)]

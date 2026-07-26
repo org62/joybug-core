@@ -13,10 +13,10 @@ use std::process::exit;
 
 use clap::Parser;
 use pelite::pe64::Pe;
-use joybug2::protocol::{
+use joybug_core::protocol::{
     DebuggerRequest, DebuggerResponse, EmulationMode, TraceExitCondition,
 };
-use joybug2::protocol_io::{BreakpointDecision, DebugSession};
+use joybug_core::protocol_io::{BreakpointDecision, DebugSession};
 
 #[derive(Parser, Debug)]
 #[command(name = "trace")]
@@ -143,7 +143,7 @@ fn main() {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
             rt.block_on(async {
-                if let Err(e) = joybug2::server::run_server_with_std_listener(
+                if let Err(e) = joybug_core::server::run_server_with_std_listener(
                     listener,
                     std::future::pending::<()>(),
                 ).await {

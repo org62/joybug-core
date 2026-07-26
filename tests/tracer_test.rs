@@ -3,7 +3,7 @@
 mod common;
 
 use common::{TestServer, get_test_program_path, find_symbol, find_module};
-use joybug2::protocol_io::{
+use joybug_core::protocol_io::{
     BreakpointDecision, DebugSession, EmulateResult, EmulationMode, TraceExitCondition,
 };
 
@@ -150,7 +150,7 @@ fn run_tracer_comparison(
 
 #[test]
 fn test_tracer_vs_emulator() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();
@@ -216,7 +216,7 @@ fn test_tracer_vs_emulator() {
 /// Simpler test that just runs the trap-flag tracer on cmd.exe
 #[test]
 fn test_trap_flag_tracer_simple() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();

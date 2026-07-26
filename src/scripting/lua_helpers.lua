@@ -1,4 +1,4 @@
--- joybug2 Lua helper library
+-- joybug-core Lua helper library
 -- Loaded automatically at startup
 
 -- ---- Color system ----

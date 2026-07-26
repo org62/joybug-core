@@ -18,7 +18,7 @@
 mod common;
 
 use common::{find_symbol, get_test_program_path, TestServer};
-use joybug2::protocol_io::{BreakpointDecision, DebugSession};
+use joybug_core::protocol_io::{BreakpointDecision, DebugSession};
 
 // Must match ITER / NUM_THREADS in tests/test_programs/bp_race_test.c
 const ITER: u64 = 10_000;
@@ -35,7 +35,7 @@ struct RaceState {
 // explicitly with `--ignored` when working on that.
 #[cfg_attr(target_arch = "aarch64", ignore = "known ARM64 dropped single-step issue")]
 fn test_software_breakpoint_multithread_race() {
-    joybug2::init_tracing();
+    joybug_core::init_tracing();
 
     let server = TestServer::spawn();
     let server_addr = server.address().to_string();

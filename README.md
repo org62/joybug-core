@@ -1,4 +1,4 @@
-# joybug2
+# joybug-core
 
 A Windows debugging engine written in Rust — usable as a library, or as a TCP server speaking a framed-JSON protocol.
 
@@ -16,10 +16,10 @@ As a library:
 
 ```toml
 [dependencies]
-joybug2 = { git = "https://github.com/org62/joybug-core" }
+joybug-core = { git = "https://github.com/org62/joybug-core" }
 ```
 
-As a server — `cargo run --bin joybug2` listens on `127.0.0.1:9000`. Clients speak the protocol in `src/protocol.rs`; `src/protocol_io.rs` has a ready-made client. Embedding the server in-process instead is a one-liner via `local_server::LocalServer`, which is what Joybug does for local sessions.
+As a server — `cargo run --bin joybug-core` listens on `127.0.0.1:9000`. Clients speak the protocol in `src/protocol.rs`; `src/protocol_io.rs` has a ready-made client. Embedding the server in-process instead is a one-liner via `local_server::LocalServer`, which is what Joybug does for local sessions.
 
 Two other binaries come along: `trace` and `jlua`, a Lua REPL exposing the debugger API.
 

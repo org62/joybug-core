@@ -8,7 +8,7 @@ Instead of using the Windows Debug API (`WaitForDebugEvent`/`ContinueDebugEvent`
 
 ---
 
-## How It Maps to Current joybug2 Architecture
+## How It Maps to Current joybug-core Architecture
 
 ### The `PlatformAPI` Trait is the Right Abstraction Boundary
 
@@ -210,9 +210,9 @@ struct VEHSharedMem {
 
 If implementing this, I'd suggest:
 
-1. **Build the VEH DLL as a separate Rust cdylib crate** (e.g., `joybug2-veh-dll/`)
+1. **Build the VEH DLL as a separate Rust cdylib crate** (e.g., `joybug-core-veh-dll/`)
 2. **Create `VEHPlatform` implementing `PlatformAPI`** alongside `WindowsPlatform`
-3. **Share types** between DLL and debugger via a common crate (`joybug2-veh-shared/`)
+3. **Share types** between DLL and debugger via a common crate (`joybug-core-veh-shared/`)
 4. **Start with hardware breakpoints only** (no int3 patching initially) — simplest path
 5. **Add thread polling** for thread create/exit events
 6. **Make the server configurable** to use either `WindowsPlatform` or `VEHPlatform`

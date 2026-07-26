@@ -3,7 +3,7 @@
 /// (syscall) or the safety timeout. Blocks may span multiple modules.
 
 use crate::helpers::EmulatorTestState;
-use joybug2::protocol_io::{DebugSession, EmulateResult, EmulationMode};
+use joybug_core::protocol_io::{DebugSession, EmulateResult, EmulationMode};
 
 pub fn test_basic_block(
     session: &mut DebugSession<EmulatorTestState>,

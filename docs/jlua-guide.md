@@ -1,6 +1,6 @@
-# jlua — Joybug2 Lua Scripting Debugger
+# jlua — joybug-core Lua Scripting Debugger
 
-`jlua` is an interactive Lua scripting interface for the joybug2 debugger. It lets you automate debugging tasks, set scripted breakpoints, inspect memory and registers, and interactively explore a paused process — all from Lua.
+`jlua` is an interactive Lua scripting interface for the joybug-core debugger. It lets you automate debugging tasks, set scripted breakpoints, inspect memory and registers, and interactively explore a paused process — all from Lua.
 
 ## Quick Start
 
@@ -21,7 +21,7 @@ jlua --command "myprogram.exe arg1 arg2" --script setup.lua
 |--------|-------------|
 | `-s, --script <FILE>` | Lua script file to execute |
 | `-c, --command <CMD>` | Launch a target program for debugging |
-| `--server <ADDR>` | Connect to a remote joybug2 server (default: start local) |
+| `--server <ADDR>` | Connect to a remote joybug-core server (default: start local) |
 | `--repl-on-break` | Drop into interactive REPL on any breakpoint/exception |
 | `<SCRIPT>` | Positional script file (same as `--script`) |
 

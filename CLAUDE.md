@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Joybug2 is a Windows debugger library and TCP server written in Rust (edition 2024). It provides debugging capabilities including process control, symbol resolution, disassembly (x64/ARM64), and stepping through a JSON-framed protocol.
+`joybug-core` is a Windows debugger library and TCP server written in Rust (edition 2024). It provides debugging capabilities including process control, symbol resolution, disassembly (x64/ARM64), and stepping through a JSON-framed protocol.
 
 ## Build & Test Commands
 

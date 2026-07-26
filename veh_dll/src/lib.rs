@@ -1,13 +1,13 @@
 //! VEH debugging DLL - injected into the target process.
 //!
 //! Registers a Vectored Exception Handler that forwards exceptions to the
-//! joybug2 debugger via shared memory IPC.
+//! joybug-core debugger via shared memory IPC.
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use joybug2_veh_shared::{VehSharedMem, DLL_HANDLER_TIMEOUT_MS, VEH_VERSION};
+use joybug_core_veh_shared::{VehSharedMem, DLL_HANDLER_TIMEOUT_MS, VEH_VERSION};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::Diagnostics::Debug::*;
 use windows_sys::Win32::System::Memory::*;
@@ -134,7 +134,7 @@ fn to_wide(s: &str) -> Vec<u16> {
 fn veh_init() {
     let pid = unsafe { GetCurrentProcessId() };
 
-    let mapping_name = to_wide(&joybug2_veh_shared::shared_mem_name(pid));
+    let mapping_name = to_wide(&joybug_core_veh_shared::shared_mem_name(pid));
     let mapping: HANDLE =
         unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, mapping_name.as_ptr()) };
     if mapping.is_null() {
@@ -166,8 +166,8 @@ fn veh_init() {
 
     let nonce = unsafe { (*shared).nonce };
 
-    let has_event_name_w = to_wide(&joybug2_veh_shared::has_event_name(pid, nonce));
-    let handled_event_name_w = to_wide(&joybug2_veh_shared::handled_event_name(pid, nonce));
+    let has_event_name_w = to_wide(&joybug_core_veh_shared::has_event_name(pid, nonce));
+    let handled_event_name_w = to_wide(&joybug_core_veh_shared::handled_event_name(pid, nonce));
 
     let has_event: HANDLE =
         unsafe { OpenEventW(EVENT_ALL_ACCESS, FALSE, has_event_name_w.as_ptr()) };
