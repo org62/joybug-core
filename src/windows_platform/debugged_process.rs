@@ -121,6 +121,19 @@ pub(crate) struct DebuggedProcess {
     /// Monotonic first-hit counter backing `CoverageEntry::first_hit_seq`.
     /// Reset (with the map) by `forget_coverage_state`, not by re-arming mid-run.
     coverage_seq: u64,
+    /// Every address where a software breakpoint of ours was ever armed. When one
+    /// is removed while the target runs, another thread can trap on the INT3 in
+    /// the window before the removal lands — the kernel queues that event and
+    /// delivers it to us after the byte is already back to the original
+    /// instruction — so such a hit has to be recognized as ours (see
+    /// [`Self::is_stale_sw_breakpoint_hit`]) instead of being reported as an
+    /// unknown breakpoint with the IP left past the INT3. Recording at arm time
+    /// (not removal time) means no removal path can forget the bookkeeping; the
+    /// live breakpoint paths claim hits on still-armed addresses before the stale
+    /// check runs, and the byte check rejects addresses where an INT3 is present.
+    /// Never cleared while the process lives: there is no bound on how long a
+    /// queued event can take to arrive.
+    ever_armed_sw_breakpoints: std::collections::HashSet<u64>,
     /// Active hardware access traces by watched address. An entry marks the
     /// hardware watchpoint at that address as silent "collect accessors" mode.
     watchpoint_traces: std::collections::HashMap<u64, WatchpointTraceEntry>,
@@ -161,6 +174,7 @@ impl DebuggedProcess {
             pending_hw_bp_rearm: std::collections::HashMap::new(),
             coverage_breakpoints: std::collections::HashMap::new(),
             coverage_seq: 0,
+            ever_armed_sw_breakpoints: std::collections::HashSet::new(),
             watchpoint_traces: std::collections::HashMap::new(),
             watchpoint_seq: 0,
         })
@@ -171,10 +185,12 @@ impl DebuggedProcess {
     pub(super) fn handle(&self) -> HANDLE { self.process_handle.0 }
     pub(super) fn architecture(&self) -> Architecture { self.architecture }
     pub(super) fn insert_single_shot_breakpoint(&mut self, address: u64, original_bytes: Vec<u8>) {
+        self.ever_armed_sw_breakpoints.insert(address);
         self.single_shot_breakpoints.insert(address, original_bytes);
     }
 
     pub(super) fn insert_persistent_breakpoint(&mut self, address: u64, original_bytes: Vec<u8>, tid: Option<u32>) {
+        self.ever_armed_sw_breakpoints.insert(address);
         self.persistent_breakpoints.insert(address, original_bytes);
         self.persistent_bp_tid_filters.insert(address, tid);
     }
@@ -533,6 +549,30 @@ impl DebuggedProcess {
         } else {
             warn!(address, "Breakpoint not found");
             Ok(())
+        }
+    }
+
+    /// Whether an `EXCEPTION_BREAKPOINT` at `address` is a *stale* hit on a software
+    /// breakpoint we have already removed: a thread trapped on the INT3 just before
+    /// (or while) the removal happened and the kernel only delivered its event
+    /// afterwards. The removal wrote the original instruction back, so the thread
+    /// merely needs its IP rewound to re-execute it.
+    ///
+    /// Verifying that the breakpoint instruction is *gone* from `address` is what
+    /// makes this safe: if the debuggee has its own `int3`/`brk` there (including the
+    /// case where that was the original byte we saved), the bytes still match the
+    /// breakpoint pattern and the hit is reported to the client as usual. A hit on
+    /// a *still-armed* address never gets here — the live breakpoint paths claim it
+    /// first — and would fail the byte check anyway.
+    pub(super) fn is_stale_sw_breakpoint_hit(&self, address: u64) -> bool {
+        if !self.ever_armed_sw_breakpoints.contains(&address) {
+            return false;
+        }
+        let bp_bytes = self.breakpoint_instruction_bytes();
+        match super::memory::read_memory_internal(self.process_handle.0, address, bp_bytes.len()) {
+            Ok(current) => current != bp_bytes,
+            // Unreadable (freed/unmapped code): nothing sensible to rewind into.
+            Err(_) => false,
         }
     }
 

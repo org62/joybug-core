@@ -223,6 +223,14 @@ end
 local info = dbg:resolve_address(pid, addr)
 print(info.name, info.module, info.offset)
 
+-- Enumerate a module's symbols. Waits briefly for an in-flight background load
+-- (JOYBUG_SYMBOL_WAIT_TIMEOUT_SECS, 5s default) and then *errors* with
+-- "Symbols are still loading for ..." rather than returning an empty list — a
+-- multi-hundred-megabyte PDB takes far longer than that to parse. Wait for the
+-- load to settle first when the module is big:
+wait_symbols(pid, "app%.exe", 300)
+local syms = dbg:list_symbols(module_path)  -- {name, rva, is_function}
+
 -- Resolve many addresses in one round-trip WITHOUT waiting on in-flight
 -- symbol loads: an address in a still-loading module yields an empty table
 -- (re-request once get_symbol_status reports it loaded). One entry per input
@@ -573,10 +581,16 @@ target executes freely. `limit` is the hit count after which each breakpoint
 auto-removes: `1` (default) = remove on first hit (pure coverage), `>1` = heat map
 capped at `limit`, `0` = never remove (uncapped heat map).
 
+Threads that trap on the same entry at the same moment are all handled: the extra
+hits arrive after the breakpoint was already auto-removed, and the server rewinds
+those threads onto the restored instruction instead of surfacing an unknown
+breakpoint.
+
 ```lua
 dbg:on_initial_breakpoint(function(pid, tid, addr)
-    -- Enumerate a module's function entry points. With PDBs, use list_symbols;
-    -- without them, ntdll/system DLLs expose a RUNTIME_FUNCTION table.
+    -- Enumerate a module's function entry points. With PDBs, use list_symbols
+    -- (after wait_symbols — see Symbols); without them, ntdll/system DLLs expose
+    -- a RUNTIME_FUNCTION table.
     local base
     for _, m in ipairs(dbg:list_modules(pid)) do
         if m.name:lower():find("ntdll%.dll") then base = m.base end

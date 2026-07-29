@@ -380,7 +380,9 @@ end
 --- Returns the module's status table ({module, base, state, symbol_count, error,
 --- pdb_path}), or nil if no matching module settled before the timeout.
 function wait_symbols(pid, pattern, timeout_s)
-    local deadline = os.clock() + (timeout_s or 30)
+    -- os.time (wall clock), not os.clock (CPU time): this loop sleeps, so a
+    -- CPU-time deadline is never reached and the timeout would not apply.
+    local deadline = os.time() + (timeout_s or 30)
     repeat
         local found
         for _, s in ipairs(dbg:symbol_status(pid)) do
@@ -390,7 +392,7 @@ function wait_symbols(pid, pattern, timeout_s)
             return found
         end
         dbg:sleep(100)
-    until os.clock() >= deadline
+    until os.time() >= deadline
     return nil
 end
 

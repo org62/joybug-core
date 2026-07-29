@@ -296,23 +296,30 @@ impl SymbolManager {
         }
     }
 
-    /// Report the symbol load state for each of the given modules.
-    /// Non-blocking: reads the cache/pending/failed sets as they are right now.
-    pub fn get_symbol_status(&self, modules: Vec<ModuleInfo>) -> Vec<ModuleSymbolStatus> {
+    /// Classify a module's load state as of right now: cached → pending → failed →
+    /// not requested. Single source of truth for every caller that needs to tell
+    /// "no symbols" apart from "not ready yet". Returns the PDB path when loaded.
+    fn load_state(&self, module_path: &str) -> (SymbolLoadState, Option<String>) {
         let cache = self.symbol_cache.lock().unwrap();
         let pending = self.pending_loads.lock().unwrap();
         let failed = self.failed_loads.lock().unwrap();
 
+        if let Some(cached) = cache.get(module_path) {
+            (SymbolLoadState::Loaded { symbol_count: cached.symbols.len() }, cached.pdb_path.clone())
+        } else if pending.contains(module_path) {
+            (SymbolLoadState::Loading, None)
+        } else if let Some(error) = failed.get(module_path) {
+            (SymbolLoadState::Failed { error: error.clone() }, None)
+        } else {
+            (SymbolLoadState::NotRequested, None)
+        }
+    }
+
+    /// Report the symbol load state for each of the given modules.
+    /// Non-blocking: reads the cache/pending/failed sets as they are right now.
+    pub fn get_symbol_status(&self, modules: Vec<ModuleInfo>) -> Vec<ModuleSymbolStatus> {
         modules.into_iter().map(|module| {
-            let (state, pdb_path) = if let Some(cached) = cache.get(&module.name) {
-                (SymbolLoadState::Loaded { symbol_count: cached.symbols.len() }, cached.pdb_path.clone())
-            } else if pending.contains(&module.name) {
-                (SymbolLoadState::Loading, None)
-            } else if let Some(error) = failed.get(&module.name) {
-                (SymbolLoadState::Failed { error: error.clone() }, None)
-            } else {
-                (SymbolLoadState::NotRequested, None)
-            };
+            let (state, pdb_path) = self.load_state(&module.name);
             ModuleSymbolStatus {
                 module_path: module.name,
                 module_base: module.base,
@@ -900,16 +907,33 @@ impl SymbolManager {
     }
 
     /// List all symbols in the specified module as raw ModuleSymbols (without VA calculation)
+    ///
+    /// Waits up to the symbol wait timeout for an in-flight background load. If the
+    /// load is still running after that, this reports [`SymbolError::SymbolsStillLoading`]
+    /// instead of an empty list: a caller enumerating a module's functions (code
+    /// coverage, symbol panels) cannot distinguish "no symbols" from "not ready yet",
+    /// and a multi-hundred-megabyte PDB takes far longer than the wait timeout.
     pub fn list_symbols_raw(&self, module_path: &str) -> Result<Vec<ModuleSymbol>, SymbolError> {
         self.wait_for_loading(module_path)?;
-        
-        let cache = self.symbol_cache.lock().unwrap();
-        if let Some(module_symbols) = cache.get(module_path) {
-            trace!(module_path, count = module_symbols.symbols.len(), "Raw symbol listing completed");
-            Ok(module_symbols.symbols.clone())
-        } else {
-            trace!(module_path, "No symbols loaded for module");
-            Ok(Vec::new())
+
+        match self.load_state(module_path).0 {
+            SymbolLoadState::Loaded { .. } => {
+                let cache = self.symbol_cache.lock().unwrap();
+                let symbols = cache.get(module_path).map(|m| m.symbols.clone()).unwrap_or_default();
+                trace!(module_path, count = symbols.len(), "Raw symbol listing completed");
+                Ok(symbols)
+            }
+            SymbolLoadState::Loading => {
+                trace!(module_path, "Symbols still loading; reporting to caller instead of an empty listing");
+                Err(SymbolError::SymbolsStillLoading(module_path.to_string()))
+            }
+            SymbolLoadState::Failed { error } => {
+                Err(SymbolError::SymbolsNotFound(format!("{}: {}", module_path, error)))
+            }
+            SymbolLoadState::NotRequested => {
+                trace!(module_path, "No symbols loaded for module");
+                Ok(Vec::new())
+            }
         }
     }
 
