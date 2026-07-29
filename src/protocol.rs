@@ -1107,6 +1107,9 @@ pub mod request_response {
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub enum SymbolLoadState {
         Loaded { symbol_count: usize },
+        /// No PDB is available; PE export names were loaded as a fallback.
+        /// `error` is the reason the PDB itself couldn't be loaded.
+        ExportsOnly { export_count: usize, error: String },
         Loading,
         Failed { error: String },
         NotRequested,

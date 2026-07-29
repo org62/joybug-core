@@ -838,6 +838,11 @@ impl LuaUserData for LuaDebugClient {
                                 st.set("state", "loaded")?;
                                 st.set("symbol_count", *symbol_count)?;
                             }
+                            SymbolLoadState::ExportsOnly { export_count, error } => {
+                                st.set("state", "exports_only")?;
+                                st.set("symbol_count", *export_count)?;
+                                st.set("error", error.as_str())?;
+                            }
                             SymbolLoadState::Loading => st.set("state", "loading")?,
                             SymbolLoadState::Failed { error } => {
                                 st.set("state", "failed")?;

@@ -669,6 +669,12 @@ fn test_lua_file_unload_symbols() {
 }
 
 #[test]
+fn test_lua_file_export_fallback() {
+    let test_exe = common::get_test_program_path("disassembly_test");
+    run_lua_test_file("modules/export_fallback.lua", Some(&test_exe));
+}
+
+#[test]
 fn test_lua_file_load_pdb() {
     let test_exe = common::get_test_program_path("disassembly_test");
     run_lua_test_file("modules/load_pdb.lua", Some(&test_exe));

@@ -239,8 +239,11 @@ local batch = dbg:try_resolve_addresses(pid, { addr1, addr2 })
 print(batch[1].name, batch[1].module, batch[1].offset)
 
 -- Per-module symbol load status. Each entry:
--- {module, base, state = "loaded"|"loading"|"failed"|"not_requested",
+-- {module, base, state = "loaded"|"exports_only"|"loading"|"failed"|"not_requested",
 --  symbol_count?, error?, pdb_path?}
+-- "exports_only": no PDB was available, so the module's PE export names were
+-- loaded as fallback symbols; symbol_count is the export count and error is
+-- the reason the PDB couldn't be loaded.
 for _, s in ipairs(dbg:symbol_status(pid)) do
     print(s.module, s.state, s.symbol_count or "", s.error or "")
 end
@@ -263,8 +266,9 @@ dbg:retry_symbols(pid, module_base)
 dbg:unload_symbols(pid, module_base)
 
 -- Replace the set of modules (lowercased file names) whose automatic symbol
--- download is suppressed. Denied modules report "failed" instead of
--- downloading; retry_symbols lifts the suppression for its module.
+-- download is suppressed. Denied modules skip the download and fall back to
+-- PE export names ("exports_only"; plain "failed" when the module has no
+-- exports); retry_symbols lifts the suppression for its module.
 dbg:set_symbol_deny_list({ "app.exe", "third_party.dll" })
 ```
 
@@ -719,7 +723,7 @@ These functions are available globally:
 | `disasm(instrs)` | Pretty-print a list of instructions |
 | `callstack(frames)` | Pretty-print a call stack |
 | `modules(mods)` | Pretty-print a module list |
-| `wait_symbols(pid, pattern, [timeout_s=30])` | Wait until symbols for the first module matching `pattern` settle (`loaded`/`failed`); returns its status table, or nil on timeout |
+| `wait_symbols(pid, pattern, [timeout_s=30])` | Wait until symbols for the first module matching `pattern` settle (`loaded`/`exports_only`/`failed`); returns its status table, or nil on timeout |
 
 ## Example Scripts
 

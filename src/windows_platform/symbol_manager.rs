@@ -12,12 +12,30 @@ use crate::protocol::{TypeLayout, TypeSummary};
 use pelite::pe64::{Pe, PeFile};
 use pelite::image::{RUNTIME_FUNCTION, UNWIND_INFO, UNW_FLAG_CHAININFO};
 
+/// Where a module's cached symbols came from. `Exports` marks the PE-export
+/// fallback used when no PDB is available; it carries the PDB failure reason
+/// and is replaceable (a later PDB load clobbers it, a real PDB is never
+/// clobbered by exports).
+#[derive(Debug, Clone)]
+pub enum SymbolSource {
+    Pdb,
+    Exports { error: String },
+}
+
+impl SymbolSource {
+    /// Export stubs may be clobbered by a later real PDB load; a PDB never is.
+    fn is_replaceable(&self) -> bool {
+        matches!(self, SymbolSource::Exports { .. })
+    }
+}
+
 /// Cached symbols for a single module with RVA-based storage
 #[derive(Debug, Clone)]
 pub struct ModuleSymbols {
     pub module_base: u64, // Base address where the module is loaded
     pub symbols: Vec<ModuleSymbol>, // All symbols stored as RVAs
     pub pdb_path: Option<String>, // PDB file the symbols were loaded from
+    pub source: SymbolSource,
 }
 
 /// Result of a lazy per-module PDB parse (line table, type info), cached by
@@ -62,27 +80,73 @@ pub struct SymbolManager {
     failed_loads: Arc<Mutex<HashMap<String, String>>>,
     /// Modules (lowercased file names, e.g. "foo.dll") whose automatic symbol
     /// download the client suppressed — typically because the download failed in
-    /// an earlier run. Denied modules go straight to `failed_loads` instead of
-    /// downloading; an explicit retry lifts the suppression.
+    /// an earlier run. Denied modules skip the download, get recorded in
+    /// `failed_loads`, and fall back to PE export names; an explicit retry lifts
+    /// the suppression.
     denied_loads: Mutex<HashSet<String>>,
     /// Condvar to notify waiters when a module finishes loading
     pending_cv: Arc<Condvar>,
 
     /// Channel to send load requests to the worker thread
-    worker_tx: mpsc::Sender<ModuleInfo>,
+    worker_tx: mpsc::Sender<SymbolLoadRequest>,
 
     /// Maximum time to wait for a symbol loading task before giving up
     wait_timeout: Duration,
 }
 
+/// A unit of work for the symbol worker threads. A set `deny_error` skips the
+/// PDB download entirely (deny-listed module) and goes straight to the
+/// PE-export fallback, carrying the message to report as the PDB failure.
+struct SymbolLoadRequest {
+    module: ModuleInfo,
+    deny_error: Option<String>,
+}
+
+/// Parse a module's PE export table into symbol entries (the no-PDB fallback).
+/// Handles both 32- and 64-bit images. Forwarders have no RVA and are skipped;
+/// unused ordinal slots (RVA 0) are skipped; nameless exports get a synthetic
+/// `Ordinal{n}` name. Returned unsorted; the caller sorts by RVA.
+fn parse_export_symbols(module_path: &str) -> Result<Vec<ModuleSymbol>, String> {
+    // Map instead of read: only the header + export-directory pages get faulted in.
+    let map = pelite::FileMap::open(module_path)
+        .map_err(|e| format!("failed to read module: {}", e))?;
+    // pelite::PeFile is the 32/64 Wrap; every method used here forwards to both arms.
+    let pe = pelite::PeFile::from_bytes(map.as_ref())
+        .map_err(|e| format!("PE parse failed: {}", e))?;
+    let exports = pe.exports().map_err(|e| format!("no export directory: {}", e))?;
+    let by = exports.by().map_err(|e| format!("export table unreadable: {}", e))?;
+    let mut index_to_name: HashMap<usize, String> = HashMap::new();
+    for (name_res, func_index) in by.iter_name_indices() {
+        if let Some(name) = name_res.ok().and_then(|c| c.to_str().ok()) {
+            index_to_name.insert(func_index, name.to_string());
+        }
+    }
+    let ordinal_base = by.ordinal_base() as u32;
+    let mut symbols: Vec<ModuleSymbol> = Vec::new();
+    for (index, result) in by.iter().enumerate() {
+        let Ok(pelite::Export::Symbol(&rva)) = result else { continue };
+        if rva == 0 {
+            continue; // unused ordinal slot
+        }
+        let name = index_to_name
+            .remove(&index)
+            .unwrap_or_else(|| format!("Ordinal{}", ordinal_base + index as u32));
+        symbols.push(ModuleSymbol { name, rva, is_function: true });
+    }
+    if symbols.is_empty() {
+        return Err("module exports no symbols".to_string());
+    }
+    Ok(symbols)
+}
+
 impl SymbolManager {
     pub fn new_with_config(cfg: SymbolConfig) -> Result<Self, SymbolError> {
-        let symbol_cache = Arc::new(Mutex::new(HashMap::new()));
+        let symbol_cache = Arc::new(Mutex::new(HashMap::<String, ModuleSymbols>::new()));
         let pending_loads = Arc::new(Mutex::new(HashSet::new()));
         let failed_loads = Arc::new(Mutex::new(HashMap::new()));
         let pending_cv = Arc::new(Condvar::new());
 
-        let (worker_tx, worker_rx) = mpsc::channel::<ModuleInfo>();
+        let (worker_tx, worker_rx) = mpsc::channel::<SymbolLoadRequest>();
         // Wrap receiver in Arc<Mutex> to share among multiple worker threads
         let worker_rx = Arc::new(Mutex::new(worker_rx));
 
@@ -111,7 +175,7 @@ impl SymbolManager {
                 
                 loop {
                     // Acquire lock to receive next job
-                    let module_info = {
+                    let request = {
                         let lock = match rx.lock() {
                             Ok(guard) => guard,
                             Err(_) => break, // Poisoned mutex, exit
@@ -122,38 +186,61 @@ impl SymbolManager {
                         }
                     };
 
-                    let module_path = module_info.name.clone();
-                    trace!(worker_id = i, module_path = %module_path, "Worker processing load request");
-                    
-                    let module_base = module_info.base;
-                    let module_size = module_info.size.map(|s| s as usize);
-                    
-                    // Load symbols synchronously (but provider uses its internal runtime)
-                    let result = provider.load_symbols_for_module(&module_path, module_base, module_size);
-                    
-                    match result {
-                        Ok(()) => {
-                            trace!(worker_id = i, module_path = %module_path, "Symbol loading completed successfully");
-                            // Store in cache
-                            if let Ok(mut symbols) = provider.list_symbols(&module_path) {
-                                // Sort symbols by RVA for binary search
-                                symbols.sort_by_key(|s| s.rva);
-                                let pdb_path = provider.pdb_path_for(&module_path);
-                                let mut cache = cache_clone.lock().unwrap();
-                                // or_insert: never clobber symbols a user loaded manually meanwhile
-                                cache.entry(module_path.clone()).or_insert(ModuleSymbols {
-                                    module_base,
-                                    symbols,
-                                    pdb_path,
-                                });
+                    let module_path = request.module.name.clone();
+                    trace!(worker_id = i, module_path = %module_path, denied = request.deny_error.is_some(), "Worker processing load request");
+
+                    let module_base = request.module.base;
+                    let module_size = request.module.size.map(|s| s as usize);
+
+                    // Insert a finished symbol list, but never clobber a real PDB a
+                    // user loaded manually meanwhile; export stubs are replaceable.
+                    let insert_symbols = |mut symbols: Vec<ModuleSymbol>, pdb_path: Option<String>, source: SymbolSource| {
+                        // Sort symbols by RVA for binary search
+                        symbols.sort_by_key(|s| s.rva);
+                        let mut cache = cache_clone.lock().unwrap();
+                        if cache.get(&module_path).is_none_or(|m| m.source.is_replaceable()) {
+                            cache.insert(module_path.clone(), ModuleSymbols { module_base, symbols, pdb_path, source });
+                        }
+                    };
+
+                    // The PDB failure reason: the deny message for a skipped
+                    // download, or the live download's error.
+                    let pdb_error = match request.deny_error {
+                        Some(deny_msg) => Some(deny_msg),
+                        // Load symbols synchronously (but provider uses its internal runtime)
+                        None => match provider.load_symbols_for_module(&module_path, module_base, module_size) {
+                            Ok(()) => {
+                                trace!(worker_id = i, module_path = %module_path, "Symbol loading completed successfully");
+                                // Store in cache
+                                if let Ok(symbols) = provider.list_symbols(&module_path) {
+                                    let pdb_path = provider.pdb_path_for(&module_path);
+                                    insert_symbols(symbols, pdb_path, SymbolSource::Pdb);
+                                }
+                                None
+                            }
+                            Err(e) => {
+                                warn!(worker_id = i, module_path = %module_path, error = %e, "Symbol loading failed");
+                                failed_clone.lock().unwrap().insert(module_path.clone(), e.to_string());
+                                Some(e.to_string())
                             }
                         },
-                        Err(e) => {
-                            warn!(worker_id = i, module_path = %module_path, error = %e, "Symbol loading failed");
-                            failed_clone.lock().unwrap().insert(module_path.clone(), e.to_string());
+                    };
+
+                    // No PDB: fall back to PE export names so the module isn't
+                    // completely nameless. The failure stays recorded (the client
+                    // persists it), only the cache gains the export stubs.
+                    if let Some(error) = pdb_error {
+                        match parse_export_symbols(&module_path) {
+                            Ok(symbols) => {
+                                trace!(worker_id = i, module_path = %module_path, count = symbols.len(), "Loaded PE export names as symbol fallback");
+                                insert_symbols(symbols, None, SymbolSource::Exports { error });
+                            }
+                            Err(e) => {
+                                trace!(worker_id = i, module_path = %module_path, error = %e, "PE export fallback unavailable");
+                            }
                         }
                     }
-                    
+
                     // Remove from pending and notify waiters
                     {
                         let mut pending = pending_clone.lock().unwrap();
@@ -222,17 +309,17 @@ impl SymbolManager {
         }
 
         // The client suppressed auto-download for this module (it failed in an
-        // earlier run). Surface it as Failed so a UI can offer an explicit retry.
-        {
+        // earlier run). Record the failure so a UI can offer an explicit retry,
+        // but still enqueue the module so the worker loads PE export names as a
+        // fallback (skipping the download).
+        let deny_error = {
             let denied = self.denied_loads.lock().unwrap();
-            if denied.contains(&Self::short_name_lower(&module_path)) {
-                self.failed_loads.lock().unwrap().insert(
-                    module_path,
-                    "symbol download skipped (failed in a previous run; retry to download again)".to_string(),
-                );
-                return;
-            }
-        }
+            denied.contains(&Self::short_name_lower(&module_path)).then(|| {
+                let msg = "symbol download skipped (failed in a previous run; retry to download again)".to_string();
+                self.failed_loads.lock().unwrap().insert(module_path.clone(), msg.clone());
+                msg
+            })
+        };
 
         // Check if already pending
         {
@@ -242,9 +329,9 @@ impl SymbolManager {
             }
             pending.insert(module_path.clone());
         }
-        
+
         // Send to worker
-        if let Err(e) = self.worker_tx.send(module.clone()) {
+        if let Err(e) = self.worker_tx.send(SymbolLoadRequest { module: module.clone(), deny_error }) {
             error!(module_path = %module_path, error = %e, "Failed to send symbol load request to worker");
             // Remove from pending if send failed
             let mut pending = self.pending_loads.lock().unwrap();
@@ -305,7 +392,18 @@ impl SymbolManager {
         let failed = self.failed_loads.lock().unwrap();
 
         if let Some(cached) = cache.get(module_path) {
-            (SymbolLoadState::Loaded { symbol_count: cached.symbols.len() }, cached.pdb_path.clone())
+            match &cached.source {
+                SymbolSource::Pdb => {
+                    (SymbolLoadState::Loaded { symbol_count: cached.symbols.len() }, cached.pdb_path.clone())
+                }
+                SymbolSource::Exports { error } => (
+                    SymbolLoadState::ExportsOnly {
+                        export_count: cached.symbols.len(),
+                        error: error.clone(),
+                    },
+                    None,
+                ),
+            }
         } else if pending.contains(module_path) {
             (SymbolLoadState::Loading, None)
         } else if let Some(error) = failed.get(module_path) {
@@ -351,6 +449,7 @@ impl SymbolManager {
                 module_base: module.base,
                 symbols,
                 pdb_path: Some(pdb_path.display().to_string()),
+                source: SymbolSource::Pdb,
             });
         }
         self.failed_loads.lock().unwrap().remove(&module.name);
@@ -573,6 +672,15 @@ impl SymbolManager {
 
     /// Retry a failed (or never-attempted) symbol download for a module.
     pub fn retry_loading_symbols(&self, module: &ModuleInfo) {
+        // Evict a cached export-fallback stub so the retry re-attempts the real
+        // PDB download (`start_loading_symbols` early-returns on any cache hit).
+        // A real PDB is never evicted.
+        {
+            let mut cache = self.symbol_cache.lock().unwrap();
+            if cache.get(&module.name).is_some_and(|m| m.source.is_replaceable()) {
+                cache.remove(&module.name);
+            }
+        }
         self.denied_loads.lock().unwrap().remove(&Self::short_name_lower(&module.name));
         self.failed_loads.lock().unwrap().remove(&module.name);
         self.start_loading_symbols(module);
@@ -917,7 +1025,7 @@ impl SymbolManager {
         self.wait_for_loading(module_path)?;
 
         match self.load_state(module_path).0 {
-            SymbolLoadState::Loaded { .. } => {
+            SymbolLoadState::Loaded { .. } | SymbolLoadState::ExportsOnly { .. } => {
                 let cache = self.symbol_cache.lock().unwrap();
                 let symbols = cache.get(module_path).map(|m| m.symbols.clone()).unwrap_or_default();
                 trace!(module_path, count = symbols.len(), "Raw symbol listing completed");
