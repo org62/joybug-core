@@ -3,7 +3,7 @@ use crate::interfaces::PlatformError;
 use crate::protocol::ModuleInfo;
 #[cfg(target_arch = "aarch64")]
 use super::debugged_process::InternalHardwareBreakpoint;
-use tracing::{error, trace, warn};
+use tracing::{debug, error, trace, warn};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, FALSE, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, DBG_REPLY_LATER, DUPLICATE_SAME_ACCESS, HANDLE, DuplicateHandle, NTSTATUS, STATUS_SINGLE_STEP, MAX_PATH};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, INFINITE};
 use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -551,6 +551,21 @@ pub(super) fn handle_exception_event(
             }
         }
 
+        // Stale hit on a software breakpoint we already removed. `ContinueDebugEvent`
+        // resumes the whole process, so on a multi-core machine several threads can
+        // trap on the same INT3 before the debugger sees the first event; the extra
+        // events are delivered after we have restored the original instruction (a
+        // coverage breakpoint reaching its hit limit, `StopCodeCoverage`, or a plain
+        // `RemoveBreakpoint`). The trap was ours, so rewind the IP to re-execute the
+        // restored instruction and continue silently. Without this the hit surfaces
+        // as an unknown breakpoint with the IP one byte past the INT3, and resuming
+        // from there runs the tail of an instruction — usually an access violation.
+        if process.is_stale_sw_breakpoint_hit(address) {
+            debug!(pid, tid, address = %format!("0x{:X}", address), "Stale software breakpoint hit (already removed); rewinding IP and continuing");
+            reset_ip_after_breakpoint(process, pid, tid, address, false)?;
+            return Ok(None);
+        }
+
         // Initial or regular breakpoint
         let is_initial_breakpoint = {
             let not_hit = !process.has_initial_breakpoint_been_hit();
@@ -560,6 +575,10 @@ pub(super) fn handle_exception_event(
         if is_initial_breakpoint {
             return Ok(Some(crate::protocol::DebugEvent::InitialBreakpoint { pid, tid, address: ex_record.ExceptionAddress as u64 }));
         } else {
+            // Not one of ours: the debuggee executed its own int3/brk. The IP is left
+            // where the trap put it (past the INT3 on x64), so a client that just
+            // continues resumes mid-instruction unless it knows better.
+            warn!(pid, tid, address = %format!("0x{:X}", address), "Breakpoint not owned by the debugger (int3/brk in the target)");
             return Ok(Some(crate::protocol::DebugEvent::Breakpoint { pid, tid, address: ex_record.ExceptionAddress as u64 }));
         }
     }

@@ -27,6 +27,11 @@ pub enum SymbolError {
     PdbNotFound(String),
     #[error("Symbols not found: {0}")]
     SymbolsNotFound(String),
+    /// The module's symbols are still being loaded in the background. Callers that
+    /// enumerate symbols must retry (poll `GetSymbolStatus`) rather than treat the
+    /// result as "this module has no symbols" — a large PDB can take minutes.
+    #[error("Symbols are still loading for {0}")]
+    SymbolsStillLoading(String),
     #[error("SymSrv error: {0}")]
     SymSrvError(String),
     #[error("Module not loaded: {0}")]

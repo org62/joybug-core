@@ -147,6 +147,7 @@ fn main() {
         let _ = compile_test_program(&manifest_dir, &out_dir, "veh_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "anti_debug_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "bp_race_test", None);
+        let _ = compile_test_program(&manifest_dir, &out_dir, "cov_race_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "tls_test", None);
     }
 }
