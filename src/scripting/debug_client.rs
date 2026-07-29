@@ -528,6 +528,9 @@ pub fn instruction_to_lua_table(lua: &Lua, inst: &Instruction) -> mlua::Result<L
     if let Some(target) = inst.jump_target {
         table.set("jump_target", target)?;
     }
+    if let Some(mem) = inst.mem_ref {
+        table.set("mem_ref", mem)?;
+    }
     if let Some(ref sym) = inst.symbol_info {
         table.set("symbol", sym.format_symbol())?;
     }

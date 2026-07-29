@@ -106,6 +106,13 @@ pub struct Instruction {
     pub is_call: bool,           // call instruction
     pub is_ret: bool,            // ret instruction
     pub jump_target: Option<u64>, // Target address if resolvable (for jumps/calls)
+    /// Absolute address of a memory operand when statically resolvable
+    /// (RIP-relative or absolute displacement) — the data address the
+    /// instruction reads/writes, e.g. `mov rdx, [rip + 0xNN]`. Unlike
+    /// `addresses_to_symbolize` this never contains plain immediates, so a UI
+    /// can offer "go to memory" only for real memory references.
+    #[serde(default)]
+    pub mem_ref: Option<u64>,
     pub addresses_to_symbolize: Vec<u64>, // Addresses extracted from operands for symbolization
     #[serde(default)]
     pub line_info: Option<SourceLineRef>, // Source file/line, if the module's line table is loaded
