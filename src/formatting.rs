@@ -81,6 +81,7 @@ impl std::fmt::Debug for DebuggerResponse {
             DebuggerResponse::SymbolList { symbols } => f.debug_struct("SymbolList").field("symbols", symbols).finish(),
             DebuggerResponse::ResolvedSymbolList { symbols } => f.debug_struct("ResolvedSymbolList").field("symbols", symbols).finish(),
             DebuggerResponse::CoverageResults { hits } => f.debug_struct("CoverageResults").field("count", &hits.len()).finish(),
+            DebuggerResponse::CoverageTargetList { targets } => f.debug_struct("CoverageTargetList").field("count", &targets.len()).finish(),
             DebuggerResponse::WatchpointAccesses { accesses } => f.debug_struct("WatchpointAccesses").field("count", &accesses.len()).finish(),
             DebuggerResponse::AddressSymbol { module_path, symbol, offset } => f.debug_struct("AddressSymbol").field("module_path", module_path).field("symbol", symbol).field("offset", offset).finish(),
             DebuggerResponse::AddressSymbolBatch { results } => f.debug_struct("AddressSymbolBatch")

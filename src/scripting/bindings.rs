@@ -118,6 +118,7 @@ impl LuaUserData for LuaDebugClient {
 
                 // Phase 2: execute action (call Lua handlers, enter REPL, etc.)
                 let mut should_continue = true;
+                let mut exited_root = false;
                 let mut pass_exception = false;
                 let (continue_pid, continue_tid) = match &action {
                     EventAction::InitialBreakpoint { pid, tid, address, has_handler, repl_on_break } => {
@@ -260,6 +261,7 @@ impl LuaUserData for LuaDebugClient {
                         }
                         if *is_root {
                             should_continue = false;
+                            exited_root = true;
                         }
                         (*pid, *tid)
                     }
@@ -308,6 +310,11 @@ impl LuaUserData for LuaDebugClient {
                 };
 
                 if !should_continue {
+                    // The root process's exit event is still outstanding; release it
+                    // so the dead target isn't kept alive by the server's handles.
+                    if exited_root {
+                        this.inner.borrow_mut().finalize_exited_process(continue_pid, continue_tid);
+                    }
                     break;
                 }
 
@@ -1755,6 +1762,45 @@ impl LuaUserData for LuaDebugClient {
 
         // ---- Code Coverage ----
 
+        // enumerate_coverage_targets(module_path, [pid], [sources])
+        //   -> { { address, rva, symbol, source }, .. }
+        // Every address in the module worth arming coverage on: `.pdata`
+        // RUNTIME_FUNCTION starts unioned with symbols, where symbols the PDB
+        // does not mark as functions must pass a code-sanity check first.
+        // `symbol` is nil when nothing names the address; `source` is one of
+        // "pdata", "function_symbol", "validated_symbol". Works on modules with
+        // no symbols at all — feed `address` values straight to start_coverage.
+        // `sources` is an optional list of those same strings restricting which
+        // tiers contribute; omit it (or pass {}) for all. {"pdata"} gives the
+        // exception directory alone, with no heuristics involved.
+        methods.add_method("enumerate_coverage_targets", |lua, this, (module_path, pid, sources): (String, Option<u32>, Option<Vec<String>>)| {
+            let mut client = this.inner.borrow_mut();
+            let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
+            let sources = sources.unwrap_or_default().into_iter()
+                .map(|s| s.parse::<crate::protocol::CoverageTargetSource>().map_err(mlua::Error::external))
+                .collect::<Result<Vec<_>, _>>()?;
+            let resp = client.send_and_receive(&DebuggerRequest::EnumerateCoverageTargets { pid, module_path, sources })
+                .map_err(mlua::Error::external)?;
+            match resp {
+                DebuggerResponse::CoverageTargetList { targets } => {
+                    let table = lua.create_table()?;
+                    for (i, target) in targets.iter().enumerate() {
+                        let entry = lua.create_table()?;
+                        entry.set("address", target.address)?;
+                        entry.set("rva", target.rva)?;
+                        entry.set("symbol", target.symbol.clone())?;
+                        entry.set("source", target.source.as_str())?;
+                        table.set(i + 1, entry)?;
+                    }
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("EnumerateCoverageTargets failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
         // start_coverage([pid], addrs, [limit=1])
         // Arm silent, server-side-counted coverage breakpoints on every address in
         // `addrs`. Hits are counted in the server and the debuggee auto-continues
@@ -1776,10 +1822,14 @@ impl LuaUserData for LuaDebugClient {
             }
         });
 
-        // get_coverage([pid]) -> { { address, hit_count, first_hit_seq, thread_ids }, .. }
+        // get_coverage([pid])
+        //   -> { { address, hit_count, first_hit_seq, first_hit_us, thread_ids }, .. }
         // One entry per coverage breakpoint hit at least once (never-hit addresses
         // are omitted; the caller knows the armed set). `first_hit_seq` is the
         // 1-based first-execution order across the run (reset by stop_coverage);
+        // `first_hit_us` is microseconds from the start of the run to that first
+        // hit, so subtracting two entries gives the gap between them (only the
+        // first hit is timed — it says nothing about a heat run's repeats);
         // `thread_ids` lists the distinct threads that hit it, in first-hit order.
         methods.add_method("get_coverage", |lua, this, pid: Option<u32>| {
             let mut client = this.inner.borrow_mut();
@@ -1794,6 +1844,7 @@ impl LuaUserData for LuaDebugClient {
                         entry.set("address", hit.address)?;
                         entry.set("hit_count", hit.hit_count)?;
                         entry.set("first_hit_seq", hit.first_hit_seq)?;
+                        entry.set("first_hit_us", hit.first_hit_us)?;
                         entry.set("thread_ids", hit.thread_ids.clone())?;
                         table.set(i + 1, entry)?;
                     }

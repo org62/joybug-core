@@ -886,6 +886,11 @@ fn test_lua_file_code_coverage() {
     run_lua_test_file("breakpoints/code_coverage.lua", None);
 }
 
+#[test]
+fn test_lua_file_coverage_targets() {
+    run_lua_test_file("breakpoints/coverage_targets.lua", None);
+}
+
 // --- anti-anti-debug ---
 
 #[test]

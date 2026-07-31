@@ -308,6 +308,16 @@ impl DebugClient {
             .map_err(|e| mlua::Error::external(e))
     }
 
+    /// Acknowledge the root process's final debug event and drop the server's
+    /// handles on it, so the exited target doesn't linger as a zombie for the
+    /// lifetime of the connection. Best-effort: the run is over either way.
+    /// See `DebuggerRequest::FinalizeExitedProcess`.
+    pub fn finalize_exited_process(&mut self, pid: u32, tid: u32) {
+        if let Err(e) = self.send_and_receive(&DebuggerRequest::FinalizeExitedProcess { pid, tid }) {
+            tracing::debug!("FinalizeExitedProcess not acknowledged: {}", e);
+        }
+    }
+
 
     /// Step and wait for StepComplete.
     ///

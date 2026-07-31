@@ -590,19 +590,35 @@ hits arrive after the breakpoint was already auto-removed, and the server rewind
 those threads onto the restored instruction instead of surfacing an unknown
 breakpoint.
 
+`enumerate_coverage_targets` picks the addresses for you. It unions the module's
+`.pdata` RUNTIME_FUNCTION starts with its symbols; symbols the PDB marks as
+functions are taken as-is, and every other symbol (labels, and publics from PDBs
+that never set `CV_PUBSYMFLAGS_Function` — control-flow obfuscators emit tens of
+thousands of these) must first pass a code-sanity check: it has to sit in
+committed **executable** memory and start a linear decode that reaches an
+unconditional terminator without hitting an undecodable byte, a privileged or
+64-bit-invalid opcode, a branch into unmapped memory, or a chain of zero bytes.
+That gate matters because a coverage breakpoint *writes* an `int3` — one landing
+in a variable is silent memory corruption, not just a bad table row.
+
+Because `.pdata` is parsed from the module file, this works with no symbols at
+all, which is what makes coverage usable on stripped and protected binaries.
+
 ```lua
 dbg:on_initial_breakpoint(function(pid, tid, addr)
-    -- Enumerate a module's function entry points. With PDBs, use list_symbols
-    -- (after wait_symbols — see Symbols); without them, ntdll/system DLLs expose
-    -- a RUNTIME_FUNCTION table.
-    local base
+    local ntdll
     for _, m in ipairs(dbg:list_modules(pid)) do
-        if m.name:lower():find("ntdll%.dll") then base = m.base end
+        if m.name:lower():find("ntdll%.dll") then ntdll = m.name end
     end
+
+    -- { { address, rva, symbol, source }, .. }; symbol is nil when nothing names
+    -- the address, source is "pdata" | "function_symbol" | "validated_symbol".
+    -- An optional third argument restricts which tiers contribute — pass
+    -- {"pdata"} for the exception directory alone (no heuristics, and the
+    -- sanity sweep is skipped entirely), or omit it for everything.
+    local targets = dbg:enumerate_coverage_targets(ntdll, pid)
     local addrs = {}
-    for _, rf in ipairs(dbg:get_module_info(pid, base).runtime_functions) do
-        addrs[#addrs + 1] = base + rf.begin_address
-    end
+    for _, t in ipairs(targets) do addrs[#addrs + 1] = t.address end
 
     -- Arm coverage (limit=1 => each function counted once, then its INT3 removed).
     dbg:start_coverage(pid, addrs, 1)
@@ -610,10 +626,14 @@ end)
 
 dbg:on_process_exited(function(pid, exit_code)
     -- get_coverage returns only addresses hit at least once (the caller knows the
-    -- armed set and fills zeros): { { address, hit_count, first_hit_seq, thread_ids }, .. }
+    -- armed set and fills zeros):
+    --   { { address, hit_count, first_hit_seq, first_hit_us, thread_ids }, .. }
     -- first_hit_seq is the 1-based first-execution order across the run (reset by
-    -- stop_coverage); thread_ids lists the distinct threads that hit the address,
-    -- in first-hit order.
+    -- stop_coverage); first_hit_us is microseconds from the start of the run to
+    -- that first hit, so subtracting two entries gives the gap between them (only
+    -- the first hit is timed, so it says nothing about a heat run's repeats);
+    -- thread_ids lists the distinct threads that hit the address, in first-hit
+    -- order.
     local hits = dbg:get_coverage(pid)
     print(#hits .. " functions executed")
     -- dbg:stop_coverage(pid)  -- remove all coverage breakpoints, clear the map
@@ -623,7 +643,9 @@ dbg:launch('cmd.exe /c "echo test"')
 dbg:run()
 ```
 
-`pid` is optional on all three methods and defaults to the current process.
+`pid` is optional on all four methods and defaults to the current process
+(on `enumerate_coverage_targets` it is the *second* argument, after the module
+path).
 
 ### Hardware Access Trace
 

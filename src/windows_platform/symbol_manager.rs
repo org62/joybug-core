@@ -929,6 +929,31 @@ impl SymbolManager {
         }
     }
 
+    /// Every *primary* `.pdata` RUNTIME_FUNCTION of a module as `(begin_rva,
+    /// end_rva)`, ascending. Chained fragments (`UNW_FLAG_CHAININFO`) are
+    /// dropped: they are continuations whose primary entry is already in the
+    /// list, so one element here means one function.
+    ///
+    /// This is the symbol-independent function table — the exception directory
+    /// is parsed from the module file, so it is available for stripped and
+    /// obfuscated binaries whose PDB marks nothing as a function. Empty when the
+    /// module has no exception directory (x86-32, or a module we can't read).
+    pub fn runtime_function_ranges(&self, module_path: &str) -> Vec<(u32, u32)> {
+        let mut pdata_cache = self.pdata_cache.lock().unwrap();
+        let cached = pdata_cache
+            .entry(module_path.to_string())
+            .or_insert_with(|| Self::load_pdata_for_module(module_path));
+        let Some(cached) = cached.as_ref() else {
+            return Vec::new();
+        };
+        cached
+            .pdata
+            .iter()
+            .filter(|rf| !cached.chain_map.contains_key(&rf.BeginAddress))
+            .map(|rf| (rf.BeginAddress, rf.EndAddress))
+            .collect()
+    }
+
     /// Check if an RVA falls in a chained RUNTIME_FUNCTION fragment, and if so
     /// return the primary function's BeginAddress. Returns None if not chained.
     fn lookup_chain_target(&self, module_path: &str, rva: u32) -> Option<u32> {

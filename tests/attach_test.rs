@@ -85,18 +85,21 @@ fn test_attach_and_list_modules() {
     .on_dll_loaded(|_sess, _pid, _tid, _name, _base| Ok(()))
     .on_event(|sess, event| {
         sess.state.events.push(event.clone());
+        // Snapshot the module list from inside the loop. The target is still
+        // fully registered here — even on `ProcessExited`, right up until the
+        // session finalizes that event — whereas once the loop unwinds the
+        // server has released the exited process and knows nothing about it.
+        if let DebugEvent::ProcessExited { pid, .. } = event {
+            let modules = sess.list_modules(*pid).expect("Should get module list");
+            sess.state.modules.extend(modules);
+        }
         Ok(true)
     })
     .attach(process_info.dwProcessId)
     .expect("debug loop");
 
-    let mut final_session =
-        DebugSession::new(final_state, Some(server_addr.as_str())).expect("reconnect");
-    let modules = final_session
-        .list_modules(final_session.state.pid)
-        .expect("Should get module list");
-    final_session.state.modules.extend(modules);
-    println!("modules: {:?}", final_session.state.modules);
+    let final_session = final_state;
+    println!("modules: {:?}", final_session.modules);
 
     unsafe {
         CloseHandle(process_info.hProcess);
@@ -104,13 +107,11 @@ fn test_attach_and_list_modules() {
     }
 
     let process_created = final_session
-        .state
         .events
         .iter()
         .filter(|e| matches!(e, DebugEvent::ProcessCreated { .. }))
         .count();
     let process_exited = final_session
-        .state
         .events
         .iter()
         .filter(|e| matches!(e, DebugEvent::ProcessExited { .. }))
@@ -126,7 +127,6 @@ fn test_attach_and_list_modules() {
         "Should be exactly one process exited event"
     );
     assert!(final_session
-        .state
         .modules
         .iter()
         .any(|m| m.name.ends_with("cmd.exe")));

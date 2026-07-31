@@ -339,6 +339,28 @@ pub trait PlatformAPI: Send + Sync {
     // client (see `handle_exception_event`). `limit` is the hit count after which
     // each breakpoint is auto-removed (`0` = never, `1` = remove on first hit).
     fn start_code_coverage(&mut self, _pid: u32, _addrs: &[u64], _limit: u64) -> Result<(), PlatformError> { Err(PlatformError::NotImplemented) }
+    /// Enumerate every address in `module_path` worth arming a coverage
+    /// breakpoint on: `.pdata` RUNTIME_FUNCTION starts unioned with the module's
+    /// symbols. Symbols the PDB marks as functions are taken as-is; the rest
+    /// (labels, and publics from PDBs that never set the function flag) must
+    /// pass a code-sanity check first, since a coverage breakpoint writes an
+    /// `int3` and one landing in a variable corrupts the target. Every returned
+    /// address is in committed executable memory.
+    ///
+    /// Independent of symbols by design: a stripped or obfuscated module still
+    /// yields its exception-directory functions.
+    /// `sources` restricts which tiers contribute; empty means all. Anything not
+    /// requested is never computed, so asking for `[Pdata]` alone skips symbol
+    /// enumeration and the code-sanity sweep outright.
+    fn enumerate_coverage_targets(
+        &self,
+        _pid: u32,
+        _module_path: &str,
+        _sources: &[crate::protocol::CoverageTargetSource],
+    ) -> Result<Vec<crate::protocol::CoverageTarget>, PlatformError> {
+        Err(PlatformError::NotImplemented)
+    }
+
     /// Fetch a [`crate::protocol::CoverageHit`] (address, hit count, first-hit
     /// order, thread ids) for every coverage breakpoint hit at least once
     /// (never-hit addresses are omitted; the client knows the armed set).
@@ -709,6 +731,24 @@ pub trait PlatformAPI: Send + Sync {
         Self: Sized,
     {
         platform.read().unwrap().break_into(pid)
+    }
+
+    /// Release an already-exited process: acknowledge its final debug event and
+    /// drop the handles keeping it alive. Must NOT wait for a further debug event
+    /// — the process is gone and none will come.
+    ///
+    /// The default impl is a no-op — backends whose debug events need an explicit
+    /// acknowledgement, or that hold per-process handles (Windows), override it.
+    fn server_finalize_exited_process(
+        platform: &std::sync::Arc<std::sync::RwLock<Self>>,
+        pid: u32,
+        tid: u32,
+    ) -> Result<(), PlatformError>
+    where
+        Self: Sized,
+    {
+        let _ = (platform, pid, tid);
+        Ok(())
     }
 
     // -----------------------------------------------------------------

@@ -348,6 +348,22 @@ pub mod request_response {
             pid: u32,
             addr: u64,
         },
+        /// Enumerate every address in `module_path` worth arming coverage on:
+        /// `.pdata` RUNTIME_FUNCTION starts unioned with symbols, where symbols
+        /// the PDB does not mark as functions must first pass a code-sanity
+        /// check. Works with no symbols at all. See
+        /// `PlatformAPI::enumerate_coverage_targets`.
+        EnumerateCoverageTargets {
+            pid: u32,
+            module_path: String,
+            /// Which sources to draw targets from; empty means all of them.
+            /// Restricting this is how a caller opts out of the heuristic tier:
+            /// `[Pdata]` alone is the exception directory, which involves no
+            /// guessing at all. Sources that aren't asked for are never computed,
+            /// so narrowing also skips the sanity sweep.
+            #[serde(default)]
+            sources: Vec<CoverageTargetSource>,
+        },
         /// Arm code-coverage breakpoints (silent, server-side counted) at every
         /// address in `addrs`. `limit` is the hit count after which each is
         /// auto-removed (`0` = never, `1` = remove on first hit = pure coverage).
@@ -545,6 +561,18 @@ pub mod request_response {
         },
         TerminateProcess {
             pid: u32,
+        },
+        /// Release a process that has already reported `ProcessExited`: issues the
+        /// final `ContinueDebugEvent` for that event and drops the debugger's
+        /// handles on it. Unlike `Continue` it never waits for another debug event
+        /// (there will not be one), so the connection stays responsive.
+        ///
+        /// The client sends this when it is done inspecting the exited process —
+        /// until it does, the process object is kept alive by the pending debug
+        /// event, which is what makes a break on `ProcessExited` inspectable at all.
+        FinalizeExitedProcess {
+            pid: u32,
+            tid: u32,
         },
         GetModuleExtraInfo {
             pid: u32,
@@ -779,6 +807,65 @@ pub mod request_response {
         },
     }
 
+    /// Where a coverage target came from, so a UI can tell a PDB-named function
+    /// from one recovered purely from the exception directory.
+    ///
+    /// The serde form (`"pdata"` / `"function_symbol"` / `"validated_symbol"`,
+    /// mirrored by [`Self::as_str`] and `FromStr`) is the one vocabulary every
+    /// client speaks — Lua, the UI, and the wire all use these strings.
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum CoverageTargetSource {
+        /// A `.pdata` RUNTIME_FUNCTION start — the authoritative function table.
+        Pdata,
+        /// A symbol the PDB marks as a function.
+        FunctionSymbol,
+        /// A symbol *not* marked as a function that passed the code-sanity
+        /// check: obfuscated block labels, and publics from PDBs that never set
+        /// `CV_PUBSYMFLAGS_Function`.
+        ValidatedSymbol,
+    }
+
+    impl CoverageTargetSource {
+        /// The serde spelling, for building client-facing tables without a
+        /// serializer round-trip.
+        pub fn as_str(self) -> &'static str {
+            match self {
+                CoverageTargetSource::Pdata => "pdata",
+                CoverageTargetSource::FunctionSymbol => "function_symbol",
+                CoverageTargetSource::ValidatedSymbol => "validated_symbol",
+            }
+        }
+    }
+
+    impl std::str::FromStr for CoverageTargetSource {
+        type Err = String;
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s {
+                "pdata" => Ok(CoverageTargetSource::Pdata),
+                "function_symbol" => Ok(CoverageTargetSource::FunctionSymbol),
+                "validated_symbol" => Ok(CoverageTargetSource::ValidatedSymbol),
+                other => Err(format!(
+                    "Unknown coverage target source '{}' (expected pdata, function_symbol or validated_symbol)",
+                    other
+                )),
+            }
+        }
+    }
+
+    /// One address worth arming a coverage breakpoint on, from
+    /// `EnumerateCoverageTargets`.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct CoverageTarget {
+        pub address: u64,
+        pub rva: u32,
+        /// Best available name — the symbol starting exactly here, else the
+        /// nearest one before it within the same function as `name+0xN`, else
+        /// `None` when nothing names the address.
+        pub symbol: Option<String>,
+        pub source: CoverageTargetSource,
+    }
+
     /// One code-coverage breakpoint that has been hit at least once.
     #[derive(Debug, Serialize, Deserialize, Clone)]
     pub struct CoverageHit {
@@ -788,6 +875,13 @@ pub mod request_response {
         /// first covered address executed). Assigned once on the first hit and
         /// never changed; reset by `StopCodeCoverage`.
         pub first_hit_seq: u64,
+        /// Microseconds from the start of the coverage run (the moment arming
+        /// finished) to this address' *first* hit, so the gap between two
+        /// functions is the difference of their values. Stamped once alongside
+        /// `first_hit_seq`; later hits of the same address are not timed, which
+        /// is why this says nothing about a heat-map run's repeat hits.
+        #[serde(default)]
+        pub first_hit_us: u64,
         /// Distinct thread ids that hit this address, in first-hit order (the
         /// first element is the thread that executed it first).
         pub thread_ids: Vec<u32>,
@@ -839,6 +933,8 @@ pub mod request_response {
         /// Code-coverage results: one [`CoverageHit`] per coverage breakpoint
         /// hit at least once.
         CoverageResults { hits: Vec<CoverageHit> },
+        /// Armable addresses for a module, from `EnumerateCoverageTargets`.
+        CoverageTargetList { targets: Vec<CoverageTarget> },
         /// Access-trace results: one [`WatchpointAccess`] per distinct instruction
         /// that touched the watched address at least once.
         WatchpointAccesses { accesses: Vec<WatchpointAccess> },
