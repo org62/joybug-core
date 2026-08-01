@@ -9,8 +9,10 @@ use tracing::{trace, warn, error};
 use crate::windows_platform::symbol_provider::{WindowsSymbolProvider, ModuleLineTable, parse_pdb_to_symbols, parse_pdb_matching_pe, parse_pdb_to_lines};
 use crate::windows_platform::type_provider::{ModuleTypeInfo, parse_pdb_to_types};
 use crate::protocol::{TypeLayout, TypeSummary};
+use pelite::pe64::exception_arm64::Arm64ExceptionExt;
 use pelite::pe64::{Pe, PeFile};
 use pelite::image::{RUNTIME_FUNCTION, UNWIND_INFO, UNW_FLAG_CHAININFO};
+use windows_sys::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_ARM64;
 
 /// Where a module's cached symbols came from. `Exports` marks the PE-export
 /// fallback used when no PDB is available; it carries the PDB failure reason
@@ -50,7 +52,8 @@ struct PdataCache {
     /// Parsed .pdata entries (sorted by BeginAddress)
     pdata: Vec<RUNTIME_FUNCTION>,
     /// Precomputed map: fragment BeginAddress → primary function BeginAddress
-    /// Only entries with UNW_FLAG_CHAININFO are included.
+    /// Only entries with UNW_FLAG_CHAININFO are included, so this is always
+    /// empty on ARM64 — that unwind format has no chained-info flag.
     chain_map: HashMap<u32, u32>,
 }
 
@@ -1213,9 +1216,21 @@ impl SymbolManager {
 
     /// Load .pdata and precompute the chain map for a module.
     /// The chain map resolves all UNW_FLAG_CHAININFO entries to their primary function.
+    ///
+    /// The exception directory is machine-specific: x64 entries are 12-byte
+    /// `RUNTIME_FUNCTION`s, ARM64 entries are 8-byte
+    /// `IMAGE_ARM64_RUNTIME_FUNCTION_ENTRY`s. Parsing an ARM64 directory with the
+    /// x64 reader doesn't just misread it, it fails outright (the directory size
+    /// is a multiple of 8, rarely of 12), which is why the machine type has to be
+    /// consulted before picking a reader.
     fn load_pdata_for_module(module_path: &str) -> Option<PdataCache> {
         let pe_bytes = std::fs::read(module_path).ok()?;
         let pe = PeFile::from_bytes(&pe_bytes).ok()?;
+
+        if pe.file_header().Machine == IMAGE_FILE_MACHINE_ARM64 {
+            return Self::load_arm64_pdata(&pe);
+        }
+
         let exception = pe.exception().ok()?;
         let pdata = exception.image().to_vec();
         if pdata.is_empty() {
@@ -1234,6 +1249,45 @@ impl SymbolManager {
         }
 
         Some(PdataCache { pdata, chain_map })
+    }
+
+    /// ARM64 exception directory, normalized into the x64 `RUNTIME_FUNCTION`
+    /// shape the rest of the manager works with.
+    ///
+    /// `EndAddress` is synthesized: ARM64 entries store only a begin RVA and
+    /// unwind data, from which the function length comes either packed in the
+    /// entry itself or from the first word of its `.xdata` record. When neither
+    /// yields a length, the next entry's begin is used as an upper bound (the
+    /// last entry falls back to a zero-length range) so ranges stay ascending and
+    /// non-inverted.
+    ///
+    /// The chain map is always empty here: ARM64 unwind info has no
+    /// `UNW_FLAG_CHAININFO` equivalent. Separated function segments are marked by
+    /// the packed-fragment flag, which identifies a fragment but does not name
+    /// its primary, so there is nothing to map them to.
+    fn load_arm64_pdata(pe: &PeFile<'_>) -> Option<PdataCache> {
+        let exception = pe.exception_arm64().ok()?;
+        let functions: Vec<(u32, u32, Option<u32>)> = exception
+            .functions()
+            .map(|f| (f.begin_address(), f.raw_unwind_data(), f.end_address().ok().flatten()))
+            .collect();
+        if functions.is_empty() {
+            return None;
+        }
+
+        let pdata: Vec<RUNTIME_FUNCTION> = functions
+            .iter()
+            .enumerate()
+            .map(|(i, &(begin, unwind, end))| {
+                let end = end
+                    .or_else(|| functions.get(i + 1).map(|&(next_begin, _, _)| next_begin))
+                    .filter(|&end| end >= begin)
+                    .unwrap_or(begin);
+                RUNTIME_FUNCTION { BeginAddress: begin, EndAddress: end, UnwindData: unwind }
+            })
+            .collect();
+
+        Some(PdataCache { pdata, chain_map: HashMap::new() })
     }
 
     /// Find the RUNTIME_FUNCTION entry containing a given RVA.
