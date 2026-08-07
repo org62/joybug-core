@@ -53,7 +53,13 @@ end)
 dbg:launch(test_exe)
 dbg:run()
 
-assert(write_dword_hit, "g_write_dword Write(Byte4) breakpoint should have been hit")
+-- Report every flag on failure: which subset fired distinguishes "DRs never
+-- armed" from "armed late" (only the first target, write_dword, missed).
+local state = string.format(
+    " [write_dword=%s rw_hits=%d write_byte=%s execute=%s]",
+    tostring(write_dword_hit), rw_dword_hits, tostring(write_byte_hit), tostring(execute_hit))
+
+assert(write_dword_hit, "g_write_dword Write(Byte4) breakpoint should have been hit" .. state)
 assert(rw_dword_hits == 2,
     "g_rw_dword ReadWrite(Byte4) should be hit 2 times, got " .. rw_dword_hits)
 assert(write_byte_hit, "g_write_byte Write(Byte1) breakpoint should have been hit")
