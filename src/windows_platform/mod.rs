@@ -15,6 +15,7 @@ mod debugged_process;
 mod module_extra;
 pub use module_extra::parse_module_extra_info_from_bytes;
 pub use symbol_provider::{WindowsSymbolProvider, parse_pdb_matching_pe};
+mod coverage_targets;
 mod dbghelp;
 mod dereference;
 mod tracer;
@@ -471,6 +472,10 @@ impl PlatformAPI for WindowsPlatform {
         trace!(pid, addr, "WindowsPlatform::remove_breakpoint called");
         let process = self.get_process_mut(pid)?;
         process.remove_breakpoint(addr)
+    }
+
+    fn enumerate_coverage_targets(&self, pid: u32, module_path: &str, sources: &[crate::protocol::CoverageTargetSource]) -> Result<Vec<crate::protocol::CoverageTarget>, PlatformError> {
+        self.enumerate_coverage_targets_impl(pid, module_path, sources)
     }
 
     fn start_code_coverage(&mut self, pid: u32, addrs: &[u64], limit: u64) -> Result<(), PlatformError> {
@@ -1061,6 +1066,32 @@ impl PlatformAPI for WindowsPlatform {
         pid: u32,
     ) -> Result<(), PlatformError> {
         crate::windows_platform::process::debug_break_process_unlocked(pid)
+    }
+
+    /// `EXIT_PROCESS_DEBUG_EVENT` is the last event a process ever reports, and
+    /// Windows keeps the process object (address space included) alive until the
+    /// debugger acknowledges it — which is precisely what lets a client pause and
+    /// inspect the corpse. Nothing acknowledges it implicitly, so without this the
+    /// target lingers as a zombie for as long as the server holds its handles.
+    ///
+    /// Deliberately not routed through `server_continue`: that one blocks in
+    /// `WaitForDebugEvent` for the next event, and for a dead process there is no
+    /// next event — the connection's thread would park forever.
+    ///
+    /// `ContinueDebugEvent` is thread-affine, so this must run on the same
+    /// connection thread that launched/attached the target and has been pumping
+    /// its events. It does.
+    fn server_finalize_exited_process(
+        platform: &std::sync::Arc<std::sync::RwLock<Self>>,
+        pid: u32,
+        tid: u32,
+    ) -> Result<(), PlatformError> {
+        let cont = crate::windows_platform::debug_events::continue_debug_event(pid, tid, false);
+
+        // Drop our handles either way: on a failed continue the process is still
+        // gone, and holding them would only keep the zombie around longer.
+        platform.write().unwrap().remove_process(pid);
+        cont
     }
 
     // ------------------ Optional features (forwarders) ------------------

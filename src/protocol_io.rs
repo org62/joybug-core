@@ -124,6 +124,7 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::SymbolList { .. } => "SymbolList".to_string(),
         DebuggerResponse::ResolvedSymbolList { .. } => "ResolvedSymbolList".to_string(),
         DebuggerResponse::CoverageResults { hits } => format!("CoverageResults ({} entries)", hits.len()),
+        DebuggerResponse::CoverageTargetList { targets } => format!("CoverageTargetList ({} entries)", targets.len()),
         DebuggerResponse::WatchpointAccesses { accesses } => format!("WatchpointAccesses ({} entries)", accesses.len()),
         DebuggerResponse::AddressSymbol { .. } => "AddressSymbol".to_string(),
         DebuggerResponse::AddressSymbolBatch { results } => format!("AddressSymbolBatch ({} addresses)", results.len()),
@@ -704,6 +705,29 @@ impl<S> DebugSession<S> {
         self.on_event = on_event;
         self.on_exception = on_exception;
 
+        // The root process exiting ends the session no matter what the handler
+        // decided, so this runs before the `should_continue` check below — a
+        // handler that stops (e.g. the user picking "stop" over "go" at a break on
+        // process exit) must not skip the release.
+        //
+        // The final debug event is still outstanding at this point: Windows keeps
+        // the dead process object alive until the debugger acknowledges it, which
+        // is what makes a break on `ProcessExited` inspectable — and what leaves a
+        // zombie behind if we just walk away.
+        if let DebugEvent::ProcessExited { pid, tid, .. } = event {
+            if self.root_pid.is_none_or(|root| root == *pid) {
+                // Best-effort: a server too old to know the request drops the
+                // connection, and we're tearing that down anyway.
+                let req = DebuggerRequest::FinalizeExitedProcess { pid: *pid, tid: *tid };
+                match self.send_and_receive(&req) {
+                    Ok(DebuggerResponse::Ack) => debug!("Released exited process {}", pid),
+                    Ok(other) => warn!("FinalizeExitedProcess: unexpected response {:?}", other),
+                    Err(e) => debug!("FinalizeExitedProcess not acknowledged (server too old?): {}", e),
+                }
+                return Ok(false);
+            }
+        }
+
         // If the on_event handler wants to stop, respect that
         if !should_continue {
             return Ok(false);
@@ -712,20 +736,15 @@ impl<S> DebugSession<S> {
         // Handle automatic continuation for most events
         match event {
             DebugEvent::ProcessExited { pid, tid, .. } => {
-                // If this is a child process exit (not root), auto-continue
-                let is_root = self.root_pid.is_none_or(|root| root == *pid);
-                if is_root {
-                    return Ok(false);
-                } else {
-                    let cont = DebuggerRequest::Continue {
-                        pid: *pid,
-                        tid: *tid,
-                        pass_exception: false,
-                    };
-                    let mut stream = self.stream.lock().unwrap();
-                    debug!("Auto-continue on child process exit: {}", event);
-                    send_request(&mut stream, &cont)?;
-                }
+                // Root exits returned above; only a child process reaches here.
+                let cont = DebuggerRequest::Continue {
+                    pid: *pid,
+                    tid: *tid,
+                    pass_exception: false,
+                };
+                let mut stream = self.stream.lock().unwrap();
+                debug!("Auto-continue on child process exit: {}", event);
+                send_request(&mut stream, &cont)?;
             }
 
             DebugEvent::Exception { pid, tid, .. } => {
@@ -900,6 +919,39 @@ impl<S> DebugSession<S> {
                 message
             )),
             other => Err(anyhow::anyhow!("Unexpected response to ListSymbols: {:?}", other)),
+        }
+    }
+
+    /// Every address in `module_path` worth arming code coverage on: `.pdata`
+    /// RUNTIME_FUNCTION starts unioned with symbols, with symbols the PDB does
+    /// not mark as functions filtered by a code-sanity check. Returns targets
+    /// even when the module has no symbols at all; feed the addresses to
+    /// [`start_coverage`].
+    /// `sources` restricts which tiers contribute (empty = all): pass
+    /// `[CoverageTargetSource::Pdata]` for exception-directory functions only,
+    /// which involves no heuristics.
+    pub fn enumerate_coverage_targets(
+        &mut self,
+        pid: u32,
+        module_path: &str,
+        sources: Vec<crate::protocol::CoverageTargetSource>,
+    ) -> anyhow::Result<Vec<crate::protocol::CoverageTarget>> {
+        let req = DebuggerRequest::EnumerateCoverageTargets {
+            pid,
+            module_path: module_path.to_string(),
+            sources,
+        };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::CoverageTargetList { targets } => Ok(targets),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!(
+                "Failed to enumerate coverage targets for '{}': {}",
+                module_path,
+                message
+            )),
+            other => Err(anyhow::anyhow!(
+                "Unexpected response to EnumerateCoverageTargets: {:?}",
+                other
+            )),
         }
     }
 

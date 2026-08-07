@@ -53,6 +53,10 @@ pub(crate) struct CoverageEntry {
     /// 1-based first-execution order across the coverage run (0 = never hit).
     /// Assigned once when `hit_count` transitions 0 -> 1.
     pub first_hit_seq: u64,
+    /// Microseconds from the coverage epoch to the first hit, stamped alongside
+    /// `first_hit_seq` (0 = never hit, same as the first address executed —
+    /// `first_hit_seq` is what distinguishes the two).
+    pub first_hit_us: u64,
     /// Distinct thread ids that hit this address, in first-hit order.
     pub thread_ids: Vec<u32>,
 }
@@ -121,6 +125,12 @@ pub(crate) struct DebuggedProcess {
     /// Monotonic first-hit counter backing `CoverageEntry::first_hit_seq`.
     /// Reset (with the map) by `forget_coverage_state`, not by re-arming mid-run.
     coverage_seq: u64,
+    /// Time origin the `CoverageEntry::first_hit_us` stamps are measured from.
+    /// Set when the first breakpoint of a run is armed — arming thousands of
+    /// INT3s takes long enough that timing from the *request* would fold the
+    /// arming cost into the first function's timestamp. Cleared with the map by
+    /// `forget_coverage_state`.
+    coverage_epoch: Option<std::time::Instant>,
     /// Every address where a software breakpoint of ours was ever armed. When one
     /// is removed while the target runs, another thread can trap on the INT3 in
     /// the window before the removal lands — the kernel queues that event and
@@ -174,6 +184,7 @@ impl DebuggedProcess {
             pending_hw_bp_rearm: std::collections::HashMap::new(),
             coverage_breakpoints: std::collections::HashMap::new(),
             coverage_seq: 0,
+            coverage_epoch: None,
             ever_armed_sw_breakpoints: std::collections::HashSet::new(),
             watchpoint_traces: std::collections::HashMap::new(),
             watchpoint_seq: 0,
@@ -585,9 +596,20 @@ impl DebuggedProcess {
     /// persistent breakpoint (no tid filter) and start a counter with `limit`.
     pub(super) fn arm_coverage(&mut self, address: u64, original_bytes: Vec<u8>, limit: u64) {
         self.insert_persistent_breakpoint(address, original_bytes, None);
+        // First arm of a run starts the clock. `get_or_insert_with` (not a plain
+        // set) so re-arming more addresses mid-run keeps the existing origin and
+        // the timestamps stay on one timeline.
+        self.coverage_epoch.get_or_insert_with(std::time::Instant::now);
         self.coverage_breakpoints.insert(
             address,
-            CoverageEntry { hit_count: 0, limit, active: true, first_hit_seq: 0, thread_ids: Vec::new() },
+            CoverageEntry {
+                hit_count: 0,
+                limit,
+                active: true,
+                first_hit_seq: 0,
+                first_hit_us: 0,
+                thread_ids: Vec::new(),
+            },
         );
     }
 
@@ -597,10 +619,17 @@ impl DebuggedProcess {
     /// "is this a coverage hit?" test and the count — this runs on the silent
     /// auto-continue hot path.
     pub(super) fn record_coverage_hit(&mut self, address: u64, tid: u32) -> Option<(u64, u64)> {
+        // Sampled before the map lookup so the stamp reflects when the trap was
+        // handled, not how long the borrow took; only read on the 0 -> 1 edge.
+        let now = std::time::Instant::now();
+        let epoch = self.coverage_epoch;
         let entry = self.coverage_breakpoints.get_mut(&address).filter(|e| e.active)?;
         if entry.hit_count == 0 {
             self.coverage_seq += 1;
             entry.first_hit_seq = self.coverage_seq;
+            entry.first_hit_us = epoch
+                .map(|e| now.saturating_duration_since(e).as_micros() as u64)
+                .unwrap_or(0);
         }
         entry.hit_count += 1;
         if !entry.thread_ids.contains(&tid) {
@@ -632,6 +661,7 @@ impl DebuggedProcess {
                 address: *addr,
                 hit_count: e.hit_count,
                 first_hit_seq: e.first_hit_seq,
+                first_hit_us: e.first_hit_us,
                 thread_ids: e.thread_ids.clone(),
             })
             .collect()
@@ -660,6 +690,7 @@ impl DebuggedProcess {
     fn forget_coverage_state(&mut self) {
         self.coverage_breakpoints.clear();
         self.coverage_seq = 0;
+        self.coverage_epoch = None;
     }
 
     // --- Hardware access traces ----------------------------------------------

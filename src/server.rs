@@ -79,6 +79,12 @@ where
                     Err(e) => { error!(pid, error = %e, "TerminateProcess failed"); DebuggerResponse::Error { message: e.to_string() } }
                 }
             }
+            DebuggerRequest::FinalizeExitedProcess { pid, tid } => {
+                match P::server_finalize_exited_process(&platform, pid, tid) {
+                    Ok(()) => { debug!(pid, tid, "Finalized exited process"); DebuggerResponse::Ack }
+                    Err(e) => { error!(pid, tid, error = %e, "FinalizeExitedProcess failed"); DebuggerResponse::Error { message: e.to_string() } }
+                }
+            }
             DebuggerRequest::BreakInto { pid } => {
                 match P::server_break_into(&platform, pid) {
                     Ok(()) => DebuggerResponse::Ack,
@@ -304,6 +310,13 @@ where
                 let p = platform.read().unwrap();
                 match p.set_symbol_deny_list(modules) {
                     Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::EnumerateCoverageTargets { pid, module_path, sources } => {
+                let p = platform.read().unwrap();
+                match p.enumerate_coverage_targets(pid, &module_path, &sources) {
+                    Ok(targets) => DebuggerResponse::CoverageTargetList { targets },
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
@@ -659,6 +672,7 @@ where
                 )
             },
             DebuggerResponse::WideStringData { data } => format!("WideStringData {{ data: \"{}\" }}", data),
+            DebuggerResponse::CoverageTargetList { targets } => format!("CoverageTargetList {{ targets: [..{} targets] }}", targets.len()),
             DebuggerResponse::SymbolList { symbols } => format!("SymbolList {{ symbols: [..{} symbols] }}", symbols.len()),
             DebuggerResponse::ResolvedSymbolList { symbols } => format!("ResolvedSymbolList {{ symbols: [..{} symbols] }}", symbols.len()),
             DebuggerResponse::CallStack { frames } => format!(

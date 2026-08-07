@@ -53,7 +53,8 @@ fn sweep_function_vas(
             .map(|s| s.state);
         match state {
             Some(SymbolLoadState::Loaded { .. }) => break,
-            Some(SymbolLoadState::Failed { error }) => {
+            Some(SymbolLoadState::Failed { error })
+            | Some(SymbolLoadState::ExportsOnly { error, .. }) => {
                 panic!("symbol load failed for {}: {}", module_path, error)
             }
             other => assert!(

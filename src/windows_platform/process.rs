@@ -109,13 +109,20 @@ pub(super) fn launch(platform: &mut WindowsPlatform, command: &str, debug_childr
     
     let pid = process_info.dwProcessId;
     let process_handle = process_info.hProcess;
-    
+
+    // We never use the initial thread handle from CreateProcessW — the debug loop
+    // gets its own (duplicated) one from CREATE_PROCESS_DEBUG_EVENT. Closing it now
+    // matters: a live thread handle keeps the *process* object alive, so holding it
+    // would leave every launched target behind as a zombie for the server's
+    // lifetime, no matter how cleanly the debug session shuts down.
+    unsafe { CloseHandle(process_info.hThread) };
+
     // Determine the architecture of the process
     let architecture = determine_process_architecture(process_handle)?;
-    
+
     // Add the new process to the platform
     platform.add_process(pid, process_handle, architecture)?;
-    
+
     // Immediately run the debug loop for the new process
     let mut debug_event: DEBUG_EVENT = unsafe { std::mem::zeroed() };
     let wait_res = unsafe { WaitForDebugEvent(&mut debug_event, INFINITE) };

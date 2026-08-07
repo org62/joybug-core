@@ -152,6 +152,15 @@ fn arm64_address_imms(engine: &Capstone, insn: &capstone::Insn) -> Vec<u64> {
     addresses
 }
 
+/// Linear address referenced by a RIP-relative memory operand. RIP-relative
+/// displacements are relative to the *end* of the instruction, so the target
+/// is next-instruction address + displacement.
+fn rip_relative_target(insn: &capstone::Insn, mem: &capstone::arch::x86::X86OpMem) -> u64 {
+    insn.address()
+        .wrapping_add(insn.len() as u64)
+        .wrapping_add_signed(mem.disp())
+}
+
 /// Extract all addresses that should be symbolized from instruction operands
 /// Uses Capstone's structured operand data instead of text parsing
 fn extract_addresses_from_operands(
@@ -180,10 +189,7 @@ fn extract_addresses_from_operands(
                         X86OperandType::Mem(ref mem) => {
                             // Check for RIP-relative addressing
                             if mem.base() == RegId(X86_REG_RIP) {
-                                // RIP-relative: target = instruction_end + displacement
-                                let target = insn.address()
-                                    .wrapping_add(insn.len() as u64)
-                                    .wrapping_add_signed(mem.disp());
+                                let target = rip_relative_target(insn, mem);
                                 if target > 0x10000 {
                                     addresses.push(target);
                                 }
@@ -208,6 +214,46 @@ fn extract_addresses_from_operands(
     addresses
 }
 
+/// Extract the absolute address of a memory operand when it is statically
+/// resolvable: RIP-relative (`[rip ± disp]`) or absolute displacement
+/// (`[0x12345678]`). Register-based operands (`[rax + rcx*8]`) have no static
+/// address and yield `None`. First memory operand wins — x86 has at most one
+/// memory operand per instruction outside of exotic string ops.
+///
+/// ARM64 memory operands are register-based (PC-relative literals surface as
+/// immediates, already covered by `arm64_address_imms`), so this is x64-only.
+fn extract_mem_ref_from_operands(
+    engine: &Capstone,
+    insn: &capstone::Insn,
+    arch: Architecture,
+) -> Option<u64> {
+    if arch != Architecture::X64 {
+        return None;
+    }
+    let detail = engine.insn_detail(insn).ok()?;
+    if let ArchDetail::X86Detail(x86) = detail.arch_detail() {
+        for op in x86.operands() {
+            if let X86OperandType::Mem(ref mem) = op.op_type {
+                // A segment-override displacement (`fs:[0x...]`) is relative
+                // to the segment base, not a linear address — never a mem_ref.
+                if mem.segment() != RegId(0) {
+                    continue;
+                }
+                if mem.base() == RegId(X86_REG_RIP) {
+                    let target = rip_relative_target(insn, mem);
+                    if target > 0x10000 {
+                        return Some(target);
+                    }
+                } else if mem.base() == RegId(0) && mem.index() == RegId(0) && mem.disp() > 0x10000 {
+                    // No base/index register: the displacement IS the address.
+                    return Some(mem.disp() as u64);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Extract jump/call target from structured operand data
 fn extract_jump_target_from_operands(
     engine: &Capstone,
@@ -230,10 +276,7 @@ fn extract_jump_target_from_operands(
                         X86OperandType::Mem(ref mem) => {
                             // RIP-relative call/jump (e.g., call qword ptr [rip+0x1234])
                             if mem.base() == RegId(X86_REG_RIP) {
-                                let target = insn.address()
-                                    .wrapping_add(insn.len() as u64)
-                                    .wrapping_add_signed(mem.disp());
-                                return Some(target);
+                                return Some(rip_relative_target(insn, mem));
                             }
                         }
                         _ => {}
@@ -324,6 +367,8 @@ impl DisassemblerProvider for CapstoneDisassembler {
                     // Extract all addresses that should be symbolized from operands
                     let addresses_to_symbolize = extract_addresses_from_operands(engine, &insn, arch);
 
+                    let mem_ref = extract_mem_ref_from_operands(engine, &insn, arch);
+
                     result.push(Instruction {
                         address: insn.address(),
                         bytes: insn.bytes().to_vec(),
@@ -334,6 +379,7 @@ impl DisassemblerProvider for CapstoneDisassembler {
                         is_call,
                         is_ret,
                         jump_target,
+                        mem_ref,
                         addresses_to_symbolize,
                         ..Default::default()
                     });
@@ -392,6 +438,62 @@ mod tests {
             .unwrap();
         assert_eq!(instrs[0].symbolized_op_str, None);
         assert!(instrs[0].op_str.contains("0x140002000"));
+    }
+
+    // mem_ref: RIP-relative and absolute memory operands resolve to a static
+    // data address; immediates and register-based operands must not.
+    #[test]
+    fn mem_ref_extracted_for_static_memory_operands() {
+        let base = 0x140001000u64;
+        let disasm = CapstoneDisassembler::new().unwrap();
+
+        // mov rax, qword ptr [rip + 0xffb] — 48 8B 05 FB 0F 00 00 (7 bytes)
+        // target = base + 7 + 0xffb
+        let rip_rel = disasm
+            .disassemble(Architecture::X64, &[0x48, 0x8B, 0x05, 0xFB, 0x0F, 0x00, 0x00], base, 1)
+            .unwrap();
+        assert_eq!(rip_rel[0].mem_ref, Some(base + 7 + 0xFFB));
+
+        // mov rax, qword ptr [0x40002000] — absolute displacement (SIB, no
+        // base/index): the displacement is the address.
+        let abs = disasm
+            .disassemble(
+                Architecture::X64,
+                &[0x48, 0x8B, 0x04, 0x25, 0x00, 0x20, 0x00, 0x40],
+                base,
+                1,
+            )
+            .unwrap();
+        assert_eq!(abs[0].mem_ref, Some(0x40002000));
+
+        // mov rax, qword ptr fs:[0x1122334455667788] — segment-relative
+        // displacement (moffs with fs override), not a linear address.
+        let seg = disasm
+            .disassemble(
+                Architecture::X64,
+                &[0x64, 0x48, 0xA1, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11],
+                base,
+                1,
+            )
+            .unwrap();
+        assert_eq!(seg[0].mem_ref, None);
+
+        // movabs rax, 0x140002000 — an immediate, not a memory reference.
+        let imm = disasm
+            .disassemble(
+                Architecture::X64,
+                &[0x48, 0xB8, 0x00, 0x20, 0x00, 0x40, 0x01, 0x00, 0x00, 0x00],
+                base,
+                1,
+            )
+            .unwrap();
+        assert_eq!(imm[0].mem_ref, None);
+
+        // mov rax, qword ptr [rcx + rdx*8 + 0x10] — register-based, no static address.
+        let reg_mem = disasm
+            .disassemble(Architecture::X64, &[0x48, 0x8B, 0x44, 0xD1, 0x10], base, 1)
+            .unwrap();
+        assert_eq!(reg_mem[0].mem_ref, None);
     }
 
     // A decode that hits an undecodable byte must emit a 1-byte `db` placeholder

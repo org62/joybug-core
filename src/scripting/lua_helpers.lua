@@ -373,7 +373,7 @@ function sym(name, max)
     return syms[1].va
 end
 
---- Wait for a module's symbols to settle (loaded or failed).
+--- Wait for a module's symbols to settle (loaded, exports_only or failed).
 --- wait_symbols(pid, pattern)            -- 30s default timeout
 --- wait_symbols(pid, pattern, timeout_s)
 --- `pattern` is matched (Lua pattern, case-insensitive) against module paths.
@@ -388,7 +388,7 @@ function wait_symbols(pid, pattern, timeout_s)
         for _, s in ipairs(dbg:symbol_status(pid)) do
             if s.module:lower():find(pattern) then found = s end
         end
-        if found and (found.state == "loaded" or found.state == "failed") then
+        if found and (found.state == "loaded" or found.state == "exports_only" or found.state == "failed") then
             return found
         end
         dbg:sleep(100)

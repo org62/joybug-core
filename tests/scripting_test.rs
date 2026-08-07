@@ -669,6 +669,12 @@ fn test_lua_file_unload_symbols() {
 }
 
 #[test]
+fn test_lua_file_export_fallback() {
+    let test_exe = common::get_test_program_path("disassembly_test");
+    run_lua_test_file("modules/export_fallback.lua", Some(&test_exe));
+}
+
+#[test]
 fn test_lua_file_load_pdb() {
     let test_exe = common::get_test_program_path("disassembly_test");
     run_lua_test_file("modules/load_pdb.lua", Some(&test_exe));
@@ -878,6 +884,11 @@ fn test_lua_file_mass_breakpoints() {
 #[test]
 fn test_lua_file_code_coverage() {
     run_lua_test_file("breakpoints/code_coverage.lua", None);
+}
+
+#[test]
+fn test_lua_file_coverage_targets() {
+    run_lua_test_file("breakpoints/coverage_targets.lua", None);
 }
 
 // --- anti-anti-debug ---

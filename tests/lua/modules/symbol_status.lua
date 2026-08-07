@@ -7,7 +7,7 @@ dbg:on_initial_breakpoint(function(pid, tid, addr)
     local statuses = dbg:symbol_status(pid)
     assert(#statuses > 0, "symbol_status should report at least one module")
     for _, s in ipairs(statuses) do
-        assert(s.state == "loaded" or s.state == "loading"
+        assert(s.state == "loaded" or s.state == "exports_only" or s.state == "loading"
             or s.state == "failed" or s.state == "not_requested",
             "unexpected state: " .. tostring(s.state))
         assert(s.base > 0, "module base should be nonzero")
