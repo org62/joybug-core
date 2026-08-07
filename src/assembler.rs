@@ -1,5 +1,5 @@
 use crate::interfaces::Architecture;
-use keystone_engine::{Keystone, Arch, Mode, OptionType, OptionValue};
+use hexpatch_keystone::{Keystone, Arch, Mode, OptionType, OptionValue};
 use std::sync::Mutex;
 
 /// Keystone is backed by LLVM's MC layer, which relies on process-global state
@@ -31,7 +31,7 @@ pub fn assemble(arch: Architecture, code: &str, address: u64) -> Result<Assemble
     // Recover from poisoning (a prior panic while assembling) rather than propagating it.
     let _guard = KEYSTONE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    let map_err = |e: keystone_engine::KeystoneError| AssembleError {
+    let map_err = |e: hexpatch_keystone::Error| AssembleError {
         message: format!("{}", e),
     };
 
@@ -60,7 +60,7 @@ pub fn assemble(arch: Architecture, code: &str, address: u64) -> Result<Assemble
 /// Input may use Intel syntax (e.g. `qword ptr [rsp+8]` from Capstone
 /// disassembly). We automatically strip `ptr` since NASM doesn't use it.
 fn assemble_x64(code: &str, address: u64) -> Result<AssembleOutput, AssembleError> {
-    let map_err = |e: keystone_engine::KeystoneError| AssembleError {
+    let map_err = |e: hexpatch_keystone::Error| AssembleError {
         message: format!("{}", e),
     };
 

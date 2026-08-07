@@ -62,7 +62,7 @@ memmap2 = "0.9"
 socket2 = "0.5"
 bincode = { version = "2.0.0-rc.3", features = ["serde"] }
 unicorn-engine = { git = "https://github.com/expend20/unicorn", branch = "AVX2-port" }
-keystone-engine = "0.1"
+hexpatch-keystone = "0.9"
 mlua = { version = "0.10", features = ["lua54", "send", "vendored"] }
 rustyline = "15"
 joybug-core-veh-shared = { path = "veh_shared" }
