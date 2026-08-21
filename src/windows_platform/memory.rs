@@ -3,8 +3,29 @@ use crate::interfaces::{PlatformAPI, PlatformError};
 use tracing::{error, trace, warn, debug};
 use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE, HANDLE};
 use windows_sys::Win32::System::Diagnostics::Debug::{FlushInstructionCache, ReadProcessMemory, WriteProcessMemory};
-use windows_sys::Win32::System::Memory::{VirtualQueryEx, MEMORY_BASIC_INFORMATION};
+use windows_sys::Win32::System::Memory::{
+    VirtualProtectEx, VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD,
+    PAGE_NOACCESS,
+};
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, PROCESS_QUERY_INFORMATION};
+
+/// x86/x64/ARM64 all use 4 KiB pages; the probe splits reads on this boundary.
+const PAGE_SIZE: u64 = 0x1000;
+
+/// `ReadProcessMemory` failed but part of the range may still be accessible.
+const ERROR_PARTIAL_COPY: u32 = 299;
+
+/// State/protection of the region containing `address`, for error messages.
+fn describe_address(handle: HANDLE, address: u64) -> String {
+    match unsafe { query_region(handle, address) } {
+        Some(info) => format!(
+            "{} {}",
+            crate::formatting::memory::state_to_str(info.State),
+            crate::formatting::memory::protect_to_str(info.Protect)
+        ),
+        None => "unmapped".to_string(),
+    }
+}
 
 pub(super) fn read_memory_internal(
     handle: HANDLE,
@@ -32,7 +53,25 @@ pub(super) fn read_memory_internal(
             let error = GetLastError();
             let error_str = utils::error_message(error);
 
-            // If we got partial data, return it with a warning instead of failing
+            // ERROR_PARTIAL_COPY only says the range isn't readable as one
+            // block — most of it usually is. Walk it region by region (and page
+            // by page within a region) to salvage the accessible prefix. This
+            // covers a read running off the end of a committed region, a hole in
+            // the middle of one, and guard pages, which RPM refuses outright.
+            if error == ERROR_PARTIAL_COPY {
+                let probed = read_memory_probed(handle, address, size);
+                if probed.len() > bytes_read {
+                    debug!(
+                        address = %format!("0x{:X}", address),
+                        requested_size = size,
+                        bytes_read = probed.len(),
+                        "ReadProcessMemory partial read (region/page probe)"
+                    );
+                    return Ok(probed);
+                }
+            }
+
+            // RPM managed a partial copy on its own — return that rather than fail.
             if bytes_read > 0 {
                 debug!(
                     address = %format!("0x{:X}", address),
@@ -46,82 +85,173 @@ pub(super) fn read_memory_internal(
                 return Ok(buffer);
             }
 
-            // If error 299 (ERROR_PARTIAL_COPY) with bytes_read == 0,
-            // query region and retry with clamped size
-            const ERROR_PARTIAL_COPY: u32 = 299;
-            if error == ERROR_PARTIAL_COPY {
-                warn!(address = %format!("0x{:X}", address), "ERROR_PARTIAL_COPY fallback triggered");
-                let mut mem_info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-                let query_result = VirtualQueryEx(
-                    handle,
-                    address as *const std::ffi::c_void,
-                    &mut mem_info,
-                    std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-                );
-
-                if query_result != 0 {
-                    const MEM_COMMIT: u32 = 0x1000;
-                    let region_base = mem_info.BaseAddress as u64;
-                    let region_end = region_base + (mem_info.RegionSize as u64);
-                    warn!(
-                        region_base = %format!("0x{:X}", region_base),
-                        region_end = %format!("0x{:X}", region_end),
-                        region_size = %format!("0x{:X}", mem_info.RegionSize),
-                        state = %format!("0x{:X}", mem_info.State),
-                        "VirtualQueryEx succeeded"
-                    );
-                    if mem_info.State == MEM_COMMIT {
-                        if address < region_end {
-                            let available = (region_end - address) as usize;
-                            warn!(available, size, "Checking available vs requested size");
-                            if available > 0 && available < size {
-                                // Retry with clamped size
-                                let mut retry_buffer = vec![0u8; available];
-                                let mut retry_bytes_read = 0;
-                                let retry_ok = ReadProcessMemory(
-                                    handle,
-                                    address as *const std::ffi::c_void,
-                                    retry_buffer.as_mut_ptr() as *mut std::ffi::c_void,
-                                    available,
-                                    &mut retry_bytes_read,
-                                );
-                                warn!(retry_ok, retry_bytes_read, "Retry read result");
-                                if retry_ok != 0 || retry_bytes_read > 0 {
-                                    retry_buffer.truncate(retry_bytes_read);
-                                    warn!(
-                                        address = %format!("0x{:X}", address),
-                                        requested_size = size,
-                                        available_in_region = available,
-                                        bytes_read = retry_bytes_read,
-                                        "ReadProcessMemory partial read (region-clamped retry)"
-                                    );
-                                    return Ok(retry_buffer);
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    let query_error = GetLastError();
-                    warn!(query_error, "VirtualQueryEx failed");
-                }
-            }
-
+            // Nothing was readable. Say WHY in the message itself — "299" alone
+            // sends every such report on a hunt for the region's real state.
+            let why = describe_address(handle, address);
             error!(
                 address = %format!("0x{:X}", address),
                 size,
                 error,
                 error_str,
+                why,
                 "ReadProcessMemory failed"
             );
             return Err(PlatformError::OsError(format!(
-                "ReadProcessMemory failed: {} ({})",
-                error, error_str
+                "ReadProcessMemory failed at 0x{:X}: {} — {} ({})",
+                address, why, error, error_str
             )));
         }
         buffer.truncate(bytes_read);
         trace!(bytes_read, "ReadProcessMemory succeeded");
         Ok(buffer)
     }
+}
+
+/// `VirtualQueryEx` wrapper: the region containing `address`, or `None`.
+unsafe fn query_region(handle: HANDLE, address: u64) -> Option<MEMORY_BASIC_INFORMATION> {
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let queried = unsafe {
+        VirtualQueryEx(
+            handle,
+            address as *const std::ffi::c_void,
+            &mut info,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    (queried != 0).then_some(info)
+}
+
+/// One `ReadProcessMemory` call. Returns however many bytes it actually copied
+/// (possibly none); never logs — the callers below expect misses.
+unsafe fn raw_read(handle: HANDLE, address: u64, size: usize) -> Vec<u8> {
+    let mut buffer = vec![0u8; size];
+    let mut bytes_read = 0usize;
+    let ok = unsafe {
+        ReadProcessMemory(
+            handle,
+            address as *const std::ffi::c_void,
+            buffer.as_mut_ptr() as *mut std::ffi::c_void,
+            size,
+            &mut bytes_read,
+        )
+    };
+    buffer.truncate(if ok != 0 { bytes_read } else { bytes_read.min(size) });
+    buffer
+}
+
+/// Read up to `size` bytes, falling back to one call per page when the whole
+/// range fails. A single unreadable page inside an otherwise fine range would
+/// otherwise cost the entire read; the prefix before it is still worth having.
+unsafe fn read_pagewise(handle: HANDLE, address: u64, size: usize) -> Vec<u8> {
+    let bulk = unsafe { raw_read(handle, address, size) };
+    if bulk.len() == size {
+        return bulk;
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(size);
+    while out.len() < size {
+        let cursor = address + out.len() as u64;
+        let to_page_end = (PAGE_SIZE - (cursor & (PAGE_SIZE - 1))) as usize;
+        let want = to_page_end.min(size - out.len());
+        let page = unsafe { raw_read(handle, cursor, want) };
+        let got = page.len();
+        out.extend_from_slice(&page);
+        if got < want {
+            break;
+        }
+    }
+    // The bulk call can still win when RPM reported a longer partial copy.
+    if bulk.len() > out.len() { bulk } else { out }
+}
+
+/// Read a `PAGE_GUARD` range. `ReadProcessMemory` can't: the copy trips the
+/// guard and fails with ERROR_PARTIAL_COPY without ever yielding bytes. Clear
+/// the guard bit for the duration of the read and re-arm it immediately, which
+/// is what keeps a stack guard page doing its job (growing the stack on the next
+/// touch). The unguarded window is a single RPM call wide; it needs
+/// `PROCESS_VM_OPERATION` on the handle, and yields nothing when absent.
+unsafe fn read_guarded(handle: HANDLE, address: u64, size: usize, protect: u32) -> Vec<u8> {
+    let mut previous: u32 = 0;
+    let unguarded = protect & !PAGE_GUARD;
+    let ok = unsafe {
+        VirtualProtectEx(
+            handle,
+            address as *const std::ffi::c_void,
+            size,
+            unguarded,
+            &mut previous,
+        )
+    };
+    if ok == 0 {
+        let error = unsafe { GetLastError() };
+        debug!(
+            address = %format!("0x{:X}", address),
+            error,
+            "VirtualProtectEx could not lift PAGE_GUARD for read"
+        );
+        return Vec::new();
+    }
+
+    let data = unsafe { read_pagewise(handle, address, size) };
+
+    let mut restored: u32 = 0;
+    let restore_ok = unsafe {
+        VirtualProtectEx(
+            handle,
+            address as *const std::ffi::c_void,
+            size,
+            previous,
+            &mut restored,
+        )
+    };
+    if restore_ok == 0 {
+        // The target keeps running with a disarmed guard page — loud on purpose.
+        let error = unsafe { GetLastError() };
+        error!(
+            address = %format!("0x{:X}", address),
+            size,
+            protect = %format!("0x{:X}", previous),
+            error,
+            "Failed to re-arm PAGE_GUARD after read"
+        );
+    }
+    data
+}
+
+/// Salvage what is readable of `[address, address + size)` after a failed bulk
+/// `ReadProcessMemory`, walking one committed region at a time. Stops at the
+/// first byte that can't be read — the result is always a prefix of the request,
+/// so callers can treat a short result as "accessible memory ends here".
+fn read_memory_probed(handle: HANDLE, address: u64, size: usize) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    while out.len() < size {
+        let cursor = address + out.len() as u64;
+        let Some(info) = (unsafe { query_region(handle, cursor) }) else { break };
+        let region_end = (info.BaseAddress as u64).saturating_add(info.RegionSize as u64);
+        if info.State != MEM_COMMIT || region_end <= cursor {
+            break;
+        }
+        // PAGE_NOACCESS is genuinely unreadable; unlike PAGE_GUARD there is no
+        // transient protection change that would make it readable.
+        if info.Protect & PAGE_NOACCESS != 0 {
+            break;
+        }
+
+        let want = ((region_end - cursor) as usize).min(size - out.len());
+        let chunk = unsafe {
+            if info.Protect & PAGE_GUARD != 0 {
+                read_guarded(handle, cursor, want, info.Protect)
+            } else {
+                read_pagewise(handle, cursor, want)
+            }
+        };
+        let got = chunk.len();
+        out.extend_from_slice(&chunk);
+        if got < want {
+            break;
+        }
+    }
+    out
 }
 
 pub(super) fn read_memory(
@@ -143,8 +273,17 @@ pub(super) fn read_memory_unlocked(
 ) -> Result<Vec<u8>, PlatformError> {
     trace!(pid, address = %format!("0x{:X}", address), size, "read_memory_unlocked called");
     unsafe {
-        // Include PROCESS_QUERY_INFORMATION for VirtualQueryEx fallback on partial reads
-        let handle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, 0, pid);
+        // PROCESS_QUERY_INFORMATION for the VirtualQueryEx probe on partial reads,
+        // PROCESS_VM_OPERATION so that probe can also lift PAGE_GUARD. The latter
+        // is a nice-to-have: retry without it rather than lose reads entirely.
+        let mut handle = OpenProcess(
+            PROCESS_VM_READ | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION,
+            0,
+            pid,
+        );
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            handle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, 0, pid);
+        }
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             let error = GetLastError();
             let error_str = utils::error_message(error);

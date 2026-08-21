@@ -745,7 +745,7 @@ impl SymbolManager {
                 if module_name.to_lowercase() == target_module_name.to_lowercase() {
                     // First pass: exact matches only (prioritize exact over partial)
                     for symbol in &module_symbols.symbols {
-                        if symbol.name.to_lowercase() == target_symbol_name.to_lowercase() {
+                        if symbol.name.eq_ignore_ascii_case(target_symbol_name) {
                             let symbol_name_with_module = format!("{}!{}", module_name, symbol.name);
                             found_symbols.push(ResolvedSymbol {
                                 name: symbol_name_with_module,
@@ -762,14 +762,16 @@ impl SymbolManager {
                         }
                     }
 
-                    // Second pass: contains matches (only if we need more results)
+                    // Second pass: token matches (only if we need more results).
+                    // The module is already fixed, so tokens match the symbol name only.
                     if found_symbols.len() < max_results {
+                        let tokens = query_tokens(target_symbol_name);
                         for symbol in &module_symbols.symbols {
                             // Skip exact matches (already added)
-                            if symbol.name.to_lowercase() == target_symbol_name.to_lowercase() {
+                            if symbol.name.eq_ignore_ascii_case(target_symbol_name) {
                                 continue;
                             }
-                            if symbol.name.to_lowercase().contains(&target_symbol_name.to_lowercase()) {
+                            if matches_tokens(&tokens, "", &symbol.name) {
                                 let symbol_name_with_module = format!("{}!{}", module_name, symbol.name);
                                 found_symbols.push(ResolvedSymbol {
                                     name: symbol_name_with_module,
@@ -790,7 +792,9 @@ impl SymbolManager {
                 }
             }
         } else {
-            // Search through all loaded modules (original behavior with contains matching)
+            // Search through all loaded modules. Tokens match the module name or
+            // the symbol name, so "user bar" finds "user32!foo_bar_baz".
+            let tokens = query_tokens(symbol_name);
             for (_module_path, module_symbols) in cache.iter() {
                 // Extract module name from path
                 let module_name = std::path::Path::new(_module_path)
@@ -799,9 +803,9 @@ impl SymbolManager {
                     .unwrap_or(_module_path)
                     .to_string();
                     
-                // Find all matching symbols in this module (contains-based search)
+                // Find all matching symbols in this module (token-based search)
                 for symbol in &module_symbols.symbols {
-                    if symbol.name.to_lowercase().contains(&symbol_name.to_lowercase()) {
+                    if matches_tokens(&tokens, &module_name, &symbol.name) {
                         let symbol_name_with_module = format!("{}!{}", module_name, symbol.name);
                         found_symbols.push(ResolvedSymbol {
                             name: symbol_name_with_module,
@@ -1350,3 +1354,67 @@ fn extract_module_name(module_path: &str) -> String {
         .to_string()
 }
 
+
+/// Whitespace-separated tokens of a search query. Order-independent AND matching
+/// (see `matches_tokens`) lets "baz foo" find "user32!foo_bar_baz".
+pub(crate) fn query_tokens(query: &str) -> Vec<&str> {
+    query.split_whitespace().collect()
+}
+
+/// True when every token appears (ASCII case-insensitively) in the module name
+/// or the symbol name. An empty token list matches everything, so a bare
+/// "ntdll!" still lists the whole module. Pass an empty `module_name` when the
+/// caller has already filtered by module and only the symbol name should match.
+pub(crate) fn matches_tokens(tokens: &[&str], module_name: &str, symbol_name: &str) -> bool {
+    tokens.iter().all(|t| {
+        crate::string_results::contains_ascii_ci(symbol_name.as_bytes(), t.as_bytes())
+            || crate::string_results::contains_ascii_ci(module_name.as_bytes(), t.as_bytes())
+    })
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::{matches_tokens, query_tokens};
+
+    fn hits(query: &str, module: &str, symbol: &str) -> bool {
+        matches_tokens(&query_tokens(query), module, symbol)
+    }
+
+    #[test]
+    fn single_token_is_the_old_substring_match() {
+        assert!(hits("foo_bar", "user32", "foo_bar_baz"));
+        assert!(hits("BAR", "user32", "foo_bar_baz"));
+        assert!(!hits("qux", "user32", "foo_bar_baz"));
+    }
+
+    #[test]
+    fn tokens_match_in_any_order() {
+        assert!(hits("baz foo", "user32", "foo_bar_baz"));
+        assert!(hits("foo baz", "user32", "foo_bar_baz"));
+    }
+
+    #[test]
+    fn tokens_match_the_module_name_too() {
+        assert!(hits("user bar", "user32", "foo_bar_baz"));
+        assert!(!hits("kernel bar", "user32", "foo_bar_baz"));
+    }
+
+    #[test]
+    fn every_token_must_match() {
+        assert!(!hits("foo nope", "user32", "foo_bar_baz"));
+    }
+
+    #[test]
+    fn empty_query_matches_everything() {
+        assert!(hits("", "user32", "foo_bar_baz"));
+        assert!(hits("   ", "user32", "foo_bar_baz"));
+    }
+
+    #[test]
+    fn module_name_is_ignored_when_not_supplied() {
+        // The module!symbol path filters by module first, so only the symbol
+        // name may satisfy the remaining tokens.
+        assert!(!hits("user bar", "", "foo_bar_baz"));
+        assert!(hits("bar baz", "", "foo_bar_baz"));
+    }
+}

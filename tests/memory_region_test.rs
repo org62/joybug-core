@@ -7,7 +7,7 @@ use joybug_core::formatting::memory::{protect_to_str, state_to_str, type_to_str}
 use joybug_core::protocol_io::DebugSession;
 use std::path::Path;
 use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, PAGE_READONLY, PAGE_READWRITE,
+    MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE,
 };
 
 #[test]
@@ -232,6 +232,61 @@ fn test_memory_regions() {
             );
 
             println!("\n========== ALL TESTS PASSED ==========\n");
+            Ok(())
+        })
+        .launch("cmd.exe /c echo test".to_string())
+        .expect("Debug session failed");
+}
+
+/// Guard pages (every thread stack has a `PAGE_READWRITE|PAGE_GUARD` region
+/// below its committed part) are refused by a plain `ReadProcessMemory` with
+/// ERROR_PARTIAL_COPY — reading them must still work, and must leave the guard
+/// armed afterwards.
+#[test]
+fn test_read_guard_page_region() {
+    joybug_core::init_tracing();
+
+    let server = TestServer::spawn();
+    let server_addr = server.address().to_string();
+
+    let _ = DebugSession::new((), Some(server_addr.as_str()))
+        .expect("Failed to connect to debug server")
+        .on_initial_breakpoint(|session, pid, _tid, _addr| {
+            let regions = session.enumerate_memory_regions(pid)?;
+            let guard = regions
+                .iter()
+                .find(|r| r.state == MEM_COMMIT && (r.protect & PAGE_GUARD) != 0)
+                .expect("Process should have at least one guard page (thread stack)");
+
+            println!(
+                "Guard region {:#018x} size {:#x} protect {} ({:#x})",
+                guard.base_address,
+                guard.region_size,
+                protect_to_str(guard.protect),
+                guard.protect
+            );
+
+            assert!(
+                protect_to_str(guard.protect).contains("PAGE_GUARD"),
+                "PAGE_GUARD must be visible in the formatted protection"
+            );
+
+            let size = 0x1000usize.min(guard.region_size as usize);
+            let data = session
+                .read_memory(pid, guard.base_address, size)
+                .expect("Reading a guard page should succeed");
+            assert_eq!(data.len(), size, "Should read the whole guard page");
+
+            // The guard has to be re-armed, or the target loses its stack-growth trap.
+            let after = session.query_memory_region(pid, guard.base_address)?;
+            assert_ne!(
+                after.protect & PAGE_GUARD,
+                0,
+                "PAGE_GUARD must be restored after the read (protect now {:#x})",
+                after.protect
+            );
+
+            println!("\n========== GUARD PAGE TEST PASSED ==========\n");
             Ok(())
         })
         .launch("cmd.exe /c echo test".to_string())

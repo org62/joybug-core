@@ -646,6 +646,11 @@ fn test_lua_file_modules_and_symbols() {
 }
 
 #[test]
+fn test_lua_file_symbol_token_search() {
+    run_lua_test_file("modules/symbol_token_search.lua", None);
+}
+
+#[test]
 fn test_lua_file_module_extra_info() {
     run_lua_test_file("modules/module_extra_info.lua", None);
 }

@@ -18,6 +18,7 @@ use tokio::runtime::{Runtime, Builder};
 
 use crate::interfaces::{Address, LineEntry, ModuleSymbol, ResolvedSymbol, SourceFileEntry, SymbolConfig, SymbolError, SymbolProvider};
 use crate::protocol::PdbMismatchInfo;
+use crate::windows_platform::symbol_manager::{matches_tokens, query_tokens};
 
 // --- PDB Identifier Logic (adapted from src/windows/symbols/pe_reader.rs) ---
 
@@ -622,7 +623,9 @@ impl SymbolProvider for WindowsSymbolProvider {
                 }
             }
         } else {
-            // Search through all loaded modules (original behavior with contains matching)
+            // Search through all loaded modules. Tokens match the module name or
+            // the symbol name, so "user bar" finds "user32!foo_bar_baz".
+            let tokens = query_tokens(symbol_name);
             for (module_path, module) in &self.loaded_modules {
                 // Extract module name from path  
                 let module_name = std::path::Path::new(module_path)
@@ -631,9 +634,9 @@ impl SymbolProvider for WindowsSymbolProvider {
                     .unwrap_or(module_path)
                     .to_string();
                     
-                // Find all matching symbols in this module (contains-based search)
+                // Find all matching symbols in this module (token-based search)
                 for symbol in &module.symbols {
-                    if symbol.name.to_lowercase().contains(&symbol_name.to_lowercase()) {
+                    if matches_tokens(&tokens, &module_name, &symbol.name) {
                         // Create ResolvedSymbol with VA calculated
                         let resolved_symbol = ResolvedSymbol {
                             name: format!("{}!{}", module_name, symbol.name),

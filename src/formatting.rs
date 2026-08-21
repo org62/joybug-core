@@ -15,7 +15,8 @@ pub mod memory {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE,
         PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
-        PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+        PAGE_GUARD, PAGE_NOACCESS, PAGE_NOCACHE, PAGE_READONLY, PAGE_READWRITE,
+        PAGE_WRITECOMBINE, PAGE_WRITECOPY,
     };
 
     /// Convert memory state to string representation
@@ -39,8 +40,8 @@ pub mod memory {
         }
     }
 
-    /// Convert memory protection flags to string representation
-    pub fn protect_to_str(protect: u32) -> &'static str {
+    /// The base access protection, with the modifier flags masked off.
+    pub fn protect_base_to_str(protect: u32) -> &'static str {
         match protect & 0xFF {
             PAGE_NOACCESS => "PAGE_NOACCESS",
             PAGE_READONLY => "PAGE_READONLY",
@@ -53,6 +54,26 @@ pub mod memory {
             0 => "NONE",
             _ => "OTHER",
         }
+    }
+
+    /// Convert memory protection flags to string representation, including the
+    /// modifier bits above the low byte. `PAGE_GUARD` in particular must be
+    /// visible: a `PAGE_READWRITE|PAGE_GUARD` stack guard region reads as an
+    /// ordinary read-write region without it, yet `ReadProcessMemory` refuses it
+    /// (ERROR_PARTIAL_COPY) because touching the page trips the guard.
+    pub fn protect_to_str(protect: u32) -> String {
+        let mut s = protect_base_to_str(protect).to_string();
+        for (flag, name) in [
+            (PAGE_GUARD, "PAGE_GUARD"),
+            (PAGE_NOCACHE, "PAGE_NOCACHE"),
+            (PAGE_WRITECOMBINE, "PAGE_WRITECOMBINE"),
+        ] {
+            if protect & flag != 0 {
+                s.push('|');
+                s.push_str(name);
+            }
+        }
+        s
     }
 }
 
