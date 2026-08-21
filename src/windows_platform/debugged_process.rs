@@ -551,15 +551,38 @@ impl DebuggedProcess {
         self.has_hit_initial_breakpoint
     }
 
-    /// Remove a persistent breakpoint
+    /// Remove a software breakpoint, persistent or single-shot, restoring the
+    /// original instruction bytes.
+    ///
+    /// Both kinds must be handled here: single-shot breakpoints (module entry /
+    /// TLS callback rows, `set_single_shot_breakpoint`) live in their own map, so
+    /// looking only at `persistent_breakpoints` silently left their INT3 armed and
+    /// the client kept trapping on a breakpoint it believed it had removed.
+    ///
+    /// An address currently owned by an in-flight step-over is left alone: the
+    /// stepper parked its saved bytes in `single_shot_breakpoints` and still needs
+    /// them to complete the step.
+    ///
+    /// `ever_armed_sw_breakpoints` is deliberately *not* cleared — a thread that
+    /// trapped just before the removal still needs [`Self::is_stale_sw_breakpoint_hit`]
+    /// to recognise its event and rewind it.
     pub(super) fn remove_breakpoint(&mut self, address: u64) -> Result<(), PlatformError> {
-        if let Some(original) = self.persistent_breakpoints.remove(&address) {
-            self.persistent_bp_tid_filters.remove(&address);
-            let process_handle = self.process_handle.0;
-            super::memory::write_memory_internal(process_handle, address, &original)
-        } else {
-            warn!(address, "Breakpoint not found");
-            Ok(())
+        let original = match self.persistent_breakpoints.remove(&address) {
+            Some(original) => {
+                self.persistent_bp_tid_filters.remove(&address);
+                Some(original)
+            }
+            // A step-over parks its saved bytes in the single-shot map; leave those.
+            None if self.step_over_breakpoints.contains_key(&address) => None,
+            None => self.single_shot_breakpoints.remove(&address),
+        };
+
+        match original {
+            Some(original) => self.restore_original_bytes(address, &original),
+            None => {
+                warn!(address, "Breakpoint not found");
+                Ok(())
+            }
         }
     }
 
