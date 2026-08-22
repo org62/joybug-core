@@ -388,6 +388,10 @@ pub trait PlatformAPI: Send + Sync {
     fn get_function_arguments(&self, pid: u32, tid: u32, count: usize) -> Result<Vec<u64>, PlatformError>;
     fn list_modules(&self, pid: u32) -> Result<Vec<ModuleInfo>, PlatformError>;
     fn list_threads(&self, pid: u32) -> Result<Vec<ThreadInfo>, PlatformError>;
+    // Thread control. Suspend/resume return the *previous* suspend count.
+    fn suspend_thread(&self, _pid: u32, _tid: u32) -> Result<u32, PlatformError> { Err(PlatformError::NotImplemented) }
+    fn resume_thread(&self, _pid: u32, _tid: u32) -> Result<u32, PlatformError> { Err(PlatformError::NotImplemented) }
+    fn terminate_thread(&self, _pid: u32, _tid: u32, _exit_code: u32) -> Result<(), PlatformError> { Err(PlatformError::NotImplemented) }
     fn list_processes(&self) -> Result<Vec<ProcessInfo>, PlatformError>;
     
     // Symbol-related methods

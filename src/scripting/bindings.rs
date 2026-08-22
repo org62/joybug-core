@@ -76,6 +76,28 @@ impl LuaUserData for LuaDebugClient {
             Ok(())
         });
 
+        // ---- Thread control ----
+        fn ack_method(name: &'static str, resp: anyhow::Result<DebuggerResponse>) -> mlua::Result<()> {
+            crate::protocol_io::expect_ack(name, resp.map_err(mlua::Error::external)?)
+                .map_err(mlua::Error::external)
+        }
+
+        methods.add_method("suspend_thread", |_lua, this, (pid, tid): (u32, u32)| {
+            let mut client = this.inner.borrow_mut();
+            ack_method("SuspendThread", client.send_and_receive(&DebuggerRequest::SuspendThread { pid, tid }))
+        });
+
+        methods.add_method("resume_thread", |_lua, this, (pid, tid): (u32, u32)| {
+            let mut client = this.inner.borrow_mut();
+            ack_method("ResumeThread", client.send_and_receive(&DebuggerRequest::ResumeThread { pid, tid }))
+        });
+
+        methods.add_method("terminate_thread", |_lua, this, (pid, tid, exit_code): (u32, u32, Option<u32>)| {
+            let mut client = this.inner.borrow_mut();
+            let req = DebuggerRequest::TerminateThread { pid, tid, exit_code: exit_code.unwrap_or(0) };
+            ack_method("TerminateThread", client.send_and_receive(&req))
+        });
+
         methods.add_method("break_into", |_lua, this, pid: u32| {
             let mut client = this.inner.borrow_mut();
             let resp = client.send_and_receive(&DebuggerRequest::BreakInto { pid })
@@ -1221,6 +1243,7 @@ impl LuaUserData for LuaDebugClient {
                         let tt = lua.create_table()?;
                         tt.set("tid", t.tid)?;
                         tt.set("start_address", t.start_address)?;
+                        tt.set("suspend_count", t.suspend_count)?;
                         table.set(i + 1, tt)?;
                     }
                     Ok(table)

@@ -222,6 +222,17 @@ pub struct DebugSession<S> {
 /// waiting for the next event is never torn down while the server is alive.
 const KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Triage a response to a request whose success answer is a bare `Ack`.
+/// Shared by `DebugSession::ack_request` and the Lua bindings, which talk to
+/// different client types but need identical Ack / Error / unexpected handling.
+pub fn expect_ack(what: &str, resp: DebuggerResponse) -> anyhow::Result<()> {
+    match resp {
+        DebuggerResponse::Ack => Ok(()),
+        DebuggerResponse::Error { message } => Err(anyhow::anyhow!("{} failed: {}", what, message)),
+        other => Err(anyhow::anyhow!("Unexpected response to {}: {:?}", what, other)),
+    }
+}
+
 impl<S> DebugSession<S> {
     pub fn new(state: S, addr: Option<&str>) -> anyhow::Result<Self> {
         let addr = addr.unwrap_or("127.0.0.1:9000");
@@ -1660,6 +1671,22 @@ impl<S> DebugSession<S> {
             }
             other => Err(anyhow::anyhow!("Unexpected response to HidePeb: {:?}", other)),
         }
+    }
+
+    fn ack_request(&mut self, req: DebuggerRequest, what: &str) -> anyhow::Result<()> {
+        expect_ack(what, self.send_and_receive(&req)?)
+    }
+
+    pub fn suspend_thread(&mut self, pid: u32, tid: u32) -> anyhow::Result<()> {
+        self.ack_request(DebuggerRequest::SuspendThread { pid, tid }, "SuspendThread")
+    }
+
+    pub fn resume_thread(&mut self, pid: u32, tid: u32) -> anyhow::Result<()> {
+        self.ack_request(DebuggerRequest::ResumeThread { pid, tid }, "ResumeThread")
+    }
+
+    pub fn terminate_thread(&mut self, pid: u32, tid: u32, exit_code: u32) -> anyhow::Result<()> {
+        self.ack_request(DebuggerRequest::TerminateThread { pid, tid, exit_code }, "TerminateThread")
     }
 
     pub fn terminate_process(&mut self, pid: u32) -> anyhow::Result<()> {

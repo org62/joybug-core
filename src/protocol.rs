@@ -418,6 +418,22 @@ pub mod request_response {
             pid: u32,
             tid: u32,
         },
+        /// `SuspendThread` on one thread (counts nest); answers `Ack`.
+        SuspendThread {
+            pid: u32,
+            tid: u32,
+        },
+        /// `ResumeThread` on one thread; answers `Ack`.
+        ResumeThread {
+            pid: u32,
+            tid: u32,
+        },
+        /// `TerminateThread` with `exit_code`; answers `Ack`.
+        TerminateThread {
+            pid: u32,
+            tid: u32,
+            exit_code: u32,
+        },
         SetThreadContext {
             pid: u32,
             tid: u32,
@@ -1633,10 +1649,14 @@ pub mod request_response {
         }
     }
 
-    #[derive(Debug, Serialize, Deserialize, Clone)]
+    #[derive(Debug, Serialize, Deserialize, Clone, Default)]
     pub struct ThreadInfo {
         pub tid: u32,
         pub start_address: u64,
+        /// Live user-mode suspend count (`SuspendThread` nesting); 0 = runnable.
+        /// A debugger-event pause does not count. Queried at list time.
+        #[serde(default)]
+        pub suspend_count: u32,
     }
 }
 

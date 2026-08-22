@@ -18,6 +18,20 @@ use windows_sys::Win32::System::SystemServices::{
 };
 use windows_sys::core::PWSTR;
 
+// `ntdll!NtQueryInformationThread`. Declared once here because a second,
+// signature-divergent declaration elsewhere in the crate is only caught at
+// link time (`clashing_extern_declarations`); all callers share this one.
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    pub fn NtQueryInformationThread(
+        thread_handle: HANDLE,
+        thread_information_class: u32,
+        thread_information: *mut std::ffi::c_void,
+        thread_information_length: u32,
+        return_length: *mut u32,
+    ) -> i32;
+}
+
 pub fn error_message(error_code: u32) -> String {
     use std::ptr::null_mut;
     let mut buf = [0u16; 512];
@@ -304,7 +318,7 @@ pub fn list_threads_toolhelp(pid: u32) -> Result<Vec<ThreadInfo>, PlatformError>
         if entry.th32OwnerProcessID == pid {
             threads.push(ThreadInfo {
                 tid: entry.th32ThreadID,
-                start_address: 0,
+                ..Default::default()
             });
         }
         if unsafe { Thread32Next(snapshot, &mut entry) } == 0 {

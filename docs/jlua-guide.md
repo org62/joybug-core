@@ -65,6 +65,9 @@ dbg:launch("program.exe", false, "C:\\work")  -- Launch in a specific working di
 dbg:attach(pid)                        -- Attach to a running process
 dbg:run()                              -- Enter the event loop (processes events until exit)
 dbg:terminate(pid)                     -- Terminate the debuggee
+dbg:suspend_thread(pid, tid)           -- SuspendThread (counts nest)
+dbg:resume_thread(pid, tid)            -- ResumeThread
+dbg:terminate_thread(pid, tid[, code]) -- TerminateThread with exit code (default 0)
 dbg:detach(pid)                        -- Detach from the process
 ```
 
@@ -376,7 +379,7 @@ end
 
 ```lua
 local mods = dbg:list_modules(pid)
-local threads = dbg:list_threads(pid)
+local threads = dbg:list_threads(pid)   -- { {tid=, start_address=, suspend_count=}, ... }
 local procs = dbg:list_processes()
 
 -- Module PE info (entry point, sections, etc.)

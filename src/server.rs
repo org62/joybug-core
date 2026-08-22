@@ -235,6 +235,27 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::SuspendThread { pid, tid } => {
+                let p = platform.read().unwrap();
+                match p.suspend_thread(pid, tid) {
+                    Ok(_) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::ResumeThread { pid, tid } => {
+                let p = platform.read().unwrap();
+                match p.resume_thread(pid, tid) {
+                    Ok(_) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::TerminateThread { pid, tid, exit_code } => {
+                let p = platform.read().unwrap();
+                match p.terminate_thread(pid, tid, exit_code) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::GetFunctionArguments { pid, tid, count } => {
                 let p = platform.read().unwrap();
                 match p.get_function_arguments(pid, tid, count) {

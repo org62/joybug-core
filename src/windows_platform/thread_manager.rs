@@ -16,7 +16,7 @@ impl ThreadManager {
     }
 
     pub fn add_thread(&mut self, tid: u32, start_address: u64, handle: HANDLE) {
-        let info = ThreadInfo { tid, start_address };
+        let info = ThreadInfo { tid, start_address, ..Default::default() };
         self.threads.insert(tid, (info, HandleSafe(handle)));
     }
 

@@ -623,6 +623,11 @@ fn test_lua_file_launch_and_registers() {
 }
 
 #[test]
+fn test_lua_thread_control() {
+    run_lua_test_file("basics/thread_control.lua", None);
+}
+
+#[test]
 fn test_lua_file_debug_client_events() {
     run_lua_test_file("basics/debug_client_events.lua", None);
 }

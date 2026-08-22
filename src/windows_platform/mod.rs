@@ -1,6 +1,7 @@
 mod utils;
 mod module_manager;
 mod thread_manager;
+mod thread_control;
 pub mod process;
 pub mod debug_events;
 mod memory;
@@ -270,17 +271,7 @@ impl WindowsPlatform {
             base_priority: i32,
         }
 
-        // Link to ntdll
-        #[link(name = "ntdll")]
-        unsafe extern "system" {
-            fn NtQueryInformationThread(
-                thread_handle: HANDLE,
-                thread_information_class: u32,
-                thread_information: *mut std::ffi::c_void,
-                thread_information_length: u32,
-                return_length: *mut u32,
-            ) -> i32;
-        }
+        use utils::NtQueryInformationThread;
 
         const THREAD_BASIC_INFORMATION: u32 = 0;
 
@@ -709,10 +700,26 @@ impl PlatformAPI for WindowsPlatform {
     }
 
     fn list_threads(&self, pid: u32) -> Result<Vec<ThreadInfo>, PlatformError> {
-        match self.get_process(pid) {
-            Ok(process) => Ok(process.thread_manager().list_threads()),
-            Err(_) => utils::list_threads_toolhelp(pid),
+        let (mut threads, count_of): (Vec<ThreadInfo>, fn(u32) -> Option<u32>) = match self.get_process(pid) {
+            Ok(process) => (process.thread_manager().list_threads(), thread_control::debugged_suspend_count),
+            Err(_) => (utils::list_threads_toolhelp(pid)?, thread_control::queried_suspend_count),
+        };
+        for t in &mut threads {
+            t.suspend_count = count_of(t.tid).unwrap_or(0);
         }
+        Ok(threads)
+    }
+
+    fn suspend_thread(&self, _pid: u32, tid: u32) -> Result<u32, PlatformError> {
+        thread_control::suspend_thread_unlocked(tid)
+    }
+
+    fn resume_thread(&self, _pid: u32, tid: u32) -> Result<u32, PlatformError> {
+        thread_control::resume_thread_unlocked(tid)
+    }
+
+    fn terminate_thread(&self, _pid: u32, tid: u32, exit_code: u32) -> Result<(), PlatformError> {
+        thread_control::terminate_thread_unlocked(tid, exit_code)
     }
 
     fn list_processes(&self) -> Result<Vec<ProcessInfo>, PlatformError> {
