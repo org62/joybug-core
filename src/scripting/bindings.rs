@@ -1405,7 +1405,7 @@ impl LuaUserData for LuaDebugClient {
                 max_instructions: max.unwrap_or(1000),
             }).map_err(|e| mlua::Error::external(e))?;
             match resp {
-                DebuggerResponse::TenetTrace { trace_text, stop_reason, trace_time_us, stats_text } => {
+                DebuggerResponse::TenetTrace { trace_text, stop_reason, trace_time_us, stats_text, .. } => {
                     let table = lua.create_table()?;
                     table.set("trace", trace_text)?;
                     table.set("stop_reason", stop_reason)?;
@@ -1457,7 +1457,7 @@ impl LuaUserData for LuaDebugClient {
                 memory_reads,
             }).map_err(|e| mlua::Error::external(e))?;
             match resp {
-                DebuggerResponse::TenetTrace { trace_text, stop_reason, trace_time_us, stats_text } => {
+                DebuggerResponse::TenetTrace { trace_text, stop_reason, trace_time_us, stats_text, .. } => {
                     let table = lua.create_table()?;
                     table.set("trace", trace_text)?;
                     table.set("stop_reason", stop_reason)?;

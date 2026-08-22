@@ -17,6 +17,9 @@ pub struct TenetTraceResult {
     pub stop_reason: String,
     pub trace_time_us: u64,
     pub stats_text: String,
+    /// PC after the last traced instruction (emulation traces only).
+    pub final_pc: Option<u64>,
+    pub instructions_executed: usize,
 }
 
 /// Result from emulate_instructions()
@@ -2066,11 +2069,15 @@ impl<S> DebugSession<S> {
                 stop_reason,
                 trace_time_us,
                 stats_text,
+                final_pc,
+                instructions_executed,
             } => Ok(TenetTraceResult {
                 trace_text,
                 stop_reason,
                 trace_time_us,
                 stats_text,
+                final_pc,
+                instructions_executed,
             }),
             DebuggerResponse::Error { message } => {
                 Err(anyhow::anyhow!("Failed to trace instructions: {}", message))
@@ -2115,11 +2122,15 @@ impl<S> DebugSession<S> {
                 stop_reason,
                 trace_time_us,
                 stats_text,
+                final_pc,
+                instructions_executed,
             } => Ok(EmulateResult::Trace(TenetTraceResult {
                 trace_text,
                 stop_reason,
                 trace_time_us,
                 stats_text,
+                final_pc,
+                instructions_executed,
             })),
             DebuggerResponse::EmulationResult {
                 final_pc,

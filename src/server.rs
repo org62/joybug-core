@@ -517,6 +517,8 @@ where
                                 stop_reason: format!("{}", result.stop_reason),
                                 trace_time_us: result.emulation_time_us,
                                 stats_text: result.stats_text,
+                                final_pc: Some(result.final_pc),
+                                instructions_executed: result.instructions_executed,
                             }
                         } else {
                             DebuggerResponse::EmulationResult {
@@ -627,6 +629,8 @@ where
                             stop_reason,
                             trace_time_us,
                             stats_text: String::new(),
+                            final_pc: None,
+                            instructions_executed: entries.len(),
                         }
                     }
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },

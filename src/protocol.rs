@@ -1041,6 +1041,12 @@ pub mod request_response {
             trace_time_us: u64,
             /// Detailed timing breakdown
             stats_text: String,
+            /// PC after the last traced instruction (emulation traces only).
+            #[serde(default)]
+            final_pc: Option<u64>,
+            /// Number of instructions actually executed.
+            #[serde(default)]
+            instructions_executed: usize,
         },
         // Anti-anti-debug
         PebHideResult {
