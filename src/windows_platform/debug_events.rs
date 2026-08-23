@@ -765,6 +765,11 @@ pub fn handle_debug_event(
     platform: &mut WindowsPlatform,
     debug_event: &DEBUG_EVENT,
 ) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
+    // A new event means the previous one was continued: threads whose exit
+    // event we already reported are gone for good now.
+    if let Ok(process) = platform.get_process_mut(debug_event.dwProcessId) {
+        process.thread_manager_mut().purge_exited();
+    }
     let event = match debug_event.dwDebugEventCode {
         EXCEPTION_DEBUG_EVENT => match handle_exception_event(platform, &debug_event) {
             Ok(ev) => ev,
