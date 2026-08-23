@@ -88,6 +88,7 @@ impl std::fmt::Debug for DebuggerResponse {
             }
             // Add other variants here, using a default debug format
             DebuggerResponse::HardwareBreakpointSet { dr_index } => f.debug_struct("HardwareBreakpointSet").field("dr_index", dr_index).finish(),
+            DebuggerResponse::MinidumpWritten { size_bytes } => f.debug_struct("MinidumpWritten").field("size_bytes", size_bytes).finish(),
             DebuggerResponse::Ack => write!(f, "Ack"),
             DebuggerResponse::Error { message } => f.debug_struct("Error").field("message", message).finish(),
             DebuggerResponse::Event { event } => f.debug_struct("Event").field("event", &format_args!("{}", event)).finish(),

@@ -12,6 +12,17 @@ pub mod request_response {
         Out,
     }
 
+    /// Which flavour of minidump to write. The platform maps this to its own
+    /// dump options (on Windows, a `MINIDUMP_TYPE` bit set).
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+    pub enum MinidumpKind {
+        /// Stacks, module list, thread info and the memory referenced from
+        /// stack/register values.
+        Mini,
+        /// The target's full committed address space (WinDbg's `.dump /ma`).
+        Full,
+    }
+
     #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
     pub enum HardwareBreakpointType {
         Execute,
@@ -660,6 +671,12 @@ pub mod request_response {
             pattern: Vec<u8>,
             max_results: usize,
         },
+        /// Write a minidump of `pid` to `path` on the server machine.
+        WriteMinidump {
+            pid: u32,
+            path: String,
+            kind: MinidumpKind,
+        },
         ScanMemoryStart {
             pid: u32,
             value_type: ScanValueType,
@@ -928,6 +945,7 @@ pub mod request_response {
     pub enum DebuggerResponse {
         Ack,
         Error { message: String },
+        MinidumpWritten { size_bytes: u64 },
         HardwareBreakpointSet { dr_index: u8 },
         Event { event: DebugEvent },
         MemoryData { data: Vec<u8> },

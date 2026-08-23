@@ -2,7 +2,7 @@ use crate::interfaces::{Architecture, Instruction, ModuleSymbol};
 use crate::pe_types::ModuleExtraInfo;
 pub use crate::protocol::{
     AddressLineInfo, DebuggerRequest, DebuggerResponse, DebugEvent, EmulationMode,
-    HardwareBreakpointSize, HardwareBreakpointType, ModuleInfo, ModuleSymbolStatus,
+    HardwareBreakpointSize, HardwareBreakpointType, MinidumpKind, ModuleInfo, ModuleSymbolStatus,
     PdbLoadOutcome, PdbMismatchInfo, ProcessInfo, ScanCompareType, ScanRegionFilter, ScanValue,
     ScanValueType, StepAction, StepKind, StringEncodingFilter, StringHit, StringSortKey,
     SymbolLoadState, ThreadContext, ThreadInfo,
@@ -113,6 +113,7 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
             format!("Instructions ({} instructions)", instructions.len())
         }
         DebuggerResponse::HardwareBreakpointSet { dr_index } => format!("HardwareBreakpointSet(dr={})", dr_index),
+        DebuggerResponse::MinidumpWritten { size_bytes } => format!("MinidumpWritten({} bytes)", size_bytes),
         DebuggerResponse::Ack => "Ack".to_string(),
         DebuggerResponse::Error { .. } => "Error".to_string(),
         DebuggerResponse::Event { .. } => "Event".to_string(),
@@ -1727,6 +1728,17 @@ impl<S> DebugSession<S> {
             DebuggerResponse::MemorySearchResult { addresses, capped } => Ok((addresses, capped)),
             DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to search memory: {}", message)),
             other => Err(anyhow::anyhow!("Unexpected response to SearchMemory: {:?}", other)),
+        }
+    }
+
+    /// Write a minidump of `pid` to `path` (on the server machine). Returns the
+    /// size of the written file in bytes.
+    pub fn write_minidump(&mut self, pid: u32, path: &str, kind: MinidumpKind) -> anyhow::Result<u64> {
+        let req = DebuggerRequest::WriteMinidump { pid, path: path.to_string(), kind };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::MinidumpWritten { size_bytes } => Ok(size_bytes),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to write minidump: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to WriteMinidump: {:?}", other)),
         }
     }
 

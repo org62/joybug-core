@@ -1,7 +1,7 @@
 use thiserror::Error;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use crate::protocol::{ModuleInfo, ProcessInfo, ThreadInfo};
+use crate::protocol::{MinidumpKind, ModuleInfo, ProcessInfo, ThreadInfo};
 
 pub type Address = u64;
 
@@ -574,6 +574,12 @@ pub trait PlatformAPI: Send + Sync {
             .iter()
             .map(|&address| self.dereference(pid, address, count, reference_base))
             .collect()
+    }
+
+    /// Write a minidump of the process to `path` (a path on the machine running
+    /// the platform). Returns the file size in bytes.
+    fn write_minidump(&self, _pid: u32, _path: &str, _kind: MinidumpKind) -> Result<u64, PlatformError> {
+        Err(PlatformError::NotImplemented)
     }
 
     // Thread Environment Block (TEB) address - used for emulator GS segment setup

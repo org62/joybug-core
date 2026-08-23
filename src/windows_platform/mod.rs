@@ -24,7 +24,7 @@ mod hardware_breakpoints;
 
 use crate::interfaces::{PlatformAPI, PlatformError, ModuleSymbol, ResolvedSymbol, SymbolError, Architecture, DisassemblerError, Instruction, DisassemblerProvider, Stepper};
 // no-op
-use crate::protocol::{ModuleInfo, ProcessInfo, ThreadInfo, StepKind};
+use crate::protocol::{MinidumpKind, ModuleInfo, ProcessInfo, ThreadInfo, StepKind};
 use crate::emulator::{Emulator, EmulationResult};
 use symbol_manager::SymbolManager;
 pub use crate::interfaces::SymbolConfig;
@@ -921,6 +921,11 @@ impl PlatformAPI for WindowsPlatform {
 
     fn get_call_stack(&self, pid: u32, tid: u32) -> Result<Vec<crate::interfaces::CallFrame>, PlatformError> {
         callstack::get_call_stack(self, pid, tid)
+    }
+
+    fn write_minidump(&self, pid: u32, path: &str, kind: MinidumpKind) -> Result<u64, PlatformError> {
+        info!(pid, path, ?kind, "Writing minidump");
+        dbghelp::write_minidump(self.process_handle(pid)?, pid, path, kind)
     }
 
     fn terminate_process(&self, pid: u32) -> Result<(), PlatformError> {

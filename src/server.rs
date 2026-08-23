@@ -490,6 +490,13 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::WriteMinidump { pid, path, kind } => {
+                let p = platform.read().unwrap();
+                match p.write_minidump(pid, &path, kind) {
+                    Ok(size_bytes) => DebuggerResponse::MinidumpWritten { size_bytes },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::DisassembleFunction { pid, address, max_instructions, arch } => {
                 let p = platform.read().unwrap();
                 match p.disassemble_function(pid, address, max_instructions, arch) {
