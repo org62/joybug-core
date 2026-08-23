@@ -1,6 +1,7 @@
 use super::WindowsPlatform;
 use super::utils;
 use super::debug_events;
+use crate::env_block::EnvironmentBlock;
 use crate::interfaces::{PlatformError, Architecture};
 use crate::protocol::{ProcessInfo};
 use std::ffi::{CString, OsStr};
@@ -73,9 +74,9 @@ pub(super) fn determine_process_architecture(process_handle: windows_sys::Win32:
     }
 }
 
-pub(super) fn launch(platform: &mut WindowsPlatform, command: &str, debug_children: bool, working_directory: Option<&str>) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
+pub(super) fn launch(platform: &mut WindowsPlatform, command: &str, debug_children: bool, working_directory: Option<&str>, environment: Option<&[(String, String)]>) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
     println!("[windows_platform] launch thread id: {:?}", std::thread::current().id());
-    trace!(command, working_directory, "WindowsPlatform::launch called");
+    trace!(command, working_directory, ?environment, "WindowsPlatform::launch called");
     let cmd_line_wide = to_wide(command);
     // Wide buffer must outlive the CreateProcessW call; null pointer => inherit debugger CWD.
     let working_dir_wide = working_directory.map(to_wide);
@@ -85,7 +86,10 @@ pub(super) fn launch(platform: &mut WindowsPlatform, command: &str, debug_childr
     let mut startup_info: STARTUPINFOW = unsafe { std::mem::zeroed() };
     startup_info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut process_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-    let debug_flags = if debug_children { DEBUG_PROCESS } else { DEBUG_ONLY_THIS_PROCESS };
+    // Must outlive the CreateProcessW call; carries its own creation flag.
+    let env_block = EnvironmentBlock::new(environment);
+    let debug_flags = (if debug_children { DEBUG_PROCESS } else { DEBUG_ONLY_THIS_PROCESS })
+        | env_block.create_flags();
     let success = unsafe {
         CreateProcessW(
             ptr::null(),
@@ -94,7 +98,7 @@ pub(super) fn launch(platform: &mut WindowsPlatform, command: &str, debug_childr
             ptr::null_mut(),
             FALSE,
             debug_flags,
-            ptr::null_mut(),
+            env_block.as_ptr(),
             working_dir_ptr,
             &mut startup_info,
             &mut process_info,

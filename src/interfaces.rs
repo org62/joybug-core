@@ -379,7 +379,7 @@ pub trait PlatformAPI: Send + Sync {
     fn get_watchpoint_accesses(&self, _pid: u32, _addr: u64) -> Result<Vec<crate::protocol::WatchpointAccess>, PlatformError> { Err(PlatformError::NotImplemented) }
     /// Remove the watchpoint at `addr` and clear its collected accesses.
     fn stop_watchpoint_trace(&mut self, _pid: u32, _addr: u64) -> Result<(), PlatformError> { Err(PlatformError::NotImplemented) }
-    fn launch(&mut self, command: &str, debug_children: bool, working_directory: Option<&str>) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>;
+    fn launch(&mut self, command: &str, debug_children: bool, working_directory: Option<&str>, environment: Option<&[(String, String)]>) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>;
     fn read_memory(&self, pid: u32, address: u64, size: usize) -> Result<Vec<u8>, PlatformError>;
     fn write_memory(&self, pid: u32, address: u64, data: &[u8]) -> Result<(), PlatformError>;
     fn read_wide_string(&self, pid: u32, address: u64, max_len: Option<usize>) -> Result<String, PlatformError>;

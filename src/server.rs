@@ -199,9 +199,9 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
-            DebuggerRequest::Launch { command, debug_children, working_directory } => {
+            DebuggerRequest::Launch { command, debug_children, working_directory, environment } => {
                 let mut p = platform.write().unwrap();
-                match p.launch(&command, debug_children, working_directory.as_deref()) {
+                match p.launch(&command, debug_children, working_directory.as_deref(), environment.as_deref()) {
                     Ok(Some(event)) => DebuggerResponse::Event { event },
                     Ok(None) => DebuggerResponse::Ack,
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },

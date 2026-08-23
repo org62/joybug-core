@@ -470,22 +470,27 @@ impl<S> DebugSession<S> {
     /// Launch a process and run the debug session with the configured callbacks
     /// Returns the final state after the session completes
     pub fn launch(self, command: String) -> anyhow::Result<S> {
-        self.launch_inner(command, false, None)
+        self.launch_inner(command, false, None, None)
     }
 
     /// Launch a process with child-process debugging enabled
     pub fn launch_with_children(self, command: String) -> anyhow::Result<S> {
-        self.launch_inner(command, true, None)
+        self.launch_inner(command, true, None, None)
     }
 
-    /// Launch a process in a specific working directory and run the debug session.
-    /// Pass `None` to inherit the debugger's current working directory.
-    pub fn launch_in_dir(self, command: String, working_directory: Option<String>) -> anyhow::Result<S> {
-        self.launch_inner(command, false, working_directory)
+    /// Launch with an optional working directory and optional extra environment
+    /// variables (merged over the server's environment, override by name).
+    pub fn launch_with_options(
+        self,
+        command: String,
+        working_directory: Option<String>,
+        environment: Option<Vec<(String, String)>>,
+    ) -> anyhow::Result<S> {
+        self.launch_inner(command, false, working_directory, environment)
     }
 
-    fn launch_inner(mut self, command: String, debug_children: bool, working_directory: Option<String>) -> anyhow::Result<S> {
-        let launch = DebuggerRequest::Launch { command, debug_children, working_directory };
+    fn launch_inner(mut self, command: String, debug_children: bool, working_directory: Option<String>, environment: Option<Vec<(String, String)>>) -> anyhow::Result<S> {
+        let launch = DebuggerRequest::Launch { command, debug_children, working_directory, environment };
         self.send(&launch)?;
         self.run_session_loop(None)?;
         Ok(self.state)

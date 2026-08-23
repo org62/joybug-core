@@ -326,6 +326,10 @@ pub mod request_response {
             debug_children: bool,
             #[serde(default)]
             working_directory: Option<String>,
+            /// Extra environment variables merged over the debugger's own
+            /// environment (override by name). `None`/empty inherits as-is.
+            #[serde(default)]
+            environment: Option<Vec<(String, String)>>,
         },
         Continue {
             pid: u32,

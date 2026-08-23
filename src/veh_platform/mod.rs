@@ -20,6 +20,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::System::Threading::*;
 
+use crate::env_block::EnvironmentBlock;
 use crate::interfaces::*;
 use crate::protocol;
 
@@ -565,6 +566,7 @@ impl PlatformAPI for VEHPlatform {
         command: &str,
         _debug_children: bool,
         working_directory: Option<&str>,
+        environment: Option<&[(String, String)]>,
     ) -> Result<Option<protocol::DebugEvent>, PlatformError> {
         // Start suspended so we can inject the VEH DLL before any user code runs.
         let mut cmd_wide: Vec<u16> = OsStr::new(command)
@@ -578,6 +580,10 @@ impl PlatformAPI for VEHPlatform {
             .as_ref()
             .map_or(std::ptr::null(), |w| w.as_ptr());
 
+        // Must outlive the CreateProcessW call; carries its own creation flag.
+        let env_block = EnvironmentBlock::new(environment);
+        let create_flags = CREATE_SUSPENDED | env_block.create_flags();
+
         let mut startup_info: STARTUPINFOW = unsafe { std::mem::zeroed() };
         startup_info.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
         let mut process_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
@@ -589,8 +595,8 @@ impl PlatformAPI for VEHPlatform {
                 std::ptr::null(),
                 std::ptr::null(),
                 FALSE,
-                CREATE_SUSPENDED,
-                std::ptr::null(),
+                create_flags,
+                env_block.as_ptr(),
                 working_dir_ptr,
                 &startup_info,
                 &mut process_info,

@@ -638,6 +638,11 @@ fn test_lua_file_launch_working_directory() {
 }
 
 #[test]
+fn test_lua_file_launch_environment() {
+    run_lua_test_file("basics/launch_environment.lua", None);
+}
+
+#[test]
 fn test_lua_file_parent_child() {
     let test_exe = common::get_test_program_path("parent_child_test");
     run_lua_test_file("basics/parent_child.lua", Some(&test_exe));

@@ -32,14 +32,20 @@ impl LuaUserData for LuaDebugClient {
     fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
         // ---- Process lifecycle ----
 
-        methods.add_method("launch", |_lua, this, (command, debug_children, working_directory): (String, Option<bool>, Option<String>)| {
+        methods.add_method("launch", |_lua, this, (command, debug_children, working_directory, env): (String, Option<bool>, Option<String>, Option<LuaTable>)| {
             let mut client = this.inner.borrow_mut();
+            // Optional `{NAME = "value"}` table of extra environment variables.
+            let environment = match env {
+                Some(t) => Some(t.pairs::<String, String>().collect::<mlua::Result<Vec<_>>>()?),
+                None => None,
+            };
             // Launch just sends the request. Events start flowing through the stream.
             // Call dbg:run() to enter the event loop.
             client.send_request_only(&DebuggerRequest::Launch {
                 command,
                 debug_children: debug_children.unwrap_or(false),
                 working_directory,
+                environment,
             }).map_err(|e| mlua::Error::external(e))?;
             Ok(())
         });

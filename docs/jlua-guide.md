@@ -62,6 +62,7 @@ break 1234:5678 0x7FF8CDCACBC4> go
 dbg:launch("program.exe arg1 arg2")   -- Launch a process
 dbg:launch("program.exe", true)        -- Launch with child-process debugging
 dbg:launch("program.exe", false, "C:\\work")  -- Launch in a specific working directory
+dbg:launch("program.exe", false, nil, { FOO = "bar" })  -- Extra env vars, merged over the debugger's own
 dbg:attach(pid)                        -- Attach to a running process
 dbg:run()                              -- Enter the event loop (processes events until exit)
 dbg:terminate(pid)                     -- Terminate the debuggee

@@ -23,6 +23,7 @@ pub mod scripting;
 pub mod inline_hook;
 pub mod veh_platform;
 pub mod anti_anti_debug;
+pub mod env_block;
 
 #[cfg(windows)]
 pub type PlatformImpl = windows_platform::WindowsPlatform;
