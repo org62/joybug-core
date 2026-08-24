@@ -66,7 +66,7 @@ impl<'a> Emulator<'a> {
                 Ok(()) => {
                     instructions_executed += 1;
                 }
-                Err(uc_error::READ_UNMAPPED) | Err(uc_error::FETCH_UNMAPPED) | Err(uc_error::WRITE_UNMAPPED) => {
+                Err(err @ (uc_error::READ_UNMAPPED | uc_error::FETCH_UNMAPPED | uc_error::WRITE_UNMAPPED)) => {
                     let pc_after = self.get_pc().unwrap_or(pc_before);
                     if pc_after != pc_before {
                         instructions_executed += 1;
@@ -86,6 +86,9 @@ impl<'a> Emulator<'a> {
                                 continue;
                             }
                             Err(_) => {
+                                if self.try_pac_fetch_recovery(platform, addr, err == uc_error::FETCH_UNMAPPED) {
+                                    continue;
+                                }
                                 stop_reason = StopReason::UnmappedMemory(addr);
                                 break;
                             }
@@ -364,7 +367,7 @@ impl<'a> Emulator<'a> {
 
                     continue;
                 }
-                Err(uc_error::READ_UNMAPPED) | Err(uc_error::FETCH_UNMAPPED) | Err(uc_error::WRITE_UNMAPPED) => {
+                Err(err @ (uc_error::READ_UNMAPPED | uc_error::FETCH_UNMAPPED | uc_error::WRITE_UNMAPPED)) => {
                     exec_time_us += emu_call_start.elapsed().as_micros() as u64;
                     if use_instruction_counting {
                         let state = self.shared_state.read().unwrap();
@@ -422,6 +425,9 @@ impl<'a> Emulator<'a> {
                             }
                             Err(_) => {
                                 page_load_time_us += load_start.elapsed().as_micros() as u64;
+                                if self.try_pac_fetch_recovery(platform, addr, err == uc_error::FETCH_UNMAPPED) {
+                                    continue;
+                                }
                                 stop_reason = StopReason::UnmappedMemory(addr);
                                 break;
                             }

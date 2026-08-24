@@ -84,6 +84,16 @@ impl Architecture {
     }
 }
 
+/// Highest user-mode virtual address on 64-bit Windows: user VAs are 47-bit.
+///
+/// Doubles as a mask. On ARM64 the pointer-authentication code occupies the
+/// bits above the VA (63:47), so `addr & MAX_USER_ADDRESS` strips a PAC
+/// signature off a signed pointer.
+///
+/// <https://learn.microsoft.com/en-us/windows-hardware/drivers/gettingstarted/virtual-address-spaces>
+/// <https://devblogs.microsoft.com/oldnewthing/20220819-00/?p=107020>
+pub const MAX_USER_ADDRESS: u64 = 0x0000_7FFF_FFFF_FFFF;
+
 /// Byte window for a self-resync backward decode of `count` instructions:
 /// one max-length instruction per row plus one extra instruction of lead-in,
 /// which gives an x86 decode room to resynchronize before it reaches the

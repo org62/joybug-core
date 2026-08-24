@@ -17,7 +17,7 @@
 
 use crate::interfaces::{
     Architecture, DisassemblerProvider, Instruction, ModuleSymbol, PlatformAPI, PlatformError,
-    SymbolError,
+    SymbolError, MAX_USER_ADDRESS,
 };
 use crate::protocol::{CoverageTarget, CoverageTargetSource, MemoryRegionInfo};
 use tracing::{info, trace, warn};
@@ -45,10 +45,6 @@ const SWEEP_MAX_INSNS: usize = 16;
 fn sweep_window(arch: Architecture) -> usize {
     arch.max_instruction_len() * (SWEEP_MAX_INSNS + 1)
 }
-
-/// Highest user-mode address on x64 Windows. Anything above is kernel space or
-/// outright non-canonical, and user-mode code never references it.
-const MAX_USER_ADDRESS: u64 = 0x0000_7FFF_FFFF_FFFF;
 
 /// A run this short is not evidence on its own. Random bytes reach a `jmp`/`ret`
 /// opcode almost immediately (`0xEB`, `0xE9`, `0xC3` are common byte values), so

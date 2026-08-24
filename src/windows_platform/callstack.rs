@@ -14,19 +14,17 @@ fn mask_aarch64_addresses(
     stack_frame: &mut STACKFRAME64,
     raw_context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
 ) {
-    // Note: 0x00007FFF_FFFF_FFFF_FFFF is a naive fix for PAC-enabled aarch64.
-    // https://learn.microsoft.com/en-us/windows-hardware/drivers/gettingstarted/virtual-address-spaces
-    // https://devblogs.microsoft.com/oldnewthing/20220819-00/?p=107020
+    use crate::interfaces::MAX_USER_ADDRESS;
 
+    // Naive PAC strip for PAC-enabled aarch64; see MAX_USER_ADDRESS.
 
     // For debugging, just print the context and see the values
     // trace!("context: {:#?}", crate::protocol::ThreadContext::Win32RawContext(raw_context));
 
-    const MAX_ADDRESS: u64 = 0x0000_7FFF_FFFF_FFFF_u64;
-    stack_frame.AddrPC.Offset &= MAX_ADDRESS;
+    stack_frame.AddrPC.Offset &= MAX_USER_ADDRESS;
     unsafe {
-        raw_context.Pc &= MAX_ADDRESS;
-        raw_context.Anonymous.Anonymous.Lr &= MAX_ADDRESS;
+        raw_context.Pc &= MAX_USER_ADDRESS;
+        raw_context.Anonymous.Anonymous.Lr &= MAX_USER_ADDRESS;
     }
 }
 

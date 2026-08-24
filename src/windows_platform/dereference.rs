@@ -1,4 +1,4 @@
-use crate::interfaces::{Architecture, PlatformError, SymbolInfo};
+use crate::interfaces::{Architecture, PlatformError, SymbolInfo, MAX_USER_ADDRESS};
 use crate::protocol::{DereferenceEntry, DereferenceValue, MemoryRegionInfo};
 use std::collections::HashSet;
 
@@ -15,13 +15,10 @@ const MEM_COMMIT: u32 = 0x1000;
 const PAGE_NOACCESS: u32 = 0x01;
 const PAGE_GUARD: u32 = 0x100;
 
-/// Maximum valid user-mode address on x64 Windows
-const MAX_USER_MODE_ADDRESS: u64 = 0x00007FFFFFFFFFFF;
-
 /// Find the region containing the given address using binary search
 fn find_region(regions: &[MemoryRegionInfo], address: u64) -> Option<&MemoryRegionInfo> {
     // Quick check: address must be within valid user-mode range
-    if address == 0 || address > MAX_USER_MODE_ADDRESS {
+    if address == 0 || address > MAX_USER_ADDRESS {
         return None;
     }
 

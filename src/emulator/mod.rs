@@ -12,7 +12,7 @@ use unicorn_engine::{
     Unicorn, RegisterX86, RegisterARM64,
 };
 
-use crate::interfaces::{Architecture, PlatformAPI};
+use crate::interfaces::{Architecture, PlatformAPI, MAX_USER_ADDRESS};
 use crate::protocol::ThreadContext;
 
 mod error;
@@ -177,6 +177,49 @@ impl<'a> Emulator<'a> {
                     .map_err(|e| EmulatorError::UnicornError(format!("{:?}", e)))
             }
         }
+    }
+
+    /// Set the instruction pointer
+    pub(super) fn set_pc(&mut self, value: u64) -> Result<(), EmulatorError> {
+        match self.architecture {
+            Architecture::X64 => {
+                self.emu.reg_write(RegisterX86::RIP, value)
+                    .map_err(|e| EmulatorError::UnicornError(format!("{:?}", e)))
+            }
+            Architecture::Arm64 => {
+                self.emu.reg_write(RegisterARM64::PC, value)
+                    .map_err(|e| EmulatorError::UnicornError(format!("{:?}", e)))
+            }
+        }
+    }
+
+    /// Recover from a fetch fault on a PAC-signed pointer.
+    ///
+    /// Windows ARM64 signs return addresses (`pacibsp`) with per-process keys
+    /// the emulator cannot know, so `autibsp` cannot authenticate them (it is
+    /// a hint-space no-op under Unicorn) and the following `ret` lands on the
+    /// still-signed address. When an unmapped fetch targets such an address,
+    /// strip the PAC bits (`MAX_USER_ADDRESS`); if the resulting address is
+    /// loadable, redirect PC there and report success so the caller can
+    /// continue emulating.
+    ///
+    /// `is_fetch` distinguishes the faulting access: only an instruction fetch
+    /// can be repaired this way, since the repair moves PC.
+    pub(super) fn try_pac_fetch_recovery<P: PlatformAPI>(
+        &mut self,
+        platform: &P,
+        fault_addr: u64,
+        is_fetch: bool,
+    ) -> bool {
+        let stripped = fault_addr & MAX_USER_ADDRESS;
+        if !is_fetch || self.architecture != Architecture::Arm64 || stripped == fault_addr {
+            return false;
+        }
+        if self.load_memory_region(platform, stripped).is_err() || self.set_pc(stripped).is_err() {
+            return false;
+        }
+        tracing::debug!("PAC fetch recovery: 0x{:X} -> 0x{:X}", fault_addr, stripped);
+        true
     }
 
     /// Get stack pointer
