@@ -406,6 +406,13 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::SymbolsInRange { pid, start, len, max_results } => {
+                let p = platform.read().unwrap();
+                match p.symbols_in_range(pid, start, len, max_results) {
+                    Ok(symbols) => DebuggerResponse::ResolvedSymbolList { symbols },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::ResolveAddressToLine { pid, address } => {
                 let p = platform.read().unwrap();
                 match p.resolve_address_to_line(pid, address) {
@@ -497,16 +504,16 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
-            DebuggerRequest::Dereference { pid, address, count, reference_base } => {
+            DebuggerRequest::Dereference { pid, address, count, reference_base, probe_start } => {
                 let p = platform.read().unwrap();
-                match p.dereference(pid, address, count, reference_base) {
+                match p.dereference(pid, address, count, reference_base, probe_start) {
                     Ok(entries) => DebuggerResponse::DereferenceResult { entries },
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
-            DebuggerRequest::DereferenceBatch { pid, addresses, count, reference_base } => {
+            DebuggerRequest::DereferenceBatch { pid, addresses, count, reference_base, probe_start } => {
                 let p = platform.read().unwrap();
-                match p.dereference_batch(pid, &addresses, count, reference_base) {
+                match p.dereference_batch(pid, &addresses, count, reference_base, probe_start) {
                     Ok(results) => DebuggerResponse::DereferenceBatchResult { results },
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }

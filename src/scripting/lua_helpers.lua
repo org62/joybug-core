@@ -320,7 +320,9 @@ function deref(addr, count)
     if not addr then print(C.err("(no address)")); return end
     if not pid then print(C.err("(no pid)")); return end
     count = count or 8
-    local entries = dbg:dereference(pid, addr, count)
+    -- Memory slots, not a register: follow only what each slot holds
+    -- (probe_start = false), never "the data at the slot's own address".
+    local entries = dbg:dereference(pid, addr, count, nil, false)
     for _, entry in ipairs(entries) do
         local parts = {}
         for _, v in ipairs(entry.chain) do

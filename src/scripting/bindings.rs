@@ -816,6 +816,26 @@ impl LuaUserData for LuaDebugClient {
             }
         });
 
+        methods.add_method("symbols_in_range", |lua, this, (pid, start, len, max_results): (u32, u64, u64, Option<usize>)| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::SymbolsInRange {
+                pid, start, len, max_results: max_results.unwrap_or(1000),
+            }).map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::ResolvedSymbolList { symbols } => {
+                    let table = lua.create_table()?;
+                    for (i, sym) in symbols.iter().enumerate() {
+                        table.set(i + 1, resolved_symbol_to_lua_table(lua, sym)?)?;
+                    }
+                    Ok(table)
+                }
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("SymbolsInRange failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
         methods.add_method("list_symbols", |lua, this, module_path: String| {
             let mut client = this.inner.borrow_mut();
             let resp = client.send_and_receive(&DebuggerRequest::ListSymbols {
@@ -1352,10 +1372,14 @@ impl LuaUserData for LuaDebugClient {
 
         // ---- Dereference ----
 
-        methods.add_method("dereference", |lua, this, (pid, addr, count, ref_base): (u32, u64, Option<usize>, Option<u64>)| {
+        // probe_start (default true): `addr` is a pointer whose target is described
+        // first (registers). Pass false for a memory slot so only its stored value
+        // is followed — see PlatformAPI::dereference.
+        methods.add_method("dereference", |lua, this, (pid, addr, count, ref_base, probe_start): (u32, u64, Option<usize>, Option<u64>, Option<bool>)| {
             let mut client = this.inner.borrow_mut();
             let resp = client.send_and_receive(&DebuggerRequest::Dereference {
                 pid, address: addr, count: count.unwrap_or(1), reference_base: ref_base,
+                probe_start: probe_start.unwrap_or(true),
             }).map_err(|e| mlua::Error::external(e))?;
             match resp {
                 DebuggerResponse::DereferenceResult { entries } => {
@@ -1372,10 +1396,11 @@ impl LuaUserData for LuaDebugClient {
             }
         });
 
-        methods.add_method("dereference_batch", |lua, this, (pid, addrs, count, ref_base): (u32, Vec<u64>, Option<usize>, Option<u64>)| {
+        methods.add_method("dereference_batch", |lua, this, (pid, addrs, count, ref_base, probe_start): (u32, Vec<u64>, Option<usize>, Option<u64>, Option<bool>)| {
             let mut client = this.inner.borrow_mut();
             let resp = client.send_and_receive(&DebuggerRequest::DereferenceBatch {
                 pid, addresses: addrs, count: count.unwrap_or(1), reference_base: ref_base,
+                probe_start: probe_start.unwrap_or(true),
             }).map_err(|e| mlua::Error::external(e))?;
             match resp {
                 DebuggerResponse::DereferenceBatchResult { results } => {

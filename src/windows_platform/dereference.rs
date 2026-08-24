@@ -83,11 +83,13 @@ fn is_executable(regions: &[MemoryRegionInfo], address: u64) -> bool {
 /// Returns a vector of DereferenceEntry, one for each slot examined.
 ///
 /// If `symbol_resolver` is provided, instruction operands will be symbolized.
+/// `probe_start`: see `PlatformAPI::dereference`.
 pub(super) fn dereference<F>(
     pid: u32,
     address: u64,
     count: usize,
     reference_base: Option<u64>,
+    probe_start: bool,
     arch: Architecture,
     symbol_resolver: Option<F>,
 ) -> Result<Vec<DereferenceEntry>, PlatformError>
@@ -96,7 +98,7 @@ where
 {
     // Query all memory regions once upfront, then telescope against that snapshot.
     let regions = super::memory::enumerate_memory_regions_unlocked(pid)?;
-    dereference_with_regions(pid, address, count, reference_base, arch, &symbol_resolver, &regions)
+    dereference_with_regions(pid, address, count, reference_base, probe_start, arch, &symbol_resolver, &regions)
 }
 
 /// Dereference many independent addresses in one go, enumerating the process's
@@ -113,6 +115,7 @@ pub(super) fn dereference_batch<F>(
     addresses: &[u64],
     count: usize,
     reference_base: Option<u64>,
+    probe_start: bool,
     arch: Architecture,
     symbol_resolver: Option<F>,
 ) -> Result<Vec<Vec<DereferenceEntry>>, PlatformError>
@@ -122,7 +125,7 @@ where
     let regions = super::memory::enumerate_memory_regions_unlocked(pid)?;
     addresses
         .iter()
-        .map(|&address| dereference_with_regions(pid, address, count, reference_base, arch, &symbol_resolver, &regions))
+        .map(|&address| dereference_with_regions(pid, address, count, reference_base, probe_start, arch, &symbol_resolver, &regions))
         .collect()
 }
 
@@ -133,6 +136,7 @@ fn dereference_with_regions<F>(
     address: u64,
     count: usize,
     reference_base: Option<u64>,
+    probe_start: bool,
     arch: Architecture,
     symbol_resolver: &Option<F>,
     regions: &[MemoryRegionInfo],
@@ -151,7 +155,7 @@ where
         let slot_addr = address.wrapping_add((i * pointer_size) as u64);
         let offset = (slot_addr as i64).wrapping_sub(base as i64);
 
-        let chain = build_dereference_chain(pid, slot_addr, arch, symbol_resolver, regions)?;
+        let chain = build_dereference_chain(pid, slot_addr, probe_start, arch, symbol_resolver, regions)?;
 
         entries.push(DereferenceEntry {
             address: slot_addr,
@@ -167,6 +171,7 @@ where
 fn build_dereference_chain<F>(
     pid: u32,
     start_address: u64,
+    probe_start: bool,
     arch: Architecture,
     symbol_resolver: &Option<F>,
     regions: &[MemoryRegionInfo],
@@ -182,15 +187,19 @@ where
     let mut visited = HashSet::new();
     let mut current_addr = start_address;
 
-    // Check if start_address itself contains recognizable data (string/instruction)
-    // before trying to read it as a pointer. This handles registers pointing directly
-    // to strings, where we want to show the string content, not interpret string bytes
-    // as a pointer value.
-    if let Some(s) = try_read_string(pid, start_address, regions) {
-        return Ok(vec![DereferenceValue::String(s)]);
-    }
-    if let Some((instr, symbol)) = try_read_instruction(pid, start_address, arch, symbol_resolver, regions) {
-        return Ok(vec![DereferenceValue::Instruction(instr, symbol)]);
+    // When the start address is itself a pointer (a register), first check whether
+    // it points straight at recognizable data (string/instruction) before reading
+    // it as a pointer: `rip` should show the instruction it points to, not the
+    // instruction bytes reinterpreted as an address. A memory slot (hex view) is
+    // NOT a pointer — its own address is just where the value lives — so callers
+    // pass `probe_start = false` and only the stored value is telescoped.
+    if probe_start {
+        if let Some(s) = try_read_string(pid, start_address, regions) {
+            return Ok(vec![DereferenceValue::String(s)]);
+        }
+        if let Some((instr, symbol)) = try_read_instruction(pid, start_address, arch, symbol_resolver, regions) {
+            return Ok(vec![DereferenceValue::Instruction(instr, symbol)]);
+        }
     }
 
     for _depth in 0..MAX_CHAIN_DEPTH {

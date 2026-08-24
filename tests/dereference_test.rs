@@ -101,7 +101,7 @@ fn test_dereference_basic() {
             let string_sym = find_symbol(session, "dereference_test!g_string_ptr", "dereference_test")?;
             println!("g_string_ptr symbol at 0x{:x}", string_sym.va);
 
-            let entries = session.dereference(pid, string_sym.va, 1, None)?;
+            let entries = session.dereference(pid, string_sym.va, 1, None, true)?;
             assert_eq!(entries.len(), 1);
             println!("{}", format_entry(&entries[0]));
 
@@ -134,7 +134,7 @@ fn test_dereference_basic() {
             let wide_string_sym = find_symbol(session, "dereference_test!g_wide_string_ptr", "dereference_test")?;
             println!("g_wide_string_ptr symbol at 0x{:x}", wide_string_sym.va);
 
-            let entries = session.dereference(pid, wide_string_sym.va, 1, None)?;
+            let entries = session.dereference(pid, wide_string_sym.va, 1, None, true)?;
             assert_eq!(entries.len(), 1);
             println!("{}", format_entry(&entries[0]));
 
@@ -169,7 +169,7 @@ fn test_dereference_basic() {
             let loop_sym = find_symbol(session, "dereference_test!g_loop_ptr1", "dereference_test")?;
             println!("g_loop_ptr1 symbol at 0x{:x}", loop_sym.va);
 
-            let entries = session.dereference(pid, loop_sym.va, 1, None)?;
+            let entries = session.dereference(pid, loop_sym.va, 1, None, true)?;
             assert_eq!(entries.len(), 1);
             println!("{}", format_entry(&entries[0]));
 
@@ -230,7 +230,7 @@ fn test_dereference_basic() {
             let list_sym = find_symbol(session, "dereference_test!g_list_head", "dereference_test")?;
             println!("g_list_head symbol at 0x{:x}", list_sym.va);
 
-            let entries = session.dereference(pid, list_sym.va, 1, None)?;
+            let entries = session.dereference(pid, list_sym.va, 1, None, true)?;
             assert_eq!(entries.len(), 1);
             println!("{}", format_entry(&entries[0]));
 
@@ -257,7 +257,7 @@ fn test_dereference_basic() {
             let main_ptr_sym = find_symbol(session, "dereference_test!g_main_ptr", "dereference_test")?;
             println!("g_main_ptr symbol at 0x{:x}", main_ptr_sym.va);
 
-            let entries = session.dereference(pid, main_ptr_sym.va, 1, None)?;
+            let entries = session.dereference(pid, main_ptr_sym.va, 1, None, true)?;
             assert_eq!(entries.len(), 1);
             println!("{}", format_entry(&entries[0]));
 
@@ -287,7 +287,7 @@ fn test_dereference_basic() {
             let null_ptr_sym = find_symbol(session, "dereference_test!g_null_ptr", "dereference_test")?;
             println!("g_null_ptr symbol at 0x{:x}", null_ptr_sym.va);
 
-            let entries = session.dereference(pid, null_ptr_sym.va, 1, None)?;
+            let entries = session.dereference(pid, null_ptr_sym.va, 1, None, true)?;
             assert_eq!(entries.len(), 1);
             println!("{}", format_entry(&entries[0]));
 
@@ -312,7 +312,7 @@ fn test_dereference_basic() {
             let small_int_ptr_sym = find_symbol(session, "dereference_test!g_ptr_to_small_int", "dereference_test")?;
             println!("g_ptr_to_small_int symbol at 0x{:x}", small_int_ptr_sym.va);
 
-            let entries = session.dereference(pid, small_int_ptr_sym.va, 1, None)?;
+            let entries = session.dereference(pid, small_int_ptr_sym.va, 1, None, true)?;
             assert_eq!(entries.len(), 1);
             println!("{}", format_entry(&entries[0]));
 
@@ -356,7 +356,7 @@ fn test_dereference_basic() {
             let invalid_ptr_sym = find_symbol(session, "dereference_test!g_invalid_ptr", "dereference_test")?;
             println!("g_invalid_ptr symbol at 0x{:x}", invalid_ptr_sym.va);
 
-            let entries = session.dereference(pid, invalid_ptr_sym.va, 1, None)?;
+            let entries = session.dereference(pid, invalid_ptr_sym.va, 1, None, true)?;
             assert_eq!(entries.len(), 1);
             println!("{}", format_entry(&entries[0]));
 
@@ -398,7 +398,7 @@ fn test_dereference_basic() {
 
             println!("Stack pointer: {:#018x}", sp);
 
-            let entries = session.dereference(pid, sp, 10, None)?;
+            let entries = session.dereference(pid, sp, 10, None, true)?;
             assert_eq!(entries.len(), 10, "Should get exactly 10 entries");
 
             println!("Stack dereference ({} entries):", entries.len());
@@ -423,7 +423,7 @@ fn test_dereference_basic() {
             println!("\n----- TEST 9: Custom reference base -----\n");
 
             let ref_base = sp + 0x20;
-            let entries = session.dereference(pid, sp, 5, Some(ref_base))?;
+            let entries = session.dereference(pid, sp, 5, Some(ref_base), true)?;
 
             println!("Dereference with reference base {:#x}:", ref_base);
             for entry in &entries {
@@ -445,7 +445,7 @@ fn test_dereference_basic() {
             // First, get the string address from g_string_ptr
             let string_sym = find_symbol(session, "dereference_test!g_string_ptr", "dereference_test")?;
 
-            let ptr_entries = session.dereference(pid, string_sym.va, 1, None)?;
+            let ptr_entries = session.dereference(pid, string_sym.va, 1, None, true)?;
             let string_addr = match &ptr_entries[0].chain[0] {
                 DereferenceValue::Pointer(addr, _) => *addr,
                 other => panic!("Expected Pointer, got {:?}", other),
@@ -454,7 +454,7 @@ fn test_dereference_basic() {
 
             // Now dereference the string address DIRECTLY
             // This simulates a register containing a string address (like RBX = string_addr)
-            let entries = session.dereference(pid, string_addr, 1, None)?;
+            let entries = session.dereference(pid, string_addr, 1, None, true)?;
             assert_eq!(entries.len(), 1);
             println!("{}", format_entry(&entries[0]));
 

@@ -242,6 +242,14 @@ local syms = dbg:list_symbols(module_path)  -- {name, rva, is_function}
 local batch = dbg:try_resolve_addresses(pid, { addr1, addr2 })
 print(batch[1].name, batch[1].module, batch[1].offset)
 
+-- Every symbol whose VA lies in [start, start + len), ascending by VA, at
+-- most max_results (default 1000). Same non-blocking rule as above: modules
+-- whose symbols are still loading contribute nothing. Entries have the
+-- find_symbol shape ({name = "mod!sym", module, rva, va, is_function}).
+for _, s in ipairs(dbg:symbols_in_range(pid, start, 0x1000)) do
+    print(hex(s.va), s.name)
+end
+
 -- Per-module symbol load status. Each entry:
 -- {module, base, state = "loaded"|"exports_only"|"loading"|"failed"|"not_requested",
 --  symbol_count?, error?, pdb_path?}
@@ -433,6 +441,11 @@ local regions = dbg:enumerate_regions(pid)
 ```lua
 -- Follow pointer chains (useful for examining stack values)
 local entries = dbg:dereference(pid, addr, 8)  -- 8 consecutive pointers
+-- 5th arg probe_start (default true): addr is itself a pointer (a register), so
+-- what it points AT is described first — rip gives the instruction at rip. Pass
+-- false when addr is merely where a value lives (a memory slot): then only the
+-- stored value is followed, and code bytes come back as a plain "value".
+local slots = dbg:dereference(pid, addr, 8, nil, false)
 
 -- Telescope many independent addresses in one round-trip (the server walks
 -- the process's memory regions once for the whole batch). Returns one entry

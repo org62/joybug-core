@@ -853,6 +853,7 @@ impl PlatformAPI for VEHPlatform {
         _address: u64,
         _count: usize,
         _reference_base: Option<u64>,
+        _probe_start: bool,
     ) -> Result<Vec<protocol::DereferenceEntry>, PlatformError> {
         Err(PlatformError::NotImplemented)
     }

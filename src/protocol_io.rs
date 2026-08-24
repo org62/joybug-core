@@ -1415,6 +1415,30 @@ impl<S> DebugSession<S> {
         }
     }
 
+    /// Every symbol whose VA lies in `[start, start + len)`, ascending by VA,
+    /// at most `max_results`. Non-blocking: modules whose symbols are still
+    /// loading contribute nothing (re-request once symbol status settles).
+    pub fn symbols_in_range(
+        &mut self,
+        pid: u32,
+        start: u64,
+        len: u64,
+        max_results: usize,
+    ) -> anyhow::Result<Vec<crate::interfaces::ResolvedSymbol>> {
+        let req = DebuggerRequest::SymbolsInRange { pid, start, len, max_results };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::ResolvedSymbolList { symbols } => Ok(symbols),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!(
+                "Failed to list symbols in range: {}",
+                message
+            )),
+            other => Err(anyhow::anyhow!(
+                "Unexpected response to SymbolsInRange: {:?}",
+                other
+            )),
+        }
+    }
+
     /// Resolve an address to a source file/line via the module's PDB line table.
     pub fn resolve_address_to_line(
         &mut self,
@@ -1960,14 +1984,18 @@ impl<S> DebugSession<S> {
     /// * `address` - Starting address to dereference
     /// * `count` - Number of consecutive pointer-sized slots to examine
     /// * `reference_base` - Optional base address for offset calculation (defaults to `address`)
+    /// * `probe_start` - `true` when `address` is itself a pointer (a register) whose
+    ///   target is described first; `false` for a memory slot, where only the stored
+    ///   value is followed. See `PlatformAPI::dereference`.
     pub fn dereference(
         &mut self,
         pid: u32,
         address: u64,
         count: usize,
         reference_base: Option<u64>,
+        probe_start: bool,
     ) -> anyhow::Result<Vec<crate::protocol::DereferenceEntry>> {
-        let req = DebuggerRequest::Dereference { pid, address, count, reference_base };
+        let req = DebuggerRequest::Dereference { pid, address, count, reference_base, probe_start };
         match self.send_and_receive(&req)? {
             DebuggerResponse::DereferenceResult { entries } => Ok(entries),
             DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to dereference: {}", message)),
@@ -1984,8 +2012,9 @@ impl<S> DebugSession<S> {
         addresses: Vec<u64>,
         count: usize,
         reference_base: Option<u64>,
+        probe_start: bool,
     ) -> anyhow::Result<Vec<Vec<crate::protocol::DereferenceEntry>>> {
-        let req = DebuggerRequest::DereferenceBatch { pid, addresses, count, reference_base };
+        let req = DebuggerRequest::DereferenceBatch { pid, addresses, count, reference_base, probe_start };
         match self.send_and_receive(&req)? {
             DebuggerResponse::DereferenceBatchResult { results } => Ok(results),
             DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to dereference batch: {}", message)),

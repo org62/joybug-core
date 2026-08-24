@@ -530,6 +530,15 @@ pub mod request_response {
             pid: u32,
             addresses: Vec<u64>,
         },
+        /// Every symbol whose VA lies in `[start, start + len)`, ascending by
+        /// VA, at most `max_results`. Non-blocking: still-loading modules
+        /// contribute nothing. Answered with `ResolvedSymbolList`.
+        SymbolsInRange {
+            pid: u32,
+            start: u64,
+            len: u64,
+            max_results: usize,
+        },
         /// Resolve an address to a source file/line via the module's PDB line table.
         ResolveAddressToLine {
             pid: u32,
@@ -639,11 +648,17 @@ pub mod request_response {
         EnumerateMemoryRegions {
             pid: u32,
         },
+        /// `probe_start`: whether `address` is itself a pointer whose target is
+        /// described first (registers) rather than a memory slot whose stored
+        /// value is followed (hex view). See `PlatformAPI::dereference`. Defaults
+        /// to the historical register behaviour for older clients.
         Dereference {
             pid: u32,
             address: u64,
             count: usize,
             reference_base: Option<u64>,
+            #[serde(default = "default_true")]
+            probe_start: bool,
         },
         /// Telescope many addresses at once, enumerating memory regions only once
         /// for the whole batch (see `PlatformAPI::dereference_batch`).
@@ -652,6 +667,8 @@ pub mod request_response {
             addresses: Vec<u64>,
             count: usize,
             reference_base: Option<u64>,
+            #[serde(default = "default_true")]
+            probe_start: bool,
         },
         /// Disassemble a function with bounds detection using exception directory
         DisassembleFunction {

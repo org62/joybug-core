@@ -415,6 +415,14 @@ pub trait PlatformAPI: Send + Sync {
             .collect())
     }
 
+    /// Every symbol whose VA lies in `[start, start + len)`, ascending by VA,
+    /// capped at `max_results`. Non-blocking like
+    /// `try_resolve_addresses_to_symbols`: modules whose symbols are still
+    /// loading contribute nothing. Used to annotate a memory window.
+    fn symbols_in_range(&self, _pid: u32, _start: u64, _len: u64, _max_results: usize) -> Result<Vec<ResolvedSymbol>, SymbolError> {
+        Err(SymbolError::SymbolsNotFound("Symbol range queries not supported by this platform".to_string()))
+    }
+
     /// Per-module symbol load status (loaded/loading/failed/not requested).
     fn get_symbol_status(&self, _pid: u32) -> Result<Vec<crate::protocol::ModuleSymbolStatus>, SymbolError> {
         Err(SymbolError::SymbolsNotFound("Symbol status not supported by this platform".to_string()))
@@ -550,12 +558,21 @@ pub trait PlatformAPI: Send + Sync {
     fn enumerate_memory_regions(&self, pid: u32) -> Result<Vec<crate::protocol::MemoryRegionInfo>, PlatformError>;
 
     // Dereference/telescope
+    /// Telescope `count` pointer-sized slots starting at `address`.
+    ///
+    /// `probe_start` says whether `address` is itself a pointer whose *target*
+    /// should be described first (a register: `rip` → the instruction it points
+    /// at, `rcx` → the string it points at). Pass `false` when `address` is just
+    /// where a value lives (a memory slot in the hex view): then only the stored
+    /// value is followed, so code bytes are reported as a plain `Value` instead
+    /// of "the instruction at this slot".
     fn dereference(
         &self,
         pid: u32,
         address: u64,
         count: usize,
         reference_base: Option<u64>,
+        probe_start: bool,
     ) -> Result<Vec<crate::protocol::DereferenceEntry>, PlatformError>;
 
     /// Telescope many independent addresses at once. The default loops
@@ -569,10 +586,11 @@ pub trait PlatformAPI: Send + Sync {
         addresses: &[u64],
         count: usize,
         reference_base: Option<u64>,
+        probe_start: bool,
     ) -> Result<Vec<Vec<crate::protocol::DereferenceEntry>>, PlatformError> {
         addresses
             .iter()
-            .map(|&address| self.dereference(pid, address, count, reference_base))
+            .map(|&address| self.dereference(pid, address, count, reference_base, probe_start))
             .collect()
     }
 

@@ -39,6 +39,26 @@ dbg:on_initial_breakpoint(function(pid, tid, addr)
     assert(batch[1].offset == 0, "exact symbol VA should have offset 0")
     assert(batch[2].name == nil, "unmapped address should stay unresolved")
 
+    -- Range query: a 1-byte window at LdrLoadDll's VA contains exactly the
+    -- symbols starting there (its module is loaded, see above); an unmapped
+    -- window yields an empty list rather than an error.
+    local in_range = dbg:symbols_in_range(pid, syms[1].va, 1)
+    assert(#in_range >= 1, "range at LdrLoadDll should contain it, got " .. #in_range)
+    local found = false
+    for _, s in ipairs(in_range) do
+        assert(s.va == syms[1].va, "every symbol in a 1-byte range shares its VA")
+        if s.name:find("LdrLoadDll") then found = true end
+    end
+    assert(found, "range at LdrLoadDll should list LdrLoadDll")
+    -- Widening the window backwards must keep results ascending by VA and
+    -- still include the anchor symbol.
+    local wide = dbg:symbols_in_range(pid, syms[1].va - 0x1000, 0x1001, 10000)
+    assert(#wide >= #in_range, "wider range can't have fewer symbols")
+    for i = 2, #wide do
+        assert(wide[i - 1].va <= wide[i].va, "symbols_in_range must be sorted by VA")
+    end
+    assert(#dbg:symbols_in_range(pid, 0x1, 0x10) == 0, "unmapped range should be empty")
+
     dbg:terminate(pid)
 end)
 

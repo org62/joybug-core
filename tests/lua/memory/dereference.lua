@@ -36,6 +36,27 @@ dbg:on_initial_breakpoint(function(pid, tid, addr)
         assert(main_entries[1].chain[1].type == "pointer", "First should be pointer")
         assert(main_entries[1].chain[2].type == "instruction", "Second should be instruction")
 
+        -- TEST 3b: probe_start. Telescoping the code address main() itself:
+        -- as a *pointer* (register-style, the default) its target is described
+        -- first, i.e. the instruction at main; as a memory *slot* (hex view,
+        -- probe_start = false) only the stored value — the instruction bytes
+        -- reinterpreted as a QWORD — is followed, and that must not be reported
+        -- as "the instruction at this slot".
+        local code_addr = main_entries[1].chain[1].address
+        local as_pointer = dbg:dereference(pid, code_addr, 1)
+        assert(as_pointer[1].chain[1].type == "instruction",
+            "code address as pointer should describe the instruction it points at")
+        local as_slot = dbg:dereference(pid, code_addr, 1, nil, false)
+        assert(#as_slot == 1 and #as_slot[1].chain >= 1, "slot telescope should yield a chain")
+        assert(as_slot[1].chain[1].type ~= "instruction",
+            "code slot must not report the instruction at its own address, got instruction")
+        assert(as_slot[1].chain[1].type ~= "string",
+            "code slot must not report a string at its own address")
+        -- The batch form takes the same flag.
+        local batch_slot = dbg:dereference_batch(pid, { code_addr }, 1, nil, false)
+        assert(batch_slot[1][1].chain[1].type == as_slot[1].chain[1].type,
+            "dereference_batch must honour probe_start like dereference")
+
         -- TEST 4: Stack pointer dereference (multiple entries)
         local ctx = dbg:get_context(pid, tid)
         local stack_entries = dbg:dereference(pid, spof(ctx), 10)

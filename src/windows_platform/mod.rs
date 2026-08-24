@@ -779,6 +779,13 @@ impl PlatformAPI for WindowsPlatform {
         Ok(symbol_manager.try_resolve_addresses_to_symbols_raw(&modules, addresses))
     }
 
+    fn symbols_in_range(&self, pid: u32, start: u64, len: u64, max_results: usize) -> Result<Vec<ResolvedSymbol>, SymbolError> {
+        let symbol_manager = self.symbols()?;
+        let mut modules = self.modules_for(pid);
+        modules.sort_by_key(|m| m.base);
+        Ok(symbol_manager.symbols_in_range(&modules, start, start.saturating_add(len), max_results))
+    }
+
     fn get_symbol_status(&self, pid: u32) -> Result<Vec<crate::protocol::ModuleSymbolStatus>, SymbolError> {
         Ok(self.symbols()?.get_symbol_status(self.modules_for(pid)))
     }
@@ -986,10 +993,11 @@ impl PlatformAPI for WindowsPlatform {
         address: u64,
         count: usize,
         reference_base: Option<u64>,
+        probe_start: bool,
     ) -> Result<Vec<crate::protocol::DereferenceEntry>, PlatformError> {
         let arch = self.arch_for(pid);
         let symbol_resolver = self.nonblocking_symbol_resolver(pid);
-        dereference::dereference(pid, address, count, reference_base, arch, Some(symbol_resolver))
+        dereference::dereference(pid, address, count, reference_base, probe_start, arch, Some(symbol_resolver))
     }
 
     fn dereference_batch(
@@ -998,6 +1006,7 @@ impl PlatformAPI for WindowsPlatform {
         addresses: &[u64],
         count: usize,
         reference_base: Option<u64>,
+        probe_start: bool,
     ) -> Result<Vec<Vec<crate::protocol::DereferenceEntry>>, PlatformError> {
         let arch = self.arch_for(pid);
 
@@ -1007,7 +1016,7 @@ impl PlatformAPI for WindowsPlatform {
         // re-walk the whole address space for each register, the dominant
         // per-step cost on large targets.
         let symbol_resolver = self.nonblocking_symbol_resolver(pid);
-        dereference::dereference_batch(pid, addresses, count, reference_base, arch, Some(symbol_resolver))
+        dereference::dereference_batch(pid, addresses, count, reference_base, probe_start, arch, Some(symbol_resolver))
     }
 
     fn get_teb_address(&self, pid: u32, tid: u32) -> Result<u64, PlatformError> {

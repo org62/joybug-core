@@ -1046,6 +1046,63 @@ impl SymbolManager {
             .collect()
     }
 
+    /// Every symbol whose VA lies in `[start, end)`, across all modules the
+    /// range overlaps, ascending by VA and capped at `max`. Names carry the
+    /// `module!symbol` prefix like `find_symbol_across_all_modules`. Built for
+    /// annotating a memory window (hex view), so it is non-blocking: a module
+    /// whose symbols are still loading contributes nothing — callers re-request
+    /// once symbol status settles. `modules` must be sorted by base address.
+    pub fn symbols_in_range(
+        &self,
+        modules: &[ModuleInfo],
+        start: u64,
+        end: u64,
+        max: usize,
+    ) -> Vec<ResolvedSymbol> {
+        let mut out = Vec::new();
+        if start >= end || max == 0 {
+            return out;
+        }
+        let pending = self.pending_loads.lock().unwrap();
+        let cache = self.symbol_cache.lock().unwrap();
+        for module in modules {
+            let module_end = module.base + module.size.unwrap_or(0);
+            if module_end <= start {
+                continue;
+            }
+            if module.base >= end {
+                break; // sorted by base: nothing further can overlap
+            }
+            if pending.contains(module.name.as_str()) {
+                continue;
+            }
+            let Some(module_symbols) = cache.get(&module.name) else {
+                continue;
+            };
+            // Clip the window to this module and convert to RVAs; symbols are
+            // sorted by RVA so the in-range run is one contiguous slice.
+            let rva_start = start.saturating_sub(module.base) as u32;
+            let rva_end = end.min(module_end).saturating_sub(module.base) as u32;
+            let symbols = &module_symbols.symbols;
+            let lo = symbols.partition_point(|s| s.rva < rva_start);
+            let hi = symbols.partition_point(|s| s.rva < rva_end);
+            let module_name = extract_module_name(&module.name);
+            for symbol in &symbols[lo..hi] {
+                if out.len() >= max {
+                    return out;
+                }
+                out.push(ResolvedSymbol {
+                    name: format!("{}!{}", module_name, symbol.name),
+                    module_name: module_name.clone(),
+                    rva: symbol.rva,
+                    va: module.base + symbol.rva as u64,
+                    is_function: symbol.is_function,
+                });
+            }
+        }
+        out
+    }
+
     /// List all symbols in the specified module as raw ModuleSymbols (without VA calculation)
     ///
     /// Waits up to the symbol wait timeout for an in-flight background load. If the
