@@ -383,6 +383,27 @@ local mods = dbg:list_modules(pid)
 local threads = dbg:list_threads(pid)   -- { {tid=, start_address=, suspend_count=}, ... }
 local procs = dbg:list_processes()
 
+-- Everything the Handles window shows (kernel handles, windows, TCP
+-- connections, token privileges) in one call.
+local objs = dbg:process_objects(pid)
+for _, h in ipairs(objs.handles) do        -- {handle=, type_index=, type_name=, granted_access=, attributes=, name=}
+    print(hex(h.handle), h.type_name, h.name)
+end
+for _, w in ipairs(objs.windows) do        -- {handle=, parent=, thread_id=, style=, style_ex=, wnd_proc=, enabled=, left=, top=, width=, height=, title=, class_name=}
+    print(hex(w.handle), w.class_name, w.title)
+end
+for _, c in ipairs(objs.tcp_connections) do -- {local_address=, local_port=, remote_address=, remote_port=, state=}
+    print(c.local_address .. ":" .. c.local_port, c.state)
+end
+for _, p in ipairs(objs.privileges) do     -- {name=, state="disabled"|"enabled"|"enabled_by_default"}
+    print(p.name, p.state)
+end
+-- objs.desktop_window: GetDesktopWindow(); objs.warnings: per-section failures
+
+dbg:close_remote_handle(pid, handle)            -- close a handle inside the target
+dbg:set_privilege(pid, "SeDebugPrivilege", true) -- enable/disable a token privilege
+dbg:set_window_enabled(pid, hwnd, false)        -- EnableWindow on a target window
+
 -- Module PE info (entry point, sections, etc.)
 local info = dbg:get_module_info(pid, module_base)
 print("Entry point: " .. hex(info.entry_point))

@@ -22,7 +22,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, IsWow64Process2, OpenThread,
     DEBUG_PROCESS, DEBUG_ONLY_THIS_PROCESS, INFINITE, PROCESS_INFORMATION, STARTUPINFOW, OpenProcess, TerminateProcess,
-    PROCESS_TERMINATE, PROCESS_ALL_ACCESS, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, PROCESS_VM_WRITE, PROCESS_VM_OPERATION,
+    PROCESS_TERMINATE, PROCESS_ALL_ACCESS, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, PROCESS_VM_WRITE, PROCESS_VM_OPERATION, PROCESS_DUP_HANDLE,
     THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION,
 };
 use windows_sys::Win32::System::SystemInformation::{
@@ -228,7 +228,9 @@ pub(super) fn open_non_invasive(platform: &mut WindowsPlatform, pid: u32) -> Res
 
     let handle = unsafe {
         OpenProcess(
-            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
+            // PROCESS_DUP_HANDLE: the Handles window names handles by duplicating
+            // them into the server, and closes them the same way.
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_DUP_HANDLE,
             0,
             pid,
         )

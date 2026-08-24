@@ -1261,6 +1261,36 @@ impl LuaUserData for LuaDebugClient {
             }
         });
 
+        // Handles, windows, TCP connections and privileges of a process
+        // (the Handles window). Returns a table with `handles`, `windows`,
+        // `tcp_connections`, `privileges`, `desktop_window`, `warnings`.
+        methods.add_method("process_objects", |lua, this, pid: u32| {
+            let mut client = this.inner.borrow_mut();
+            match client.send_and_receive(&DebuggerRequest::ListProcessObjects { pid })
+                .map_err(mlua::Error::external)? {
+                DebuggerResponse::ProcessObjects { objects } => process_objects_to_lua_table(lua, &objects),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("ListProcessObjects failed: {}", message))),
+                other => Err(mlua::Error::external(
+                    anyhow::anyhow!("Unexpected response to ListProcessObjects: {:?}", other))),
+            }
+        });
+
+        methods.add_method("close_remote_handle", |_lua, this, (pid, handle): (u32, u64)| {
+            let mut client = this.inner.borrow_mut();
+            ack_method("CloseRemoteHandle", client.send_and_receive(&DebuggerRequest::CloseRemoteHandle { pid, handle }))
+        });
+
+        methods.add_method("set_privilege", |_lua, this, (pid, name, enable): (u32, String, bool)| {
+            let mut client = this.inner.borrow_mut();
+            ack_method("SetPrivilege", client.send_and_receive(&DebuggerRequest::SetPrivilege { pid, name, enable }))
+        });
+
+        methods.add_method("set_window_enabled", |_lua, this, (pid, hwnd, enabled): (u32, u64, bool)| {
+            let mut client = this.inner.borrow_mut();
+            ack_method("SetWindowEnabled", client.send_and_receive(&DebuggerRequest::SetWindowEnabled { pid, hwnd, enabled }))
+        });
+
         methods.add_method("list_processes", |lua, this, ()| {
             let mut client = this.inner.borrow_mut();
             let resp = client.send_and_receive(&DebuggerRequest::ListProcesses)
@@ -2474,6 +2504,68 @@ fn set_type_class_fields(lua: &Lua, table: &LuaTable, class: &TypeClass) -> mlua
         _ => {}
     }
     Ok(())
+}
+
+/// Build a Lua array (1-based) of tables, one per item, each filled by `fill`.
+/// Shared by the `ProcessObjects` sections, which are all arrays of flat records.
+fn lua_rows<T>(lua: &Lua, items: &[T], fill: impl Fn(&LuaTable, &T) -> mlua::Result<()>) -> mlua::Result<LuaTable> {
+    let arr = lua.create_table()?;
+    for (i, item) in items.iter().enumerate() {
+        let t = lua.create_table()?;
+        fill(&t, item)?;
+        arr.set(i + 1, t)?;
+    }
+    Ok(arr)
+}
+
+/// Convert a `ProcessObjects` snapshot (the Handles window) to a Lua table.
+fn process_objects_to_lua_table(lua: &Lua, o: &ProcessObjects) -> mlua::Result<LuaTable> {
+    let out = lua.create_table()?;
+    out.set("handles", lua_rows(lua, &o.handles, |t, h| {
+        t.set("handle", h.handle)?;
+        t.set("type_index", h.type_index)?;
+        t.set("type_name", h.type_name.as_str())?;
+        t.set("granted_access", h.granted_access)?;
+        t.set("attributes", h.attributes)?;
+        t.set("name", h.name.as_str())
+    })?)?;
+    out.set("windows", lua_rows(lua, &o.windows, |t, w| {
+        t.set("handle", w.handle)?;
+        t.set("parent", w.parent)?;
+        t.set("thread_id", w.thread_id)?;
+        t.set("style", w.style)?;
+        t.set("style_ex", w.style_ex)?;
+        t.set("wnd_proc", w.wnd_proc)?;
+        t.set("enabled", w.enabled)?;
+        t.set("left", w.left)?;
+        t.set("top", w.top)?;
+        t.set("width", w.width)?;
+        t.set("height", w.height)?;
+        t.set("title", w.title.as_str())?;
+        t.set("class_name", w.class_name.as_str())
+    })?)?;
+    out.set("tcp_connections", lua_rows(lua, &o.tcp_connections, |t, c| {
+        t.set("local_address", c.local_address.as_str())?;
+        t.set("local_port", c.local_port)?;
+        t.set("remote_address", c.remote_address.as_str())?;
+        t.set("remote_port", c.remote_port)?;
+        t.set("state", c.state.as_str())
+    })?)?;
+    out.set("privileges", lua_rows(lua, &o.privileges, |t, p| {
+        t.set("name", p.name.as_str())?;
+        t.set("state", match p.state {
+            PrivilegeState::Disabled => "disabled",
+            PrivilegeState::Enabled => "enabled",
+            PrivilegeState::EnabledByDefault => "enabled_by_default",
+        })
+    })?)?;
+    out.set("desktop_window", o.desktop_window)?;
+    let warnings = lua.create_table()?;
+    for (i, w) in o.warnings.iter().enumerate() {
+        warnings.set(i + 1, w.as_str())?;
+    }
+    out.set("warnings", warnings)?;
+    Ok(out)
 }
 
 /// Convert a `TypeRef` (a pointer's pointee / an array's element) to a Lua table.

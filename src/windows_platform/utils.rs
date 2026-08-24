@@ -32,6 +32,27 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+// `ntdll!NtQueryInformationProcess` / `ntdll!NtQueryObject`. Shared for the
+// same reason as `NtQueryInformationThread` above: a signature-divergent
+// second declaration is only caught at link time.
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    pub fn NtQueryInformationProcess(
+        process_handle: HANDLE,
+        process_information_class: u32,
+        process_information: *mut std::ffi::c_void,
+        process_information_length: u32,
+        return_length: *mut u32,
+    ) -> i32;
+    pub fn NtQueryObject(
+        handle: HANDLE,
+        object_information_class: u32,
+        object_information: *mut std::ffi::c_void,
+        object_information_length: u32,
+        return_length: *mut u32,
+    ) -> i32;
+}
+
 pub fn error_message(error_code: u32) -> String {
     use std::ptr::null_mut;
     let mut buf = [0u16; 512];

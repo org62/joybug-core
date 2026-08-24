@@ -284,6 +284,34 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::ListProcessObjects { pid } => {
+                let p = platform.read().unwrap();
+                match p.list_process_objects(pid) {
+                    Ok(objects) => DebuggerResponse::ProcessObjects { objects },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::CloseRemoteHandle { pid, handle } => {
+                let p = platform.read().unwrap();
+                match p.close_remote_handle(pid, handle) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::SetPrivilege { pid, name, enable } => {
+                let p = platform.read().unwrap();
+                match p.set_privilege(pid, &name, enable) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::SetWindowEnabled { pid, hwnd, enabled } => {
+                let p = platform.read().unwrap();
+                match p.set_window_enabled(pid, hwnd, enabled) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::ListProcesses => {
                 let p = platform.read().unwrap();
                 match p.list_processes() {
@@ -696,6 +724,7 @@ where
             },
             DebuggerResponse::ModuleList { modules } => format!("ModuleList {{ modules: [..{} modules] }}", modules.len()),
             DebuggerResponse::ThreadList { threads } => format!("ThreadList {{ threads: [..{} threads] }}", threads.len()),
+            DebuggerResponse::ProcessObjects { objects } => format!("ProcessObjects {{ handles: {}, windows: {}, tcp: {}, privileges: {} }}", objects.handles.len(), objects.windows.len(), objects.tcp_connections.len(), objects.privileges.len()),
             DebuggerResponse::ProcessList { processes } => format!("ProcessList {{ processes: [..{} processes] }}", processes.len()),
             DebuggerResponse::Instructions { instructions } => {
                 format!(

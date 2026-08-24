@@ -656,6 +656,11 @@ fn test_lua_file_modules_and_symbols() {
 }
 
 #[test]
+fn test_lua_file_process_objects() {
+    run_lua_test_file("basics/process_objects.lua", None);
+}
+
+#[test]
 fn test_lua_file_symbol_token_search() {
     run_lua_test_file("modules/symbol_token_search.lua", None);
 }

@@ -21,10 +21,11 @@ mod dbghelp;
 mod dereference;
 mod tracer;
 mod hardware_breakpoints;
+mod process_objects;
 
 use crate::interfaces::{PlatformAPI, PlatformError, ModuleSymbol, ResolvedSymbol, SymbolError, Architecture, DisassemblerError, Instruction, DisassemblerProvider, Stepper};
 // no-op
-use crate::protocol::{MinidumpKind, ModuleInfo, ProcessInfo, ThreadInfo, StepKind};
+use crate::protocol::{MinidumpKind, ModuleInfo, ProcessInfo, ProcessObjects, ThreadInfo, StepKind};
 use crate::emulator::{Emulator, EmulationResult};
 use symbol_manager::SymbolManager;
 pub use crate::interfaces::SymbolConfig;
@@ -921,6 +922,24 @@ impl PlatformAPI for WindowsPlatform {
 
     fn get_call_stack(&self, pid: u32, tid: u32) -> Result<Vec<crate::interfaces::CallFrame>, PlatformError> {
         callstack::get_call_stack(self, pid, tid)
+    }
+
+    fn list_process_objects(&self, pid: u32) -> Result<ProcessObjects, PlatformError> {
+        Ok(process_objects::list_process_objects(self.process_handle(pid)?, pid))
+    }
+
+    fn close_remote_handle(&self, pid: u32, handle: u64) -> Result<(), PlatformError> {
+        info!(pid, handle = format!("{:#x}", handle), "Closing remote handle");
+        process_objects::close_remote_handle(self.process_handle(pid)?, handle)
+    }
+
+    fn set_privilege(&self, pid: u32, name: &str, enable: bool) -> Result<(), PlatformError> {
+        info!(pid, name, enable, "Adjusting privilege");
+        process_objects::set_privilege(self.process_handle(pid)?, name, enable)
+    }
+
+    fn set_window_enabled(&self, pid: u32, hwnd: u64, enabled: bool) -> Result<(), PlatformError> {
+        process_objects::set_window_enabled(pid, hwnd, enabled)
     }
 
     fn write_minidump(&self, pid: u32, path: &str, kind: MinidumpKind) -> Result<u64, PlatformError> {

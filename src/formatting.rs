@@ -98,6 +98,7 @@ impl std::fmt::Debug for DebuggerResponse {
             DebuggerResponse::SetContextAck => write!(f, "SetContextAck"),
             DebuggerResponse::ModuleList { modules } => f.debug_struct("ModuleList").field("modules", modules).finish(),
             DebuggerResponse::ThreadList { threads } => f.debug_struct("ThreadList").field("threads", threads).finish(),
+            DebuggerResponse::ProcessObjects { objects } => f.debug_struct("ProcessObjects").field("handles", &objects.handles.len()).field("windows", &objects.windows.len()).finish(),
             DebuggerResponse::ProcessList { processes } => f.debug_struct("ProcessList").field("processes", processes).finish(),
             DebuggerResponse::Symbol { symbol } => f.debug_struct("Symbol").field("symbol", symbol).finish(),
             DebuggerResponse::SymbolList { symbols } => f.debug_struct("SymbolList").field("symbols", symbols).finish(),

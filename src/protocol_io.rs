@@ -5,7 +5,7 @@ pub use crate::protocol::{
     HardwareBreakpointSize, HardwareBreakpointType, MinidumpKind, ModuleInfo, ModuleSymbolStatus,
     PdbLoadOutcome, PdbMismatchInfo, ProcessInfo, ScanCompareType, ScanRegionFilter, ScanValue,
     ScanValueType, StepAction, StepKind, StringEncodingFilter, StringHit, StringSortKey,
-    SymbolLoadState, ThreadContext, ThreadInfo,
+    SymbolLoadState, ThreadContext, ThreadInfo, ProcessObjects,
     TraceExitCondition, TypeClass, TypeEnumValue, TypeLayout, TypeMember, TypeRef, TypeSummary,
     UdtKind,
 };
@@ -123,6 +123,7 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::SetContextAck => "SetContextAck".to_string(),
         DebuggerResponse::ModuleList { .. } => "ModuleList".to_string(),
         DebuggerResponse::ThreadList { .. } => "ThreadList".to_string(),
+        DebuggerResponse::ProcessObjects { .. } => "ProcessObjects".to_string(),
         DebuggerResponse::ProcessList { .. } => "ProcessList".to_string(),
         DebuggerResponse::Symbol { .. } => "Symbol".to_string(),
         DebuggerResponse::SymbolList { .. } => "SymbolList".to_string(),
@@ -837,6 +838,28 @@ impl<S> DebugSession<S> {
         } else {
             Err(anyhow::anyhow!("Unexpected response: {:?}", resp))
         }
+    }
+
+    /// Handles, windows, TCP connections and privileges of `pid` in one trip.
+    pub fn list_process_objects(&mut self, pid: u32) -> anyhow::Result<ProcessObjects> {
+        let req = DebuggerRequest::ListProcessObjects { pid };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::ProcessObjects { objects } => Ok(objects),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("{}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response: {:?}", other)),
+        }
+    }
+
+    pub fn close_remote_handle(&mut self, pid: u32, handle: u64) -> anyhow::Result<()> {
+        self.ack_request(DebuggerRequest::CloseRemoteHandle { pid, handle }, "CloseRemoteHandle")
+    }
+
+    pub fn set_privilege(&mut self, pid: u32, name: &str, enable: bool) -> anyhow::Result<()> {
+        self.ack_request(DebuggerRequest::SetPrivilege { pid, name: name.to_string(), enable }, "SetPrivilege")
+    }
+
+    pub fn set_window_enabled(&mut self, pid: u32, hwnd: u64, enabled: bool) -> anyhow::Result<()> {
+        self.ack_request(DebuggerRequest::SetWindowEnabled { pid, hwnd, enabled }, "SetWindowEnabled")
     }
 
     /// Open a process non-invasively (no debugger attach) so read-only features

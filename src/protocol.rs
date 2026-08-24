@@ -306,6 +306,29 @@ pub mod request_response {
         ListThreads {
             pid: u32,
         },
+        /// Enumerate the kernel handles, top-level/child windows, TCP
+        /// connections and token privileges of `pid` (the Handles window).
+        ListProcessObjects {
+            pid: u32,
+        },
+        /// Close `handle` inside `pid` (DuplicateHandle + DUPLICATE_CLOSE_SOURCE).
+        CloseRemoteHandle {
+            pid: u32,
+            handle: u64,
+        },
+        /// Enable or disable a named privilege (`SeDebugPrivilege`, ...) on
+        /// `pid`'s primary token.
+        SetPrivilege {
+            pid: u32,
+            name: String,
+            enable: bool,
+        },
+        /// `EnableWindow` on a window owned by `pid`.
+        SetWindowEnabled {
+            pid: u32,
+            hwnd: u64,
+            enabled: bool,
+        },
         Attach {
             pid: u32,
         },
@@ -958,6 +981,7 @@ pub mod request_response {
         SetContextAck,
         ModuleList { modules: Vec<ModuleInfo> },
         ThreadList { threads: Vec<ThreadInfo> },
+        ProcessObjects { objects: ProcessObjects },
         ProcessList { processes: Vec<ProcessInfo> },
         // Symbol-related responses
         SymbolStatusList { statuses: Vec<ModuleSymbolStatus> },
@@ -1669,6 +1693,79 @@ pub mod request_response {
                 Err(serde::de::Error::custom("Unknown arch variant for ThreadContext"))
             }
         }
+    }
+
+    /// One kernel handle of the debuggee.
+    #[derive(Debug, Serialize, Deserialize, Clone, Default)]
+    pub struct HandleInfo {
+        pub handle: u64,
+        pub type_index: u32,
+        /// Object type ("File", "Event", "Key", ...); empty when unresolved.
+        pub type_name: String,
+        pub granted_access: u32,
+        /// Kernel handle attributes (0x1 protect-from-close, 0x2 inherit).
+        pub attributes: u32,
+        /// Object name, or a synthesized description for Process/Thread
+        /// handles; empty when unnamed, unresolvable, or skipped (a pipe whose
+        /// name query would block).
+        pub name: String,
+    }
+
+    /// One window owned by the debuggee.
+    #[derive(Debug, Serialize, Deserialize, Clone, Default)]
+    pub struct WindowInfo {
+        pub handle: u64,
+        pub parent: u64,
+        pub thread_id: u32,
+        pub style: u32,
+        pub style_ex: u32,
+        pub wnd_proc: u64,
+        pub enabled: bool,
+        pub left: i32,
+        pub top: i32,
+        pub width: i32,
+        pub height: i32,
+        pub title: String,
+        pub class_name: String,
+    }
+
+    /// One TCP endpoint owned by the debuggee (IPv4 or IPv6).
+    #[derive(Debug, Serialize, Deserialize, Clone, Default)]
+    pub struct TcpConnectionInfo {
+        pub local_address: String,
+        pub local_port: u16,
+        pub remote_address: String,
+        pub remote_port: u16,
+        /// `ESTABLISHED`, `LISTEN`, ...
+        pub state: String,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+    pub enum PrivilegeState {
+        Disabled,
+        Enabled,
+        /// Enabled, and enabled by default for this token.
+        EnabledByDefault,
+    }
+
+    /// One privilege present in the debuggee's primary token.
+    #[derive(Debug, Serialize, Deserialize, Clone)]
+    pub struct PrivilegeInfo {
+        pub name: String,
+        pub state: PrivilegeState,
+    }
+
+    /// Everything the Handles window shows, gathered in one round trip.
+    #[derive(Debug, Serialize, Deserialize, Clone, Default)]
+    pub struct ProcessObjects {
+        pub handles: Vec<HandleInfo>,
+        pub windows: Vec<WindowInfo>,
+        pub tcp_connections: Vec<TcpConnectionInfo>,
+        pub privileges: Vec<PrivilegeInfo>,
+        /// `GetDesktopWindow()` on the server, so parents equal to it can be labelled.
+        pub desktop_window: u64,
+        /// Non-fatal problems (e.g. token could not be opened), one per entry.
+        pub warnings: Vec<String>,
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone, Default)]

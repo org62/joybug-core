@@ -1,7 +1,7 @@
 use thiserror::Error;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use crate::protocol::{MinidumpKind, ModuleInfo, ProcessInfo, ThreadInfo};
+use crate::protocol::{MinidumpKind, ModuleInfo, ProcessInfo, ProcessObjects, ThreadInfo};
 
 pub type Address = u64;
 
@@ -579,6 +579,27 @@ pub trait PlatformAPI: Send + Sync {
     /// Write a minidump of the process to `path` (a path on the machine running
     /// the platform). Returns the file size in bytes.
     fn write_minidump(&self, _pid: u32, _path: &str, _kind: MinidumpKind) -> Result<u64, PlatformError> {
+        Err(PlatformError::NotImplemented)
+    }
+
+    /// Kernel handles, windows, TCP connections and token privileges of the
+    /// process (the Handles window).
+    fn list_process_objects(&self, _pid: u32) -> Result<ProcessObjects, PlatformError> {
+        Err(PlatformError::NotImplemented)
+    }
+
+    /// Close a handle inside the target process.
+    fn close_remote_handle(&self, _pid: u32, _handle: u64) -> Result<(), PlatformError> {
+        Err(PlatformError::NotImplemented)
+    }
+
+    /// Enable/disable a named privilege on the target's primary token.
+    fn set_privilege(&self, _pid: u32, _name: &str, _enable: bool) -> Result<(), PlatformError> {
+        Err(PlatformError::NotImplemented)
+    }
+
+    /// `EnableWindow` on a window owned by the target.
+    fn set_window_enabled(&self, _pid: u32, _hwnd: u64, _enabled: bool) -> Result<(), PlatformError> {
         Err(PlatformError::NotImplemented)
     }
 
