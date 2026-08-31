@@ -37,6 +37,13 @@ fn test_parent_child_debugging() {
         .expect("Failed to connect to debug server")
         .on_process_created(|session, pid, _tid, name, _base| {
             println!("ProcessCreated: pid={} name={}", pid, name);
+            // Launching with CREATE_NEW_CONSOLE puts the console host inside
+            // the debugged tree, so a conhost.exe ProcessCreated arrives before
+            // the real child. It is infrastructure, not the test child (and it
+            // outlives the child's exit) — skip it when identifying processes.
+            if name.to_ascii_lowercase().ends_with("conhost.exe") {
+                return Ok(());
+            }
             if session.state.parent_pid.is_none() {
                 session.state.parent_pid = Some(pid);
                 println!("  -> parent pid set to {}", pid);

@@ -64,9 +64,14 @@ fn run_lua_test_file(lua_path: &str, test_exe: Option<&str>) {
 }
 
 /// Helper: run a Lua test that only needs the helpers (no server connection).
-fn run_lua_test_file_no_server(lua_path: &str) {
+/// If `test_exe` is provided, it's injected as the global `TEST_EXE`.
+fn run_lua_test_file_no_server(lua_path: &str, test_exe: Option<&str>) {
     let lua = scripting::create_lua().expect("create lua");
     set_arch_global(&lua);
+
+    if let Some(exe) = test_exe {
+        lua.globals().set("TEST_EXE", exe).unwrap();
+    }
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let full_path = format!("{}\\tests\\lua\\{}", manifest_dir, lua_path);
@@ -614,7 +619,7 @@ fn test_repl_stepping_and_register_globals() {
 
 #[test]
 fn test_lua_file_helpers() {
-    run_lua_test_file_no_server("basics/helpers.lua");
+    run_lua_test_file_no_server("basics/helpers.lua", None);
 }
 
 #[test]
@@ -916,4 +921,86 @@ fn test_lua_file_coverage_targets() {
 #[test]
 fn test_lua_file_hide_peb() {
     run_lua_test_file("anti_anti_debug/hide_peb.lua", None);
+}
+
+// --- host ETW (etw bindings; requires the `etw` feature) ---
+
+// Pure: asserts the `etw` table shape + the stateless reader/time helpers without
+// launching a tracer (that needs elevation), so it runs on any machine.
+#[test]
+fn test_lua_file_etw_shape() {
+    run_lua_test_file_no_server("etw/shape.lua", None);
+}
+
+// --- sandbox (sbx bindings; requires the `sandbox` feature) ---
+
+// Pure: asserts the `sbx.status()` table shape without booting a VM, so it runs
+// on any machine. Live provision tests would need Win11 24H2 + the feature and
+// belong behind an env gate.
+#[test]
+fn test_lua_file_sbx_status() {
+    run_lua_test_file_no_server("sandbox/status.lua", None);
+}
+
+// Windows Sandbox allows exactly ONE running sandbox per user, so the live
+// tests below must not overlap -- cargo runs tests in the same binary on
+// several threads, and a second `wsb start` fails outright with
+// CO_E_APPSINGLEUSE ("Application cannot be run more than once"). Serialize them
+// here rather than relying on `--test-threads=1` at the call site. A panicking
+// test poisons the lock; recover from that so the other still runs and reports
+// its own result instead of a confusing poison error.
+static SANDBOX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn run_lua_sandbox_test(lua_path: &str, test_exe: Option<&str>) {
+    let _guard = SANDBOX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    run_lua_test_file_no_server(lua_path, test_exe);
+}
+
+// Live: boots a real Windows Sandbox and collects ETW inside it, driven from Lua
+// (`sbx.provision` → `handle:run_traced()` → `sbx.events`). Opt-in via
+// JOYBUG_SANDBOX_LIVE (a plain `cargo test` must never boot a VM), and needs
+// JOYBUG_SANDBOX_TEST_BINDIR pointing at a folder with the guest exe. The
+// script itself self-skips when Windows Sandbox isn't available. Mirrors the
+// env-gated `big_source_test` pattern.
+#[test]
+fn test_lua_file_sbx_etw_live() {
+    if std::env::var("JOYBUG_SANDBOX_LIVE").is_err() {
+        eprintln!("skipping live sandbox+ETW test (set JOYBUG_SANDBOX_LIVE=1 to run)");
+        return;
+    }
+    run_lua_sandbox_test("sandbox/etw_live.lua", None);
+}
+
+// Live: the same rig, but proving the tracer follows the process TREE rather
+// than just its root. `spawn_chain.exe` walks a chain in which every generation
+// spawns a successor and exits immediately, so each descendant does all of its
+// work after its whole ancestry is already dead. Same gates as the test above,
+// and serialized against it by SANDBOX_LOCK.
+#[test]
+fn test_lua_file_sbx_process_tree() {
+    if std::env::var("JOYBUG_SANDBOX_LIVE").is_err() {
+        eprintln!("skipping live sandbox process-tree test (set JOYBUG_SANDBOX_LIVE=1 to run)");
+        return;
+    }
+    run_lua_sandbox_test(
+        "sandbox/process_tree.lua",
+        Some(&common::get_test_program_path("spawn_chain")),
+    );
+}
+
+// Live: cross-process memory access seen through Kernel-Audit-API-Calls.
+// `open_remote.exe` opens a victim with VM_READ|VM_WRITE and pokes its memory;
+// the audit provider reports the OpenProcess/OpenThread that must precede that
+// (the reads/writes themselves are Threat-Intelligence-only, i.e. PPL-gated).
+// Same gates as the tests above, and serialized against them by SANDBOX_LOCK.
+#[test]
+fn test_lua_file_sbx_audit_open_process() {
+    if std::env::var("JOYBUG_SANDBOX_LIVE").is_err() {
+        eprintln!("skipping live sandbox audit test (set JOYBUG_SANDBOX_LIVE=1 to run)");
+        return;
+    }
+    run_lua_sandbox_test(
+        "sandbox/audit_open_process.lua",
+        Some(&common::get_test_program_path("open_remote")),
+    );
 }

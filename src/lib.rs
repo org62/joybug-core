@@ -24,6 +24,11 @@ pub mod inline_hook;
 pub mod veh_platform;
 pub mod anti_anti_debug;
 pub mod env_block;
+/// Host ETW tracing: drives the collector in [`winsandbox::tracer`], run as a
+/// mode of the hosting executable rather than a separate binary.
+pub mod etw;
+/// Windows Sandbox run mode (host-side VM orchestration).
+pub mod sandbox;
 
 #[cfg(windows)]
 pub type PlatformImpl = windows_platform::WindowsPlatform;

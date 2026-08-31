@@ -4,7 +4,11 @@ use tracing::{error, trace, warn};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, MAX_PATH,
 };
-use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleA;
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, GetFinalPathNameByHandleA, QueryDosDeviceW,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+};
+use windows_sys::Win32::System::ProcessStatus::GetMappedFileNameW;
 use windows_sys::Win32::System::Diagnostics::Debug::{
     FormatMessageW, ReadProcessMemory, IMAGE_NT_HEADERS64, FORMAT_MESSAGE_FROM_SYSTEM,
     FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -16,6 +20,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 use windows_sys::Win32::System::SystemServices::{
     IMAGE_DOS_HEADER, IMAGE_DOS_SIGNATURE, IMAGE_NT_SIGNATURE,
 };
+use windows_sys::Win32::System::Threading::QueryFullProcessImageNameW;
 use windows_sys::core::PWSTR;
 
 // `ntdll!NtQueryInformationThread`. Declared once here because a second,
@@ -143,6 +148,198 @@ pub fn get_path_from_handle(file_handle: HANDLE) -> Option<String> {
             None
         }
     }
+}
+
+/// Gets the full image path of a process from its handle via
+/// `QueryFullProcessImageNameW`. Unlike [`get_path_from_handle`] (which relies on
+/// the `CREATE_PROCESS_DEBUG_EVENT`'s file handle — sometimes NULL/limited, e.g.
+/// inside Windows Sandbox), this queries the kernel's own record of the image
+/// path, so it resolves a full `C:\...\name.exe` even when the file handle route
+/// fails. The handle needs `PROCESS_QUERY_LIMITED_INFORMATION` (the debug event's
+/// process handle has it).
+///
+/// # Returns
+/// * `Some(path)` - The full image path on success
+/// * `None` - If the handle is invalid or the query fails
+pub fn get_process_image_path(process_handle: HANDLE) -> Option<String> {
+    if process_handle.is_null() {
+        return None;
+    }
+    let mut buf: Vec<u16> = vec![0u16; MAX_PATH as usize];
+    let mut size = buf.len() as u32;
+    // PROCESS_NAME_WIN32 (0): return a normal Win32 path, not an NT device path.
+    let ok = unsafe { QueryFullProcessImageNameW(process_handle, 0, buf.as_mut_ptr(), &mut size) };
+    if ok == 0 {
+        // ERROR_INSUFFICIENT_BUFFER leaves `size` unchanged on some versions;
+        // one grow-and-retry covers unusually long paths.
+        let err = unsafe { GetLastError() };
+        if err == 122 /* ERROR_INSUFFICIENT_BUFFER */ {
+            buf.resize(32768, 0u16);
+            size = buf.len() as u32;
+            if unsafe { QueryFullProcessImageNameW(process_handle, 0, buf.as_mut_ptr(), &mut size) } == 0 {
+                return None;
+            }
+        } else {
+            warn!(error_code = %err, "QueryFullProcessImageNameW failed");
+            return None;
+        }
+    }
+    if size == 0 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buf[..size as usize]))
+}
+
+/// Resolves the on-disk path of the image mapped at `base` in the target process
+/// via `GetMappedFileNameW`, then normalizes the `\Device\HarddiskVolumeN\...`
+/// result to a drive-letter path (e.g. `C:\...`).
+///
+/// This is the reliable fallback for naming a loaded DLL when the
+/// `LOAD_DLL_DEBUG_EVENT`'s file handle is NULL — which happens for most DLLs
+/// inside Windows Sandbox. Unlike a handle- or module-list-based lookup, it reads
+/// the memory manager's section name directly, so it works even mid-load. A
+/// drive-letter path (not the raw device path) is what lets dbghelp open the file
+/// to load symbols.
+///
+/// # Returns
+/// * `Some(path)` - The resolved image path
+/// * `None` - If the address isn't a mapped image or resolution fails
+pub fn get_mapped_file_path(process_handle: HANDLE, base: usize) -> Option<String> {
+    if process_handle.is_null() || base == 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; 1024];
+    let len = unsafe {
+        GetMappedFileNameW(
+            process_handle,
+            base as *const core::ffi::c_void,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+        )
+    };
+    if len == 0 {
+        return None;
+    }
+    let device_path = String::from_utf16_lossy(&buf[..len as usize]);
+    // 1. Windows Sandbox serves its OS files from a VSMB share that no drive
+    //    letter maps to, but they ARE reachable at `C:\...`. This is a pure
+    //    string mapping self-verified with an existence check, so it goes first:
+    //    in-sandbox (this path's main case, hit for most DLLs at process start)
+    //    it avoids route 2's doomed CreateFile + per-drive probing entirely.
+    if let Some(p) = sandbox_vsmb_os_path_to_c(&device_path) {
+        if std::path::Path::new(&p).exists() {
+            return Some(p);
+        }
+    }
+    // 2. A clean drive-letter path when one exists (plain disk volumes).
+    if let Some(p) = drive_path_from_device_path(&device_path) {
+        return Some(p);
+    }
+    // 3. Last resort: the `\\?\GLOBALROOT` form — ugly, but openable by
+    //    CreateFile/dbghelp (a raw `\Device\...` path is not), so symbols and PE
+    //    reads still work. The basename shown in the UI is unaffected.
+    Some(format!(r"\\?\GLOBALROOT{device_path}"))
+}
+
+/// Map a Windows Sandbox OS-share device path to its `C:\...` equivalent:
+/// `\Device\vmsmb\VSMB-{guid}\os\<rest>` → `C:\<rest>`. Returns None for any other
+/// device path (the caller verifies the result exists before trusting it).
+fn sandbox_vsmb_os_path_to_c(device_path: &str) -> Option<String> {
+    let rest = device_path.strip_prefix(r"\Device\vmsmb\")?; // VSMB-{guid}\os\<rest>
+    let (_vsmb_id, after) = rest.split_once('\\')?; // os\<rest>
+    let (share, tail) = after.split_once('\\')?; // share = "os", tail = <rest>
+    if share.eq_ignore_ascii_case("os") {
+        return Some(format!(r"C:\{tail}"));
+    }
+    None
+}
+
+/// True for a `X:\...` drive-letter path (as opposed to a raw `\Device\...` NT path).
+fn is_drive_letter_path(p: &str) -> bool {
+    let b = p.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+}
+
+/// Convert an NT device path (`\Device\HarddiskVolume3\...`, `\Device\vmsmb\...`)
+/// to a drive-letter path (`C:\...`), returning None if none maps.
+///
+/// Route 1: open the path through the NT `\\?\GLOBALROOT` namespace and ask
+/// `GetFinalPathNameByHandle` for its DOS volume name — works for plain disk
+/// volumes. (For a VSMB-backed sandbox system file there is no DOS mapping, so
+/// this yields the device path again, which we reject.) Route 2: match a DOS
+/// drive whose `QueryDosDevice` target prefixes the path.
+fn drive_path_from_device_path(device_path: &str) -> Option<String> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    // Route 1: GLOBALROOT + GetFinalPathNameByHandle. Accept only a real drive path.
+    let nt = format!(r"\\?\GLOBALROOT{device_path}");
+    let wide: Vec<u16> = OsStr::new(&nt).encode_wide().chain(std::iter::once(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0, // query only — no read access needed for the final-path lookup
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if !handle.is_null() && !std::ptr::eq(handle, INVALID_HANDLE_VALUE) {
+        let dos = get_path_from_handle(handle);
+        unsafe { CloseHandle(handle) };
+        if let Some(p) = dos {
+            if is_drive_letter_path(&p) {
+                return Some(p);
+            }
+        }
+    }
+
+    // Route 2: match a DOS drive whose device target prefixes the path. The
+    // drive → device table (26 QueryDosDeviceW calls) is built once per process:
+    // this runs per DLL-load debug event, and drive mappings effectively never
+    // change mid-session (a drive mounted later still resolves via route 1).
+    for (drive, target) in dos_device_table() {
+        if let Some(rest) = device_path.strip_prefix(target.as_str()) {
+            if rest.starts_with('\\') {
+                return Some(format!("{drive}{rest}"));
+            }
+        }
+    }
+    None
+}
+
+/// The `("C:", "\Device\HarddiskVolume3")`-style table of present DOS drives,
+/// queried once per process.
+fn dos_device_table() -> &'static Vec<(String, String)> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::sync::OnceLock;
+
+    static TABLE: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = Vec::new();
+        let mut target_buf = [0u16; 512];
+        for letter in b'A'..=b'Z' {
+            let drive = format!("{}:", letter as char);
+            let wide: Vec<u16> =
+                OsStr::new(&drive).encode_wide().chain(std::iter::once(0)).collect();
+            let n = unsafe {
+                QueryDosDeviceW(wide.as_ptr(), target_buf.as_mut_ptr(), target_buf.len() as u32)
+            };
+            if n == 0 {
+                continue;
+            }
+            // QueryDosDeviceW may return several NUL-separated targets; use the first.
+            let end = target_buf.iter().position(|&c| c == 0).unwrap_or(target_buf.len());
+            let target = String::from_utf16_lossy(&target_buf[..end]);
+            if !target.is_empty() {
+                table.push((drive, target));
+            }
+        }
+        table
+    })
 }
 
 /// Gets the size of a module (DLL/EXE) loaded at the specified base address by reading PE headers.

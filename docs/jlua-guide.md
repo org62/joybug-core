@@ -953,3 +953,193 @@ dbg:hook(CreateFileW_addr, function(ctx)
     print("  access:", hex(ctx.rdx))
 end)
 ```
+
+### Windows Sandbox (`sbx`)
+
+> Requires a build with the `sandbox` feature and Windows 11 24H2+ with the
+> "Windows Sandbox" optional feature. Absent, `sbx` is not registered.
+
+The `sbx` table boots and controls a disposable Windows Sandbox VM **in-process**
+(host-side orchestration — unlike `dbg`, which talks to a debug server). It
+provisions a sandbox running a debug server inside the guest and hands back the
+in-guest server URL, which you connect a normal `dbg` client to.
+
+The guest binary is **caller-supplied**: point `guest_bin_dir` at a folder holding
+one executable that provides both the debug server and the ETW collector,
+selected by the flags it is launched with (`--listen` / `--out`). Joybug stages a
+copy of its own exe; `guest_exe` names it inside that folder and defaults to
+`joybug.exe`.
+
+```lua
+-- Availability (no VM booted): { supported, build, wsb_present, reason }
+local s = sbx.status()
+if not (s.supported and s.wsb_present) then error(s.reason) end
+
+-- Provision a sandbox. Blocks ~tens of seconds while the VM boots. Only one
+-- sandbox per user is allowed, so guard with pcall.
+local ok, h, info = pcall(sbx.provision, {
+    guest_bin_dir  = [[C:\path\to\guest-bin]],   -- required
+    io_dir         = [[C:\path\to\io]],          -- required (writable share)
+    launch_command = [[C:\mounts\app\target.exe]], -- required
+    -- optional:
+    -- symbols_dir  = ...,        -- default: a `symbols` sibling of io_dir
+    -- mounts       = { { host_path = [[C:\proj\app]], read_only = true } },
+    -- memory_mb    = 4096,
+    -- debug        = true,       -- attach the debugger (false = run-only detonation)
+    -- collect_etw  = true,
+    -- etw          = { ops = { "file.create", "network.connect" }, callstacks = false },
+    -- server_port  = 9000,
+    -- working_directory = ...,
+})
+if not ok then error(h) end   -- h is the error message when pcall fails
+
+-- Debug the in-guest target like any other server.
+local dbg = sbx.connect(info.server_url)
+dbg:set_breakpoint(info.some_pid, "kernel32!CreateFileW")
+dbg:run()
+
+-- Read ETW events the guest tracer wrote (JSONL in the io share).
+for _, ev in ipairs(sbx.events(info.io_dir, info.etw_out_file)) do
+    print(ev.kind, ev.op, ev.pid, ev.path or ev.dest or ev.image)
+end
+
+-- Stop the VM. Explicit is best; if you drop `h` without stopping, Lua GC tears
+-- the VM down as a backstop (non-deterministic timing).
+h:stop()
+```
+
+**`provision` returns** `(handle, info)`. **`info` fields:** `server_url`,
+`guest_launch_command`, `guest_working_directory`, `io_dir`, `etw_out_file`,
+`etw_enabled`, `debug`.
+
+**Handle methods:** `h:stop()` (idempotent), `h:server_url()`, `h:info()`
+(returns the same table, or `nil` once stopped), and `h:run_traced()` (run-only
+handles only — see below).
+
+**Sandbox + ETW, no UAC.** Collecting ETW *inside* the sandbox needs no UAC prompt
+— kernel ETW runs as the sandbox's built-in admin. Provision **run-only**
+(`debug = false`): the guest exe runs only as the collector, never as a server,
+and `h:run_traced()` launches the target under it and **blocks until the whole
+traced tree exits**. Then enumerate with `sbx.events`:
+
+```lua
+local h, info = sbx.provision{
+    guest_bin_dir  = [[C:\path\to\guest-bin]],   -- holds the guest exe
+    io_dir         = [[C:\path\to\io]],
+    launch_command = [[cmd.exe /c whoami]],       -- traced from launch to exit
+    debug          = false,                       -- run-only: tracer is the launcher
+    collect_etw    = true,
+    -- etw = { ops = { "process.start", "file.create" }, callstacks = false },
+}
+h:run_traced()                                    -- blocks ~seconds until the target exits
+for _, e in ipairs(sbx.events(info.io_dir, info.etw_out_file)) do
+    print(e.time, e.kind .. "." .. e.op, e.pid, e.path or e.image or e.dest or "")
+end
+h:stop()
+```
+
+`h:run_traced()` errors on a `debug = true` handle (there is no run-only launch
+command to run). See the live integration test `tests/lua/sandbox/etw_live.lua`
+(gated on `JOYBUG_SANDBOX_LIVE`).
+
+**The run follows the whole process tree.** Tracing is rooted at the target and
+extends transitively to everything it spawns, so a "dropper" — a process that
+starts a successor and exits immediately — is captured to the end of the chain
+rather than truncated at its first process. `h:run_traced()` therefore blocks
+until the **last** descendant exits, not the first, bounded by the tracer's
+`--tree-timeout` (default 120s); hitting that bound writes a
+`{ kind = "tracer", op = "tree_timeout" }` record so a truncated capture is
+visible rather than silent. Descendants also inherit tree membership for their
+*file*, *registry* and *network* events, not just process ones. The target gets
+its own console, so a console app is visible on the sandbox desktop just as a GUI
+app is. `tests/lua/sandbox/process_tree.lua` pins all of this down.
+
+**Cross-process access (`kind = "audit"`).** Two ops, off by default, report the
+`OpenProcess`/`OpenThread` a process performs against another — with the rights
+it asked for:
+
+```lua
+etw = { ops = { "audit.open_process", "audit.open_thread" } }
+-- audit.open_process  pid=8032  target_pid=8228
+--                     access="VM_OPERATION|VM_READ|VM_WRITE|QUERY_INFORMATION"
+```
+
+`pid` is the actor, `target_pid` the process acted upon (for `open_thread`, the
+thread's owning process — the provider reports no thread id), `access` the
+decoded `DesiredAccess`, and `status` the NTSTATUS (0 = success; non-zero means
+the call was refused, which is often the interesting case).
+
+This is as close as ordinary ETW gets to *"process A read process B's memory"*.
+The reads and writes themselves — `NtReadVirtualMemory` and friends — are only
+emitted by Microsoft-Windows-Threat-Intelligence, which requires the consumer to
+be a Protected Process Light with an anti-malware ELAM signature, so they are out
+of reach. What you get is the handle acquisition that must precede them: no
+handle carrying `VM_READ`/`VM_WRITE` means no cross-process memory access. What
+you lose is the address, the size, and the count — one handle serves unlimited
+reads. When you need those, breakpoint `ntdll!NtReadVirtualMemory` in the actor
+instead; you are a debugger. Note these ops are noisy (a process opening *itself*
+for a routine query is common), which is why they are not in the default set.
+See `tests/lua/sandbox/audit_open_process.lua`.
+
+**`sbx.events(io_dir, out_file[, from_seq])`** returns a list of event tables
+(`seq`, `time`, `kind`, `op`, `pid`, `ts`, `image`, `ppid`, `path`, `size`,
+`dest`, `exit`, `stack`, `target_pid`, `access`, `status`); pass `from_seq` to
+page past events already seen. It
+shares the incremental reader used by [`etw`](#host-etw-tracing-etw) below — a
+repeated poll of the same file seeks from where the last read ended rather than
+rescanning it. (`time` is `ts` formatted as `HH:MM:SS.mmm` UTC.)
+
+### Host ETW Tracing (`etw`)
+
+> Requires a build with the `etw` feature (implied by `sandbox`). Absent, `etw`
+> is not registered.
+
+Where `sbx` runs the collector *inside* a sandbox VM, the `etw` table runs it
+directly on the **host machine** — no VM. Two modes: **attach** to a live process
+tree, or **spawn** a target under it ("procmon-lite"). The collector is a mode of
+the hosting executable, so this re-launches the current exe with the collector's
+flags rather than shelling out to a separate binary.
+
+> **Elevation:** kernel ETW needs admin, so `etw.start`/`etw.spawn` pop a **UAC
+> prompt** unless jlua is already elevated (run jlua elevated for unattended
+> scripts). The launch is **asynchronous** — the call returns before the tracer
+> initializes, so poll `h:events()` with retries; there is no data immediately. A
+> **cancelled UAC surfaces no error** — events simply never arrive, so bound your
+> loop with `h:done()` and/or a timeout.
+
+```lua
+-- Spawn mode: trace a target from launch to exit, then stop.
+local out = os.getenv("TEMP") .. "\\notepad-etw.jsonl"
+local h = etw.spawn{
+    args = { [[C:\Windows\System32\notepad.exe]] },  -- required: argv list
+    out  = out,                                       -- required: JSONL output path
+    -- optional: tracer_exe = ..., session_name = ...,
+    --           ops = { "file.create", "process.start" }, callstacks = false,
+}
+while not h:done() do
+    for _, e in ipairs(h:events()) do                 -- incremental; handle-tracked cursor
+        print(e.time, e.kind, e.op, e.path or e.dest or e.image or "")
+    end
+end
+
+-- Attach mode: trace a live process tree with a resident tracer.
+local h = etw.start{ pid = some_pid, out = out }      -- one UAC; reused across restarts
+h:attach(other_pid)                                    -- re-target in place (no new UAC)
+h:stop()                                               -- drain + exit (attach mode only)
+```
+
+- **`etw.start{ pid=, out=, [tracer_exe=], [control=], [session_name=], [ops=],
+  [callstacks=] }`** → a resident (attached) handle. `tracer_exe` defaults to the
+  running executable itself; `control` to `<out>.control.txt`.
+- **`etw.spawn{ args=, out=, [tracer_exe=], [session_name=], [ops=],
+  [callstacks=] }`** → a spawn-mode handle (`args` is a non-empty argv list).
+- **Handle methods:** `h:events([from_seq])` (list of event tables — same shape
+  as `sbx.events`, incremental via the handle's own cursor); `h:done()`;
+  `h:attach(pid)` and `h:stop()` (attach mode only — a spawn tracer exits with
+  its target); `h:info()` (`out`, `session_name`, `pid`, `control`, `mode`).
+- **Stateless helpers:** `etw.events(path[, from_seq])` (module-cursor reader over
+  any JSONL), `etw.done(path)`, `etw.time(ts)` (FILETIME 100 ns ticks →
+  `HH:MM:SS.mmm` UTC time-of-day).
+
+Event tables carry: `seq`, `time`, `kind`, `op`, `pid`, `ts`, `image`, `ppid`,
+`path`, `size`, `dest`, `exit`, `stack`.

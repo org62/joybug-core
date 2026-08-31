@@ -261,9 +261,17 @@ impl<S> DebugSession<S> {
         })
     }
 
-    /// Enable TCP keepalive on the connection. Applied to every client so a
-    /// silently-dropped connection is detected rather than hanging forever.
+    /// Tune the client connection: disable Nagle (latency) and enable keepalive
+    /// (dead-peer detection).
     fn configure_socket(stream: &TcpStream) {
+        // Disable Nagle's algorithm. This is a request/response protocol with
+        // small framed messages; Nagle interacting with the peer's delayed-ACK
+        // stalls each exchange by ~40-200ms over a real TCP link (host ↔ sandbox
+        // guest) — invisible on loopback, but the dominant per-command cost when
+        // debugging into a VM. TCP_NODELAY sends each frame immediately.
+        if let Err(e) = stream.set_nodelay(true) {
+            warn!("Failed to set TCP_NODELAY: {}", e);
+        }
         let ka = socket2::TcpKeepalive::new().with_time(KEEPALIVE_IDLE);
         let sock = socket2::SockRef::from(stream);
         if let Err(e) = sock.set_tcp_keepalive(&ka) {

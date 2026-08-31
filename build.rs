@@ -5,6 +5,19 @@ use std::path::Path;
 /// Returns true if compilation succeeded, false if skipped (cl.exe not available)
 /// If fixed_base is Some, the executable will be linked with that base address
 fn compile_test_program(manifest_dir: &str, out_dir: &str, name: &str, fixed_base: Option<u64>) -> bool {
+    compile_test_program_with(manifest_dir, out_dir, name, fixed_base, &[])
+}
+
+/// [`compile_test_program`] plus extra `cl.exe` flags, for the rare program that
+/// needs them (e.g. `/MT` for a target that must run somewhere with no VC++
+/// redistributable, like inside a bare Windows Sandbox image).
+fn compile_test_program_with(
+    manifest_dir: &str,
+    out_dir: &str,
+    name: &str,
+    fixed_base: Option<u64>,
+    extra_flags: &[&str],
+) -> bool {
     // Prefer a C++ source (.cpp) if present, else fall back to C (.c).
     let programs_dir = Path::new(manifest_dir).join("tests").join("test_programs");
     let cpp_src = programs_dir.join(format!("{}.cpp", name));
@@ -49,6 +62,9 @@ fn compile_test_program(manifest_dir: &str, out_dir: &str, name: &str, fixed_bas
     if is_cpp {
         cmd.args(&["/EHsc", "/std:c++17"]);
     }
+    // Before our own flags so an explicit /MT overrides cc's default /MD
+    // (cl honors the last of a conflicting pair, warning D9025).
+    cmd.args(extra_flags);
     cmd.args(&[
         "/Od",                                              // Disable optimization
         "/Zi",                                              // Generate debug info
@@ -149,5 +165,10 @@ fn main() {
         let _ = compile_test_program(&manifest_dir, &out_dir, "bp_race_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "cov_race_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "tls_test", None);
+        // /MT (static CRT): spawn_chain runs inside a Windows Sandbox guest, which
+        // has no VC++ redistributable, reached through a read-only mount with no
+        // DLLs beside it. A /MD build would fail to start with 0xC0000135.
+        let _ = compile_test_program_with(&manifest_dir, &out_dir, "spawn_chain", None, &["/MT"]);
+        let _ = compile_test_program_with(&manifest_dir, &out_dir, "open_remote", None, &["/MT"]);
     }
 }

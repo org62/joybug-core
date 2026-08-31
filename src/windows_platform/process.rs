@@ -21,6 +21,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, IsWow64Process2, OpenThread,
+    CREATE_NEW_CONSOLE,
     DEBUG_PROCESS, DEBUG_ONLY_THIS_PROCESS, INFINITE, PROCESS_INFORMATION, STARTUPINFOW, OpenProcess, TerminateProcess,
     PROCESS_TERMINATE, PROCESS_ALL_ACCESS, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, PROCESS_VM_WRITE, PROCESS_VM_OPERATION, PROCESS_DUP_HANDLE,
     THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION,
@@ -88,7 +89,12 @@ pub(super) fn launch(platform: &mut WindowsPlatform, command: &str, debug_childr
     let mut process_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     // Must outlive the CreateProcessW call; carries its own creation flag.
     let env_block = EnvironmentBlock::new(environment);
+    // CREATE_NEW_CONSOLE gives a console debuggee its own visible console window
+    // instead of inheriting the debugger's (which, for the sandbox server, is
+    // redirected to a log file and thus invisible). Harmless for GUI-subsystem
+    // targets — they simply don't display the unused console.
     let debug_flags = (if debug_children { DEBUG_PROCESS } else { DEBUG_ONLY_THIS_PROCESS })
+        | CREATE_NEW_CONSOLE
         | env_block.create_flags();
     let success = unsafe {
         CreateProcessW(

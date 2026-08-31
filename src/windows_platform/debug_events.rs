@@ -93,8 +93,14 @@ pub(super) fn handle_create_process_event(
     let info = unsafe { debug_event.u.CreateProcessInfo };
     let pid = debug_event.dwProcessId;
 
-    let image_file_name =
-        utils::get_path_from_handle(info.hFile).unwrap_or_else(|| image_path_fallback.unwrap_or("<unknown>").to_string());
+    // Resolve the main image's full path. Prefer the debug event's file handle;
+    // fall back to querying the process's own image path (works when hFile is
+    // NULL/limited, e.g. inside Windows Sandbox); only then use the launch-command
+    // token, which may be a bare/relative name like `cmd.exe` that can't be read
+    // as a file or matched to symbols.
+    let image_file_name = utils::get_path_from_handle(info.hFile)
+        .or_else(|| utils::get_process_image_path(info.hProcess))
+        .unwrap_or_else(|| image_path_fallback.unwrap_or("<unknown>").to_string());
 
     // If this PID is unknown, it's a child process — register it
     if platform.get_process(pid).is_err() {
@@ -877,11 +883,17 @@ pub fn handle_debug_event(
         }
         LOAD_DLL_DEBUG_EVENT => {
             let info = unsafe { debug_event.u.LoadDll };
-            let dll_name =
-                utils::get_path_from_handle(info.hFile).unwrap_or_else(|| "<unknown>".to_string());
 
-            let process = platform.get_process(debug_event.dwProcessId)?;
-            let h_process = process.handle();
+            let h_process = platform.get_process(debug_event.dwProcessId)?.handle();
+            // Resolve the DLL's path to an *openable* Win32 path (so dbghelp can
+            // load symbols and the UI can read the PE): the event's file handle
+            // (NULL for most DLLs inside Sandbox), else the mapped-image path
+            // resolved to a drive letter — inside Sandbox system DLLs are backed
+            // by a VSMB share, so that resolution goes through `\\?\GLOBALROOT`.
+            let dll_name = utils::get_path_from_handle(info.hFile)
+                .or_else(|| utils::get_mapped_file_path(h_process, info.lpBaseOfDll as usize))
+                .unwrap_or_else(|| "<unknown>".to_string());
+
             let size_of_dll =
                 utils::get_module_size_from_address(h_process, info.lpBaseOfDll as usize)
                     .map(|sz| sz as u64);

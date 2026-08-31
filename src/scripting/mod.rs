@@ -7,6 +7,12 @@ pub mod colors;
 pub mod debug_client;
 pub mod bindings;
 pub mod repl;
+/// Host ETW tracing bindings (`etw` global). Behind the `etw` feature so the
+/// default build never pulls the winsandbox/`windows` deps.
+pub mod etw;
+/// In-process Windows Sandbox bindings (`sbx` global). Behind the `sandbox`
+/// feature so the default build never pulls the winsandbox/`windows` deps.
+pub mod sbx;
 
 use mlua::Lua;
 
@@ -31,6 +37,12 @@ pub fn create_lua() -> mlua::Result<Lua> {
 
     // Register in-process memory access (mem.read, mem.write, etc.)
     bindings::register_mem_functions(&lua)?;
+
+    // Register the host ETW table (etw.start, etw.spawn, etw.events, etc.).
+    etw::register_etw_functions(&lua)?;
+
+    // Register the in-process Windows Sandbox table (sbx.provision, etc.).
+    sbx::register_sbx_functions(&lua)?;
 
     Ok(lua)
 }

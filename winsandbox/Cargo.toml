@@ -1,0 +1,30 @@
+[package]
+name = "winsandbox"
+version = "0.1.0"
+edition = "2021"
+description = "Control Windows Sandbox from Rust via the wsb.exe CLI (Windows 11 24H2+)"
+license = "MIT"
+
+# Vendored from the rust-win-sbx proof-of-concept (MIT). Library only: the host
+# side (Sandbox / SandboxConfig / TraceEvent) and the ETW collector (`tracer`)
+# both link into whatever hosts them. Joybug's own exe is that host in every
+# case — in the sandbox guest and on the host — so there is no separate
+# collector binary to build or stage.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+ferrisetw = "1.2"
+
+# Kept on the same major as the rest of the workspace (src-tauri pulls 0.61)
+# so the app build compiles a single copy of windows/windows-core.
+[dependencies.windows]
+version = "0.61"
+features = [
+    "Wdk_System_SystemServices",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Foundation",
+]

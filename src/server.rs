@@ -1,7 +1,7 @@
 use crate::interfaces::{PlatformAPI, Stepper};
 use crate::protocol::{DebuggerRequest, DebuggerResponse};
 use tokio::net::TcpListener;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use std::future::{pending, Future};
 use std::net::TcpListener as StdTcpListener;
@@ -776,6 +776,16 @@ pub async fn run_server() -> anyhow::Result<()> {
     run_server_with_listener(listener, crate::PlatformImpl::new(), pending()).await
 }
 
+/// Bind `listen` and serve the debug protocol with the default platform until
+/// the process is killed. The one owner of the server bootstrap (bind →
+/// platform with `cfg` → serve forever), shared by core's own `main` and by
+/// hosts that re-launch themselves as an in-guest server (the Joybug UI's guest
+/// mode) — so the CLI and an embedded server can't drift apart.
+pub async fn serve(listen: &str, cfg: crate::SymbolConfig) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(listen).await?;
+    run_server_with_listener(listener, crate::PlatformImpl::new_with_config(cfg), pending()).await
+}
+
 pub async fn run_server_with_shutdown<F>(shutdown: F) -> anyhow::Result<()>
 where
     F: Future<Output = ()> + Send,
@@ -823,6 +833,13 @@ where
                 info!(%addr, "Accepted connection");
                 let std_stream = socket.into_std()?;
                 std_stream.set_nonblocking(false)?;
+                // Disable Nagle: this is a small-message request/response protocol,
+                // and Nagle + the client's delayed-ACK add ~40-200ms per exchange
+                // over a real TCP link (e.g. host ↔ sandbox guest). Invisible on
+                // loopback; ~150ms/round-trip to a VM without this.
+                if let Err(e) = std_stream.set_nodelay(true) {
+                    warn!(%addr, "Failed to set TCP_NODELAY on accepted socket: {}", e);
+                }
 
                 let platform = Arc::clone(&shared_platform);
                 std::thread::spawn(move || {

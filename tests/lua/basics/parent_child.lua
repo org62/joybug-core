@@ -10,6 +10,11 @@ local initial_breakpoints = {}
 local exited_pids = {}
 
 dbg:on_process_created(function(pid, tid, name, base)
+    -- CREATE_NEW_CONSOLE at launch puts conhost.exe inside the debugged tree;
+    -- it is infrastructure, not the test child — skip it (see parent_child_test.rs).
+    if string.lower(name):find("conhost%.exe$") then
+        return
+    end
     if parent_pid == nil then
         parent_pid = pid
     elseif child_pid == nil then
