@@ -123,6 +123,7 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::SetContextAck => "SetContextAck".to_string(),
         DebuggerResponse::ModuleList { .. } => "ModuleList".to_string(),
         DebuggerResponse::ThreadList { .. } => "ThreadList".to_string(),
+        DebuggerResponse::ProcessArchitecture { arch } => format!("ProcessArchitecture({:?})", arch),
         DebuggerResponse::ProcessObjects { .. } => "ProcessObjects".to_string(),
         DebuggerResponse::ProcessList { .. } => "ProcessList".to_string(),
         DebuggerResponse::Symbol { .. } => "Symbol".to_string(),
@@ -152,8 +153,8 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::StringScanResult { match_count, capped, .. } => format!("StringScanResult ({} strings{})", match_count, if *capped { ", capped" } else { "" }),
         DebuggerResponse::StringScanResults { strings, total_count } => format!("StringScanResults ({}/{} returned)", strings.len(), total_count),
         DebuggerResponse::PebHideResult { report } => format!(
-            "PebHideResult (peb=0x{:X}, applied={}, failed={}, wow64_skipped={})",
-            report.peb_address, report.applied.len(), report.failures.len(), report.wow64_skipped,
+            "PebHideResult (peb=0x{:X}, applied={}, failed={})",
+            report.peb_address, report.applied.len(), report.failures.len(),
         ),
         DebuggerResponse::FreezeValueStarted { freeze_id } => format!("FreezeValueStarted (id={})", freeze_id),
         DebuggerResponse::SymbolStatusList { statuses } => format!("SymbolStatusList ({} modules)", statuses.len()),
@@ -835,6 +836,17 @@ impl<S> DebugSession<S> {
             Ok(modules)
         } else {
             Err(anyhow::anyhow!("Unexpected response: {:?}", resp))
+        }
+    }
+
+    /// The debuggee's instruction-set architecture (`X86` for a WOW64 process).
+    pub fn get_process_architecture(&mut self, pid: u32) -> anyhow::Result<crate::interfaces::Architecture> {
+        let req = DebuggerRequest::GetProcessArchitecture { pid };
+        let resp = self.send_and_receive(&req)?;
+        match resp {
+            DebuggerResponse::ProcessArchitecture { arch } => Ok(arch),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("GetProcessArchitecture failed: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response: {:?}", other)),
         }
     }
 

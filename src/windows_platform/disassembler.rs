@@ -8,6 +8,7 @@ use std::cell::RefCell;
 // Thread-local cache for Capstone engines (one per architecture per thread)
 // This avoids expensive engine recreation for repeated disassembly calls
 thread_local! {
+    static X86_ENGINE: RefCell<Option<Capstone>> = const { RefCell::new(None) };
     static X64_ENGINE: RefCell<Option<Capstone>> = const { RefCell::new(None) };
     static ARM64_ENGINE: RefCell<Option<Capstone>> = const { RefCell::new(None) };
 }
@@ -25,6 +26,7 @@ impl CapstoneDisassembler {
         F: FnOnce(&Capstone) -> Result<R, DisassemblerError>,
     {
         let tls = match arch {
+            Architecture::X86 => &X86_ENGINE,
             Architecture::X64 => &X64_ENGINE,
             Architecture::Arm64 => &ARM64_ENGINE,
         };
@@ -33,6 +35,15 @@ impl CapstoneDisassembler {
             let mut engine_opt = cell.borrow_mut();
             if engine_opt.is_none() {
                 let engine = match arch {
+                    Architecture::X86 => {
+                        Capstone::new()
+                            .x86()
+                            .mode(arch::x86::ArchMode::Mode32)
+                            .syntax(arch::x86::ArchSyntax::Intel)
+                            .detail(true)
+                            .build()
+                            .map_err(|e| DisassemblerError::CapstoneError(e.to_string()))?
+                    }
                     Architecture::X64 => {
                         Capstone::new()
                             .x86()
@@ -58,11 +69,11 @@ impl CapstoneDisassembler {
     }
 }
 
-/// Detect if mnemonic is a jump instruction (x64 or arm64)
+/// Detect if mnemonic is a jump instruction (x86/x64 or arm64)
 fn is_jump_mnemonic(mnemonic: &str, arch: Architecture) -> bool {
     let mnemonic_lower = mnemonic.to_lowercase();
     match arch {
-        Architecture::X64 => {
+        Architecture::X86 | Architecture::X64 => {
             // x64 jumps: jmp, jcc (ja, jae, jb, jbe, jc, je, jg, jge, jl, jle, jna, jnae, jnb, jnbe, jnc, jne, jng, jnge, jnl, jnle, jno, jnp, jns, jnz, jo, jp, jpe, jpo, js, jz)
             // Also: loop, loope, loopne, jcxz, jecxz, jrcxz
             mnemonic_lower.starts_with('j')
@@ -84,7 +95,7 @@ fn is_jump_mnemonic(mnemonic: &str, arch: Architecture) -> bool {
 fn is_call_mnemonic(mnemonic: &str, arch: Architecture) -> bool {
     let mnemonic_lower = mnemonic.to_lowercase();
     match arch {
-        Architecture::X64 => mnemonic_lower == "call",
+        Architecture::X86 | Architecture::X64 => mnemonic_lower == "call",
         Architecture::Arm64 => mnemonic_lower == "bl" || mnemonic_lower == "blr",
     }
 }
@@ -93,7 +104,7 @@ fn is_call_mnemonic(mnemonic: &str, arch: Architecture) -> bool {
 fn is_ret_mnemonic(mnemonic: &str, arch: Architecture) -> bool {
     let mnemonic_lower = mnemonic.to_lowercase();
     match arch {
-        Architecture::X64 => mnemonic_lower == "ret" || mnemonic_lower == "retf" || mnemonic_lower == "retn",
+        Architecture::X86 | Architecture::X64 => mnemonic_lower == "ret" || mnemonic_lower == "retf" || mnemonic_lower == "retn",
         Architecture::Arm64 => mnemonic_lower == "ret",
     }
 }
@@ -171,7 +182,9 @@ fn extract_addresses_from_operands(
     let mut addresses = Vec::new();
 
     match arch {
-        Architecture::X64 => {
+        // 32-bit code has no RIP-relative operands, so the RIP branch below is
+        // simply never taken; absolute displacements are the common case there.
+        Architecture::X86 | Architecture::X64 => {
             let detail = match engine.insn_detail(insn) {
                 Ok(d) => d,
                 Err(_) => return addresses,
@@ -221,13 +234,13 @@ fn extract_addresses_from_operands(
 /// memory operand per instruction outside of exotic string ops.
 ///
 /// ARM64 memory operands are register-based (PC-relative literals surface as
-/// immediates, already covered by `arm64_address_imms`), so this is x64-only.
+/// immediates, already covered by `arm64_address_imms`), so this is x86/x64-only.
 fn extract_mem_ref_from_operands(
     engine: &Capstone,
     insn: &capstone::Insn,
     arch: Architecture,
 ) -> Option<u64> {
-    if arch != Architecture::X64 {
+    if !arch.is_x86_family() {
         return None;
     }
     let detail = engine.insn_detail(insn).ok()?;
@@ -261,7 +274,7 @@ fn extract_jump_target_from_operands(
     arch: Architecture,
 ) -> Option<u64> {
     match arch {
-        Architecture::X64 => {
+        Architecture::X86 | Architecture::X64 => {
             let detail = engine.insn_detail(insn).ok()?;
             if let ArchDetail::X86Detail(x86) = detail.arch_detail() {
                 for op in x86.operands() {
@@ -419,6 +432,49 @@ mod tests {
                 offset,
             })
         }
+    }
+
+    // 32-bit mode: a PE32 image or a WOW64 thread. The decoder must be the
+    // Mode32 engine (a Mode64 decode of these bytes reads `mov edi, edi` the
+    // same but turns `55` into `push rbp`), and absolute `[disp32]` operands —
+    // the way 32-bit code reaches its IAT — must surface as `mem_ref`.
+    #[test]
+    fn x86_decodes_32bit_prologue() {
+        let disasm = CapstoneDisassembler::new().unwrap();
+        // kernel32!BaseThreadInitThunk-style hot-patchable prologue.
+        let instrs = disasm
+            .disassemble(Architecture::X86, &[0x8B, 0xFF, 0x55, 0x8B, 0xEC], 0x10015970, 3)
+            .unwrap();
+        let text: Vec<String> = instrs.iter().map(|i| format!("{} {}", i.mnemonic, i.op_str)).collect();
+        assert_eq!(text, ["mov edi, edi", "push ebp", "mov ebp, esp"]);
+        assert_eq!(instrs[1].address, 0x10015972);
+    }
+
+    #[test]
+    fn x86_absolute_memory_operand_is_mem_ref() {
+        let disasm = CapstoneDisassembler::new().unwrap();
+        // call dword ptr [0x10080DD0] — FF 15 D0 0D 08 10 (IAT thunk call)
+        let instrs = disasm
+            .disassemble(Architecture::X86, &[0xFF, 0x15, 0xD0, 0x0D, 0x08, 0x10], 0x10001000, 1)
+            .unwrap();
+        assert!(instrs[0].is_call);
+        assert_eq!(instrs[0].mem_ref, Some(0x10080DD0));
+        // In 32-bit mode a rel32 call target is a 32-bit VA and gets symbolized.
+        let call = disasm
+            .disassemble_with_symbols(
+                Architecture::X86,
+                &[0xE8, 0xFB, 0x0F, 0x00, 0x00],
+                0x10001000,
+                1,
+                |addr| (addr == 0x10002000).then(|| SymbolInfo {
+                    module_name: "k32".into(),
+                    symbol_name: "fn".into(),
+                    offset: 0,
+                }),
+            )
+            .unwrap();
+        assert_eq!(call[0].jump_target, Some(0x10002000));
+        assert_eq!(call[0].symbolized_op_str.as_deref(), Some("k32!fn"));
     }
 
     #[test]

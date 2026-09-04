@@ -1,7 +1,7 @@
 use crate::interfaces::{PlatformError, CallFrame, SymbolInfo, Architecture, PlatformAPI};
 use crate::windows_platform::WindowsPlatform;
 use windows_sys::Win32::System::Diagnostics::Debug::*;
-use windows_sys::Win32::System::SystemInformation::{IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64};
+use windows_sys::Win32::System::SystemInformation::{IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_I386};
 use windows_sys::Win32::Foundation::*;
 use tracing::{warn, trace, error};
 use std::mem;
@@ -53,11 +53,12 @@ pub fn get_call_stack(
     let context = platform.get_thread_context(pid, tid)?;
     
     // Initialize the stack frame and extract the raw context
-    let (mut stack_frame, mut raw_context) = initialize_stack_frame_with_context(&context, architecture)?;
+    let (mut stack_frame, mut walk_context) = initialize_stack_frame_with_context(&context, architecture)?;
     
     // Walk the stack
     let mut frames = Vec::new();
     let machine_type = match architecture {
+        Architecture::X86 => IMAGE_FILE_MACHINE_I386 as u32,
         Architecture::X64 => IMAGE_FILE_MACHINE_AMD64 as u32,
         Architecture::Arm64 => IMAGE_FILE_MACHINE_ARM64 as u32,
     };
@@ -72,7 +73,7 @@ pub fn get_call_stack(
                 process_handle,
                 thread_handle,
                 &mut stack_frame,
-                &mut raw_context as *mut _ as *mut _,
+                walk_context.as_mut_ptr(),
                 Some(read_process_memory_proc),
                 Some(SymFunctionTableAccess64),
                 Some(SymGetModuleBase64),
@@ -86,7 +87,9 @@ pub fn get_call_stack(
         }
         
         #[cfg(target_arch = "aarch64")]
-        mask_aarch64_addresses(&mut stack_frame, &mut raw_context);
+        if let WalkContext::Native(raw_context) = &mut walk_context {
+            mask_aarch64_addresses(&mut stack_frame, raw_context);
+        }
         
         let (instruction_pointer, stack_pointer, frame_pointer) = (
             stack_frame.AddrPC.Offset,
@@ -156,18 +159,52 @@ fn is_valid_instruction_pointer(ip: u64, modules: &[crate::protocol::ModuleInfo]
     })
 }
 
-/// Initialize the STACKFRAME_EX structure and return both the frame and the raw context
+/// The register block `StackWalk64` unwinds through: it must match the machine
+/// type — a host `CONTEXT` for a native debuggee, a `WOW64_CONTEXT` for a
+/// 32-bit one (`IMAGE_FILE_MACHINE_I386`).
+enum WalkContext {
+    Native(windows_sys::Win32::System::Diagnostics::Debug::CONTEXT),
+    Wow64(windows_sys::Win32::System::Diagnostics::Debug::WOW64_CONTEXT),
+}
+
+impl WalkContext {
+    fn as_mut_ptr(&mut self) -> *mut core::ffi::c_void {
+        match self {
+            WalkContext::Native(ctx) => ctx as *mut _ as *mut core::ffi::c_void,
+            WalkContext::Wow64(ctx) => ctx as *mut _ as *mut core::ffi::c_void,
+        }
+    }
+}
+
+/// Initialize the STACKFRAME64 structure and return both the frame and the
+/// register block to walk with.
 fn initialize_stack_frame_with_context(
     context: &crate::protocol::ThreadContext,
     architecture: Architecture,
-) -> Result<(STACKFRAME64, windows_sys::Win32::System::Diagnostics::Debug::CONTEXT), PlatformError> {
+) -> Result<(STACKFRAME64, WalkContext), PlatformError> {
     let mut stack_frame: STACKFRAME64 = unsafe { mem::zeroed() };
-    
+
     match context {
-        #[cfg(windows)]
+        // A 32-bit thread: EBP-chain / FPO unwinding by dbghelp.
+        crate::protocol::ThreadContext::Wow64RawContext(ctx) => {
+            if architecture != Architecture::X86 {
+                return Err(PlatformError::NotImplemented);
+            }
+            stack_frame.AddrPC.Offset = ctx.Eip as u64;
+            stack_frame.AddrPC.Mode = AddrModeFlat;
+            stack_frame.AddrStack.Offset = ctx.Esp as u64;
+            stack_frame.AddrStack.Mode = AddrModeFlat;
+            stack_frame.AddrFrame.Offset = ctx.Ebp as u64;
+            stack_frame.AddrFrame.Mode = AddrModeFlat;
+            stack_frame.AddrReturn.Offset = 0;
+            stack_frame.AddrReturn.Mode = AddrModeFlat;
+            Ok((stack_frame, WalkContext::Wow64(*ctx)))
+        }
         crate::protocol::ThreadContext::Win32RawContext(ctx) => {
             #[cfg(target_arch = "x86_64")]
             {
+                // A native context of a WOW64 thread (the 64-bit break-in
+                // thread) is not walkable as x86, and its x64 walk is noise.
                 if architecture != Architecture::X64 {
                     return Err(PlatformError::NotImplemented);
                 }
@@ -181,10 +218,7 @@ fn initialize_stack_frame_with_context(
                 stack_frame.AddrReturn.Offset = 0;
                 stack_frame.AddrReturn.Mode = AddrModeFlat;
 
-                //trace!("Initialized stack frame: IP=0x{:016x}, SP=0x{:016x}, FP=0x{:016x}", 
-                //       ctx.Rip, ctx.Rsp, ctx.Rbp);
-                       
-                Ok((stack_frame, *ctx))
+                Ok((stack_frame, WalkContext::Native(*ctx)))
             }
             #[cfg(target_arch = "aarch64")]
             {
@@ -206,10 +240,7 @@ fn initialize_stack_frame_with_context(
                 stack_frame.AddrFrame.Mode = AddrModeFlat;
                 stack_frame.AddrReturn.Mode = AddrModeFlat;
 
-                //trace!("Initialized stack frame: IP=0x{:016x}, SP=0x{:016x}, FP=0x{:016x}", 
-                //       ctx.Pc, ctx.Sp, unsafe { ctx.Anonymous.Anonymous.Fp });
-                       
-                Ok((stack_frame, *ctx))
+                Ok((stack_frame, WalkContext::Native(*ctx)))
             }
             #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             {

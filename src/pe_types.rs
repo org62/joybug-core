@@ -44,7 +44,7 @@ pub struct ImageDataDirectory {
 
 #[allow(non_snake_case)]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct ImageOptionalHeader64 {
+pub struct ImageOptionalHeader {
     pub Magic: u16,
     pub MajorLinkerVersion: u8,
     pub MinorLinkerVersion: u8,
@@ -53,6 +53,11 @@ pub struct ImageOptionalHeader64 {
     pub SizeOfUninitializedData: u32,
     pub AddressOfEntryPoint: u32,
     pub BaseOfCode: u32,
+    /// PE32 only (`Magic == 0x10B`): start of the data section. Absent in PE32+,
+    /// where `ImageBase` widens to occupy this slot.
+    #[serde(default)]
+    pub BaseOfData: Option<u32>,
+    /// Widened to `u64` for both formats; PE32 stores this as a `u32`.
     pub ImageBase: u64,
     pub SectionAlignment: u32,
     pub FileAlignment: u32,
@@ -77,12 +82,27 @@ pub struct ImageOptionalHeader64 {
     pub DataDirectory: [ImageDataDirectory; 16],
 }
 
+pub const IMAGE_NT_OPTIONAL_HDR32_MAGIC: u16 = 0x10B;
+pub const IMAGE_NT_OPTIONAL_HDR64_MAGIC: u16 = 0x20B;
+
+impl ImageOptionalHeader {
+    /// `true` for a PE32 (32-bit) image, `false` for PE32+.
+    pub fn is_pe32(&self) -> bool {
+        self.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC
+    }
+
+    /// Pointer width implied by the optional-header format.
+    pub fn pointer_size(&self) -> usize {
+        if self.is_pe32() { 4 } else { 8 }
+    }
+}
+
 #[allow(non_snake_case)]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct NtHeaders64 {
+pub struct NtHeaders {
     pub Signature: u32,
     pub FileHeader: ImageFileHeader,
-    pub OptionalHeader: ImageOptionalHeader64,
+    pub OptionalHeader: ImageOptionalHeader,
 }
 
 #[allow(non_snake_case)]
@@ -216,7 +236,7 @@ impl std::fmt::Debug for ImageDataDirectory {
     }
 }
 
-impl std::fmt::Debug for ImageOptionalHeader64 {
+impl std::fmt::Debug for ImageOptionalHeader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         struct HexU16(u16);
         impl std::fmt::Debug for HexU16 { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "0x{:04x}", self.0) } }
@@ -225,7 +245,7 @@ impl std::fmt::Debug for ImageOptionalHeader64 {
         struct HexU64(u64);
         impl std::fmt::Debug for HexU64 { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "0x{:016x}", self.0) } }
 
-        f.debug_struct("ImageOptionalHeader64")
+        f.debug_struct("ImageOptionalHeader")
             .field("Magic", &HexU16(self.Magic))
             .field("MajorLinkerVersion", &self.MajorLinkerVersion)
             .field("MinorLinkerVersion", &self.MinorLinkerVersion)
@@ -234,6 +254,7 @@ impl std::fmt::Debug for ImageOptionalHeader64 {
             .field("SizeOfUninitializedData", &HexU32(self.SizeOfUninitializedData))
             .field("AddressOfEntryPoint", &HexU32(self.AddressOfEntryPoint))
             .field("BaseOfCode", &HexU32(self.BaseOfCode))
+            .field("BaseOfData", &self.BaseOfData.map(HexU32))
             .field("ImageBase", &HexU64(self.ImageBase))
             .field("SectionAlignment", &HexU32(self.SectionAlignment))
             .field("FileAlignment", &HexU32(self.FileAlignment))
@@ -260,11 +281,11 @@ impl std::fmt::Debug for ImageOptionalHeader64 {
     }
 }
 
-impl std::fmt::Debug for NtHeaders64 {
+impl std::fmt::Debug for NtHeaders {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         struct HexU32(u32);
         impl std::fmt::Debug for HexU32 { fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "0x{:08x}", self.0) } }
-        f.debug_struct("NtHeaders64")
+        f.debug_struct("NtHeaders")
             .field("Signature", &HexU32(self.Signature))
             .field("FileHeader", &self.FileHeader)
             .field("OptionalHeader", &self.OptionalHeader)
@@ -319,9 +340,9 @@ impl std::fmt::Display for ImageDataDirectory {
     }
 }
 
-impl std::fmt::Display for ImageOptionalHeader64 {
+impl std::fmt::Display for ImageOptionalHeader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "ImageOptionalHeader64 {{")?;
+        writeln!(f, "ImageOptionalHeader {{")?;
         writeln!(f, "  Magic: 0x{:04x}", self.Magic)?;
         writeln!(f, "  MajorLinkerVersion: {}", self.MajorLinkerVersion)?;
         writeln!(f, "  MinorLinkerVersion: {}", self.MinorLinkerVersion)?;
@@ -330,7 +351,11 @@ impl std::fmt::Display for ImageOptionalHeader64 {
         writeln!(f, "  SizeOfUninitializedData: 0x{:08x}", self.SizeOfUninitializedData)?;
         writeln!(f, "  AddressOfEntryPoint: 0x{:08x}", self.AddressOfEntryPoint)?;
         writeln!(f, "  BaseOfCode: 0x{:08x}", self.BaseOfCode)?;
-        writeln!(f, "  ImageBase: 0x{:016x}", self.ImageBase)?;
+        if let Some(base_of_data) = self.BaseOfData {
+            writeln!(f, "  BaseOfData: 0x{:08x}", base_of_data)?;
+        }
+        let w = self.pointer_size() * 2;
+        writeln!(f, "  ImageBase: 0x{:0w$x}", self.ImageBase, w = w)?;
         writeln!(f, "  SectionAlignment: 0x{:08x}", self.SectionAlignment)?;
         writeln!(f, "  FileAlignment: 0x{:08x}", self.FileAlignment)?;
         writeln!(f, "  MajorOperatingSystemVersion: 0x{:04x}", self.MajorOperatingSystemVersion)?;
@@ -345,10 +370,10 @@ impl std::fmt::Display for ImageOptionalHeader64 {
         writeln!(f, "  CheckSum: 0x{:08x}", self.CheckSum)?;
         writeln!(f, "  Subsystem: 0x{:04x}", self.Subsystem)?;
         writeln!(f, "  DllCharacteristics: 0x{:04x}", self.DllCharacteristics)?;
-        writeln!(f, "  SizeOfStackReserve: 0x{:016x}", self.SizeOfStackReserve)?;
-        writeln!(f, "  SizeOfStackCommit: 0x{:016x}", self.SizeOfStackCommit)?;
-        writeln!(f, "  SizeOfHeapReserve: 0x{:016x}", self.SizeOfHeapReserve)?;
-        writeln!(f, "  SizeOfHeapCommit: 0x{:016x}", self.SizeOfHeapCommit)?;
+        writeln!(f, "  SizeOfStackReserve: 0x{:0w$x}", self.SizeOfStackReserve, w = w)?;
+        writeln!(f, "  SizeOfStackCommit: 0x{:0w$x}", self.SizeOfStackCommit, w = w)?;
+        writeln!(f, "  SizeOfHeapReserve: 0x{:0w$x}", self.SizeOfHeapReserve, w = w)?;
+        writeln!(f, "  SizeOfHeapCommit: 0x{:0w$x}", self.SizeOfHeapCommit, w = w)?;
         writeln!(f, "  LoaderFlags: 0x{:08x}", self.LoaderFlags)?;
         writeln!(f, "  NumberOfRvaAndSizes: 0x{:08x}", self.NumberOfRvaAndSizes)?;
         writeln!(f, "  DataDirectory: [")?;
@@ -362,9 +387,9 @@ impl std::fmt::Display for ImageOptionalHeader64 {
     }
 }
 
-impl std::fmt::Display for NtHeaders64 {
+impl std::fmt::Display for NtHeaders {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "NtHeaders64 {{")?;
+        writeln!(f, "NtHeaders {{")?;
         writeln!(f, "  Signature: 0x{:08x}", self.Signature)?;
         writeln!(f, "  FileHeader: {}", self.FileHeader)?;
         writeln!(f, "  OptionalHeader: {}", self.OptionalHeader)?;
@@ -375,7 +400,7 @@ impl std::fmt::Display for NtHeaders64 {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModuleExtraInfo {
     pub dos_header: DosHeader,
-    pub nt_headers: NtHeaders64,
+    pub nt_headers: NtHeaders,
     pub sections: Vec<ImageSectionHeader>,
     pub imports: Vec<ImportDescriptorInfo>,
     pub exports: Option<ExportInfo>,

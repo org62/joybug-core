@@ -155,6 +155,28 @@ pub mod request_response {
             }
         }
 
+        /// Snapshot of any thread context. A WOW64 (32-bit) thread is reported
+        /// through the x64 shape with its registers zero-extended and r8-r15 zero,
+        /// so tracers and operand analysis need no third variant.
+        pub fn from_thread_context(ctx: &ThreadContext) -> Self {
+            match ctx {
+                ThreadContext::Win32RawContext(c) => Self::from_context(c),
+                ThreadContext::Wow64RawContext(c) => RegisterSnapshot::X64(X64RegisterSnapshot {
+                    rax: c.Eax as u64,
+                    rbx: c.Ebx as u64,
+                    rcx: c.Ecx as u64,
+                    rdx: c.Edx as u64,
+                    rsi: c.Esi as u64,
+                    rdi: c.Edi as u64,
+                    rbp: c.Ebp as u64,
+                    rsp: c.Esp as u64,
+                    rip: c.Eip as u64,
+                    rflags: c.EFlags as u64,
+                    ..Default::default()
+                }),
+            }
+        }
+
         /// Get program counter (RIP on x64, PC on ARM64)
         pub fn pc(&self) -> u64 {
             match self {
@@ -304,6 +326,10 @@ pub mod request_response {
             pid: u32,
         },
         ListThreads {
+            pid: u32,
+        },
+        /// The debuggee's instruction-set architecture (X86 for a WOW64 process).
+        GetProcessArchitecture {
             pid: u32,
         },
         /// Enumerate the kernel handles, top-level/child windows, TCP
@@ -998,6 +1024,7 @@ pub mod request_response {
         SetContextAck,
         ModuleList { modules: Vec<ModuleInfo> },
         ThreadList { threads: Vec<ThreadInfo> },
+        ProcessArchitecture { arch: crate::interfaces::Architecture },
         ProcessObjects { objects: ProcessObjects },
         ProcessList { processes: Vec<ProcessInfo> },
         // Symbol-related responses
@@ -1615,42 +1642,148 @@ pub mod request_response {
 
 
 
+    /// A thread's register file.
+    ///
+    /// `Win32RawContext` is the host-native `CONTEXT` (an x64 or ARM64 debuggee
+    /// on the matching host). `Wow64RawContext` is a 32-bit x86 thread of a
+    /// WOW64 process, on either host. Consumers go through the accessors below
+    /// rather than matching the variant, so the per-host `#[cfg]` lives here only.
     pub enum ThreadContext {
         #[cfg(windows)]
         Win32RawContext(crate::protocol::CONTEXT),
+        #[cfg(windows)]
+        Wow64RawContext(crate::protocol::WOW64_CONTEXT),
     }
 
-    // get PC from ThreadContext, on x64 it's RIP on arm64 it's PC
+    /// x86/x64 EFLAGS trap flag.
+    const X86_TRAP_FLAG: u32 = 0x100;
+    /// ARM64 PSTATE single-step bit.
+    #[cfg(target_arch = "aarch64")]
+    const ARM64_PSTATE_SS_BIT: u32 = 1 << 21;
+
     impl ThreadContext {
-        pub fn get_pc(&self) -> u64 {
-            #[cfg(target_arch = "x86_64")]
-            {
-                match self {
-                    ThreadContext::Win32RawContext(ctx) => ctx.Rip,
-                }
+        /// Architecture whose register file this is.
+        pub fn architecture(&self) -> crate::interfaces::Architecture {
+            match self {
+                ThreadContext::Win32RawContext(_) => crate::interfaces::Architecture::from_native(),
+                ThreadContext::Wow64RawContext(_) => crate::interfaces::Architecture::X86,
             }
-            #[cfg(target_arch = "aarch64")]
-            {
-                match self {
-                    ThreadContext::Win32RawContext(ctx) => ctx.Pc,
+        }
+
+        /// Pointer width of the thread's address space.
+        pub fn pointer_size(&self) -> usize {
+            self.architecture().pointer_size()
+        }
+
+        /// Program counter: RIP / PC / EIP.
+        pub fn pc(&self) -> u64 {
+            match self {
+                ThreadContext::Win32RawContext(ctx) => {
+                    #[cfg(target_arch = "x86_64")]
+                    { ctx.Rip }
+                    #[cfg(target_arch = "aarch64")]
+                    { ctx.Pc }
+                }
+                ThreadContext::Wow64RawContext(ctx) => ctx.Eip as u64,
+            }
+        }
+
+        /// Stack pointer: RSP / SP / ESP.
+        pub fn sp(&self) -> u64 {
+            match self {
+                ThreadContext::Win32RawContext(ctx) => {
+                    #[cfg(target_arch = "x86_64")]
+                    { ctx.Rsp }
+                    #[cfg(target_arch = "aarch64")]
+                    { ctx.Sp }
+                }
+                ThreadContext::Wow64RawContext(ctx) => ctx.Esp as u64,
+            }
+        }
+
+        /// Frame pointer: RBP / FP (X29) / EBP.
+        pub fn fp(&self) -> u64 {
+            match self {
+                ThreadContext::Win32RawContext(ctx) => {
+                    #[cfg(target_arch = "x86_64")]
+                    { ctx.Rbp }
+                    #[cfg(target_arch = "aarch64")]
+                    { unsafe { ctx.Anonymous.Anonymous.Fp } }
+                }
+                ThreadContext::Wow64RawContext(ctx) => ctx.Ebp as u64,
+            }
+        }
+
+        /// Flags register: EFLAGS / CPSR / EFLAGS.
+        pub fn flags(&self) -> u64 {
+            match self {
+                ThreadContext::Win32RawContext(ctx) => {
+                    #[cfg(target_arch = "x86_64")]
+                    { ctx.EFlags as u64 }
+                    #[cfg(target_arch = "aarch64")]
+                    { ctx.Cpsr as u64 }
+                }
+                ThreadContext::Wow64RawContext(ctx) => ctx.EFlags as u64,
+            }
+        }
+
+        /// Move the program counter (a 32-bit thread truncates to its width).
+        pub fn set_pc(&mut self, pc: u64) {
+            match self {
+                ThreadContext::Win32RawContext(ctx) => {
+                    #[cfg(target_arch = "x86_64")]
+                    { ctx.Rip = pc; }
+                    #[cfg(target_arch = "aarch64")]
+                    { ctx.Pc = pc; }
+                }
+                ThreadContext::Wow64RawContext(ctx) => ctx.Eip = pc as u32,
+            }
+        }
+
+        /// Set or clear the CPU single-step flag (x86 TF / ARM64 PSTATE.SS).
+        pub fn set_single_step(&mut self, on: bool) {
+            match self {
+                ThreadContext::Win32RawContext(ctx) => {
+                    #[cfg(target_arch = "x86_64")]
+                    { if on { ctx.EFlags |= X86_TRAP_FLAG } else { ctx.EFlags &= !X86_TRAP_FLAG } }
+                    #[cfg(target_arch = "aarch64")]
+                    { if on { ctx.Cpsr |= ARM64_PSTATE_SS_BIT } else { ctx.Cpsr &= !ARM64_PSTATE_SS_BIT } }
+                }
+                ThreadContext::Wow64RawContext(ctx) => {
+                    if on { ctx.EFlags |= X86_TRAP_FLAG } else { ctx.EFlags &= !X86_TRAP_FLAG }
                 }
             }
         }
 
-        pub fn get_sp(&self) -> u64 {
-            #[cfg(target_arch = "x86_64")]
-            {
-                match self {
-                    ThreadContext::Win32RawContext(ctx) => ctx.Rsp,
+        /// Whether the single-step flag is currently set.
+        pub fn single_step(&self) -> bool {
+            match self {
+                ThreadContext::Win32RawContext(ctx) => {
+                    #[cfg(target_arch = "x86_64")]
+                    { ctx.EFlags & X86_TRAP_FLAG != 0 }
+                    #[cfg(target_arch = "aarch64")]
+                    { ctx.Cpsr & ARM64_PSTATE_SS_BIT != 0 }
                 }
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                match self {
-                    ThreadContext::Win32RawContext(ctx) => ctx.Sp,
-                }
+                ThreadContext::Wow64RawContext(ctx) => ctx.EFlags & X86_TRAP_FLAG != 0,
             }
         }
+
+        pub fn as_native(&self) -> Option<&crate::protocol::CONTEXT> {
+            match self { ThreadContext::Win32RawContext(ctx) => Some(ctx), _ => None }
+        }
+        pub fn as_native_mut(&mut self) -> Option<&mut crate::protocol::CONTEXT> {
+            match self { ThreadContext::Win32RawContext(ctx) => Some(ctx), _ => None }
+        }
+        pub fn as_wow64(&self) -> Option<&crate::protocol::WOW64_CONTEXT> {
+            match self { ThreadContext::Wow64RawContext(ctx) => Some(ctx), _ => None }
+        }
+        pub fn as_wow64_mut(&mut self) -> Option<&mut crate::protocol::WOW64_CONTEXT> {
+            match self { ThreadContext::Wow64RawContext(ctx) => Some(ctx), _ => None }
+        }
+
+        // Older spellings, kept for the many call sites.
+        pub fn get_pc(&self) -> u64 { self.pc() }
+        pub fn get_sp(&self) -> u64 { self.sp() }
     }
 
     #[cfg(windows)]
@@ -1668,9 +1801,13 @@ pub mod request_response {
                     }
                     ThreadContext::Win32RawContext(new_ctx)
                 }
+                ThreadContext::Wow64RawContext(ctx) => ThreadContext::Wow64RawContext(*ctx),
             }
         }
     }
+
+    const NATIVE_CONTEXT_TAG: &str = "Win32RawContext";
+    const WOW64_CONTEXT_TAG: &str = "Wow64RawContext";
 
     #[cfg(windows)]
     impl serde::Serialize for ThreadContext {
@@ -1678,16 +1815,15 @@ pub mod request_response {
         where
             S: serde::Serializer,
         {
-            match self {
-                ThreadContext::Win32RawContext(ctx) => {
-                    use serde::ser::SerializeStruct;
-                    let mut s = serializer.serialize_struct("ThreadContext", 2)?;
-                    s.serialize_field("arch", "Win32RawContext")?;
-                    let bytes = crate::protocol::windows_context_serde::serialize(ctx);
-                    s.serialize_field("context", &bytes)?;
-                    s.end()
-                }
-            }
+            use serde::ser::SerializeStruct;
+            let (tag, bytes) = match self {
+                ThreadContext::Win32RawContext(ctx) => (NATIVE_CONTEXT_TAG, crate::protocol::windows_context_serde::serialize(ctx)),
+                ThreadContext::Wow64RawContext(ctx) => (WOW64_CONTEXT_TAG, crate::protocol::windows_context_serde::serialize_wow64(ctx)),
+            };
+            let mut s = serializer.serialize_struct("ThreadContext", 2)?;
+            s.serialize_field("arch", tag)?;
+            s.serialize_field("context", &bytes)?;
+            s.end()
         }
     }
 
@@ -1703,11 +1839,14 @@ pub mod request_response {
                 context: Vec<u8>,
             }
             let helper = Helper::deserialize(deserializer)?;
-            if helper.arch == "Win32RawContext" {
-                let ctx = crate::protocol::windows_context_serde::deserialize(&helper.context)?;
-                Ok(ThreadContext::Win32RawContext(ctx))
-            } else {
-                Err(serde::de::Error::custom("Unknown arch variant for ThreadContext"))
+            match helper.arch.as_str() {
+                NATIVE_CONTEXT_TAG => Ok(ThreadContext::Win32RawContext(
+                    crate::protocol::windows_context_serde::deserialize(&helper.context)?,
+                )),
+                WOW64_CONTEXT_TAG => Ok(ThreadContext::Wow64RawContext(
+                    crate::protocol::windows_context_serde::deserialize_wow64(&helper.context)?,
+                )),
+                _ => Err(serde::de::Error::custom("Unknown arch variant for ThreadContext")),
             }
         }
     }
@@ -1797,31 +1936,42 @@ pub mod request_response {
 }
 
 #[cfg(windows)]
-pub use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
+pub use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, WOW64_CONTEXT};
 
+/// Byte-image (de)serialization of the plain-old-data context structs. The
+/// size is the discriminator's safety net: a blob of the wrong length is
+/// rejected rather than reinterpreted.
 #[cfg(windows)]
 pub mod windows_context_serde {
-    use super::CONTEXT;
-    pub fn serialize(ctx: &CONTEXT) -> Vec<u8> {
+    use super::{CONTEXT, WOW64_CONTEXT};
+
+    fn pod_bytes<T: Copy>(value: &T) -> Vec<u8> {
         unsafe {
-            std::slice::from_raw_parts(
-                ctx as *const CONTEXT as *const u8,
-                std::mem::size_of::<CONTEXT>(),
-            ).to_vec()
+            std::slice::from_raw_parts(value as *const T as *const u8, std::mem::size_of::<T>()).to_vec()
         }
     }
-    pub fn deserialize<'de, D: serde::de::Error>(bytes: &[u8]) -> Result<CONTEXT, D> {
-        if bytes.len() != std::mem::size_of::<CONTEXT>() {
-            return Err(D::custom("Invalid CONTEXT size"));
+
+    fn pod_from_bytes<'de, T: Copy, D: serde::de::Error>(bytes: &[u8], what: &str) -> Result<T, D> {
+        if bytes.len() != std::mem::size_of::<T>() {
+            return Err(D::custom(format!("Invalid {} size: {} bytes", what, bytes.len())));
         }
-        let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+        let mut value: T = unsafe { std::mem::zeroed() };
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                &mut ctx as *mut CONTEXT as *mut u8,
-                std::mem::size_of::<CONTEXT>(),
-            );
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), &mut value as *mut T as *mut u8, std::mem::size_of::<T>());
         }
-        Ok(ctx)
+        Ok(value)
+    }
+
+    pub fn serialize(ctx: &CONTEXT) -> Vec<u8> {
+        pod_bytes(ctx)
+    }
+    pub fn deserialize<'de, D: serde::de::Error>(bytes: &[u8]) -> Result<CONTEXT, D> {
+        pod_from_bytes(bytes, "CONTEXT")
+    }
+    pub fn serialize_wow64(ctx: &WOW64_CONTEXT) -> Vec<u8> {
+        pod_bytes(ctx)
+    }
+    pub fn deserialize_wow64<'de, D: serde::de::Error>(bytes: &[u8]) -> Result<WOW64_CONTEXT, D> {
+        pod_from_bytes(bytes, "WOW64_CONTEXT")
     }
 }

@@ -199,6 +199,22 @@ function regs(c)
                     annotation))
             end
         end
+    elseif c.eax ~= nil then
+        -- 32-bit (WOW64) thread
+        local names = {"eax","ebx","ecx","edx","esi","edi","ebp","esp","eip","eflags"}
+        for _, name in ipairs(names) do
+            if c[name] then
+                local annotation = ""
+                if name ~= "eflags" then
+                    annotation = _deref_annotation(c[name])
+                end
+                print(string.format("  %s %s %s%s",
+                    C.reg(string.format("%-7s", name)),
+                    C.dim("="),
+                    C.addr(hex(c[name])),
+                    annotation))
+            end
+        end
     elseif c.pc ~= nil then
         local arm_names = {"fp","lr","sp","pc"}
         if c.x then

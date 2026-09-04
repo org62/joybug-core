@@ -277,6 +277,13 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::GetProcessArchitecture { pid } => {
+                let p = platform.read().unwrap();
+                match p.process_architecture(pid) {
+                    Ok(arch) => DebuggerResponse::ProcessArchitecture { arch },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::ListThreads { pid } => {
                 let p = platform.read().unwrap();
                 match p.list_threads(pid) {

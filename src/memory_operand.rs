@@ -14,6 +14,7 @@ use crate::protocol::{MemoryAccess, MemoryAccessType, RegisterSnapshot, X64Regis
 // Thread-local Capstone engines for memory operand analysis
 thread_local! {
     static X64_ENGINE: RefCell<Option<Capstone>> = const { RefCell::new(None) };
+    static X86_ENGINE: RefCell<Option<Capstone>> = const { RefCell::new(None) };
 }
 
 /// Information about a memory operand before execution
@@ -179,22 +180,28 @@ pub fn analyze_memory_operands(
     arch: Architecture,
 ) -> Vec<MemoryOperandInfo> {
     match arch {
-        Architecture::X64 => analyze_x64_memory_operands(instruction_bytes, instruction_address, registers),
+        Architecture::X64 => analyze_x86_family_memory_operands(instruction_bytes, instruction_address, registers, false),
+        // A WOW64 snapshot arrives in the x64 shape (zero-extended, see
+        // `RegisterSnapshot::from_thread_context`); decode in 32-bit mode and
+        // wrap effective addresses at 32 bits.
+        Architecture::X86 => analyze_x86_family_memory_operands(instruction_bytes, instruction_address, registers, true),
         Architecture::Arm64 => Vec::new(), // TODO: Implement ARM64 support
     }
 }
 
-fn analyze_x64_memory_operands(
+fn analyze_x86_family_memory_operands(
     instruction_bytes: &[u8],
     instruction_address: u64,
     registers: &RegisterSnapshot,
+    mode32: bool,
 ) -> Vec<MemoryOperandInfo> {
-    X64_ENGINE.with(|cell| {
+    let engine_cell = if mode32 { &X86_ENGINE } else { &X64_ENGINE };
+    engine_cell.with(|cell| {
         let mut engine_opt = cell.borrow_mut();
         if engine_opt.is_none() {
             let engine = Capstone::new()
                 .x86()
-                .mode(arch::x86::ArchMode::Mode64)
+                .mode(if mode32 { arch::x86::ArchMode::Mode32 } else { arch::x86::ArchMode::Mode64 })
                 .syntax(arch::x86::ArchSyntax::Intel)
                 .detail(true)
                 .build();
@@ -259,6 +266,9 @@ fn analyze_x64_memory_operands(
 
                     // Add displacement
                     addr = addr.wrapping_add_signed(mem.disp());
+                    if mode32 {
+                        addr &= 0xFFFF_FFFF;
+                    }
 
                     // Skip addresses in the null page guard region (< 0x10000 on Windows)
                     // These are invalid addresses that would cause read errors

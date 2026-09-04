@@ -4,7 +4,8 @@ use std::fs::File;
 use std::convert::TryInto;
 
 use msvc_demangler::DemangleFlags;
-use pelite::pe64::{Pe, PeFile};
+// The 32/64 wrap: PDB identifiers are read from PE32 and PE32+ images alike.
+use pelite::PeFile;
 use pelite::image::IMAGE_DEBUG_TYPE_CODEVIEW;
 use pelite::Error as PeliteError;
 use pdb::{

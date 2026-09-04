@@ -3,11 +3,8 @@
 # shares the root lockfile. It is a required dependency of the root package, so it
 # always builds; leaving it out of `default-members` below only keeps it from being
 # built/tested a second time as a standalone target.
-members = [".", "veh_shared", "veh_dll", "winsandbox"]
-# Build/test all members by default. Without this, plain `cargo build`/`cargo test`
-# only operate on the root package (joybug-core) and skip the `veh_dll` cdylib, so the
-# VEH integration tests can't find joybug_core_veh_dll.dll. See VehPlatform::find_veh_dll.
-default-members = [".", "veh_shared", "veh_dll"]
+members = [".", "winsandbox"]
+default-members = ["."]
 
 [package]
 name = "joybug-core"
@@ -73,7 +70,6 @@ unicorn-engine = { git = "https://github.com/expend20/unicorn", branch = "AVX2-p
 hexpatch-keystone = "0.9"
 mlua = { version = "0.10", features = ["lua54", "send", "vendored"] }
 rustyline = "15"
-joybug-core-veh-shared = { path = "veh_shared" }
 # Windows Sandbox control (wsb.exe wrapper + ETW tracer driver). Optional and
 # behind the `sandbox` feature so the default lib/`jlua`/app build never pulls
 # `windows 0.61`. `default-features = false` keeps the tracer bin's `ferrisetw`

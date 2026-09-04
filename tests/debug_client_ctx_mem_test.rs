@@ -3,7 +3,6 @@
 mod common;
 
 use common::TestServer;
-use joybug_core::protocol::ThreadContext;
 use joybug_core::protocol_io::DebugSession;
 use joybug_core::interfaces::{Architecture, InstructionFormatter};
 
@@ -51,16 +50,8 @@ fn test_debug_client_ctx_mem_test() {
 
             // Request thread context
             let context = session.get_thread_context(pid, tid).unwrap();
-            match context {
-                joybug_core::protocol::ThreadContext::Win32RawContext(ctx) => {
-                    // Try round-trip: set the same context back
-                    session.set_thread_context(pid, tid, ThreadContext::Win32RawContext(ctx.clone())).unwrap();
-                }
-                #[cfg(not(windows))]
-                _ => {
-                    panic!("Unexpected thread context type");
-                }
-            }
+            // Try round-trip: set the same context back (either variant).
+            session.set_thread_context(pid, tid, context.clone()).unwrap();
 
             // Read memory at breakpoint, on x64 read 1 byte, on arm64 read 4 bytes
             let read_size = if cfg!(target_arch = "x86_64") { 1 } else { 4 };

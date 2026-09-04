@@ -259,6 +259,9 @@ fn is_red_flag(ins: &Instruction, arch: Architecture) -> bool {
     }
     let mnemonic = ins.mnemonic.as_str();
     match arch {
+        // 32-bit code legitimately uses the x87 FPU, `esp`, string ops and the
+        // rest of the list below, so no mnemonic is a red flag on its own.
+        Architecture::X86 => false,
         Architecture::X64 => {
             // The x87 FPU. 64-bit compilers do everything in SSE; an `f`-prefixed
             // stack op is the single most common thing random bytes decode into
@@ -427,7 +430,7 @@ fn is_terminator(ins: &Instruction, arch: Architecture) -> bool {
         return true;
     }
     match arch {
-        Architecture::X64 => matches!(ins.mnemonic.as_str(), "jmp" | "int3" | "ud2"),
+        Architecture::X86 | Architecture::X64 => matches!(ins.mnemonic.as_str(), "jmp" | "int3" | "ud2"),
         Architecture::Arm64 => matches!(
             ins.mnemonic.as_str(),
             "b" | "br" | "braa" | "brab" | "braaz" | "brabz" | "brk" | "udf"
@@ -502,7 +505,7 @@ fn classify_code_start(
     if head.iter().all(|&b| b == 0x00) || head.iter().all(|&b| b == 0xFF) {
         return Some(Reject::Padding);
     }
-    if arch == Architecture::X64 && slice[0] == 0xCC {
+    if arch.is_x86_family() && slice[0] == 0xCC {
         return Some(Reject::Padding); // int3 filler between functions
     }
 

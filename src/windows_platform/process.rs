@@ -27,7 +27,7 @@ use windows_sys::Win32::System::Threading::{
     THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION,
 };
 use windows_sys::Win32::System::SystemInformation::{
-    IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_UNKNOWN
+    IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_UNKNOWN
 };
 use windows_sys::Win32::System::Diagnostics::Debug::DebugBreakProcess;
 
@@ -48,30 +48,24 @@ pub(super) fn determine_process_architecture(process_handle: windows_sys::Win32:
         return Err(PlatformError::OsError(format!("IsWow64Process2 failed: {} ({})", error, utils::error_message(error))));
     }
 
-    match native_machine {
-        IMAGE_FILE_MACHINE_AMD64 => {
-            if process_machine == IMAGE_FILE_MACHINE_UNKNOWN {
-                // Not a WOW64 process, so it's a native 64-bit process
-                Ok(Architecture::X64)
-            } else {
-                // This is a 32-bit process on a 64-bit system. For our purposes, we'll treat it as X64
-                // as the debugging APIs will behave as if it's a 64-bit process.
-                Ok(Architecture::X64)
-            }
-        }
-        IMAGE_FILE_MACHINE_ARM64 => {
-             if process_machine == IMAGE_FILE_MACHINE_UNKNOWN {
-                // Not a WOW64 process, so it's a native 64-bit process
-                Ok(Architecture::Arm64)
-            } else {
-                // This is a 32-bit process on a 64-bit system.
-                Ok(Architecture::Arm64)
-            }
-        }
+    let native = match native_machine {
+        IMAGE_FILE_MACHINE_AMD64 => Architecture::X64,
+        IMAGE_FILE_MACHINE_ARM64 => Architecture::Arm64,
         _ => {
-            error!("Unknown native machine type: {}, defaulting to X64", native_machine);
-            Err(PlatformError::OsError(format!("Unknown native machine type: {}", native_machine)))
+            error!("Unknown native machine type: {}", native_machine);
+            return Err(PlatformError::OsError(format!("Unknown native machine type: {}", native_machine)));
         }
+    };
+    // `process_machine` is UNKNOWN for a native process and the guest machine
+    // for a WOW64 one. x86 guests are debugged through their 32-bit register
+    // file (`ThreadContext::Wow64RawContext`) on both x64 and ARM64 hosts;
+    // 32-bit ARM guests (older ARM64 Windows) have no decoder or context here.
+    match process_machine {
+        IMAGE_FILE_MACHINE_UNKNOWN => Ok(native),
+        IMAGE_FILE_MACHINE_I386 => Ok(Architecture::X86),
+        other => Err(PlatformError::Other(format!(
+            "Unsupported WOW64 guest machine 0x{:04X} (only x86 guests are supported)", other
+        ))),
     }
 }
 
@@ -132,6 +126,9 @@ pub(super) fn launch(platform: &mut WindowsPlatform, command: &str, debug_childr
 
     // Add the new process to the platform
     platform.add_process(pid, process_handle, architecture)?;
+    // Launched (not attached): the loader's initial breakpoint sequence is ours
+    // to interpret — see the WOW64 rule in `handle_exception_event`.
+    platform.get_process_mut(pid)?.set_created_by_launch(true);
 
     // Immediately run the debug loop for the new process
     let mut debug_event: DEBUG_EVENT = unsafe { std::mem::zeroed() };

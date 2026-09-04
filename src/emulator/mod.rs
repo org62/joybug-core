@@ -25,7 +25,7 @@ mod execution;
 pub use error::EmulatorError;
 pub use types::{EmulationResult, StopReason};
 use types::{ModuleBoundary, EmulatorSharedState};
-use registers::{write_x64_registers, write_arm64_registers, read_x64_registers, read_arm64_registers};
+use registers::{write_x64_registers, write_x86_registers, write_arm64_registers, read_x64_registers, read_arm64_registers};
 
 /// CPU Emulator that initializes from debugger state
 pub struct Emulator<'a> {
@@ -62,6 +62,7 @@ impl<'a> Emulator<'a> {
         let shared_state = Arc::new(RwLock::new(EmulatorSharedState::new(modules)));
 
         let (arch, mode) = match architecture {
+            Architecture::X86 => (Arch::X86, Mode::MODE_32),
             Architecture::X64 => (Arch::X86, Mode::MODE_64),
             Architecture::Arm64 => (Arch::ARM64, Mode::LITTLE_ENDIAN),
         };
@@ -92,8 +93,14 @@ impl<'a> Emulator<'a> {
             Self::setup_x64_segments(&mut emu, platform, pid, tid)?;
         }
 
+        // For a WOW64 thread, `fs:` addresses the 32-bit TEB.
+        if matches!(architecture, Architecture::X86) {
+            Self::setup_x86_segments(&mut emu, platform, pid, tid)?;
+        }
+
         // Write registers from context
         match architecture {
+            Architecture::X86 => write_x86_registers(&mut emu, &context)?,
             Architecture::X64 => write_x64_registers(&mut emu, &context)?,
             Architecture::Arm64 => write_arm64_registers(&mut emu, &context)?,
         }
@@ -115,11 +122,40 @@ impl<'a> Emulator<'a> {
         })
     }
 
-    fn detect_architecture(_context: &ThreadContext) -> Architecture {
-        #[cfg(target_arch = "x86_64")]
-        { Architecture::X64 }
-        #[cfg(target_arch = "aarch64")]
-        { Architecture::Arm64 }
+    fn detect_architecture(context: &ThreadContext) -> Architecture {
+        context.architecture()
+    }
+
+    /// Set up the 32-bit FS base: the WOW64 thread's 32-bit TEB
+    /// (`get_teb_address` reports that one for an x86 target).
+    fn setup_x86_segments<D, P: PlatformAPI>(
+        emu: &mut Unicorn<'_, D>,
+        platform: &P,
+        pid: u32,
+        tid: u32,
+    ) -> Result<(), EmulatorError> {
+        use windows_sys::Win32::System::Memory::MEM_COMMIT;
+
+        match platform.get_teb_address(pid, tid) {
+            Ok(teb32) => {
+                tracing::debug!("Setting FS_BASE to TEB32 address: 0x{:08X}", teb32);
+                emu.reg_write(RegisterX86::FS_BASE, teb32)
+                    .map_err(|e| EmulatorError::UnicornError(format!("FS_BASE write failed: {:?}", e)))?;
+                if let Ok(region) = platform.query_memory_region(pid, teb32) {
+                    let size = Self::align_size(region.region_size);
+                    let prot = Self::windows_protect_to_unicorn(region.protect);
+                    if emu.mem_map(region.base_address, size, prot).is_ok() && region.state == MEM_COMMIT {
+                        if let Ok(data) = platform.read_memory(pid, region.base_address, region.region_size as usize) {
+                            let _ = emu.mem_write(region.base_address, &data);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Could not get TEB32 address: {}. FS segment access will fail.", e);
+            }
+        }
+        Ok(())
     }
 
     /// Set up x64 segment bases (GS for TEB)
@@ -168,6 +204,10 @@ impl<'a> Emulator<'a> {
     /// Get current instruction pointer
     pub fn get_pc(&self) -> Result<u64, EmulatorError> {
         match self.architecture {
+            Architecture::X86 => {
+                self.emu.reg_read(RegisterX86::EIP)
+                    .map_err(|e| EmulatorError::UnicornError(format!("{:?}", e)))
+            }
             Architecture::X64 => {
                 self.emu.reg_read(RegisterX86::RIP)
                     .map_err(|e| EmulatorError::UnicornError(format!("{:?}", e)))
@@ -182,6 +222,10 @@ impl<'a> Emulator<'a> {
     /// Set the instruction pointer
     pub(super) fn set_pc(&mut self, value: u64) -> Result<(), EmulatorError> {
         match self.architecture {
+            Architecture::X86 => {
+                self.emu.reg_write(RegisterX86::EIP, value)
+                    .map_err(|e| EmulatorError::UnicornError(format!("{:?}", e)))
+            }
             Architecture::X64 => {
                 self.emu.reg_write(RegisterX86::RIP, value)
                     .map_err(|e| EmulatorError::UnicornError(format!("{:?}", e)))
@@ -225,6 +269,10 @@ impl<'a> Emulator<'a> {
     /// Get stack pointer
     pub fn get_sp(&self) -> Result<u64, EmulatorError> {
         match self.architecture {
+            Architecture::X86 => {
+                self.emu.reg_read(RegisterX86::ESP)
+                    .map_err(|e| EmulatorError::UnicornError(format!("{:?}", e)))
+            }
             Architecture::X64 => {
                 self.emu.reg_read(RegisterX86::RSP)
                     .map_err(|e| EmulatorError::UnicornError(format!("{:?}", e)))
@@ -239,7 +287,7 @@ impl<'a> Emulator<'a> {
     /// Read a register by name (for condition checking)
     pub fn read_register(&self, name: &str) -> Result<u64, EmulatorError> {
         match self.architecture {
-            Architecture::X64 => read_x64_registers(&self.emu, name),
+            Architecture::X86 | Architecture::X64 => read_x64_registers(&self.emu, name),
             Architecture::Arm64 => read_arm64_registers(&self.emu, name),
         }
     }

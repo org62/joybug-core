@@ -1,7 +1,317 @@
-use crate::interfaces::PlatformError;
+use crate::interfaces::{Architecture, PlatformError};
 use crate::protocol::{HardwareBreakpointType, HardwareBreakpointSize};
 use crate::windows_platform::debugged_process::InternalHardwareBreakpoint;
 use tracing::trace;
+use windows_sys::Win32::Foundation::HANDLE as ThreadHandle;
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    Wow64GetThreadContext, Wow64SetThreadContext, WOW64_CONTEXT, WOW64_CONTEXT_CONTROL,
+    WOW64_CONTEXT_DEBUG_REGISTERS,
+};
+
+// ============================================================================
+// x86 family: the DR0-DR7 model shared by a native x64 thread (`CONTEXT`, x64
+// host only) and a WOW64 thread (`WOW64_CONTEXT`, either host). The encoding
+// helpers are generic over this trait; the per-host `CONTEXT` wrappers below
+// and the WOW64 path both delegate to them.
+// ============================================================================
+
+pub(super) trait X86DebugRegs {
+    fn set_dr(&mut self, index: u8, value: u64);
+    fn dr6(&self) -> u64;
+    fn set_dr6(&mut self, value: u64);
+    fn dr7(&self) -> u64;
+    fn set_dr7(&mut self, value: u64);
+    /// Instruction pointer (RIP / EIP).
+    fn pc(&self) -> u64;
+    fn set_trap_flag(&mut self, on: bool);
+}
+
+impl X86DebugRegs for WOW64_CONTEXT {
+    fn set_dr(&mut self, index: u8, value: u64) {
+        let v = value as u32;
+        match index { 0 => self.Dr0 = v, 1 => self.Dr1 = v, 2 => self.Dr2 = v, 3 => self.Dr3 = v, _ => {} }
+    }
+    fn dr6(&self) -> u64 { self.Dr6 as u64 }
+    fn set_dr6(&mut self, value: u64) { self.Dr6 = value as u32; }
+    fn dr7(&self) -> u64 { self.Dr7 as u64 }
+    fn set_dr7(&mut self, value: u64) { self.Dr7 = value as u32; }
+    fn pc(&self) -> u64 { self.Eip as u64 }
+    fn set_trap_flag(&mut self, on: bool) {
+        if on { self.EFlags |= 0x100 } else { self.EFlags &= !0x100 }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl X86DebugRegs for CONTEXT {
+    fn set_dr(&mut self, index: u8, value: u64) {
+        match index { 0 => self.Dr0 = value, 1 => self.Dr1 = value, 2 => self.Dr2 = value, 3 => self.Dr3 = value, _ => {} }
+    }
+    fn dr6(&self) -> u64 { self.Dr6 }
+    fn set_dr6(&mut self, value: u64) { self.Dr6 = value; }
+    fn dr7(&self) -> u64 { self.Dr7 }
+    fn set_dr7(&mut self, value: u64) { self.Dr7 = value; }
+    fn pc(&self) -> u64 { self.Rip }
+    fn set_trap_flag(&mut self, on: bool) {
+        if on { self.EFlags |= 0x100 } else { self.EFlags &= !0x100 }
+    }
+}
+
+/// Encode the DR7 condition bits for a hardware breakpoint type.
+/// Returns the 2-bit condition value:
+///   00 = execute, 01 = write, 11 = read/write
+fn x86_bp_type_to_condition(bp_type: HardwareBreakpointType) -> u64 {
+    match bp_type {
+        HardwareBreakpointType::Execute => 0b00,
+        HardwareBreakpointType::Write => 0b01,
+        HardwareBreakpointType::ReadWrite => 0b11,
+    }
+}
+
+/// Encode the DR7 length bits for a hardware breakpoint size.
+/// Returns the 2-bit length value:
+///   00 = 1 byte, 01 = 2 bytes, 11 = 4 bytes, 10 = 8 bytes
+fn x86_bp_size_to_length(size: HardwareBreakpointSize) -> u64 {
+    match size {
+        HardwareBreakpointSize::Byte1 => 0b00,
+        HardwareBreakpointSize::Byte2 => 0b01,
+        HardwareBreakpointSize::Byte4 => 0b11,
+        HardwareBreakpointSize::Byte8 => 0b10,
+    }
+}
+
+/// Program DR<index> + its DR7 enable/condition/length fields.
+pub(super) fn x86_set_hw_bp<C: X86DebugRegs + ?Sized>(
+    ctx: &mut C,
+    dr_index: u8,
+    address: u64,
+    bp_type: HardwareBreakpointType,
+    size: HardwareBreakpointSize,
+) {
+    if dr_index > 3 {
+        return;
+    }
+    ctx.set_dr(dr_index, address);
+    let condition = x86_bp_type_to_condition(bp_type);
+    // Execute breakpoints must use 1-byte size
+    let length = if bp_type == HardwareBreakpointType::Execute { 0b00 } else { x86_bp_size_to_length(size) };
+    // DR7 bit layout per debug register:
+    //   Local enable: bit (dr_index * 2)
+    //   Condition (RW): bits (16 + dr_index * 4) to (17 + dr_index * 4)
+    //   Length (LEN):   bits (18 + dr_index * 4) to (19 + dr_index * 4)
+    let idx = dr_index as u64;
+    let mut dr7 = ctx.dr7();
+    dr7 |= 1 << (idx * 2);
+    let cond_shift = 16 + idx * 4;
+    dr7 &= !(0b11 << cond_shift);
+    dr7 |= condition << cond_shift;
+    let len_shift = 18 + idx * 4;
+    dr7 &= !(0b11 << len_shift);
+    dr7 |= length << len_shift;
+    ctx.set_dr7(dr7);
+}
+
+/// Zero DR<index> and clear its DR7 fields.
+pub(super) fn x86_clear_hw_bp<C: X86DebugRegs + ?Sized>(ctx: &mut C, dr_index: u8) {
+    if dr_index > 3 {
+        return;
+    }
+    ctx.set_dr(dr_index, 0);
+    let idx = dr_index as u64;
+    let mut dr7 = ctx.dr7();
+    dr7 &= !(1 << (idx * 2));
+    dr7 &= !(0b11 << (16 + idx * 4));
+    dr7 &= !(0b11 << (18 + idx * 4));
+    ctx.set_dr7(dr7);
+}
+
+/// Which breakpoint DR6 reports as hit (bits 0-3); clears DR6 when one is.
+pub(super) fn x86_check_dr6<C: X86DebugRegs + ?Sized>(ctx: &mut C) -> Option<u8> {
+    let dr6 = ctx.dr6();
+    for i in 0..4u8 {
+        if dr6 & (1 << i) != 0 {
+            ctx.set_dr6(0);
+            return Some(i);
+        }
+    }
+    None
+}
+
+pub(super) fn x86_disable_enable_bit<C: X86DebugRegs + ?Sized>(ctx: &mut C, dr_index: u8) {
+    ctx.set_dr7(ctx.dr7() & !(1 << (dr_index as u64 * 2)));
+}
+
+pub(super) fn x86_enable_enable_bit<C: X86DebugRegs + ?Sized>(ctx: &mut C, dr_index: u8) {
+    ctx.set_dr7(ctx.dr7() | (1 << (dr_index as u64 * 2)));
+}
+
+/// The debug-register (and optionally control) block of one thread of an
+/// x86-family debuggee, read and written with the right API for its kind:
+/// `GetThreadContext` for a native x64 thread, `Wow64GetThreadContext` for a
+/// WOW64 thread on either host.
+pub(super) enum X86DebugCtx {
+    #[cfg(target_arch = "x86_64")]
+    Native(AlignedContext),
+    Wow64(WOW64_CONTEXT),
+}
+
+impl X86DebugCtx {
+    /// `with_control` adds the control block (EFlags/EIP) for trap-flag work.
+    pub(super) fn read(thread_handle: ThreadHandle, arch: Architecture, with_control: bool) -> Result<Self, PlatformError> {
+        match arch {
+            Architecture::X86 => {
+                let mut ctx: WOW64_CONTEXT = unsafe { std::mem::zeroed() };
+                ctx.ContextFlags = WOW64_CONTEXT_DEBUG_REGISTERS | if with_control { WOW64_CONTEXT_CONTROL } else { 0 };
+                if unsafe { Wow64GetThreadContext(thread_handle, &mut ctx) } == 0 {
+                    let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+                    return Err(PlatformError::OsError(format!(
+                        "Wow64GetThreadContext(DR) failed: {}",
+                        super::utils::error_message(err)
+                    )));
+                }
+                Ok(X86DebugCtx::Wow64(ctx))
+            }
+            #[cfg(target_arch = "x86_64")]
+            Architecture::X64 => {
+                let mut aligned = AlignedContext { context: unsafe { std::mem::zeroed() } };
+                aligned.context.ContextFlags = CONTEXT_DEBUG_REGISTERS_AMD64
+                    | if with_control { windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64 } else { 0 };
+                if unsafe { GetThreadContext(thread_handle, &mut aligned.context) } == 0 {
+                    let err = unsafe { GetLastError() };
+                    return Err(PlatformError::OsError(format!(
+                        "GetThreadContext(DR) failed: {}",
+                        utils::error_message(err)
+                    )));
+                }
+                Ok(X86DebugCtx::Native(aligned))
+            }
+            _ => Err(PlatformError::NotImplemented),
+        }
+    }
+
+    pub(super) fn write(&self, thread_handle: ThreadHandle) -> Result<(), PlatformError> {
+        match self {
+            X86DebugCtx::Wow64(ctx) => {
+                if unsafe { Wow64SetThreadContext(thread_handle, ctx) } == 0 {
+                    let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+                    return Err(PlatformError::OsError(format!(
+                        "Wow64SetThreadContext(DR) failed: {}",
+                        super::utils::error_message(err)
+                    )));
+                }
+                Ok(())
+            }
+            #[cfg(target_arch = "x86_64")]
+            X86DebugCtx::Native(aligned) => {
+                if unsafe { SetThreadContext(thread_handle, &aligned.context) } == 0 {
+                    let err = unsafe { GetLastError() };
+                    return Err(PlatformError::OsError(format!(
+                        "SetThreadContext(DR) failed: {}",
+                        utils::error_message(err)
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn regs(&mut self) -> &mut dyn X86DebugRegs {
+        match self {
+            X86DebugCtx::Wow64(ctx) => ctx,
+            #[cfg(target_arch = "x86_64")]
+            X86DebugCtx::Native(aligned) => &mut aligned.context,
+        }
+    }
+
+    pub(super) fn set_bp(&mut self, dr_index: u8, address: u64, bp_type: HardwareBreakpointType, size: HardwareBreakpointSize) {
+        x86_set_hw_bp(self.regs(), dr_index, address, bp_type, size);
+    }
+    pub(super) fn clear_bp(&mut self, dr_index: u8) { x86_clear_hw_bp(self.regs(), dr_index); }
+    pub(super) fn check_dr6(&mut self) -> Option<u8> { x86_check_dr6(self.regs()) }
+    pub(super) fn enable_bit(&mut self, dr_index: u8) { x86_enable_enable_bit(self.regs(), dr_index); }
+    pub(super) fn disable_bit(&mut self, dr_index: u8) { x86_disable_enable_bit(self.regs(), dr_index); }
+    pub(super) fn set_dr6(&mut self, value: u64) { self.regs().set_dr6(value); }
+    pub(super) fn pc(&mut self) -> u64 { self.regs().pc() }
+    pub(super) fn set_trap_flag(&mut self, on: bool) { self.regs().set_trap_flag(on); }
+}
+
+// ---- Thread-level operations dispatched on the debuggee's architecture ----
+
+/// Program one breakpoint on one thread.
+pub(super) fn apply_single_hw_bp_to_thread_for(
+    arch: Architecture,
+    thread_handle: ThreadHandle,
+    dr_index: u8,
+    address: u64,
+    bp_type: HardwareBreakpointType,
+    size: HardwareBreakpointSize,
+) -> Result<(), PlatformError> {
+    match arch {
+        Architecture::X86 => {
+            let mut ctx = X86DebugCtx::read(thread_handle, arch, false)?;
+            ctx.set_bp(dr_index, address, bp_type, size);
+            trace!("apply_single_hw_bp (wow64): dr{}=0x{:X}", dr_index, address);
+            ctx.write(thread_handle)
+        }
+        _ => apply_single_hw_bp_to_thread(thread_handle, dr_index, address, bp_type, size),
+    }
+}
+
+/// Clear one breakpoint from one thread.
+pub(super) fn clear_hw_bp_from_thread_for(
+    arch: Architecture,
+    thread_handle: ThreadHandle,
+    dr_index: u8,
+    bp_type: HardwareBreakpointType,
+) -> Result<(), PlatformError> {
+    match arch {
+        Architecture::X86 => {
+            let mut ctx = X86DebugCtx::read(thread_handle, arch, false)?;
+            ctx.clear_bp(dr_index);
+            ctx.write(thread_handle)
+        }
+        _ => clear_hw_bp_from_thread(thread_handle, dr_index, bp_type),
+    }
+}
+
+/// Program every active breakpoint on one thread (new thread, re-arm).
+pub(super) fn apply_all_hw_bps_to_thread_for(
+    arch: Architecture,
+    thread_handle: ThreadHandle,
+    bps: &[InternalHardwareBreakpoint],
+) -> Result<(), PlatformError> {
+    match arch {
+        Architecture::X86 => {
+            if bps.is_empty() {
+                return Ok(());
+            }
+            let mut ctx = X86DebugCtx::read(thread_handle, arch, false)?;
+            for bp in bps {
+                ctx.set_bp(bp.dr_index, bp.address, bp.bp_type, bp.size);
+            }
+            ctx.write(thread_handle)
+        }
+        _ => apply_all_hw_bps_to_thread(thread_handle, bps),
+    }
+}
+
+/// Re-assert the debug registers only (never the control block), so a pending
+/// trap flag is left alone.
+pub(super) fn apply_hw_bps_dr_only_for(
+    arch: Architecture,
+    thread_handle: ThreadHandle,
+    bps: &[InternalHardwareBreakpoint],
+) -> Result<(), PlatformError> {
+    match arch {
+        // The WOW64 read above is already DR-only.
+        Architecture::X86 => apply_all_hw_bps_to_thread_for(arch, thread_handle, bps),
+        #[cfg(target_arch = "x86_64")]
+        Architecture::X64 => apply_hw_bps_dr_only(thread_handle, bps),
+        #[cfg(target_arch = "aarch64")]
+        Architecture::Arm64 => apply_hw_bps_dr_only(thread_handle, bps),
+        #[allow(unreachable_patterns)]
+        _ => Err(PlatformError::NotImplemented),
+    }
+}
 
 #[cfg(target_arch = "x86_64")]
 use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -14,31 +324,6 @@ use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
 #[cfg(target_arch = "x86_64")]
 use super::{AlignedContext, utils};
 
-/// Encode the DR7 condition bits for a hardware breakpoint type.
-/// Returns the 2-bit condition value:
-///   00 = execute, 01 = write, 11 = read/write
-#[cfg(target_arch = "x86_64")]
-fn bp_type_to_condition(bp_type: HardwareBreakpointType) -> u64 {
-    match bp_type {
-        HardwareBreakpointType::Execute => 0b00,
-        HardwareBreakpointType::Write => 0b01,
-        HardwareBreakpointType::ReadWrite => 0b11,
-    }
-}
-
-/// Encode the DR7 length bits for a hardware breakpoint size.
-/// Returns the 2-bit length value:
-///   00 = 1 byte, 01 = 2 bytes, 11 = 4 bytes, 10 = 8 bytes
-#[cfg(target_arch = "x86_64")]
-fn bp_size_to_length(size: HardwareBreakpointSize) -> u64 {
-    match size {
-        HardwareBreakpointSize::Byte1 => 0b00,
-        HardwareBreakpointSize::Byte2 => 0b01,
-        HardwareBreakpointSize::Byte4 => 0b11,
-        HardwareBreakpointSize::Byte8 => 0b10,
-    }
-}
-
 /// Set a hardware breakpoint in a CONTEXT structure.
 /// Sets the appropriate DR0-3 address register and configures DR7 enable/condition/length bits.
 #[cfg(target_arch = "x86_64")]
@@ -49,99 +334,16 @@ pub(super) fn set_hw_bp_in_context(
     bp_type: HardwareBreakpointType,
     size: HardwareBreakpointSize,
 ) {
-    // Set the address in DR0-DR3
-    match dr_index {
-        0 => ctx.Dr0 = address,
-        1 => ctx.Dr1 = address,
-        2 => ctx.Dr2 = address,
-        3 => ctx.Dr3 = address,
-        _ => return,
-    }
-
-    let condition = bp_type_to_condition(bp_type);
-    // Execute breakpoints must use 1-byte size
-    let length = if bp_type == HardwareBreakpointType::Execute {
-        0b00
-    } else {
-        bp_size_to_length(size)
-    };
-
-    // DR7 bit layout per debug register:
-    //   Local enable: bit (dr_index * 2)
-    //   Condition (RW): bits (16 + dr_index * 4) to (17 + dr_index * 4)
-    //   Length (LEN):   bits (18 + dr_index * 4) to (19 + dr_index * 4)
-    let idx = dr_index as u64;
-
-    // Set local enable bit
-    ctx.Dr7 |= 1 << (idx * 2);
-
-    // Clear and set condition bits
-    let cond_shift = 16 + idx * 4;
-    ctx.Dr7 &= !(0b11 << cond_shift);
-    ctx.Dr7 |= condition << cond_shift;
-
-    // Clear and set length bits
-    let len_shift = 18 + idx * 4;
-    ctx.Dr7 &= !(0b11 << len_shift);
-    ctx.Dr7 |= length << len_shift;
+    x86_set_hw_bp(ctx, dr_index, address, bp_type, size);
 }
 
 /// Clear a hardware breakpoint from a CONTEXT structure.
 /// Zeros the DR address register and clears DR7 enable/condition/length bits.
 #[cfg(target_arch = "x86_64")]
 pub(super) fn clear_hw_bp_in_context(ctx: &mut CONTEXT, dr_index: u8) {
-    // Zero the address register
-    match dr_index {
-        0 => ctx.Dr0 = 0,
-        1 => ctx.Dr1 = 0,
-        2 => ctx.Dr2 = 0,
-        3 => ctx.Dr3 = 0,
-        _ => return,
-    }
-
-    let idx = dr_index as u64;
-
-    // Clear local enable bit
-    ctx.Dr7 &= !(1 << (idx * 2));
-
-    // Clear condition bits
-    let cond_shift = 16 + idx * 4;
-    ctx.Dr7 &= !(0b11 << cond_shift);
-
-    // Clear length bits
-    let len_shift = 18 + idx * 4;
-    ctx.Dr7 &= !(0b11 << len_shift);
+    x86_clear_hw_bp(ctx, dr_index);
 }
 
-/// Check DR6 status register for which hardware breakpoint triggered.
-/// Returns the DR index (0-3) if a breakpoint was hit, and clears DR6.
-#[cfg(target_arch = "x86_64")]
-pub(super) fn check_dr6_for_hw_bp(ctx: &mut CONTEXT) -> Option<u8> {
-    let dr6 = ctx.Dr6;
-    // Bits 0-3 of DR6 indicate which breakpoint triggered
-    for i in 0..4u8 {
-        if dr6 & (1 << i) != 0 {
-            // Clear DR6 (write 0 to the hit bits; DR6 bits 0-3 are cleared by writing 0)
-            ctx.Dr6 = 0;
-            return Some(i);
-        }
-    }
-    None
-}
-
-/// Disable the local enable bit for a hardware breakpoint in DR7.
-#[cfg(target_arch = "x86_64")]
-pub(super) fn disable_hw_bp_enable(ctx: &mut CONTEXT, dr_index: u8) {
-    let idx = dr_index as u64;
-    ctx.Dr7 &= !(1 << (idx * 2));
-}
-
-/// Enable the local enable bit for a hardware breakpoint in DR7.
-#[cfg(target_arch = "x86_64")]
-pub(super) fn enable_hw_bp_enable(ctx: &mut CONTEXT, dr_index: u8) {
-    let idx = dr_index as u64;
-    ctx.Dr7 |= 1 << (idx * 2);
-}
 
 /// Apply a single hardware breakpoint to a thread by getting/setting its context.
 /// Uses CONTEXT_DEBUG_REGISTERS only — we only need DR0-DR7, and CONTEXT_ALL

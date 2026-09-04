@@ -119,6 +119,56 @@ fn compile_test_program_with(
     }
 }
 
+/// Compile a test program as a 32-bit x86 image (`<name>32.exe`) for the WOW64
+/// tests, using the cross `cl.exe` (`Host{X64,ARM64}\x86`) that the `cc` crate
+/// locates for the `i686-pc-windows-msvc` target — the tool's environment
+/// carries the x86 INCLUDE/LIB paths, so no vcvars shell is needed. Skips
+/// (warning, not error) when no x86 toolchain is installed.
+fn compile_test_program_x86(manifest_dir: &str, out_dir: &str, name: &str) -> bool {
+    let src = Path::new(manifest_dir).join("tests").join("test_programs").join(format!("{}.c", name));
+    if !src.exists() {
+        println!("cargo:warning=Test program source not found: {:?}", src);
+        return false;
+    }
+    let stem = format!("{}32", name);
+    let out_exe = Path::new(out_dir).join(format!("{}.exe", stem));
+    let out_pdb = Path::new(out_dir).join(format!("{}.pdb", stem));
+    let out_obj = Path::new(out_dir).join(format!("{}.obj", stem));
+    println!("cargo:rerun-if-changed=tests/test_programs/{}.c", name);
+    let _ = std::fs::remove_file(&out_exe);
+    let _ = std::fs::remove_file(&out_pdb);
+    let _ = std::fs::remove_file(&out_obj);
+
+    let Some(tool) = cc::windows_registry::find_tool("i686-pc-windows-msvc", "cl.exe") else {
+        println!("cargo:warning=No x86 cl.exe for i686-pc-windows-msvc; skipping 32-bit fixture {}", stem);
+        return false;
+    };
+    let mut cmd = tool.to_command();
+    cmd.args(&[
+        "/nologo", "/Od", "/Zi", "/W4",
+        &format!("/Fe:{}", out_exe.to_str().unwrap()),
+        &format!("/Fd:{}", out_pdb.to_str().unwrap()),
+        &format!("/Fo:{}", out_obj.to_str().unwrap()),
+        src.to_str().unwrap(),
+        "/link", "/DEBUG",
+    ]);
+    match cmd.output() {
+        Ok(output) if output.status.success() => {
+            println!("cargo:warning=Compiled 32-bit test program: {}", out_exe.display());
+            true
+        }
+        Ok(output) => {
+            println!("cargo:warning=Failed to compile 32-bit {}: {}{}", stem,
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            false
+        }
+        Err(e) => {
+            println!("cargo:warning=Failed to run x86 cl.exe for {}: {}", stem, e);
+            false
+        }
+    }
+}
+
 fn main() {
     // keystone-engine builds with /MTd (static debug CRT) while Rust uses /MD (dynamic CRT).
     // Suppress the conflicting default lib and link ucrtd to provide _CrtDbgReport symbols.
@@ -160,7 +210,6 @@ fn main() {
         let _ = compile_test_program(&manifest_dir, &out_dir, "freeze_chain_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "pointer_bench_target", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "parent_child_test", None);
-        let _ = compile_test_program(&manifest_dir, &out_dir, "veh_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "anti_debug_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "bp_race_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "cov_race_test", None);
@@ -170,5 +219,7 @@ fn main() {
         // DLLs beside it. A /MD build would fail to start with 0xC0000135.
         let _ = compile_test_program_with(&manifest_dir, &out_dir, "spawn_chain", None, &["/MT"]);
         let _ = compile_test_program_with(&manifest_dir, &out_dir, "open_remote", None, &["/MT"]);
+        // 32-bit (WOW64) debuggee for the wow64 tests: wow64_test32.exe.
+        let _ = compile_test_program_x86(&manifest_dir, &out_dir, "wow64_test");
     }
 }

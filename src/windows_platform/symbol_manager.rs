@@ -788,7 +788,9 @@ impl SymbolManager {
                             }
                         }
                     }
-                    break; // We found the target module, no need to continue
+                    // Don't stop at the first module of that name: a WOW64 process
+                    // maps two `ntdll.dll`s (System32 and SysWOW64), and the caller
+                    // picks the one whose address space matches the target.
                 }
             }
         } else {

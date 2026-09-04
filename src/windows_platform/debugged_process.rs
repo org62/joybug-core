@@ -95,6 +95,10 @@ pub(crate) struct DebuggedProcess {
     persistent_bp_tid_filters: std::collections::HashMap<u64, Option<u32>>,
     /// Track whether this process has hit its initial breakpoint
     has_hit_initial_breakpoint: bool,
+    /// Created by our `CreateProcess` (or a debugged child of one), as opposed to
+    /// attached/opened. Only a launched WOW64 process delivers the 64-bit
+    /// loader break *and* the 32-bit one; an attach break-in is native only.
+    created_by_launch: bool,
     /// Track active stepping operations by (tid)
     active_single_steps: std::collections::HashMap<u32, super::StepState>,
     /// Track step-over breakpoints by address
@@ -174,6 +178,7 @@ impl DebuggedProcess {
             persistent_breakpoints: std::collections::HashMap::new(),
             persistent_bp_tid_filters: std::collections::HashMap::new(),
             has_hit_initial_breakpoint: false,
+            created_by_launch: false,
             active_single_steps: std::collections::HashMap::new(),
             step_over_breakpoints: std::collections::HashMap::new(),
             step_out_breakpoints: std::collections::HashMap::new(),
@@ -468,7 +473,7 @@ impl DebuggedProcess {
     /// Return the architecture-appropriate bytes for a breakpoint instruction.
     pub(super) fn breakpoint_instruction_bytes(&self) -> Vec<u8> {
         match self.architecture {
-            Architecture::X64 => vec![0xCC],
+            Architecture::X86 | Architecture::X64 => vec![0xCC],
             Architecture::Arm64 => vec![0x00, 0x00, 0x3e, 0xD4],
         }
     }
@@ -513,7 +518,7 @@ impl DebuggedProcess {
                 };
                 arm64_word_is_svc(word)
             }
-            Architecture::X64 => {
+            Architecture::X86 | Architecture::X64 => {
                 // Only the first byte is saved (0xCC overwrote exactly one byte).
                 if let Some(original) = saved {
                     if !matches!(original.first(), Some(0x0F | 0xCD)) {
@@ -549,6 +554,14 @@ impl DebuggedProcess {
     /// Query whether the initial breakpoint was already observed.
     pub(super) fn has_initial_breakpoint_been_hit(&self) -> bool {
         self.has_hit_initial_breakpoint
+    }
+
+    pub(super) fn set_created_by_launch(&mut self, launched: bool) {
+        self.created_by_launch = launched;
+    }
+
+    pub(super) fn created_by_launch(&self) -> bool {
+        self.created_by_launch
     }
 
     /// Remove a software breakpoint, persistent or single-shot, restoring the
@@ -831,7 +844,7 @@ impl DebuggedProcess {
     /// within the relevant bank, or None if that bank is full.
     pub(super) fn find_free_debug_register(&self, bp_type: HardwareBreakpointType) -> Option<u8> {
         match self.architecture {
-            Architecture::X64 => {
+            Architecture::X86 | Architecture::X64 => {
                 let used: std::collections::HashSet<u8> =
                     self.hardware_breakpoints.iter().map(|bp| bp.dr_index).collect();
                 (0..4u8).find(|i| !used.contains(i))
@@ -865,7 +878,6 @@ impl DebuggedProcess {
     }
 
     /// Find a hardware breakpoint by DR index.
-    #[cfg(target_arch = "x86_64")]
     pub(super) fn find_hardware_breakpoint_by_dr_index(&self, dr_index: u8) -> Option<&InternalHardwareBreakpoint> {
         self.hardware_breakpoints.iter().find(|bp| bp.dr_index == dr_index)
     }

@@ -6,8 +6,6 @@
 use std::sync::{Arc, RwLock};
 
 use unicorn_engine::{Unicorn, RegisterX86, RegisterARM64, UcHookId};
-
-#[cfg(target_arch = "x86_64")]
 use unicorn_engine::unicorn_const::X86Insn;
 
 use crate::interfaces::Architecture;
@@ -24,6 +22,37 @@ impl<'a> Emulator<'a> {
     pub(super) fn install_syscall_hook(&mut self) -> Result<UcHookId, EmulatorError> {
         let shared = self.shared_state.clone();
         match self.architecture {
+            // 32-bit code enters the kernel through `sysenter` / `int 2Eh`; the
+            // WOW64 gate itself (a far jmp Unicorn cannot follow) is classified
+            // at the execution loop, see `Emulator::is_x86_far_jump_at`.
+            Architecture::X86 => {
+                let shared_int = shared.clone();
+                self.emu.add_intr_hook(move |emu, intno| {
+                    let pc = emu.reg_read(RegisterX86::EIP).unwrap_or(0);
+                    let mut state = shared_int.write().unwrap();
+                    if intno == 0x2E {
+                        state.syscall_address = Some(pc);
+                    } else {
+                        tracing::warn!("Unhandled x86 interrupt: intno={} at EIP=0x{:X}", intno, pc);
+                        state.exception_intno = Some(intno);
+                    }
+                    state.stop_requested = true;
+                    drop(state);
+                    emu.emu_stop().ok();
+                }).map_err(|e| EmulatorError::UnicornError(format!("intr hook failed: {:?}", e)))?;
+                self.emu.add_insn_sys_hook(
+                    X86Insn::SYSENTER,
+                    0, u64::MAX,
+                    move |emu| {
+                        let pc = emu.reg_read(RegisterX86::EIP).unwrap_or(0);
+                        let mut state = shared.write().unwrap();
+                        state.syscall_address = Some(pc);
+                        state.stop_requested = true;
+                        drop(state);
+                        emu.emu_stop().ok();
+                    }
+                ).map_err(|e| EmulatorError::UnicornError(format!("sysenter hook failed: {:?}", e)))
+            }
             Architecture::X64 => {
                 #[cfg(target_arch = "x86_64")]
                 {
@@ -141,7 +170,7 @@ impl<'a> Emulator<'a> {
         let step = state.instruction_trace.len();
 
         // Capture full register snapshot
-        let snapshot = snapshot_from_unicorn(emu, addr);
+        let snapshot = snapshot_from_unicorn(emu, arch, addr);
         state.register_trace.push(snapshot.clone());
 
         tracing::trace!("step {} RIP=0x{:X} RFLAGS=0x{:X} size={}", step, addr,

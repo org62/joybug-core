@@ -6,6 +6,7 @@
 use unicorn_engine::unicorn_const::uc_error;
 use unicorn_engine::RegisterX86;
 
+use crate::interfaces::Architecture;
 use crate::interfaces::PlatformAPI;
 use crate::protocol::{EmulationMode, MemoryAccess, MemoryAccessType};
 
@@ -496,6 +497,13 @@ impl<'a> Emulator<'a> {
                         continue;
                     }
 
+                    // WOW64's user→kernel transition is a far `jmp` into the
+                    // 64-bit side, which Unicorn (no GDT) faults on: for a
+                    // 32-bit target that is the syscall stop.
+                    if self.is_x86_far_jump_at(pc_before) {
+                        stop_reason = StopReason::Syscall { address: pc_before };
+                        break;
+                    }
                     // PC didn't move - this is a real exception
                     self.log_exception_details(platform, pc_before);
                     stop_reason = StopReason::Error("EXCEPTION".into());
@@ -554,6 +562,14 @@ impl<'a> Emulator<'a> {
             total_pages,
         );
         self.build_result(instructions_executed, stop_reason, emulation_time_us, pages_before, stats_text, memory_reads)
+    }
+
+    /// Whether the instruction at `pc` is a far `jmp` (`EA`) in a 32-bit
+    /// target — `wow64cpu!KiFastSystemCall2` / xtajit's gate, reached through
+    /// `call [ntdll!Wow64Transition]` by every 32-bit syscall stub.
+    fn is_x86_far_jump_at(&self, pc: u64) -> bool {
+        self.architecture == Architecture::X86
+            && self.emu.mem_read_as_vec(pc, 1).map(|b| b[0] == 0xEA).unwrap_or(false)
     }
 
     /// Log detailed diagnostics for a CPU exception (PC didn't move).

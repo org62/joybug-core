@@ -10,6 +10,19 @@ use joybug_core::protocol_io::DebugSession;
 #[allow(dead_code)]
 /// Searches OUT_DIR first, then falls back to scanning target/{debug,release}/build/*/out/.
 pub fn get_test_program_path(name: &str) -> String {
+    try_get_test_program_path(name).unwrap_or_else(|| {
+        panic!(
+            "Could not find {}.exe. Make sure to build the project first.",
+            name
+        )
+    })
+}
+
+/// [`get_test_program_path`] that returns `None` instead of panicking — for
+/// fixtures build.rs may legitimately skip (the 32-bit `*32.exe` programs
+/// need an x86 cross toolchain).
+#[allow(dead_code)]
+pub fn try_get_test_program_path(name: &str) -> Option<String> {
     let out_dir = std::env::var("OUT_DIR").unwrap_or_else(|_| {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         format!("{}\\target\\debug\\build", manifest_dir)
@@ -17,7 +30,7 @@ pub fn get_test_program_path(name: &str) -> String {
 
     let expected_path = format!("{}\\{}.exe", out_dir, name);
     if std::path::Path::new(&expected_path).exists() {
-        return expected_path;
+        return Some(expected_path);
     }
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -28,17 +41,13 @@ pub fn get_test_program_path(name: &str) -> String {
                 if entry.path().is_dir() {
                     let candidate = entry.path().join("out").join(format!("{}.exe", name));
                     if candidate.exists() {
-                        return candidate.to_string_lossy().to_string();
+                        return Some(candidate.to_string_lossy().to_string());
                     }
                 }
             }
         }
     }
-
-    panic!(
-        "Could not find {}.exe. Make sure to build the project first.",
-        name
-    );
+    None
 }
 
 /// Case-insensitive file-name match: does `image_name`'s basename equal `target`?
@@ -123,7 +132,7 @@ pub fn print_disassembly_and_callstack<T>(
     tid: u32,
     address: u64,
 ) -> anyhow::Result<()> {
-    let arch = Architecture::from_native();
+    let arch = session.get_process_architecture(pid).unwrap_or_else(|_| Architecture::from_native());
     let disassembly = session.disassemble_memory(pid, address, 10, arch)?;
     println!("{}", disassembly.format_disassembly());
     let call_stack = session.get_call_stack(pid, tid)?;

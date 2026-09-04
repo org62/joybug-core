@@ -390,6 +390,10 @@ end
 local mods = dbg:list_modules(pid)
 local threads = dbg:list_threads(pid)   -- { {tid=, start_address=, suspend_count=}, ... }
 local procs = dbg:list_processes()
+-- Instruction-set architecture of the debuggee: "x64", "arm64", or "x86" for a
+-- 32-bit (WOW64) process. Registers of an "x86" target come back as
+-- eax/ebx/.../eip/eflags; pointers are 4 bytes.
+local arch = dbg:arch(pid)
 
 -- Everything the Handles window shows (kernel handles, windows, TCP
 -- connections, token privileges) in one call.

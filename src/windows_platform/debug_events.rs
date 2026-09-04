@@ -4,7 +4,8 @@ use crate::protocol::ModuleInfo;
 #[cfg(target_arch = "aarch64")]
 use super::debugged_process::InternalHardwareBreakpoint;
 use tracing::{debug, error, trace, warn};
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, FALSE, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, DBG_REPLY_LATER, DUPLICATE_SAME_ACCESS, HANDLE, DuplicateHandle, NTSTATUS, STATUS_SINGLE_STEP, MAX_PATH};
+use crate::interfaces::{Architecture, PlatformAPI};
+use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, FALSE, DBG_CONTINUE, DBG_EXCEPTION_NOT_HANDLED, DBG_REPLY_LATER, DUPLICATE_SAME_ACCESS, HANDLE, DuplicateHandle, NTSTATUS, STATUS_SINGLE_STEP, STATUS_WX86_BREAKPOINT, STATUS_WX86_SINGLE_STEP, EXCEPTION_BREAKPOINT, MAX_PATH};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, INFINITE};
 use windows_sys::Win32::System::Diagnostics::Debug::{
     ContinueDebugEvent, WaitForDebugEvent, DEBUG_EVENT, EXCEPTION_DEBUG_EVENT,
@@ -120,6 +121,8 @@ pub(super) fn handle_create_process_event(
             unsafe { CloseHandle(dup_handle); }
             return Err(e);
         }
+        // A debugged child is created (not attached) like its parent.
+        platform.get_process_mut(pid)?.set_created_by_launch(true);
     }
 
     // Get the process for this PID to use its handle and clear its managers
@@ -253,7 +256,7 @@ pub(super) fn handle_create_process_event(
         // Apply active hardware breakpoints to the initial thread
         let active_hw_bps = process.active_hardware_breakpoints();
         if !active_hw_bps.is_empty() {
-            if let Err(e) = super::hardware_breakpoints::apply_all_hw_bps_to_thread(thread_handle, &active_hw_bps) {
+            if let Err(e) = super::hardware_breakpoints::apply_all_hw_bps_to_thread_for(process.architecture(), thread_handle, &active_hw_bps) {
                 warn!(tid = debug_event.dwThreadId, error = %e, "Failed to apply HW breakpoints to initial thread");
             }
         }
@@ -334,21 +337,13 @@ fn arm64_begin_step_over_hw_bp(
     pid: u32,
     tid: u32,
 ) -> Result<(), PlatformError> {
-    let mut context = {
-        let process = platform.get_process(pid)?;
-        match super::thread_context::get_thread_context(process, pid, tid)? {
-            crate::protocol::ThreadContext::Win32RawContext(ctx) => ctx,
-        }
-    };
-    // Disable all breakpoint and watchpoint registers for the step.
-    super::hardware_breakpoints::clear_all_hw_bp_in_context(&mut context);
-    stepper::set_single_step_flag_native(&mut context)?;
-    super::thread_context::set_thread_context(
-        platform.get_process(pid)?,
-        pid,
-        tid,
-        crate::protocol::ThreadContext::Win32RawContext(context),
-    )?;
+    super::thread_context::modify_thread_context(platform.get_process(pid)?, pid, tid, |context| {
+        // Disable all breakpoint and watchpoint registers for the step.
+        let native = context.as_native_mut().ok_or(PlatformError::NotImplemented)?;
+        super::hardware_breakpoints::clear_all_hw_bp_in_context(native);
+        context.set_single_step(true);
+        Ok(())
+    })?;
     // dr_index is unused on ARM64 (we re-arm all active bps); pass 0 as a marker.
     platform.get_process_mut(pid)?.schedule_hw_bp_rearm(tid, 0);
     Ok(())
@@ -366,17 +361,29 @@ fn reset_ip_after_breakpoint(
     address: u64,
     single_step: bool,
 ) -> Result<(), PlatformError> {
-    let mut context = match super::thread_context::get_thread_context(process, pid, tid)? {
-        crate::protocol::ThreadContext::Win32RawContext(ctx) => ctx,
-    };
-    #[cfg(target_arch = "x86_64")]
-    { context.Rip = address; }
-    #[cfg(target_arch = "aarch64")]
-    { context.Pc = address; }
-    if single_step {
-        stepper::set_single_step_flag_native(&mut context)?;
+    super::thread_context::modify_thread_context(process, pid, tid, |context| {
+        context.set_pc(address);
+        if single_step {
+            context.set_single_step(true);
+        }
+        Ok(())
+    })
+}
+
+/// The exception code a WOW64 process's 32-bit side raises for a breakpoint or
+/// a trap-flag step is the `STATUS_WX86_*` twin of the native code; fold them
+/// so every breakpoint/step path below sees one code. Native codes from the
+/// 64-bit side of the same process (the loader's first break, an injected
+/// break-in thread) pass through unchanged and are told apart by `raw_code`.
+fn normalize_exception_code(raw_code: NTSTATUS, arch: Architecture) -> NTSTATUS {
+    if arch != Architecture::X86 {
+        return raw_code;
     }
-    super::thread_context::set_thread_context(process, pid, tid, crate::protocol::ThreadContext::Win32RawContext(context))
+    match raw_code {
+        STATUS_WX86_BREAKPOINT => EXCEPTION_BREAKPOINT,
+        STATUS_WX86_SINGLE_STEP => STATUS_SINGLE_STEP,
+        other => other,
+    }
 }
 
 // Handle EXCEPTION_DEBUG_EVENT in a dedicated function to keep continue_exec simpler.
@@ -389,10 +396,29 @@ pub(super) fn handle_exception_event(
     let ex_info = unsafe { debug_event.u.Exception };
     let ex_record = ex_info.ExceptionRecord;
     let process = platform.get_process_mut(pid)?;
+    let arch = process.architecture();
+    let raw_code = ex_record.ExceptionCode;
+    let code = normalize_exception_code(raw_code, arch);
 
-    if ex_record.ExceptionCode == windows_sys::Win32::Foundation::EXCEPTION_BREAKPOINT {
+    if code == EXCEPTION_BREAKPOINT {
         let address = ex_record.ExceptionAddress as u64;
-        trace!(pid = pid, tid = tid, address = %format!("0x{:X}", address), "Breakpoint event");
+        trace!(pid = pid, tid = tid, address = %format!("0x{:X}", address), raw_code = %format!("0x{:X}", raw_code as u32), "Breakpoint event");
+
+        // WOW64 launch: the first breakpoint is the 64-bit loader's, raised
+        // from native ntdll before the 32-bit side exists — its register file
+        // is not the debuggee's yet. The 32-bit ntdll raises its own
+        // STATUS_WX86_BREAKPOINT right after, and that is the stop a 32-bit
+        // debugger shows (x32dbg does the same). Attach and pause deliver a
+        // native break from an injected 64-bit thread with no WX86 follow-up,
+        // so only a process we launched skips its native first break.
+        if arch == Architecture::X86
+            && raw_code == EXCEPTION_BREAKPOINT
+            && process.created_by_launch()
+            && !process.has_initial_breakpoint_been_hit()
+        {
+            debug!(pid, tid, address = %format!("0x{:X}", address), "WOW64: skipping the 64-bit loader breakpoint; waiting for the 32-bit one");
+            return Ok(None);
+        }
 
         // ARM64 hardware breakpoints and watchpoints are both delivered as
         // EXCEPTION_BREAKPOINT (there is no DR6-equivalent). Distinguish them:
@@ -403,7 +429,7 @@ pub(super) fn handle_exception_event(
         // In both cases the PC stays at the faulting instruction, so we must
         // single-step past it (with the registers disabled) and re-arm.
         #[cfg(target_arch = "aarch64")]
-        {
+        if arch == Architecture::Arm64 {
             let hw_hit: Option<InternalHardwareBreakpoint> = {
                 let wp = if ex_record.NumberParameters >= 2 {
                     let data_addr = ex_record.ExceptionInformation[1] as u64;
@@ -589,20 +615,54 @@ pub(super) fn handle_exception_event(
         }
     }
 
-    if ex_record.ExceptionCode == STATUS_SINGLE_STEP {
+    if code == STATUS_SINGLE_STEP {
         trace!(
             pid = pid,
             tid = tid,
             address = %format!("0x{:X}", ex_record.ExceptionAddress as u64),
             first_chance = ex_info.dwFirstChance == 1,
+            raw_code = %format!("0x{:X}", raw_code as u32),
             "Single-step event"
         );
+
+        // A *native* trap in a WOW64 process: a 32-bit trap flag carried
+        // through the 32→64 gate into wow64cpu/xtajit. The stepper avoids the
+        // gate (`x86_far_jump_return`), so this is the safety net: clear the
+        // native flag (the WOW64 context cannot) and, if a step was pending,
+        // finish it at the 32-bit return address the gate will come back to.
+        if arch == Architecture::X86 && raw_code == STATUS_SINGLE_STEP {
+            if let Err(e) = super::thread_context::clear_native_single_step(process, tid) {
+                error!("Failed to clear native single-step flag in WOW64 process: {}", e);
+            }
+            if let Some(step_state) = process.take_active_single_step(tid) {
+                // Right after the far jump the 64-bit side still runs on the
+                // 32-bit stack, whose top is the syscall stub's return address.
+                let sp = process
+                    .thread_manager()
+                    .get_thread_handle(tid)
+                    .and_then(|h| super::thread_context::get_native_context(h).ok())
+                    .map(|c| crate::protocol::ThreadContext::Win32RawContext(c).sp());
+                let return_address = sp
+                    .and_then(|sp| super::memory::read_memory_internal(process.handle(), sp, 4).ok())
+                    .and_then(|b| b.first_chunk::<4>().map(|c| u32::from_le_bytes(*c) as u64))
+                    .filter(|&ra| ra != 0 && process.module_manager().list_modules().iter().any(|m| ra >= m.base && ra < m.base + m.size.unwrap_or(0)));
+                match return_address {
+                    Some(ra) => {
+                        warn!(pid, tid, kind = ?step_state.kind, return_address = %format!("0x{:X}", ra), "WOW64 gate reached with a pending step; running to the 32-bit return address");
+                        platform.set_single_shot_breakpoint(pid, ra)?;
+                        platform.get_process_mut(pid)?.insert_step_over_breakpoint(ra, tid, step_state.kind);
+                    }
+                    None => warn!(pid, tid, kind = ?step_state.kind, "WOW64 gate reached with a pending step and no recoverable return address; the step is dropped"),
+                }
+            }
+            return Ok(None);
+        }
 
         // Handle SW breakpoint re-arming first
         // Return None so the server auto-continues without exposing this internal event to the client
         if let Some((rearm_addr, _is_single_shot)) = process.take_pending_rearm_for_tid(tid) {
             trace!(pid = pid, tid = tid, rearm_addr = %format!("0x{:X}", rearm_addr), "SS used for persistent breakpoint re-arm");
-            if let Err(e) = stepper::clear_single_step_flag_native2(platform, pid, tid) { error!("Failed to clear single-step flag: {}", e); }
+            if let Err(e) = stepper::clear_single_step_flag(platform, pid, tid) { error!("Failed to clear single-step flag: {}", e); }
             {
                 let process = platform.get_process_mut(pid)?;
                 // This thread finished stepping over its breakpoint: re-arm the
@@ -619,27 +679,27 @@ pub(super) fn handle_exception_event(
         // Return None so the server auto-continues without exposing this internal event to the client
         if let Some(rearm_dr_index) = process.take_pending_hw_bp_rearm(tid) {
             trace!(pid, tid, rearm_dr_index, "SS used for hardware breakpoint re-arm");
-            // Re-enable the HW BP and clear the trap flag
-            #[cfg(target_arch = "x86_64")]
-            {
+            // Re-enable the HW BP and clear the trap flag (x64 native or WOW64).
+            if arch.is_x86_family() {
                 let thread_handle = process.thread_manager().get_thread_handle(tid)
                     .ok_or_else(|| PlatformError::OsError(format!("No handle for thread {}", tid)))?;
-                let mut aligned = super::AlignedContext { context: unsafe { std::mem::zeroed() } };
-                aligned.context.ContextFlags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_DEBUG_REGISTERS_AMD64
-                    | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64;
-                if unsafe { windows_sys::Win32::System::Diagnostics::Debug::GetThreadContext(thread_handle, &mut aligned.context) } != 0 {
-                    super::hardware_breakpoints::enable_hw_bp_enable(&mut aligned.context, rearm_dr_index);
-                    // Clear trap flag
-                    aligned.context.EFlags &= !(0x100u32);
-                    let _ = unsafe { windows_sys::Win32::System::Diagnostics::Debug::SetThreadContext(thread_handle, &aligned.context) };
+                match super::hardware_breakpoints::X86DebugCtx::read(thread_handle, arch, true) {
+                    Ok(mut dctx) => {
+                        dctx.enable_bit(rearm_dr_index);
+                        dctx.set_trap_flag(false);
+                        if let Err(e) = dctx.write(thread_handle) {
+                            error!("Failed to re-arm hardware breakpoint: {}", e);
+                        }
+                    }
+                    Err(e) => error!("Failed to read debug registers for re-arm: {}", e),
                 }
             }
             // ARM64: we disabled all HW debug registers before the step. Clear the
             // single-step (SS) flag and re-arm every active breakpoint/watchpoint.
             #[cfg(target_arch = "aarch64")]
-            {
+            if arch == Architecture::Arm64 {
                 let _ = rearm_dr_index;
-                if let Err(e) = stepper::clear_single_step_flag_native2(platform, pid, tid) {
+                if let Err(e) = stepper::clear_single_step_flag(platform, pid, tid) {
                     error!("Failed to clear single-step flag during HW BP re-arm: {}", e);
                 }
                 let proc = platform.get_process(pid)?;
@@ -660,28 +720,27 @@ pub(super) fn handle_exception_event(
             let rearm_addr = ex_record.ExceptionAddress as u64;
             // Clear single-step flag, and if there's a deferred HW BP rearm, combine both
             // into one context operation to avoid a redundant GetThreadContext/SetThreadContext.
-            #[cfg(target_arch = "x86_64")]
-            if let Some(rearm_dr_index) = step_state.deferred_hw_bp_rearm {
-                trace!(pid, tid, rearm_dr_index, "Re-arming deferred hardware breakpoint after step completion");
-                let process = platform.get_process(pid)?;
-                let thread_handle = process.thread_manager().get_thread_handle(tid)
-                    .ok_or_else(|| PlatformError::OsError(format!("No handle for thread {}", tid)))?;
-                let mut aligned = super::AlignedContext { context: unsafe { std::mem::zeroed() } };
-                aligned.context.ContextFlags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_DEBUG_REGISTERS_AMD64
-                    | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64;
-                if unsafe { windows_sys::Win32::System::Diagnostics::Debug::GetThreadContext(thread_handle, &mut aligned.context) } != 0 {
-                    // Clear trap flag
-                    aligned.context.EFlags &= !(0x100u32);
-                    super::hardware_breakpoints::enable_hw_bp_enable(&mut aligned.context, rearm_dr_index);
-                    aligned.context.Dr6 = 0;
-                    let _ = unsafe { windows_sys::Win32::System::Diagnostics::Debug::SetThreadContext(thread_handle, &aligned.context) };
+            match step_state.deferred_hw_bp_rearm.filter(|_| arch.is_x86_family()) {
+                Some(rearm_dr_index) => {
+                    trace!(pid, tid, rearm_dr_index, "Re-arming deferred hardware breakpoint after step completion");
+                    let process = platform.get_process(pid)?;
+                    let thread_handle = process.thread_manager().get_thread_handle(tid)
+                        .ok_or_else(|| PlatformError::OsError(format!("No handle for thread {}", tid)))?;
+                    match super::hardware_breakpoints::X86DebugCtx::read(thread_handle, arch, true) {
+                        Ok(mut dctx) => {
+                            dctx.set_trap_flag(false);
+                            dctx.enable_bit(rearm_dr_index);
+                            dctx.set_dr6(0);
+                            if let Err(e) = dctx.write(thread_handle) {
+                                error!("Failed to re-arm deferred hardware breakpoint: {}", e);
+                            }
+                        }
+                        Err(e) => error!("Failed to read debug registers for deferred re-arm: {}", e),
+                    }
                 }
-            } else {
-                if let Err(e) = stepper::clear_single_step_flag_native2(platform, pid, tid) { error!("Failed to clear single-step flag: {}", e); }
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                if let Err(e) = stepper::clear_single_step_flag_native2(platform, pid, tid) { error!("Failed to clear single-step flag: {}", e); }
+                None => {
+                    if let Err(e) = stepper::clear_single_step_flag(platform, pid, tid) { error!("Failed to clear single-step flag: {}", e); }
+                }
             }
             {
                 let process = platform.get_process_mut(pid)?;
@@ -698,26 +757,22 @@ pub(super) fn handle_exception_event(
             return Ok(Some(crate::protocol::DebugEvent::StepComplete { pid, tid, kind: step_state.kind, address: ex_record.ExceptionAddress as u64 }));
         }
 
-        // Check for hardware breakpoint hit via DR6
-        #[cfg(target_arch = "x86_64")]
-        {
+        // Check for hardware breakpoint hit via DR6 (x64 native or WOW64)
+        if arch.is_x86_family() {
             let thread_handle = process.thread_manager().get_thread_handle(tid)
                 .ok_or_else(|| PlatformError::OsError(format!("No handle for thread {}", tid)))?;
-            let mut aligned = super::AlignedContext { context: unsafe { std::mem::zeroed() } };
-            aligned.context.ContextFlags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_DEBUG_REGISTERS_AMD64
-                | windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64;
-            if unsafe { windows_sys::Win32::System::Diagnostics::Debug::GetThreadContext(thread_handle, &mut aligned.context) } != 0 {
-                if let Some(dr_index) = super::hardware_breakpoints::check_dr6_for_hw_bp(&mut aligned.context) {
+            if let Ok(mut dctx) = super::hardware_breakpoints::X86DebugCtx::read(thread_handle, arch, true) {
+                if let Some(dr_index) = dctx.check_dr6() {
                     if let Some(bp) = process.find_hardware_breakpoint_by_dr_index(dr_index) {
                         let bp_address = bp.address;
                         let bp_type = bp.bp_type;
                         trace!(pid, tid, dr_index, address = %format!("0x{:X}", bp_address), "Hardware breakpoint hit");
 
                         // Disable the HW BP enable bit so we can step past
-                        super::hardware_breakpoints::disable_hw_bp_enable(&mut aligned.context, dr_index);
+                        dctx.disable_bit(dr_index);
                         // Set trap flag to single-step one instruction
-                        aligned.context.EFlags |= 0x100u32;
-                        let _ = unsafe { windows_sys::Win32::System::Diagnostics::Debug::SetThreadContext(thread_handle, &aligned.context) };
+                        dctx.set_trap_flag(true);
+                        let _ = dctx.write(thread_handle);
 
                         // Schedule re-arm after the single step completes
                         process.schedule_hw_bp_rearm(tid, dr_index);
@@ -727,7 +782,7 @@ pub(super) fn handle_exception_event(
                         // traps *after* the access, so this is the following
                         // instruction — attributed back at snapshot time) and
                         // auto-continue without forwarding a HardwareBreakpoint event.
-                        if process.record_watchpoint_access(bp_address, aligned.context.Rip, tid) {
+                        if process.record_watchpoint_access(bp_address, dctx.pc(), tid) {
                             return Ok(None);
                         }
 
@@ -740,21 +795,9 @@ pub(super) fn handle_exception_event(
         }
 
         // Unexpected SS
-        #[cfg(target_arch = "x86_64")]
-        {
-            let ctx_for_log = match super::thread_context::get_thread_context(process, pid, tid) {
-                Ok(crate::protocol::ThreadContext::Win32RawContext(c)) => Some(c),
-                _ => None,
-            };
-            if let Some(ref ctx) = ctx_for_log {
-                trace!(pid = pid, tid = tid, rip = %format!("0x{:X}", ctx.Rip), eflags = %format!("0x{:X}", ctx.EFlags), "Unexpected single-step event (no active step record)");
-            } else {
-                trace!(pid = pid, tid = tid, "Unexpected single-step event (no active step record) - failed to fetch context for log");
-            }
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            trace!(pid = pid, tid = tid, "Unexpected single-step event (no active step record)");
+        match super::thread_context::get_thread_context(process, pid, tid) {
+            Ok(ctx) => trace!(pid = pid, tid = tid, pc = %format!("0x{:X}", ctx.pc()), flags = %format!("0x{:X}", ctx.flags()), "Unexpected single-step event (no active step record)"),
+            Err(_) => trace!(pid = pid, tid = tid, "Unexpected single-step event (no active step record) - failed to fetch context for log"),
         }
         return Ok(Some(crate::protocol::DebugEvent::Exception { pid, tid, code: ex_record.ExceptionCode as u32, address: ex_record.ExceptionAddress as u64, first_chance: ex_info.dwFirstChance == 1, parameters: vec![] }));
     }
@@ -852,7 +895,7 @@ pub fn handle_debug_event(
                 // Apply active hardware breakpoints to the new thread
                 let active_hw_bps = process.active_hardware_breakpoints();
                 if !active_hw_bps.is_empty() {
-                    if let Err(e) = super::hardware_breakpoints::apply_all_hw_bps_to_thread(thread_handle, &active_hw_bps) {
+                    if let Err(e) = super::hardware_breakpoints::apply_all_hw_bps_to_thread_for(process.architecture(), thread_handle, &active_hw_bps) {
                         warn!(tid = debug_event.dwThreadId, error = %e, "Failed to apply HW breakpoints to new thread");
                     }
                 }
@@ -1054,15 +1097,15 @@ pub fn handle_debug_event(
     //    reads back potentially-zeroed DRs and writes them back, clobbering our values
     // By applying DR-only context at the end of every event, we ensure DRs are correct
     // when ContinueDebugEvent is called next.
-    #[cfg(target_arch = "x86_64")]
     {
         let pid = debug_event.dwProcessId;
-        if let Ok(process) = platform.get_process(pid) {
+        if let Some(process) = platform.get_process(pid).ok().filter(|p| p.architecture().is_x86_family()) {
+            let arch = process.architecture();
             let active_bps = process.active_hardware_breakpoints();
             if !active_bps.is_empty() {
                 let thread_handles = process.thread_manager().all_thread_handles();
                 for (tid, handle) in &thread_handles {
-                    if let Err(e) = super::hardware_breakpoints::apply_hw_bps_dr_only(*handle, &active_bps) {
+                    if let Err(e) = super::hardware_breakpoints::apply_hw_bps_dr_only_for(arch, *handle, &active_bps) {
                         trace!(tid, error = %e, "Failed to ensure HW BPs on thread (may have exited)");
                     }
                 }

@@ -99,8 +99,16 @@ impl<A: CodeAllocator, T: ThreadFreezer> HookEngine<A, T> {
         let trampoline_addr = unsafe { entry.slot.add(entry.layout.trampoline_offset) };
         let patch_size = entry.patch_size;
 
-        // Build the 5-byte relative jump to the relay.
-        let jmp = trampoline::build_rel_jmp(target as u64, relay_addr as u64)?;
+        // Build the full patch: the 5-byte relative jump to the relay, then NOP
+        // padding out to `patch_size` (when the prologue's instruction
+        // boundaries don't land exactly on 5). The whole thing is written in one
+        // `write_code` call: `write_code` uses `WriteProcessMemory`, which makes
+        // the read-only `.text` page writable for the write. A raw-pointer store
+        // for the NOP fill would fault on that page (this bug only surfaced for a
+        // prologue longer than the jump — one summing to exactly 5 skipped the
+        // fill entirely).
+        let mut patch = trampoline::build_rel_jmp(target as u64, relay_addr as u64)?;
+        patch.resize(patch_size, 0x90); // NOP fill
 
         self.freezer.freeze()?;
 
@@ -112,11 +120,7 @@ impl<A: CodeAllocator, T: ThreadFreezer> HookEngine<A, T> {
 
         // Patch the target.
         unsafe {
-            write_code(target, &jmp);
-            // NOP-fill any remaining bytes.
-            for i in jmp.len()..patch_size {
-                *target.add(i) = 0x90; // NOP
-            }
+            write_code(target, &patch);
             flush_icache(target, patch_size);
         }
 

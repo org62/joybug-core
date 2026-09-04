@@ -381,20 +381,7 @@ fn test_dereference_basic() {
             println!("\n----- TEST 8: Stack pointer dereference -----\n");
 
             let ctx = session.get_thread_context(pid, tid)?;
-
-            #[cfg(target_arch = "x86_64")]
-            let sp = {
-                match ctx {
-                    joybug_core::protocol::ThreadContext::Win32RawContext(ref c) => c.Rsp,
-                }
-            };
-
-            #[cfg(target_arch = "aarch64")]
-            let sp = {
-                match ctx {
-                    joybug_core::protocol::ThreadContext::Win32RawContext(ref c) => c.Sp,
-                }
-            };
+            let sp = ctx.sp();
 
             println!("Stack pointer: {:#018x}", sp);
 

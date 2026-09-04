@@ -141,9 +141,7 @@ fn dereference_with_regions<F>(
 where
     F: Fn(u64) -> Option<SymbolInfo>,
 {
-    let pointer_size: usize = match arch {
-        Architecture::X64 | Architecture::Arm64 => 8,
-    };
+    let pointer_size = arch.pointer_size();
     let base = reference_base.unwrap_or(address);
 
     let mut entries = Vec::with_capacity(count);
@@ -176,9 +174,7 @@ fn build_dereference_chain<F>(
 where
     F: Fn(u64) -> Option<SymbolInfo>,
 {
-    let pointer_size: usize = match arch {
-        Architecture::X64 | Architecture::Arm64 => 8,
-    };
+    let pointer_size = arch.pointer_size();
 
     let mut chain = Vec::new();
     let mut visited = HashSet::new();

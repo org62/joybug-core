@@ -63,7 +63,4 @@ pub struct PebHideReport {
     pub applied: Vec<String>,
     /// `(technique, error_message)` for techniques that failed.
     pub failures: Vec<(String, String)>,
-    /// True if the target is WOW64 (32-bit on 64-bit Windows) — patching was
-    /// skipped because v1 only supports 64-bit native PEB layout.
-    pub wow64_skipped: bool,
 }

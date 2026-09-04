@@ -1,4 +1,4 @@
-use crate::interfaces::Architecture;
+﻿use crate::interfaces::Architecture;
 use hexpatch_keystone::{Keystone, Arch, Mode, OptionType, OptionValue};
 use std::sync::Mutex;
 
@@ -36,6 +36,7 @@ pub fn assemble(arch: Architecture, code: &str, address: u64) -> Result<Assemble
     };
 
     match arch {
+        Architecture::X86 => assemble_x86(code, address),
         Architecture::X64 => assemble_x64(code, address),
         Architecture::Arm64 => {
             let engine = Keystone::new(Arch::ARM64, Mode::LITTLE_ENDIAN).map_err(map_err)?;
@@ -46,6 +47,47 @@ pub fn assemble(arch: Architecture, code: &str, address: u64) -> Result<Assemble
             })
         }
     }
+}
+
+/// Assemble 32-bit x86 code.
+///
+/// Unlike x64 there is no RIP-relative addressing: a bare `[0xADDR]` operand
+/// *is* an absolute 32-bit displacement, so statements assemble directly in
+/// NASM syntax (Intel-style `ptr` stripped, as for x64).
+fn assemble_x86(code: &str, address: u64) -> Result<AssembleOutput, AssembleError> {
+    let map_err = |e: hexpatch_keystone::Error| AssembleError {
+        message: format!("{}", e),
+    };
+
+    let engine = Keystone::new(Arch::X86, Mode::MODE_32).map_err(map_err)?;
+    engine
+        .option(OptionType::SYNTAX, OptionValue::SYNTAX_NASM)
+        .map_err(map_err)?;
+
+    let mut output_bytes = Vec::new();
+    let mut stat_count = 0u32;
+    for statement in split_statements(code) {
+        let trimmed = statement.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let stripped = strip_intel_ptr(trimmed);
+        let current_addr = address + output_bytes.len() as u64;
+        let result = engine.asm(stripped, current_addr).map_err(map_err)?;
+        stat_count += result.stat_count;
+        output_bytes.extend_from_slice(&result.bytes);
+    }
+
+    if output_bytes.is_empty() {
+        return Err(AssembleError {
+            message: "Assembly produced no output".to_string(),
+        });
+    }
+
+    Ok(AssembleOutput {
+        bytes: output_bytes,
+        stat_count,
+    })
 }
 
 /// Assemble x86-64 code with proper RIP-relative address handling.
@@ -80,7 +122,7 @@ fn assemble_x64(code: &str, address: u64) -> Result<AssembleOutput, AssembleErro
         }
 
         // Strip Intel-style "ptr" keyword (NASM doesn't use it).
-        // "qword ptr [rsp+8]" → "qword [rsp+8]"
+        // "qword ptr [rsp+8]" â†’ "qword [rsp+8]"
         let trimmed = &strip_intel_ptr(trimmed);
 
         let current_addr = address + output_bytes.len() as u64;
@@ -112,7 +154,7 @@ fn assemble_x64(code: &str, address: u64) -> Result<AssembleOutput, AssembleErro
             stat_count += 1;
             output_bytes.extend_from_slice(&result.bytes);
         } else {
-            // No absolute address — assemble directly
+            // No absolute address â€” assemble directly
             let asm_code = format!("default rel\n{}", trimmed);
             let result = engine.asm(asm_code, current_addr).map_err(map_err)?;
             stat_count += result.stat_count;
@@ -133,7 +175,7 @@ fn assemble_x64(code: &str, address: u64) -> Result<AssembleOutput, AssembleErro
 }
 
 /// Strip Intel-syntax `ptr` keyword from assembly text.
-/// Converts e.g. `qword ptr [rsp+8]` → `qword [rsp+8]`.
+/// Converts e.g. `qword ptr [rsp+8]` â†’ `qword [rsp+8]`.
 fn strip_intel_ptr(s: &str) -> String {
     let lower = s.to_lowercase();
     let mut result = String::with_capacity(s.len());
@@ -238,10 +280,10 @@ mod tests {
         let (addr, _, _) = extract_bracket_address("mov eax, [0x7ff64cff8004]").unwrap();
         assert_eq!(addr, 0x7ff64cff8004);
 
-        // Register-based — should return None
+        // Register-based â€” should return None
         assert!(extract_bracket_address("mov eax, [rax+0x10]").is_none());
 
-        // Already has rel — should return None
+        // Already has rel â€” should return None
         assert!(extract_bracket_address("mov eax, [rel 0x1000]").is_none());
 
         // No brackets
@@ -249,6 +291,20 @@ mod tests {
 
         // Not a hex address
         assert!(extract_bracket_address("mov eax, [rsp]").is_none());
+    }
+
+    #[test]
+    fn test_assemble_x86_basic() {
+        // 32-bit mode: `push ebp; mov ebp, esp` and an absolute-address load,
+        // which is a plain disp32 (no RIP-relative fixup pass).
+        let result = assemble(Architecture::X86, "push ebp
+mov ebp, esp", 0x401000).unwrap();
+        assert_eq!(result.bytes, vec![0x55, 0x89, 0xE5]); // keystone picks the 89 /r form
+        let result = assemble(Architecture::X86, "mov eax, dword ptr [0x10080dd0]", 0x401000).unwrap();
+        assert_eq!(result.bytes, vec![0xA1, 0xD0, 0x0D, 0x08, 0x10]);
+        // rel32 call is encoded relative to the given address.
+        let result = assemble(Architecture::X86, "call 0x401100", 0x401000).unwrap();
+        assert_eq!(result.bytes, vec![0xE8, 0xFB, 0x00, 0x00, 0x00]);
     }
 
     #[test]
@@ -324,7 +380,7 @@ mod tests {
         assert_eq!(strip_intel_ptr("mov qword ptr [rsp + 8], rbx"), "mov qword [rsp + 8], rbx");
         assert_eq!(strip_intel_ptr("mov DWORD PTR [rax], 1"), "mov DWORD [rax], 1");
         assert_eq!(strip_intel_ptr("mov byte ptr[rcx], 0"), "mov byte [rcx], 0");
-        // No ptr — unchanged
+        // No ptr â€” unchanged
         assert_eq!(strip_intel_ptr("mov qword [rsp + 8], rbx"), "mov qword [rsp + 8], rbx");
         assert_eq!(strip_intel_ptr("nop"), "nop");
     }

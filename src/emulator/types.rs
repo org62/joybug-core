@@ -2,22 +2,10 @@
 
 use std::collections::HashMap;
 
-use unicorn_engine::Unicorn;
+use unicorn_engine::{RegisterARM64, RegisterX86, Unicorn};
 
-#[cfg(target_arch = "x86_64")]
-use unicorn_engine::RegisterX86;
-
-#[cfg(target_arch = "aarch64")]
-use unicorn_engine::RegisterARM64;
-
-use crate::interfaces::ModuleSymbol;
-use crate::protocol::{RegisterSnapshot, MemoryAccess};
-
-#[cfg(target_arch = "x86_64")]
-use crate::protocol::X64RegisterSnapshot;
-
-#[cfg(target_arch = "aarch64")]
-use crate::protocol::Arm64RegisterSnapshot;
+use crate::interfaces::{Architecture, ModuleSymbol};
+use crate::protocol::{Arm64RegisterSnapshot, MemoryAccess, RegisterSnapshot, X64RegisterSnapshot};
 
 /// Memory region info for lazy loading
 #[derive(Debug, Clone)]
@@ -170,70 +158,63 @@ pub(super) fn format_symbol_with_offset(sym: ModuleSymbol, offset: u64) -> Strin
     }
 }
 
-/// Create RegisterSnapshot from Unicorn x64 emulator state
-#[cfg(target_arch = "x86_64")]
-pub(super) fn snapshot_from_unicorn<D>(emu: &Unicorn<'_, D>, pc: u64) -> RegisterSnapshot {
-    RegisterSnapshot::X64(X64RegisterSnapshot {
-        rax: emu.reg_read(RegisterX86::RAX).unwrap_or(0),
-        rbx: emu.reg_read(RegisterX86::RBX).unwrap_or(0),
-        rcx: emu.reg_read(RegisterX86::RCX).unwrap_or(0),
-        rdx: emu.reg_read(RegisterX86::RDX).unwrap_or(0),
-        rsi: emu.reg_read(RegisterX86::RSI).unwrap_or(0),
-        rdi: emu.reg_read(RegisterX86::RDI).unwrap_or(0),
-        rbp: emu.reg_read(RegisterX86::RBP).unwrap_or(0),
-        rsp: emu.reg_read(RegisterX86::RSP).unwrap_or(0),
-        r8: emu.reg_read(RegisterX86::R8).unwrap_or(0),
-        r9: emu.reg_read(RegisterX86::R9).unwrap_or(0),
-        r10: emu.reg_read(RegisterX86::R10).unwrap_or(0),
-        r11: emu.reg_read(RegisterX86::R11).unwrap_or(0),
-        r12: emu.reg_read(RegisterX86::R12).unwrap_or(0),
-        r13: emu.reg_read(RegisterX86::R13).unwrap_or(0),
-        r14: emu.reg_read(RegisterX86::R14).unwrap_or(0),
-        r15: emu.reg_read(RegisterX86::R15).unwrap_or(0),
-        rip: pc,
-        rflags: emu.reg_read(RegisterX86::RFLAGS).unwrap_or(0),
-    })
-}
-
-/// Create RegisterSnapshot from Unicorn ARM64 emulator state
-#[cfg(target_arch = "aarch64")]
-pub(super) fn snapshot_from_unicorn<D>(emu: &Unicorn<'_, D>, pc: u64) -> RegisterSnapshot {
-    RegisterSnapshot::Arm64(Arm64RegisterSnapshot {
-        x: [
-            emu.reg_read(RegisterARM64::X0).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X1).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X2).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X3).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X4).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X5).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X6).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X7).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X8).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X9).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X10).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X11).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X12).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X13).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X14).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X15).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X16).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X17).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X18).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X19).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X20).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X21).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X22).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X23).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X24).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X25).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X26).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X27).unwrap_or(0),
-            emu.reg_read(RegisterARM64::X28).unwrap_or(0),
-        ],
-        fp: emu.reg_read(RegisterARM64::X29).unwrap_or(0),
-        lr: emu.reg_read(RegisterARM64::X30).unwrap_or(0),
-        sp: emu.reg_read(RegisterARM64::SP).unwrap_or(0),
-        pc,
-        cpsr: emu.reg_read(RegisterARM64::NZCV).unwrap_or(0),
-    })
+/// Register snapshot of the emulated CPU for the traced architecture. Unicorn
+/// emulates every architecture on every host, so this is host-independent; a
+/// 32-bit (WOW64) target reports through the x64 shape, zero-extended, like
+/// `RegisterSnapshot::from_thread_context`.
+pub(super) fn snapshot_from_unicorn<D>(emu: &Unicorn<'_, D>, arch: Architecture, pc: u64) -> RegisterSnapshot {
+    let rd = |r: RegisterX86| emu.reg_read(r).unwrap_or(0);
+    let ra = |r: RegisterARM64| emu.reg_read(r).unwrap_or(0);
+    match arch {
+        Architecture::X86 => RegisterSnapshot::X64(X64RegisterSnapshot {
+            rax: rd(RegisterX86::EAX),
+            rbx: rd(RegisterX86::EBX),
+            rcx: rd(RegisterX86::ECX),
+            rdx: rd(RegisterX86::EDX),
+            rsi: rd(RegisterX86::ESI),
+            rdi: rd(RegisterX86::EDI),
+            rbp: rd(RegisterX86::EBP),
+            rsp: rd(RegisterX86::ESP),
+            rip: pc,
+            rflags: rd(RegisterX86::EFLAGS),
+            ..Default::default()
+        }),
+        Architecture::X64 => RegisterSnapshot::X64(X64RegisterSnapshot {
+            rax: rd(RegisterX86::RAX),
+            rbx: rd(RegisterX86::RBX),
+            rcx: rd(RegisterX86::RCX),
+            rdx: rd(RegisterX86::RDX),
+            rsi: rd(RegisterX86::RSI),
+            rdi: rd(RegisterX86::RDI),
+            rbp: rd(RegisterX86::RBP),
+            rsp: rd(RegisterX86::RSP),
+            r8: rd(RegisterX86::R8),
+            r9: rd(RegisterX86::R9),
+            r10: rd(RegisterX86::R10),
+            r11: rd(RegisterX86::R11),
+            r12: rd(RegisterX86::R12),
+            r13: rd(RegisterX86::R13),
+            r14: rd(RegisterX86::R14),
+            r15: rd(RegisterX86::R15),
+            rip: pc,
+            rflags: rd(RegisterX86::RFLAGS),
+        }),
+        Architecture::Arm64 => RegisterSnapshot::Arm64(Arm64RegisterSnapshot {
+            x: [
+                ra(RegisterARM64::X0), ra(RegisterARM64::X1), ra(RegisterARM64::X2), ra(RegisterARM64::X3),
+                ra(RegisterARM64::X4), ra(RegisterARM64::X5), ra(RegisterARM64::X6), ra(RegisterARM64::X7),
+                ra(RegisterARM64::X8), ra(RegisterARM64::X9), ra(RegisterARM64::X10), ra(RegisterARM64::X11),
+                ra(RegisterARM64::X12), ra(RegisterARM64::X13), ra(RegisterARM64::X14), ra(RegisterARM64::X15),
+                ra(RegisterARM64::X16), ra(RegisterARM64::X17), ra(RegisterARM64::X18), ra(RegisterARM64::X19),
+                ra(RegisterARM64::X20), ra(RegisterARM64::X21), ra(RegisterARM64::X22), ra(RegisterARM64::X23),
+                ra(RegisterARM64::X24), ra(RegisterARM64::X25), ra(RegisterARM64::X26), ra(RegisterARM64::X27),
+                ra(RegisterARM64::X28),
+            ],
+            fp: ra(RegisterARM64::X29),
+            lr: ra(RegisterARM64::X30),
+            sp: ra(RegisterARM64::SP),
+            pc,
+            cpsr: ra(RegisterARM64::NZCV),
+        }),
+    }
 }

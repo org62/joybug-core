@@ -24,11 +24,35 @@ fn call_opaque(f: BinOp, a: i32, b: i32) -> i32 {
     std::hint::black_box(f(std::hint::black_box(a), std::hint::black_box(b)))
 }
 
+/// Pad a hook target's prologue to at least the 5-byte patch-jump size.
+///
+/// A one-line `extern "C"` target like `a + b` optimizes to a 3-byte
+/// `lea eax, [rcx+rdx]; ret` in release — shorter than the engine's 5-byte
+/// `E9` patch jump, so hooking it fails with `PrologueTooShort` (the engine
+/// correctly refusing to overwrite past a 4-byte function). Emitting a handful
+/// of leading `nop`s (real, un-foldable instructions) guarantees >= 5
+/// relocatable bytes before any control flow, in every build. Unlike a naked
+/// function this keeps a normal, optimizer-visible `extern "C" fn` with proper
+/// frame/unwind info — naked targets tripped a release-only miscompile here.
+///
+/// x86 `nop` and ARM64 `nop` are both 1 instruction; five is comfortably over
+/// the 5-byte (x86) / 4-byte (ARM64) minimum.
+macro_rules! prologue_pad {
+    () => {
+        // SAFETY: pure padding — touches no memory, stack or flags.
+        unsafe {
+            core::arch::asm!("nop", "nop", "nop", "nop", "nop", options(nomem, nostack, preserves_flags));
+        }
+    };
+}
+
 // Target function to hook. `inline(never)` keeps a real, patchable body in
-// release; see `call_opaque` for why the call sites matter too.
+// release; `prologue_pad!` keeps that body long enough to hook. See
+// `call_opaque` for why the call sites matter too.
 #[unsafe(no_mangle)]
 #[inline(never)]
 extern "C" fn test_add(a: i32, b: i32) -> i32 {
+    prologue_pad!();
     a + b
 }
 
@@ -107,16 +131,18 @@ fn test_allocator_near_allocation() {
 use std::sync::Mutex;
 static LUA_HOOK_LOCK: Mutex<()> = Mutex::new(());
 
-// Separate targets for each Lua hook test.
+// Separate targets for each Lua hook test. Padded like `test_add` above.
 #[unsafe(no_mangle)]
 #[inline(never)]
 extern "C" fn test_multiply(a: i32, b: i32) -> i32 {
+    prologue_pad!();
     a * b
 }
 
 #[unsafe(no_mangle)]
 #[inline(never)]
 extern "C" fn test_sub(a: i32, b: i32) -> i32 {
+    prologue_pad!();
     a - b
 }
 

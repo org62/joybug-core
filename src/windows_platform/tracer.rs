@@ -3,11 +3,10 @@
 //! Provides instruction-level tracing by repeatedly single-stepping
 //! with the trap flag and capturing register state at each step.
 
-use crate::interfaces::{PlatformAPI, PlatformError, Architecture};
+use crate::interfaces::{PlatformAPI, PlatformError};
 use crate::memory_operand::analyze_memory_operands;
-use crate::protocol::{MemoryAccess, MemoryAccessType, RegisterSnapshot, TraceEntry, TraceExitCondition, ThreadContext};
+use crate::protocol::{MemoryAccess, MemoryAccessType, RegisterSnapshot, TraceEntry, TraceExitCondition};
 use super::WindowsPlatform;
-use super::stepper::{set_single_step_flag_native, clear_single_step_flag_native};
 use super::debug_events;
 use tracing::{trace, debug};
 use std::time::Instant;
@@ -34,23 +33,15 @@ pub fn trace_instructions(
     debug!(pid, tid, ?exit_condition, max_instructions, "Starting instruction trace");
 
     // Get architecture for disassembly
-    let arch = Architecture::from_native();
+    let arch = platform.get_process(pid)?.architecture();
 
     // Track pending write operations to capture after instruction executes
     let mut pending_write_ops: Vec<(u64, usize)> = Vec::new();
 
     for step_count in 0..max_instructions {
         // Get current thread context
-        let thread_context = platform.get_thread_context(pid, tid)?;
-        let mut context = match thread_context {
-            ThreadContext::Win32RawContext(ctx) => ctx,
-        };
-
-        // Get program counter (Rip on x64, Pc on ARM64)
-        #[cfg(target_arch = "x86_64")]
-        let current_pc = context.Rip;
-        #[cfg(target_arch = "aarch64")]
-        let current_pc = context.Pc;
+        let mut context = platform.get_thread_context(pid, tid)?;
+        let current_pc = context.pc();
 
         // Step 1: Capture pending write data from previous instruction
         // (previous instruction has now completed execution)
@@ -77,7 +68,7 @@ pub fn trace_instructions(
         }
 
         // Capture register snapshot (before executing this instruction)
-        let snapshot = RegisterSnapshot::from_context(&context);
+        let snapshot = RegisterSnapshot::from_thread_context(&context);
 
         // Get instruction bytes and size via disassembly
         let (insn_bytes, insn_size) = platform.disassemble_memory(pid, current_pc, 1, arch)
@@ -141,11 +132,10 @@ pub fn trace_instructions(
         }
 
         // Set trap flag to single-step
-        set_single_step_flag_native(&mut context)?;
+        context.set_single_step(true);
 
         // Set the modified context back
-        let updated_context = ThreadContext::Win32RawContext(context);
-        super::thread_context::set_thread_context(platform.get_process(pid)?, pid, tid, updated_context)?;
+        super::thread_context::set_thread_context(platform.get_process(pid)?, pid, tid, context)?;
 
         // Continue execution (will stop on next instruction due to trap flag)
         debug_events::continue_only(pid, tid)?;
@@ -209,11 +199,9 @@ pub fn trace_instructions(
 
     // Clear trap flag after tracing (while process is still stopped on the pending event).
     // The caller (framework) will ContinueDebugEvent for the last pending event.
-    if let Ok(thread_context) = platform.get_thread_context(pid, tid) {
-        let ThreadContext::Win32RawContext(mut context) = thread_context;
-        let _ = clear_single_step_flag_native(&mut context);
-        let updated_context = ThreadContext::Win32RawContext(context);
-        let _ = super::thread_context::set_thread_context(platform.get_process(pid)?, pid, tid, updated_context);
+    if let Ok(mut context) = platform.get_thread_context(pid, tid) {
+        context.set_single_step(false);
+        let _ = super::thread_context::set_thread_context(platform.get_process(pid)?, pid, tid, context);
     }
 
     let trace_time_us = start_time.elapsed().as_micros() as u64;

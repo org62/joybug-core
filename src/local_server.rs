@@ -35,8 +35,8 @@ impl LocalServer {
         Self::start_with(crate::PlatformImpl::new_with_config(cfg))
     }
 
-    /// Start a local debug server with a custom platform implementation
-    /// (e.g., `VEHPlatform`). Panics on failure.
+    /// Start a local debug server with a custom platform implementation.
+    /// Panics on failure.
     pub fn spawn_with<P>(platform: P) -> Self
     where
         P: PlatformAPI + Stepper + Send + Sync + 'static,

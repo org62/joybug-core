@@ -21,7 +21,6 @@ pub mod scan_results;
 pub mod freeze_manager;
 pub mod scripting;
 pub mod inline_hook;
-pub mod veh_platform;
 pub mod anti_anti_debug;
 pub mod env_block;
 /// Host ETW tracing: drives the collector in [`winsandbox::tracer`], run as a

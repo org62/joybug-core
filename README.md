@@ -8,7 +8,7 @@ It covers the ground you'd expect from a debugging backend — process launch an
 
 ## Supported targets
 
-Windows, x64 and ARM64. Breakpoints and single-stepping are written natively, so **the host architecture must match the target's** — an ARM64 build won't correctly debug an emulated x64 process, or vice versa. 32-bit/WOW64 targets aren't supported.
+Windows, x64 and ARM64. Breakpoints and single-stepping are written natively, so for a **native 64-bit** target **the host architecture must match** — an ARM64 build won't correctly debug an emulated x64 process, or vice versa. **32-bit x86 (WOW64)** targets are supported on either host, driven through the 32-bit (`WOW64_CONTEXT`) register file.
 
 ## Usage
 
@@ -52,7 +52,7 @@ Integration tests under `tests/` need Windows with debugging privileges. The liv
 
 ## Documentation
 
-Notes on specific subsystems live in [`docs/`](docs/) — the Lua scripting API, the VEH-based debugging mode, and the trace format.
+Notes on specific subsystems live in [`docs/`](docs/) — the Lua scripting API and the trace format.
 
 ## License
 

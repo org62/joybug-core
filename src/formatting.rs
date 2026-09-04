@@ -89,6 +89,7 @@ impl std::fmt::Debug for DebuggerResponse {
             // Add other variants here, using a default debug format
             DebuggerResponse::HardwareBreakpointSet { dr_index } => f.debug_struct("HardwareBreakpointSet").field("dr_index", dr_index).finish(),
             DebuggerResponse::MinidumpWritten { size_bytes } => f.debug_struct("MinidumpWritten").field("size_bytes", size_bytes).finish(),
+            DebuggerResponse::ProcessArchitecture { arch } => f.debug_struct("ProcessArchitecture").field("arch", arch).finish(),
             DebuggerResponse::Ack => write!(f, "Ack"),
             DebuggerResponse::Error { message } => f.debug_struct("Error").field("message", message).finish(),
             DebuggerResponse::Event { event } => f.debug_struct("Event").field("event", &format_args!("{}", event)).finish(),
@@ -230,7 +231,6 @@ impl std::fmt::Debug for DebuggerResponse {
                     .field("peb_address", &format_args!("0x{:X}", report.peb_address))
                     .field("applied", &report.applied)
                     .field("failures", &report.failures)
-                    .field("wow64_skipped", &report.wow64_skipped)
                     .finish()
             }
             DebuggerResponse::FreezeValueStarted { freeze_id } => {
@@ -271,22 +271,21 @@ impl std::fmt::Debug for ModuleInfo {
 
 impl std::fmt::Debug for ThreadContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        #[cfg(all(windows, target_arch = "x86_64"))]
-        {
-            let ThreadContext::Win32RawContext(ctx) = self;
-            return write!(f,
+        match self {
+            #[cfg(windows)]
+            ThreadContext::Wow64RawContext(ctx) => write!(f,
+                "eax=0x{:08X} ebx=0x{:08X} ecx=0x{:08X} edx=0x{:08X} esi=0x{:08X} edi=0x{:08X} esp=0x{:08X} ebp=0x{:08X} eip=0x{:08X} eflags=0x{:08X}",
+                ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Esp, ctx.Ebp, ctx.Eip, ctx.EFlags
+            ),
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            ThreadContext::Win32RawContext(ctx) => write!(f,
                 "rax=0x{:016X} rbx=0x{:016X} rcx=0x{:016X} rdx=0x{:016X} rsi=0x{:016X} rdi=0x{:016X} rsp=0x{:016X} rbp=0x{:016X} r8=0x{:016X} r9=0x{:016X} r10=0x{:016X} r11=0x{:016X} r12=0x{:016X} r13=0x{:016X} r14=0x{:016X} r15=0x{:016X} rip=0x{:016X}",
                 ctx.Rax, ctx.Rbx, ctx.Rcx, ctx.Rdx, ctx.Rsi, ctx.Rdi,
                 ctx.Rsp, ctx.Rbp, ctx.R8, ctx.R9, ctx.R10, ctx.R11,
                 ctx.R12, ctx.R13, ctx.R14, ctx.R15, ctx.Rip
-            );
-        }
-        
-        #[cfg(all(windows, target_arch = "aarch64"))]
-        {
-            let ThreadContext::Win32RawContext(ctx) = self;
-            
-            return unsafe { write!(f,
+            ),
+            #[cfg(all(windows, target_arch = "aarch64"))]
+            ThreadContext::Win32RawContext(ctx) => unsafe { write!(f,
                 "X0:   {:016X}   X1:   {:016X}   X2:   {:016X}   \n\
                  X3:   {:016X}   X4:   {:016X}   X5:   {:016X}   \n\
                  X6:   {:016X}   X7:   {:016X}   X8:   {:016X}   \n\
@@ -299,42 +298,22 @@ impl std::fmt::Debug for ThreadContext {
                  X27:  {:016X}   X28:  {:016X}   FP:   {:016X}   \n\
                  LR:   {:016X}   SP:   {:016X}   PC:   {:016X}   \n\
                  CPSR: {:08X}",
-                // X0-X2
                 ctx.Anonymous.X[0], ctx.Anonymous.X[1], ctx.Anonymous.X[2],
-                // X3-X5  
                 ctx.Anonymous.X[3], ctx.Anonymous.X[4], ctx.Anonymous.X[5],
-                // X6-X8
                 ctx.Anonymous.X[6], ctx.Anonymous.X[7], ctx.Anonymous.X[8],
-                // X9-X11
                 ctx.Anonymous.X[9], ctx.Anonymous.X[10], ctx.Anonymous.X[11],
-                // X12-X14
                 ctx.Anonymous.X[12], ctx.Anonymous.X[13], ctx.Anonymous.X[14],
-                // X15-X17
                 ctx.Anonymous.X[15], ctx.Anonymous.X[16], ctx.Anonymous.X[17],
-                // X18-X20
                 ctx.Anonymous.X[18], ctx.Anonymous.X[19], ctx.Anonymous.X[20],
-                // X21-X23
                 ctx.Anonymous.X[21], ctx.Anonymous.X[22], ctx.Anonymous.X[23],
-                // X24-X26
                 ctx.Anonymous.X[24], ctx.Anonymous.X[25], ctx.Anonymous.X[26],
-                // X27-X28, FP (X29)
                 ctx.Anonymous.X[27], ctx.Anonymous.X[28], ctx.Anonymous.X[29],
-                // LR (X30), SP, PC
                 ctx.Anonymous.X[30], ctx.Sp, ctx.Pc,
-                // CPSR
-                ctx.Cpsr, 
-            ) };
-        }
-        
-        #[cfg(not(any(all(windows, target_arch = "x86_64"), all(windows, target_arch = "aarch64"))))]
-        {
-            // Fallback for non-Windows x86_64/ARM64 platforms
-            match self {
-                #[cfg(windows)]
-                ThreadContext::Win32RawContext(_) => write!(f, "ThreadContext::Win32RawContext(<unsupported on this architecture>)"),
-                #[allow(unreachable_patterns)]
-                _ => write!(f, "ThreadContext(<unsupported platform>)"),
-            }
+                ctx.Cpsr,
+            ) },
+            #[cfg(not(any(all(windows, target_arch = "x86_64"), all(windows, target_arch = "aarch64"))))]
+            #[allow(unreachable_patterns)]
+            _ => write!(f, "ThreadContext(<unsupported platform>)"),
         }
     }
 }
@@ -413,71 +392,8 @@ impl std::fmt::Display for DebugEvent {
 
 impl std::fmt::Display for ThreadContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        #[cfg(all(windows, target_arch = "x86_64"))]
-        {
-            let ThreadContext::Win32RawContext(ctx) = self;
-            return write!(f,
-                "rax=0x{:016X} rbx=0x{:016X} rcx=0x{:016X} rdx=0x{:016X} rsi=0x{:016X} rdi=0x{:016X} rsp=0x{:016X} rbp=0x{:016X} r8=0x{:016X} r9=0x{:016X} r10=0x{:016X} r11=0x{:016X} r12=0x{:016X} r13=0x{:016X} r14=0x{:016X} r15=0x{:016X} rip=0x{:016X}",
-                ctx.Rax, ctx.Rbx, ctx.Rcx, ctx.Rdx, ctx.Rsi, ctx.Rdi,
-                ctx.Rsp, ctx.Rbp, ctx.R8, ctx.R9, ctx.R10, ctx.R11,
-                ctx.R12, ctx.R13, ctx.R14, ctx.R15, ctx.Rip
-            );
-        }
-        
-        #[cfg(all(windows, target_arch = "aarch64"))]
-        {
-            let ThreadContext::Win32RawContext(ctx) = self;
-
-            return unsafe { write!(f,
-                "X0:   {:016X}   X1:   {:016X}   X2:   {:016X}   \n\
-                 X3:   {:016X}   X4:   {:016X}   X5:   {:016X}   \n\
-                 X6:   {:016X}   X7:   {:016X}   X8:   {:016X}   \n\
-                 X9:   {:016X}   X10:  {:016X}   X11:  {:016X}   \n\
-                 X12:  {:016X}   X13:  {:016X}   X14:  {:016X}   \n\
-                 X15:  {:016X}   X16:  {:016X}   X17:  {:016X}   \n\
-                 X18:  {:016X}   X19:  {:016X}   X20:  {:016X}   \n\
-                 X21:  {:016X}   X22:  {:016X}   X23:  {:016X}   \n\
-                 X24:  {:016X}   X25:  {:016X}   X26:  {:016X}   \n\
-                 X27:  {:016X}   X28:  {:016X}   FP:   {:016X}   \n\
-                 LR:   {:016X}   SP:   {:016X}   PC:   {:016X}   \n\
-                 CPSR: {:08X}",
-                // X0-X2
-                ctx.Anonymous.X[0], ctx.Anonymous.X[1], ctx.Anonymous.X[2],
-                // X3-X5
-                ctx.Anonymous.X[3], ctx.Anonymous.X[4], ctx.Anonymous.X[5],
-                // X6-X8
-                ctx.Anonymous.X[6], ctx.Anonymous.X[7], ctx.Anonymous.X[8],
-                // X9-X11
-                ctx.Anonymous.X[9], ctx.Anonymous.X[10], ctx.Anonymous.X[11],
-                // X12-X14
-                ctx.Anonymous.X[12], ctx.Anonymous.X[13], ctx.Anonymous.X[14],
-                // X15-X17
-                ctx.Anonymous.X[15], ctx.Anonymous.X[16], ctx.Anonymous.X[17],
-                // X18-X20
-                ctx.Anonymous.X[18], ctx.Anonymous.X[19], ctx.Anonymous.X[20],
-                // X21-X23
-                ctx.Anonymous.X[21], ctx.Anonymous.X[22], ctx.Anonymous.X[23],
-                // X24-X26
-                ctx.Anonymous.X[24], ctx.Anonymous.X[25], ctx.Anonymous.X[26],
-                // X27-X28, FP (X29)
-                ctx.Anonymous.X[27], ctx.Anonymous.X[28], ctx.Anonymous.X[29],
-                // LR (X30), SP, PC
-                ctx.Anonymous.X[30], ctx.Sp, ctx.Pc,
-                // CPSR
-                ctx.Cpsr,
-            ) };
-        }
-        
-        #[cfg(not(any(all(windows, target_arch = "x86_64"), all(windows, target_arch = "aarch64"))))]
-        {
-            // Fallback for non-Windows x86_64/ARM64 platforms
-            match self {
-                #[cfg(windows)]
-                ThreadContext::Win32RawContext(_) => write!(f, "ThreadContext::Win32RawContext(<unsupported on this architecture>)"),
-                #[allow(unreachable_patterns)]
-                _ => write!(f, "ThreadContext(<unsupported platform>)"),
-            }
-        }
+        // Same register dump as Debug.
+        std::fmt::Debug::fmt(self, f)
     }
 }
 

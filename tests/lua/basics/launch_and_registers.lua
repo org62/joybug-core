@@ -12,6 +12,10 @@ dbg:on_initial_breakpoint(function(pid, tid, addr)
     assert(ipof(ctx) > 0, "instruction pointer should be nonzero")
     assert(spof(ctx) > 0, "stack pointer should be nonzero")
 
+    -- cmd.exe is a native 64-bit target on both hosts; a WOW64 one reports "x86".
+    local arch = dbg:arch(pid)
+    assert(arch == "x64" or arch == "arm64", "unexpected arch: " .. tostring(arch))
+
     dbg:terminate(pid)
 end)
 

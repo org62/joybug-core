@@ -29,17 +29,22 @@ fn resolve_target<P: PlatformAPI + ?Sized>(
     pid: u32,
     base: u64,
     offsets: &[u64],
+    pointer_size: usize,
 ) -> Option<u64> {
     if offsets.is_empty() {
         return Some(base);
     }
     let mut addr = base;
     for off in offsets {
-        let buf = platform.read_memory(pid, addr, 8).ok()?;
-        if buf.len() < 8 {
+        let buf = platform.read_memory(pid, addr, pointer_size).ok()?;
+        if buf.len() < pointer_size {
             return None;
         }
-        let ptr = u64::from_le_bytes(buf[..8].try_into().unwrap());
+        let ptr = if pointer_size == 4 {
+            u32::from_le_bytes(buf[..4].try_into().unwrap()) as u64
+        } else {
+            u64::from_le_bytes(buf[..8].try_into().unwrap())
+        };
         // A null hop means the object isn't there (e.g. mid-reload); treat the chain
         // as unresolvable this tick rather than writing to a near-null address.
         if ptr == 0 {
@@ -98,6 +103,11 @@ impl FreezeManager {
             interval_ms.filter(|&n| n > 0).unwrap_or(DEFAULT_INTERVAL_MS),
         );
 
+        // Pointer width for the chain follow: 4 for a WOW64 target, else 8.
+        let pointer_size = {
+            let plat = platform.read().unwrap();
+            plat.process_architecture(pid).map(|a| a.pointer_size()).unwrap_or(8)
+        };
         let thread = {
             let stop = stop.clone();
             let shared = shared.clone();
@@ -110,7 +120,7 @@ impl FreezeManager {
                         // Brief read lock per tick; PlatformAPI read/write take &self.
                         let plat = platform.read().unwrap();
                         // Re-resolve the (possibly moving) target each tick.
-                        match resolve_target(&*plat, pid, address, &offsets) {
+                        match resolve_target(&*plat, pid, address, &offsets, pointer_size) {
                             Some(addr) => {
                                 if let Err(e) = plat.write_memory(pid, addr, &bytes) {
                                     warn!("freeze {} write to 0x{:X} failed: {}", id, addr, e);

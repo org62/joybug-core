@@ -429,6 +429,19 @@ pub fn context_to_lua_table(lua: &Lua, ctx: &ThreadContext) -> mlua::Result<LuaT
     let table = lua.create_table()?;
     match ctx {
         #[cfg(windows)]
+        ThreadContext::Wow64RawContext(c) => {
+            table.set("eax", c.Eax)?;
+            table.set("ebx", c.Ebx)?;
+            table.set("ecx", c.Ecx)?;
+            table.set("edx", c.Edx)?;
+            table.set("esi", c.Esi)?;
+            table.set("edi", c.Edi)?;
+            table.set("ebp", c.Ebp)?;
+            table.set("esp", c.Esp)?;
+            table.set("eip", c.Eip)?;
+            table.set("eflags", c.EFlags)?;
+        }
+        #[cfg(windows)]
         ThreadContext::Win32RawContext(c) => {
             #[cfg(target_arch = "x86_64")]
             {
@@ -475,10 +488,22 @@ pub fn context_to_lua_table(lua: &Lua, ctx: &ThreadContext) -> mlua::Result<LuaT
 /// Convert a Lua table back to a ThreadContext (for set_context).
 #[cfg(windows)]
 pub fn lua_table_to_context(table: &LuaTable, original: &ThreadContext) -> mlua::Result<ThreadContext> {
-    match original {
-        ThreadContext::Win32RawContext(_orig_ctx) => {
+    {
+        {
             let mut ctx = original.clone();
             match &mut ctx {
+                ThreadContext::Wow64RawContext(c) => {
+                    if let Ok(v) = table.get::<u32>("eax") { c.Eax = v; }
+                    if let Ok(v) = table.get::<u32>("ebx") { c.Ebx = v; }
+                    if let Ok(v) = table.get::<u32>("ecx") { c.Ecx = v; }
+                    if let Ok(v) = table.get::<u32>("edx") { c.Edx = v; }
+                    if let Ok(v) = table.get::<u32>("esi") { c.Esi = v; }
+                    if let Ok(v) = table.get::<u32>("edi") { c.Edi = v; }
+                    if let Ok(v) = table.get::<u32>("ebp") { c.Ebp = v; }
+                    if let Ok(v) = table.get::<u32>("esp") { c.Esp = v; }
+                    if let Ok(v) = table.get::<u32>("eip") { c.Eip = v; }
+                    if let Ok(v) = table.get::<u32>("eflags") { c.EFlags = v; }
+                }
                 ThreadContext::Win32RawContext(c) => {
                     #[cfg(target_arch = "x86_64")]
                     {

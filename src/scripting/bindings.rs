@@ -1258,6 +1258,24 @@ impl LuaUserData for LuaDebugClient {
             }
         });
 
+        // Instruction-set architecture of the debuggee: "x86" (WOW64), "x64" or "arm64".
+        methods.add_method("arch", |_lua, this, pid: u32| {
+            let mut client = this.inner.borrow_mut();
+            let resp = client.send_and_receive(&DebuggerRequest::GetProcessArchitecture { pid })
+                .map_err(|e| mlua::Error::external(e))?;
+            match resp {
+                DebuggerResponse::ProcessArchitecture { arch } => Ok(match arch {
+                    crate::interfaces::Architecture::X86 => "x86",
+                    crate::interfaces::Architecture::X64 => "x64",
+                    crate::interfaces::Architecture::Arm64 => "arm64",
+                }.to_string()),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(
+                    anyhow::anyhow!("GetProcessArchitecture failed: {}", message),
+                )),
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
         methods.add_method("list_threads", |lua, this, pid: u32| {
             let mut client = this.inner.borrow_mut();
             let resp = client.send_and_receive(&DebuggerRequest::ListThreads { pid })
@@ -2114,7 +2132,6 @@ impl LuaUserData for LuaDebugClient {
                 DebuggerResponse::PebHideResult { report } => {
                     let t = lua.create_table()?;
                     t.set("peb_address", report.peb_address)?;
-                    t.set("wow64_skipped", report.wow64_skipped)?;
                     let applied = lua.create_table()?;
                     for (i, name) in report.applied.iter().enumerate() {
                         applied.set(i + 1, name.clone())?;

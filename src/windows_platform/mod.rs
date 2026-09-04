@@ -15,7 +15,7 @@ mod stepper;
 mod debugged_process;
 mod module_extra;
 pub use module_extra::parse_module_extra_info_from_bytes;
-pub use symbol_provider::{WindowsSymbolProvider, parse_pdb_matching_pe};
+pub use symbol_provider::{WindowsSymbolProvider, parse_pdb_matching_pe, extract_pdb_identifier_from_file, PdbIdentifier};
 mod coverage_targets;
 mod dbghelp;
 mod dereference;
@@ -289,15 +289,44 @@ impl WindowsPlatform {
             )
         };
 
-        if status >= 0 {
-            Ok(info.teb_base_address as u64)
-        } else {
-            Err(PlatformError::Other(format!("NtQueryInformationThread failed: 0x{:08X}", status)))
+        if status < 0 {
+            return Err(PlatformError::Other(format!("NtQueryInformationThread failed: 0x{:08X}", status)));
         }
+        let teb = info.teb_base_address as u64;
+        // A WOW64 thread has two TEBs. The 32-bit one — what its code reaches
+        // through `fs:` and what the 32-bit ntdll's `_TEB` describes — sits at
+        // TEB64.WowTebOffset (normally +0x2000). Report that for x86 targets.
+        if process.architecture() == Architecture::X86 {
+            if let Some(teb32) = self.wow64_teb32(pid, teb) {
+                return Ok(teb32);
+            }
+        }
+        Ok(teb)
     }
 
-    /// Get the PEB (Process Environment Block) base address for a process.
+    /// `TEB64.WowTebOffset` applied to `teb64`, when set.
+    fn wow64_teb32(&self, pid: u32, teb64: u64) -> Option<u64> {
+        const TEB64_WOW_TEB_OFFSET: u64 = 0x180C;
+        let bytes = memory::read_memory_unlocked(pid, teb64 + TEB64_WOW_TEB_OFFSET, 4).ok()?;
+        let offset = i32::from_le_bytes(bytes.first_chunk::<4>().copied()?);
+        (offset != 0).then(|| teb64.wrapping_add(offset as i64 as u64))
+    }
+
+    /// The PEB the target's own code uses: the 32-bit PEB of a WOW64 process,
+    /// otherwise the native one. See [`Self::get_native_peb_address`].
     pub fn get_peb_address(&self, pid: u32) -> Result<u64, PlatformError> {
+        if self.get_process(pid)?.architecture() == Architecture::X86 {
+            let peb32 = self.get_wow64_peb_address(pid)?;
+            if peb32 != 0 {
+                return Ok(peb32);
+            }
+        }
+        self.get_native_peb_address(pid)
+    }
+
+    /// The native (64-bit) PEB of a process — a WOW64 process has this one too,
+    /// read by the 64-bit ntdll on its behalf.
+    pub fn get_native_peb_address(&self, pid: u32) -> Result<u64, PlatformError> {
         let process_handle = self.get_process(pid)?.handle();
 
         // PROCESS_BASIC_INFORMATION layout — see `winternl.h`.
@@ -346,8 +375,14 @@ impl WindowsPlatform {
         }
     }
 
-    /// True if the target process is WOW64 (32-bit on 64-bit Windows).
+    /// True if the target process is WOW64 (32-bit x86 on 64-bit Windows).
     pub fn is_wow64_process(&self, pid: u32) -> Result<bool, PlatformError> {
+        Ok(self.get_process(pid)?.architecture() == Architecture::X86)
+    }
+
+    /// The 32-bit PEB of a WOW64 process (`ProcessWow64Information`); 0 for a
+    /// native process.
+    pub fn get_wow64_peb_address(&self, pid: u32) -> Result<u64, PlatformError> {
         let process_handle = self.get_process(pid)?.handle();
 
         #[link(name = "ntdll")]
@@ -377,7 +412,7 @@ impl WindowsPlatform {
         };
 
         if status >= 0 {
-            Ok(wow64_peb != 0)
+            Ok(wow64_peb as u64)
         } else {
             Err(PlatformError::Other(format!(
                 "NtQueryInformationProcess(ProcessWow64Information) failed: 0x{:08X}",
@@ -407,20 +442,11 @@ impl PlatformAPI for WindowsPlatform {
     fn set_single_shot_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError> {
         let process = self.get_process_mut(pid)?;
         let process_handle = process.handle();
-        let arch = process.architecture();
 
-        let (breakpoint_bytes, original_bytes) = match arch {
-            Architecture::X64 => {
-                let original_byte = memory::read_memory_internal(process_handle, addr, 1)?;
-                (vec![0xCC], original_byte)
-            }
-            Architecture::Arm64 => {
-                // ARM64 BRK instruction (BRK #0)
-                let original_bytes = memory::read_memory_internal(process_handle, addr, 4)?;
-                (vec![0x00, 0x00, 0x3e, 0xD4], original_bytes)
-            }
-        };
-        
+        // `int3` on x86/x64, `BRK #0` on ARM64; save exactly the bytes it overwrites.
+        let breakpoint_bytes = process.breakpoint_instruction_bytes();
+        let original_bytes = memory::read_memory_internal(process_handle, addr, breakpoint_bytes.len())?;
+
         // Store the original bytes
         process.insert_single_shot_breakpoint(addr, original_bytes);
         
@@ -439,22 +465,13 @@ impl PlatformAPI for WindowsPlatform {
         trace!(pid, addr, "WindowsPlatform::set_breakpoint called");
         let process = self.get_process_mut(pid)?;
         let process_handle = process.handle();
-        let arch = process.architecture();
 
         if process.is_persistent_breakpoint(addr) {
             return Ok(());
         }
 
-        let (breakpoint_bytes, original_bytes) = match arch {
-            Architecture::X64 => {
-                let original_byte = memory::read_memory_internal(process_handle, addr, 1)?;
-                (vec![0xCC], original_byte)
-            }
-            Architecture::Arm64 => {
-                let original_bytes = memory::read_memory_internal(process_handle, addr, 4)?;
-                (vec![0x00, 0x00, 0x3e, 0xD4], original_bytes)
-            }
-        };
+        let breakpoint_bytes = process.breakpoint_instruction_bytes();
+        let original_bytes = memory::read_memory_internal(process_handle, addr, breakpoint_bytes.len())?;
 
         process.insert_persistent_breakpoint(addr, original_bytes, tid);
         memory::write_memory_internal(process_handle, addr, &breakpoint_bytes)
@@ -559,6 +576,18 @@ impl PlatformAPI for WindowsPlatform {
             )));
         }
 
+        // A WOW64 target's debug registers are 32-bit: no 8-byte length, no
+        // address above 4 GB.
+        let arch = process.architecture();
+        if arch == Architecture::X86 {
+            if size == crate::protocol::HardwareBreakpointSize::Byte8 {
+                return Err(PlatformError::Other("32-bit targets have no 8-byte hardware breakpoint length".into()));
+            }
+            if addr > u32::MAX as u64 {
+                return Err(PlatformError::Other(format!("0x{:X} is outside the 32-bit address space", addr)));
+            }
+        }
+
         // Allocate a free debug register slot from the appropriate bank
         let dr_index = process.find_free_debug_register(bp_type)
             .ok_or_else(|| PlatformError::Other(
@@ -570,7 +599,7 @@ impl PlatformAPI for WindowsPlatform {
         let thread_handles = process.thread_manager().all_thread_handles();
         let mut applied_count = 0u32;
         for (tid, handle) in &thread_handles {
-            match hardware_breakpoints::apply_single_hw_bp_to_thread(*handle, dr_index, addr, bp_type, size) {
+            match hardware_breakpoints::apply_single_hw_bp_to_thread_for(arch, *handle, dr_index, addr, bp_type, size) {
                 Ok(()) => applied_count += 1,
                 Err(e) => {
                     warn!(tid, addr, error = %e, "Failed to apply HW BP to thread (may have exited or be in kernel transition)");
@@ -606,9 +635,10 @@ impl PlatformAPI for WindowsPlatform {
             )))?;
 
         // Clear from all threads
+        let arch = process.architecture();
         let thread_handles = process.thread_manager().all_thread_handles();
         for (_tid, handle) in &thread_handles {
-            let _ = hardware_breakpoints::clear_hw_bp_from_thread(*handle, bp.dr_index, bp.bp_type);
+            let _ = hardware_breakpoints::clear_hw_bp_from_thread_for(arch, *handle, bp.dr_index, bp.bp_type);
         }
 
         info!(pid, addr, dr_index = bp.dr_index, "Hardware breakpoint removed");
@@ -666,6 +696,16 @@ impl PlatformAPI for WindowsPlatform {
                     
                     for chunk in stack_data.chunks_exact(8) {
                         arguments.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+                    }
+                }
+            }
+            // 32-bit cdecl/stdcall: every argument is on the stack, 4 bytes each,
+            // starting just above the return address.
+            (Architecture::X86, crate::protocol::ThreadContext::Wow64RawContext(ctx)) => {
+                if count > 0 {
+                    let stack_data = self.read_memory(pid, ctx.Esp as u64 + 4, count * 4)?;
+                    for chunk in stack_data.chunks_exact(4) {
+                        arguments.push(u32::from_le_bytes(chunk.try_into().unwrap()) as u64);
                     }
                 }
             }
@@ -1030,6 +1070,14 @@ impl PlatformAPI for WindowsPlatform {
 
     fn is_wow64(&self, pid: u32) -> Result<bool, PlatformError> {
         WindowsPlatform::is_wow64_process(self, pid)
+    }
+
+    fn get_native_peb_address(&self, pid: u32) -> Result<u64, PlatformError> {
+        WindowsPlatform::get_native_peb_address(self, pid)
+    }
+
+    fn process_architecture(&self, pid: u32) -> Result<Architecture, PlatformError> {
+        Ok(self.arch_for(pid))
     }
 
     // ---------------------- Server-side fast paths ----------------------

@@ -28,8 +28,9 @@ use crate::memory_scanner::{
 };
 use crate::protocol::PointerPath;
 
-/// Pointer size on the supported 64-bit targets (x64 / ARM64).
-const POINTER_SIZE: usize = 8;
+/// Largest pointer width — the default alignment and the read granularity of a
+/// 64-bit target. A WOW64 (x86) scan overrides `pointer_size` to 4.
+const MAX_POINTER_SIZE: usize = 8;
 /// Max distinct candidate slots processed at a single node (branch cap), keeping
 /// the reverse walk from exploding exponentially on hot pointer values.
 const MAX_OFFSETS_PER_NODE: usize = 1024;
@@ -47,6 +48,15 @@ const PARALLEL_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 /// Size of one pointer-map candidate `(value, slot)`.
 const PAIR_BYTES: usize = std::mem::size_of::<(u64, u64)>();
+
+/// Read a little-endian pointer of `pointer_size` (4 or 8) bytes, zero-extended.
+fn read_ptr_le(bytes: &[u8], pointer_size: usize) -> u64 {
+    if pointer_size == 4 {
+        u32::from_le_bytes(bytes[..4].try_into().unwrap()) as u64
+    } else {
+        u64::from_le_bytes(bytes[..8].try_into().unwrap())
+    }
+}
 
 /// When the map exceeds the RAM budget we spill sorted runs of this many pairs
 /// (~256 MB) so each run sorts quickly (sequentially, concurrently across worker
@@ -188,7 +198,9 @@ impl PointerScanner {
         thread_count: Option<usize>,
         writable_only: bool,
     ) -> Result<(String, u64, u64), String> {
-        let alignment = alignment.unwrap_or(POINTER_SIZE).max(1);
+        // A WOW64 target has 4-byte pointers; a scan reads and tiles by that width.
+        let pointer_size = platform.process_architecture(pid).map(|a| a.pointer_size()).unwrap_or(MAX_POINTER_SIZE);
+        let alignment = alignment.unwrap_or(pointer_size).max(1);
         // Results stream to disk, so there is no in-RAM cap by default; `None`
         // means unlimited (still bounded by depth, frontier, and the time budget).
         let max_results = max_results.map(|n| n as usize).unwrap_or(usize::MAX);
@@ -251,6 +263,7 @@ impl PointerScanner {
         // Global committed-address span for the fast pointer reject in the scan.
         let global_min = region_ranges.first().map(|r| r.0).unwrap_or(0);
         let global_max = region_ranges.iter().map(|r| r.1).max().unwrap_or(0);
+        let _ = MAX_POINTER_SIZE;
 
         // Phase 2 always reverse-walks from the target (map sorted by value).
         // A module filter is applied at *emission* time through `module_ranges`
@@ -268,7 +281,7 @@ impl PointerScanner {
         let scan_ns = AtomicU64::new(0);
         let budget_pairs = map_budget_pairs();
         let map = build_pointer_map(
-            platform, pid, &chunks, &region_ranges, global_min, global_max, alignment,
+            platform, pid, &chunks, &region_ranges, global_min, global_max, alignment, pointer_size,
             by_value, budget_pairs, thread_count, &read_ns, &scan_ns,
         )?;
         let pairs = map.as_slice();
@@ -384,6 +397,7 @@ impl PointerScanner {
             .map_err(|e| format!("Failed to list modules: {}", e))?;
         // Re-base by stored module name (stable across restarts); see get_results.
         let base_index = crate::pointer_results::module_base_index(&modules);
+        let pointer_size = platform.process_architecture(pid).map(|a| a.pointer_size()).unwrap_or(MAX_POINTER_SIZE);
         // Pre-resolve each table entry's live base once: table index -> Option<base>.
         let table_bases: Vec<Option<u64>> = reader
             .module_names()
@@ -416,11 +430,11 @@ impl PointerScanner {
                         // addr = base + base_offset; for off: addr = read_u64(addr) + off
                         let mut addr = base.checked_add(p.base_offset)?;
                         for &off in &p.offsets {
-                            let bytes = platform.read_memory(pid, addr, 8).ok()?;
-                            if bytes.len() < 8 {
+                            let bytes = platform.read_memory(pid, addr, pointer_size).ok()?;
+                            if bytes.len() < pointer_size {
                                 return None;
                             }
-                            let ptr = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+                            let ptr = read_ptr_le(&bytes, pointer_size);
                             addr = ptr.checked_add(off)?;
                         }
                         if addr == target_address {
@@ -623,14 +637,15 @@ fn extract_pointers_chunk(
     c_start: usize,
     c_end: usize,
     alignment: usize,
+    pointer_size: usize,
     region_ranges: &[(u64, u64)],
     global_min: u64,
     global_max: u64,
     read_ns: &AtomicU64,
     scan_ns: &AtomicU64,
 ) -> Vec<(u64, u64)> {
-    // Overlap is 0 when alignment >= POINTER_SIZE (slots never cross c_end then).
-    let read_end = c_end.saturating_add(POINTER_SIZE.saturating_sub(alignment)).min(region_size);
+    // Overlap is 0 when alignment >= pointer_size (slots never cross c_end then).
+    let read_end = c_end.saturating_add(pointer_size.saturating_sub(alignment)).min(region_size);
     if read_end <= c_start {
         return Vec::new();
     }
@@ -641,12 +656,12 @@ fn extract_pointers_chunk(
     let t_scan = Instant::now();
     let mut out = Vec::new();
     let mut pos = c_start;
-    while pos < c_end && pos + POINTER_SIZE <= region_size {
+    while pos < c_end && pos + pointer_size <= region_size {
         let di = pos - c_start;
-        if di + POINTER_SIZE > data.len() {
+        if di + pointer_size > data.len() {
             break; // partial read (unmapped tail)
         }
-        let value = u64::from_le_bytes(data[di..di + POINTER_SIZE].try_into().unwrap());
+        let value = read_ptr_le(&data[di..di + pointer_size], pointer_size);
         // Fast reject: most slots hold non-pointer data outside the committed
         // address span, killed here in two comparisons before the binary search.
         if value >= global_min && value < global_max && in_ranges(value, region_ranges) {
@@ -680,6 +695,7 @@ fn build_pointer_map(
     global_min: u64,
     global_max: u64,
     alignment: usize,
+    pointer_size: usize,
     by_value: bool,
     budget_pairs: usize,
     thread_count: Option<usize>,
@@ -700,7 +716,7 @@ fn build_pointer_map(
             if err.lock().unwrap().is_some() {
                 return;
             }
-            let found = extract_pointers_chunk(platform, pid, *b, *s, *cs, *ce, alignment, region_ranges, global_min, global_max, read_ns, scan_ns);
+            let found = extract_pointers_chunk(platform, pid, *b, *s, *cs, *ce, alignment, pointer_size, region_ranges, global_min, global_max, read_ns, scan_ns);
             if found.is_empty() {
                 return;
             }

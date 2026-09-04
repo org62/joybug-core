@@ -1,13 +1,34 @@
 //! Register mapping between Windows CONTEXT and Unicorn registers
 
-#[cfg(target_arch = "x86_64")]
-use unicorn_engine::RegisterX86;
-use unicorn_engine::Unicorn;
+use unicorn_engine::{RegisterARM64, RegisterX86, Unicorn};
 use crate::protocol::ThreadContext;
 use super::error::EmulatorError;
 
-#[cfg(target_arch = "aarch64")]
-use unicorn_engine::RegisterARM64;
+/// Load a WOW64 (32-bit x86) thread's registers into a Mode32 Unicorn.
+pub fn write_x86_registers<D>(
+    emu: &mut Unicorn<'_, D>,
+    context: &ThreadContext,
+) -> Result<(), EmulatorError> {
+    let ThreadContext::Wow64RawContext(ctx) = context else {
+        return Err(EmulatorError::RegisterError("x86 emulation needs a WOW64 context".into()));
+    };
+    let regs: [(RegisterX86, u32, &str); 9] = [
+        (RegisterX86::EAX, ctx.Eax, "EAX"), (RegisterX86::EBX, ctx.Ebx, "EBX"),
+        (RegisterX86::ECX, ctx.Ecx, "ECX"), (RegisterX86::EDX, ctx.Edx, "EDX"),
+        (RegisterX86::ESI, ctx.Esi, "ESI"), (RegisterX86::EDI, ctx.Edi, "EDI"),
+        (RegisterX86::EBP, ctx.Ebp, "EBP"), (RegisterX86::ESP, ctx.Esp, "ESP"),
+        (RegisterX86::EIP, ctx.Eip, "EIP"),
+    ];
+    for (reg, value, name) in regs {
+        emu.reg_write(reg, value as u64)
+            .map_err(|e| EmulatorError::RegisterError(format!("{}: {:?}", name, e)))?;
+    }
+    // Clear TF (bit 8) so the emulation itself never single-steps.
+    let eflags_no_tf = (ctx.EFlags as u64) & !0x100;
+    emu.reg_write(RegisterX86::EFLAGS, eflags_no_tf)
+        .map_err(|e| EmulatorError::RegisterError(format!("EFLAGS: {:?}", e)))?;
+    Ok(())
+}
 
 /// Write x64 registers from Windows CONTEXT to Unicorn
 #[cfg(target_arch = "x86_64")]
@@ -16,6 +37,9 @@ pub fn write_x64_registers<D>(
     context: &ThreadContext,
 ) -> Result<(), EmulatorError> {
     match context {
+        ThreadContext::Wow64RawContext(_) => {
+            return Err(EmulatorError::RegisterError("emulation of 32-bit (WOW64) contexts is not supported yet".into()));
+        }
         ThreadContext::Win32RawContext(ctx) => {
             // General purpose registers
             emu.reg_write(RegisterX86::RAX, ctx.Rax)
@@ -87,6 +111,9 @@ pub fn write_arm64_registers<D>(
     context: &ThreadContext,
 ) -> Result<(), EmulatorError> {
     match context {
+        ThreadContext::Wow64RawContext(_) => {
+            return Err(EmulatorError::RegisterError("emulation of 32-bit (WOW64) contexts is not supported yet".into()));
+        }
         ThreadContext::Win32RawContext(ctx) => {
             // General purpose registers X0-X28
             let x_regs = unsafe { ctx.Anonymous.X };
@@ -157,8 +184,7 @@ pub fn write_arm64_registers<D>(
     Err(EmulatorError::RegisterError("ARM64 not supported on this platform".to_string()))
 }
 
-/// Read x64 register by name
-#[cfg(target_arch = "x86_64")]
+/// Read x64 (or, by its 32-bit names, x86) register by name
 pub fn read_x64_registers<D>(emu: &Unicorn<'_, D>, name: &str) -> Result<u64, EmulatorError> {
     let reg = match name.to_uppercase().as_str() {
         "RAX" => RegisterX86::RAX,
@@ -187,6 +213,7 @@ pub fn read_x64_registers<D>(emu: &Unicorn<'_, D>, name: &str) -> Result<u64, Em
         "EDI" => RegisterX86::EDI,
         "EBP" => RegisterX86::EBP,
         "ESP" => RegisterX86::ESP,
+        "EIP" => RegisterX86::EIP,
         _ => return Err(EmulatorError::RegisterError(format!("Unknown register: {}", name))),
     };
 
@@ -194,13 +221,7 @@ pub fn read_x64_registers<D>(emu: &Unicorn<'_, D>, name: &str) -> Result<u64, Em
         .map_err(|e| EmulatorError::RegisterError(format!("{}: {:?}", name, e)))
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-pub fn read_x64_registers<D>(_emu: &Unicorn<'_, D>, _name: &str) -> Result<u64, EmulatorError> {
-    Err(EmulatorError::RegisterError("x64 not supported on this platform".to_string()))
-}
-
 /// Read ARM64 register by name
-#[cfg(target_arch = "aarch64")]
 pub fn read_arm64_registers<D>(emu: &Unicorn<'_, D>, name: &str) -> Result<u64, EmulatorError> {
     let reg = match name.to_uppercase().as_str() {
         "X0" => RegisterARM64::X0,
@@ -244,7 +265,3 @@ pub fn read_arm64_registers<D>(emu: &Unicorn<'_, D>, name: &str) -> Result<u64, 
         .map_err(|e| EmulatorError::RegisterError(format!("{}: {:?}", name, e)))
 }
 
-#[cfg(not(target_arch = "aarch64"))]
-pub fn read_arm64_registers<D>(_emu: &Unicorn<'_, D>, _name: &str) -> Result<u64, EmulatorError> {
-    Err(EmulatorError::RegisterError("ARM64 not supported on this platform".to_string()))
-}

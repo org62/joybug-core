@@ -68,6 +68,9 @@ pub struct ResolvedSymbol {
 pub enum Architecture {
     X64,
     Arm64,
+    /// 32-bit x86: a PE32 image, or a WOW64 process on a 64-bit host. Never the
+    /// debugger's own architecture (there is no 32-bit build).
+    X86,
 }
 
 impl Architecture {
@@ -78,9 +81,32 @@ impl Architecture {
     /// Longest possible instruction encoding, in bytes (ARM64 is fixed-width).
     pub fn max_instruction_len(self) -> usize {
         match self {
-            Architecture::X64 => 15,
+            Architecture::X86 | Architecture::X64 => 15,
             Architecture::Arm64 => 4,
         }
+    }
+
+    /// Width of a pointer in the target's address space.
+    pub fn pointer_size(self) -> usize {
+        match self {
+            Architecture::X86 => 4,
+            Architecture::X64 | Architecture::Arm64 => 8,
+        }
+    }
+
+    /// Highest user-mode address the target can form. 64-bit targets share
+    /// [`MAX_USER_ADDRESS`]; a WOW64 process is confined to the low 4 GB.
+    pub fn max_user_address(self) -> u64 {
+        match self {
+            Architecture::X86 => 0xFFFF_FFFF,
+            Architecture::X64 | Architecture::Arm64 => MAX_USER_ADDRESS,
+        }
+    }
+
+    /// x86 or x64: the same instruction set family (mnemonics, `int3`, `syscall`
+    /// stubs), differing in operand width and pointer size.
+    pub fn is_x86_family(self) -> bool {
+        matches!(self, Architecture::X86 | Architecture::X64)
     }
 }
 
@@ -636,16 +662,28 @@ pub trait PlatformAPI: Send + Sync {
         Err(PlatformError::NotImplemented)
     }
 
-    /// Process Environment Block (PEB) base address — used by the
-    /// anti-anti-debug subsystem for PEB hiding.
+    /// Process Environment Block (PEB) base address of the target's own
+    /// architecture: the 32-bit PEB for a WOW64 process, else the native one.
     fn get_peb_address(&self, _pid: u32) -> Result<u64, PlatformError> {
         Err(PlatformError::NotImplemented)
+    }
+
+    /// The native (64-bit) PEB, which a WOW64 process has alongside its 32-bit
+    /// one. Same as [`Self::get_peb_address`] for a native target.
+    fn get_native_peb_address(&self, pid: u32) -> Result<u64, PlatformError> {
+        self.get_peb_address(pid)
     }
 
     /// True if the target is a 32-bit (WOW64) process on 64-bit Windows.
     /// Used to bail out of features that assume the 64-bit PEB layout.
     fn is_wow64(&self, _pid: u32) -> Result<bool, PlatformError> {
         Err(PlatformError::NotImplemented)
+    }
+
+    /// The debuggee's instruction-set architecture: `X86` for a WOW64 process,
+    /// otherwise the host's. Decided per process at create/attach/open time.
+    fn process_architecture(&self, _pid: u32) -> Result<Architecture, PlatformError> {
+        Ok(Architecture::from_native())
     }
 
     /// Search process memory for a byte pattern, returning matching addresses.
