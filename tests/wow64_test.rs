@@ -67,9 +67,13 @@ fn wow64_launch_stops_at_the_32bit_initial_breakpoint() {
             assert!(ctx.sp() != 0 && ctx.sp() < 0x1_0000_0000);
 
             let modules = session.list_modules(pid)?;
-            let ntdll32 = module_named(&modules, r"\syswow64\ntdll.dll").expect("32-bit ntdll in the module list");
+            // On an x64 host the 32-bit ntdll comes from SysWOW64; on ARM64 the x86
+            // emulation layer loads the CHPE build from SyChpe32 instead.
+            let ntdll32 = module_named(&modules, r"\syswow64\ntdll.dll")
+                .or_else(|| module_named(&modules, r"\sychpe32\ntdll.dll"))
+                .expect("32-bit ntdll in the module list");
             assert!(module_named(&modules, r"\system32\ntdll.dll").is_some(), "64-bit ntdll in the module list");
-            assert!(contains(ntdll32, address), "initial break {:#x} not inside SysWOW64\\ntdll {:#x}+{:#x?}", address, ntdll32.base, ntdll32.size);
+            assert!(contains(ntdll32, address), "initial break {:#x} not inside {} {:#x}+{:#x?}", address, ntdll32.name, ntdll32.base, ntdll32.size);
 
             let insns = session.disassemble_memory(pid, address, 3, Architecture::X86)?;
             assert!(!insns.is_empty());
@@ -339,10 +343,18 @@ fn wow64_freeze_through_pointer_chain() {
                 const SENTINEL: u32 = 0x0BADF00D;
                 // base = &g_value_ptr, offsets = [0] => *g_value_ptr == &g_value.
                 let id = session.freeze_value(pid, ptr_slot, SENTINEL.to_le_bytes().to_vec(), Some(5), vec![0])?;
-                std::thread::sleep(std::time::Duration::from_millis(80));
-                let got = session.read_memory(pid, target, 4)?;
+                // The freeze thread's first write needs the platform lock, so under
+                // load it can land late: poll for the sentinel instead of sleeping.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                let got = loop {
+                    let bytes = session.read_memory(pid, target, 4)?;
+                    let v = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                    if v == SENTINEL || std::time::Instant::now() >= deadline {
+                        break v;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                };
                 session.unfreeze_value(id)?;
-                let got = u32::from_le_bytes(got[..4].try_into().unwrap());
                 assert_eq!(got, SENTINEL, "freeze through 32-bit chain did not write g_value");
                 session.state.ok = true;
                 session.terminate_process(pid)?;
