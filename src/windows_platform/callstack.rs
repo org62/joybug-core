@@ -91,10 +91,15 @@ pub fn get_call_stack(
             mask_aarch64_addresses(&mut stack_frame, raw_context);
         }
         
+        // dbghelp's ADDRESS64 offsets are sign-extended for 32-bit code, so a
+        // garbage x86 return address such as 0xFFFFFFFF (an EBP-chain walk
+        // running off the end) comes back as 0xFFFFFFFF_FFFFFFFF. A 32-bit
+        // frame lives below 4 GB by construction: keep the low half.
+        let width = |offset: u64| if architecture == Architecture::X86 { offset & 0xFFFF_FFFF } else { offset };
         let (instruction_pointer, stack_pointer, frame_pointer) = (
-            stack_frame.AddrPC.Offset,
-            stack_frame.AddrStack.Offset,
-            stack_frame.AddrFrame.Offset
+            width(stack_frame.AddrPC.Offset),
+            width(stack_frame.AddrStack.Offset),
+            width(stack_frame.AddrFrame.Offset)
         );
         
         // Skip invalid frames
