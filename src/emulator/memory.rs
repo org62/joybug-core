@@ -142,7 +142,6 @@ impl<'a> Emulator<'a> {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
     pub(super) fn align_size(size: u64) -> u64 {
         const PAGE_SIZE: u64 = 0x1000;
         (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
