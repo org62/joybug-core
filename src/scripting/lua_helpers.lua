@@ -489,3 +489,29 @@ function regions()
             mem_type(r.region_type)))
     end
 end
+
+--- Set a breakpoint on an imported API via the debuggee's own IAT
+--- bpi("kernel32!CreateProcessW")         -- REPL on hit
+--- bpi("CreateProcessW", handler)         -- any importing DLL, with a handler
+function bpi(spec, handler)
+    if not pid then print(C.err("(no pid)")); return end
+    if not handler then
+        handler = function(p, t, a) dbg:repl() end
+    end
+    local stub, target = dbg:set_breakpoint_import(pid, spec, handler)
+    print("Import hook: " .. C.sym(spec) .. " slot -> stub " .. C.addr(hex(stub))
+        .. " (was " .. C.addr(hex(target)) .. ")")
+    return stub, target
+end
+
+--- Return from the current call without running it (neutralise an API)
+--- skip()                 -- return 0, stdcall (pop callee args on x86)
+--- skip(0x1234)           -- set the return value
+--- skip(0, 10, "stdcall") -- 10 stdcall args
+--- skip(0, 0, "cdecl")    -- caller cleans the stack
+function skip(ret, args, conv)
+    if not pid or not tid then print(C.err("(no pid/tid)")); return end
+    local ra = dbg:skip_call(pid, tid, { ret = ret or 0, args = args or 0, conv = conv or "stdcall" })
+    print("Skipped call; returning to " .. C.addr(hex(ra)))
+    return ra
+end

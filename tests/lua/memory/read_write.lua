@@ -28,6 +28,29 @@ dbg:on_initial_breakpoint(function(pid, tid, addr)
     assert(dbg:read_u32(pid, sp) ~= nil, "read_u32 should return a value")
     assert(dbg:read_u64(pid, sp) ~= nil, "read_u64 should return a value")
 
+    -- Wide-string round trip (RETRO B1: read_string used to drop the last
+    -- character). Write UTF-16LE "UnholyDragon-0.exe\0" onto the stack and read
+    -- it back whole; a bounded read of 6 chars returns exactly "Unholy".
+    local text = "UnholyDragon-0.exe"
+    local wide = ""
+    for i = 1, #text do wide = wide .. string.char(text:byte(i), 0) end
+    wide = wide .. string.char(0, 0)  -- NUL terminator
+    local scratch = sp + 0x40         -- writable stack space, away from live data
+    dbg:write_memory(pid, scratch, wide)
+    assert(dbg:read_string(pid, scratch) == text,
+        "read_string should return the whole wide string, got: " .. tostring(dbg:read_string(pid, scratch)))
+    assert(dbg:read_string(pid, scratch, 6) == "Unholy",
+        "bounded read_string(6) should return exactly 6 chars, got: " .. tostring(dbg:read_string(pid, scratch, 6)))
+
+
+    -- A fresh allocation is readable and writable; an executable one too.
+    local buf = dbg:allocate_memory(pid, 0x1000)
+    assert(buf and buf > 0, "allocate_memory should return an address")
+    dbg:write_memory(pid, buf, "joybug")
+    assert(dbg:read_memory(pid, buf, 6) == "joybug", "allocated memory should round-trip a write")
+    local code = dbg:allocate_memory(pid, 0x1000, true)
+    assert(code and code > 0 and code ~= buf, "an executable allocation is a distinct region")
+
     dbg:terminate(pid)
 end)
 

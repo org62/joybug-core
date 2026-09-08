@@ -37,17 +37,15 @@ fn set_arch_global(lua: &mlua::Lua) {
     .unwrap();
 }
 
-/// Helper: run a Lua test script from a file path.
-/// If `test_exe` is provided, it's injected as the global `TEST_EXE`.
-fn run_lua_test_file(lua_path: &str, test_exe: Option<&str>) {
-    joybug_core::init_tracing();
-    let server = TestServer::spawn();
-    let lua = setup_lua_with_server(&server);
-
+/// Inject `TEST_EXE` when a test program is given.
+fn set_test_exe(lua: &mlua::Lua, test_exe: Option<&str>) {
     if let Some(exe) = test_exe {
         lua.globals().set("TEST_EXE", exe).unwrap();
     }
+}
 
+/// Run `tests/lua/<lua_path>` in `lua` and require it to return `{ passed = true }`.
+fn eval_lua_test_file(lua: &mlua::Lua, lua_path: &str) {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let full_path = format!("{}\\tests\\lua\\{}", manifest_dir, lua_path);
     let script = std::fs::read_to_string(&full_path)
@@ -56,35 +54,34 @@ fn run_lua_test_file(lua_path: &str, test_exe: Option<&str>) {
     let result: mlua::Value = lua.load(&script).set_name(&full_path).eval()
         .unwrap_or_else(|e| panic!("Lua test {} failed: {}", lua_path, e));
 
-    // Verify the script returned { passed = true }
     if let mlua::Value::Table(t) = result {
         let passed: bool = t.get("passed").unwrap_or(false);
         assert!(passed, "Lua test {} did not return passed=true", lua_path);
     }
 }
 
+/// Helper: run a Lua test script from a file path.
+/// If `test_exe` is provided, it's injected as the global `TEST_EXE`.
+fn run_lua_test_file(lua_path: &str, test_exe: Option<&str>) {
+    joybug_core::init_tracing();
+    let server = TestServer::spawn();
+    let lua = setup_lua_with_server(&server);
+    set_test_exe(&lua, test_exe);
+    eval_lua_test_file(&lua, lua_path);
+}
+
+/// A Lua state with the helpers and arch globals but no server connection.
+fn lua_without_server(test_exe: Option<&str>) -> mlua::Lua {
+    let lua = scripting::create_lua().expect("create lua");
+    set_arch_global(&lua);
+    set_test_exe(&lua, test_exe);
+    lua
+}
+
 /// Helper: run a Lua test that only needs the helpers (no server connection).
 /// If `test_exe` is provided, it's injected as the global `TEST_EXE`.
 fn run_lua_test_file_no_server(lua_path: &str, test_exe: Option<&str>) {
-    let lua = scripting::create_lua().expect("create lua");
-    set_arch_global(&lua);
-
-    if let Some(exe) = test_exe {
-        lua.globals().set("TEST_EXE", exe).unwrap();
-    }
-
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let full_path = format!("{}\\tests\\lua\\{}", manifest_dir, lua_path);
-    let script = std::fs::read_to_string(&full_path)
-        .unwrap_or_else(|e| panic!("Failed to read {}: {}", full_path, e));
-
-    let result: mlua::Value = lua.load(&script).set_name(&full_path).eval()
-        .unwrap_or_else(|e| panic!("Lua test {} failed: {}", lua_path, e));
-
-    if let mlua::Value::Table(t) = result {
-        let passed: bool = t.get("passed").unwrap_or(false);
-        assert!(passed, "Lua test {} did not return passed=true", lua_path);
-    }
+    eval_lua_test_file(&lua_without_server(test_exe), lua_path);
 }
 
 // ---------------------------------------------------------------------------
@@ -653,6 +650,13 @@ fn test_lua_file_parent_child() {
     run_lua_test_file("basics/parent_child.lua", Some(&test_exe));
 }
 
+// Per-child hook contract (RETRO F6): on_child_ready fires only for a child.
+#[test]
+fn test_lua_file_child_hooks() {
+    let test_exe = common::get_test_program_path("parent_child_test");
+    run_lua_test_file("basics/child_hooks.lua", Some(&test_exe));
+}
+
 // --- modules ---
 
 #[test]
@@ -795,6 +799,20 @@ fn test_lua_file_disassembly_backward() {
 fn test_lua_file_breakpoint_handler() {
     let test_exe = common::get_test_program_path("disassembly_test");
     run_lua_test_file("breakpoints/breakpoint_handler.lua", Some(&test_exe));
+}
+
+// Import-aware breakpoints + the live import table (RETRO F7).
+#[test]
+fn test_lua_file_import_breakpoint() {
+    let test_exe = common::get_test_program_path("disassembly_test");
+    run_lua_test_file("breakpoints/import_breakpoint.lua", Some(&test_exe));
+}
+
+// dbg:skip_call — return from a call without running it (RETRO F8).
+#[test]
+fn test_lua_file_skip_call() {
+    let test_exe = common::get_test_program_path("disassembly_test");
+    run_lua_test_file("breakpoints/skip_call.lua", Some(&test_exe));
 }
 
 #[test]
@@ -953,7 +971,21 @@ static SANDBOX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn run_lua_sandbox_test(lua_path: &str, test_exe: Option<&str>) {
     let _guard = SANDBOX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    run_lua_test_file_no_server(lua_path, test_exe);
+    run_lua_sandbox_test_with_guest(lua_path, test_exe);
+}
+
+/// The live sandbox tests need a guest binary that provides both the debug
+/// server and the ETW collector. `joybug-core.exe` is exactly that (RETRO
+/// B3/B4), and Cargo hands its built path to integration tests as
+/// `CARGO_BIN_EXE_joybug-core` — so there is nothing to stage or point an env
+/// var at. `JOYBUG_SANDBOX_TEST_GUEST_EXE` overrides it (e.g. to test jlua.exe
+/// as the guest); the legacy `JOYBUG_SANDBOX_TEST_BINDIR` still works too.
+fn run_lua_sandbox_test_with_guest(lua_path: &str, test_exe: Option<&str>) {
+    let lua = lua_without_server(test_exe);
+    let guest_exe = std::env::var("JOYBUG_SANDBOX_TEST_GUEST_EXE")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_joybug-core").to_string());
+    lua.globals().set("GUEST_EXE_PATH", guest_exe).unwrap();
+    eval_lua_test_file(&lua, lua_path);
 }
 
 // Live: boots a real Windows Sandbox and collects ETW inside it, driven from Lua
@@ -1003,4 +1035,27 @@ fn test_lua_file_sbx_audit_open_process() {
         "sandbox/audit_open_process.lua",
         Some(&common::get_test_program_path("open_remote")),
     );
+}
+
+// Live: recover / reuse a running sandbox by id (RETRO B5). Provision, adopt the
+// same VM with sbx.attach, prove the attached handle reaches the guest server
+// and does not own the VM. Same gates as above, serialized by SANDBOX_LOCK.
+#[test]
+fn test_lua_file_sbx_attach_reuse() {
+    if std::env::var("JOYBUG_SANDBOX_LIVE").is_err() {
+        eprintln!("skipping live sandbox attach test (set JOYBUG_SANDBOX_LIVE=1 to run)");
+        return;
+    }
+    run_lua_sandbox_test("sandbox/attach_reuse.lua", None);
+}
+
+// Live: see the guest desktop from the host (RETRO F4) — window list, screenshot
+// and window text of a Notepad launched in the guest's interactive session.
+#[test]
+fn test_lua_file_sbx_guest_ui() {
+    if std::env::var("JOYBUG_SANDBOX_LIVE").is_err() {
+        eprintln!("skipping live sandbox guest-UI test (set JOYBUG_SANDBOX_LIVE=1 to run)");
+        return;
+    }
+    run_lua_sandbox_test("sandbox/guest_ui.lua", None);
 }

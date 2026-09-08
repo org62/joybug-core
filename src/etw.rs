@@ -31,7 +31,10 @@ use std::path::{Path, PathBuf};
 // Lua bindings depend only on `joybug_core::etw::*` — never on the winsandbox
 // crate, and never on `crate::sandbox` (which the `sandbox` feature may gate off
 // while `etw` alone is on).
-pub use winsandbox::{is_tracer_done, pretty_path, TraceEvent, DEFAULT_OPS};
+pub use winsandbox::{
+    expand_ops, is_tracer_done, pretty_path, tracer_record, TraceEvent, ALL_OPS, DEFAULT_OPS,
+    OP_ALIASES, OP_KINDS,
+};
 /// Run the ETW collector in this process, consuming it: the hosting executable
 /// dispatches here when launched with the collector's flags instead of shipping
 /// a separate tracer binary. Never returns.
@@ -43,7 +46,8 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// FILETIME epoch (1601-01-01) → Unix epoch (1970-01-01) offset, in 100ns ticks.
 const EPOCH_DIFF_100NS: i64 = 116_444_736_000_000_000;
 
-/// What the ETW tracer records. `ops` is the explicit per-operation token set;
+/// What the ETW tracer records. `ops` is the per-operation token set — canonical
+/// tokens, `kind.*` groups, `all`, or a documented alias (see [`expand_ops`]);
 /// empty means the tracer's built-in default ([`DEFAULT_OPS`]). Owned here (not
 /// in `sandbox`) so it is available whenever the `etw` feature is on, with or
 /// without `sandbox`; `crate::sandbox` re-exports it for compatibility.
@@ -51,14 +55,31 @@ const EPOCH_DIFF_100NS: i64 = 116_444_736_000_000_000;
 pub struct EtwCaptureSpec {
     pub ops: Vec<String>,
     pub callstacks: bool,
+    /// ETW buffer size in KB; `None` = the tracer's default. Raise it (or
+    /// `buffers`) when a capture reports `tracer.lost` records.
+    pub buffer_kb: Option<u32>,
+    /// Cap on the ETW buffer pool; `None` = the tracer's default.
+    pub buffers: Option<u32>,
 }
 
 impl EtwCaptureSpec {
-    /// The `--capture` value (csv of op tokens), or `None` when the set is empty
-    /// or equals the tracer's built-in default — then the flag is omitted and the
-    /// tracer's own default applies.
+    /// Reject unknown op tokens up front, with the valid vocabulary in the
+    /// message — before a VM is booted or a UAC prompt is paid.
+    pub fn validate(&self) -> Result<(), String> {
+        expand_ops(&self.ops).map(|_| ())
+    }
+
+    /// The canonical, expanded token list (groups and aliases resolved). An
+    /// invalid list is passed through unchanged — `validate` is where it fails.
+    pub fn expanded_ops(&self) -> Vec<String> {
+        expand_ops(&self.ops).unwrap_or_else(|_| self.ops.clone())
+    }
+
+    /// The `--capture` value (csv of canonical op tokens), or `None` when the set
+    /// is empty or equals the tracer's built-in default — then the flag is
+    /// omitted and the tracer's own default applies.
     pub fn capture_ops(&self) -> Option<String> {
-        let ops = &self.ops;
+        let ops = self.expanded_ops();
         let is_default = ops.is_empty()
             || (ops.len() == DEFAULT_OPS.len()
                 && DEFAULT_OPS.iter().all(|d| ops.iter().any(|o| o == d)));
@@ -69,20 +90,35 @@ impl EtwCaptureSpec {
         }
     }
 
-    /// The guest-command fragment for this spec: `" --capture a,b --stacks"`
-    /// (leading space so it splices into a command line); default ops and
-    /// callstacks-off each omit their flag. Only `crate::sandbox` uses it (it
-    /// builds a single command string rather than an argv — the argv path is
-    /// `tracer_args`).
-    pub(crate) fn cmd_flags(&self) -> String {
-        let mut flags = match self.capture_ops() {
-            Some(csv) => format!(" --capture {csv}"),
-            None => String::new(),
-        };
-        if self.callstacks {
-            flags.push_str(" --stacks");
+    /// The tracer argv tokens for this spec (`--capture a,b --stacks
+    /// --buffer-kb N --buffers N`); default ops, callstacks-off and unset
+    /// buffer options each omit their flag. None of the tokens contains a
+    /// space, so [`Self::cmd_flags`] can join them into a command line.
+    pub fn capture_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some(csv) = self.capture_ops() {
+            args.push("--capture".to_string());
+            args.push(csv);
         }
-        flags
+        if self.callstacks {
+            args.push("--stacks".to_string());
+        }
+        if let Some(kb) = self.buffer_kb {
+            args.push("--buffer-kb".to_string());
+            args.push(kb.to_string());
+        }
+        if let Some(n) = self.buffers {
+            args.push("--buffers".to_string());
+            args.push(n.to_string());
+        }
+        args
+    }
+
+    /// [`Self::capture_args`] as a guest-command fragment with a leading space
+    /// (so it splices into a command line), empty when nothing is set. Only
+    /// `crate::sandbox` uses it: it builds a single command string, not an argv.
+    pub(crate) fn cmd_flags(&self) -> String {
+        self.capture_args().iter().map(|a| format!(" {a}")).collect()
     }
 }
 
@@ -120,6 +156,7 @@ impl HostTracer {
         control_path: PathBuf,
         pid: u32,
     ) -> Result<HostTracer, String> {
+        cfg.capture.validate()?;
         write_control(&control_path, "")?;
         let mut args = tracer_args(cfg);
         args.push("--attach-pid".to_string());
@@ -150,6 +187,7 @@ impl HostTracer {
 /// (`-- <program> [args]`). Returns once the launcher is spawned; observe
 /// completion via [`tracer_done`] on `cfg.out_path`.
 pub fn launch_spawn(cfg: &HostTracerConfig, target_argv: &[String]) -> Result<(), String> {
+    cfg.capture.validate()?;
     let mut args = tracer_args(cfg);
     args.push("--".to_string());
     args.extend(target_argv.iter().cloned());
@@ -167,13 +205,7 @@ fn tracer_args(cfg: &HostTracerConfig) -> Vec<String> {
         "--session-name".to_string(),
         cfg.session_name.clone(),
     ];
-    if let Some(csv) = cfg.capture.capture_ops() {
-        args.push("--capture".to_string());
-        args.push(csv);
-    }
-    if cfg.capture.callstacks {
-        args.push("--stacks".to_string());
-    }
+    args.extend(cfg.capture.capture_args());
     args
 }
 
@@ -510,12 +542,36 @@ mod tests {
             tracer_exe: PathBuf::from("t.exe"),
             out_path: PathBuf::from("o.jsonl"),
             session_name: "s".to_string(),
-            capture: EtwCaptureSpec { ops: vec!["file.read".to_string()], callstacks: true },
+            capture: EtwCaptureSpec {
+                ops: vec!["file.read".to_string()],
+                callstacks: true,
+                buffer_kb: Some(64),
+                buffers: Some(8),
+            },
         };
         let args = tracer_args(&cfg);
         let cap = args.iter().position(|a| a == "--capture").expect("--capture present");
         assert_eq!(args[cap + 1], "file.read");
         assert_eq!(args.iter().filter(|a| *a == "--stacks").count(), 1, "exactly one --stacks");
+        let kb = args.iter().position(|a| a == "--buffer-kb").expect("--buffer-kb present");
+        assert_eq!(args[kb + 1], "64");
+        let n = args.iter().position(|a| a == "--buffers").expect("--buffers present");
+        assert_eq!(args[n + 1], "8");
+    }
+
+    #[test]
+    fn capture_ops_expands_groups_and_aliases() {
+        let spec = EtwCaptureSpec { ops: vec!["registry.query".into(), "audit.*".into()], ..Default::default() };
+        assert!(spec.validate().is_ok());
+        assert_eq!(
+            spec.capture_ops().as_deref(),
+            Some("registry.query_value,audit.open_process,audit.open_thread")
+        );
+        // A spelling of the default set through a group is still "the default".
+        let all_default = EtwCaptureSpec { ops: DEFAULT_OPS.iter().map(|s| s.to_string()).collect(), ..Default::default() };
+        assert_eq!(all_default.capture_ops(), None);
+        let bad = EtwCaptureSpec { ops: vec!["file.wriet".into()], ..Default::default() };
+        assert!(bad.validate().unwrap_err().contains("file.wriet"));
     }
 
     #[test]

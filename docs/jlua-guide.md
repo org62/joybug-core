@@ -56,6 +56,15 @@ break 1234:5678 0x7FF8CDCACBC4> go
 
 ## Debugger API (`dbg`)
 
+### Handshake
+
+Connecting (via `dbg` / `sbx.connect`) performs a protocol handshake: the client
+and server exchange a fingerprint derived from the wire-format source, so a host
+driving a guest server built from another revision fails immediately with a clear
+"protocol mismatch" (or "the server closed the connection during the handshake")
+message instead of hanging on the first request. `dbg:server_info()` returns the
+server's `{ server, version, fingerprint }`.
+
 ### Process Control
 
 ```lua
@@ -128,6 +137,56 @@ end)
 
 -- Remove a breakpoint
 dbg:remove_breakpoint(pid, addr)
+
+-- Hook an imported API through the debuggee's OWN import table: the IAT slot is
+-- pointed at a private `jmp [target]` stub carrying the breakpoint, so it fires
+-- only for calls made through this module's slot -- a breakpoint at the API
+-- itself would fire process-wide (every DLL and the loader call kernel32). It is
+-- also unambiguous in a WOW64 process (where both the 32- and 64-bit kernel32
+-- are mapped). "dll!name" filters by importing DLL; a bare "name" matches any.
+-- Returns the stub (breakpoint) address, which is what the handler receives,
+-- and the slot's original target; removing the breakpoint restores the slot.
+-- Also `bpi("kernel32!CreateProcessW")` at the REPL.
+local stub, target = dbg:set_breakpoint_import(pid, "kernel32!CreateProcessW", function(pid, tid, addr)
+    print("CreateProcessW via IAT")  -- the stack/registers are exactly as at the API's entry
+    return "remove"
+end)
+
+-- The debuggee's live import table (default module = its main image): each entry
+-- is { dll, name, ordinal, iat_va, target } where target is the slot's current
+-- resolved address.
+for _, imp in ipairs(dbg:imports(pid)) do
+    print(imp.dll, imp.name, hex(imp.iat_va), imp.target and hex(imp.target))
+end
+```
+
+**Neutralise a call.** `dbg:skip_call` returns from the current function without
+running it — the standard "block this API" move in detonation work. It pops the
+return address into the instruction pointer, cleans the stack for the calling
+convention, and sets the return-value register.
+
+```lua
+-- At the entry of an API you want to no-op (e.g. a CreateProcessW breakpoint):
+dbg:skip_call(pid, tid, { ret = 0, args = 10, conv = "stdcall" })
+--   x86 stdcall: pop the return addr + args*4 off esp, eax = ret
+--   x86 cdecl (args ignored): pop only the return addr, eax = ret
+--   x64: pop the return addr, rax = ret (the caller cleans its own stack)
+--   arm64: return via lr, x0 = ret
+-- Shortcut at the REPL: skip(0, 10, "stdcall")
+```
+
+### Per-child hooks (tree debugging)
+
+Under `dbg:launch(cmd, true)` every process in the tree hits an initial
+breakpoint. `on_initial_breakpoint` fires for all of them; `on_child_ready` fires
+only for the children (pid != the launch root) — the place to re-resolve the new
+process's IAT and re-arm its breakpoints.
+
+```lua
+dbg:on_child_ready(function(pid, tid, addr)
+    dbg:set_breakpoint_import(pid, "kernel32!CreateProcessW", on_spawn)
+end)
+dbg:launch(target, true)
 ```
 
 ### Hardware Breakpoints
@@ -194,6 +253,11 @@ local str = dbg:read_string(pid, addr)
 
 -- Write memory
 dbg:write_memory(pid, addr, "\x90\x90\x90")  -- Write NOPs
+
+-- A fresh committed region in the debuggee (VirtualAllocEx): read-write, or RWX
+-- with `executable = true`. Never freed by the debugger.
+local buf = dbg:allocate_memory(pid, 0x1000)
+local code = dbg:allocate_memory(pid, 0x1000, true)
 
 -- Search for a byte pattern in process memory
 local addrs, capped = dbg:search_memory(pid, "PATTERN", 100)
@@ -970,9 +1034,15 @@ in-guest server URL, which you connect a normal `dbg` client to.
 
 The guest binary is **caller-supplied**: point `guest_bin_dir` at a folder holding
 one executable that provides both the debug server and the ETW collector,
-selected by the flags it is launched with (`--listen` / `--out`). Joybug stages a
-copy of its own exe; `guest_exe` names it inside that folder and defaults to
-`joybug.exe`.
+selected by the flags it is launched with (`--listen` / `--out`). Any joybug
+build is a valid guest — `joybug-core.exe`, `jlua.exe`, or the Joybug app exe;
+`guest_exe` names it inside the folder and defaults to `joybug.exe` (what the app
+stages). Before booting a VM, `provision` **preflights** the file: it must carry
+this build's guest marker (proving both roles and a matching protocol revision),
+so a wrong or stale binary fails immediately with a clear message instead of
+producing an empty capture or a hung request. The folder is snapshotted into the
+session's `io_dir` and *that* is shared into the VM, so your build output is
+never locked while a sandbox is up.
 
 ```lua
 -- Availability (no VM booted): { supported, build, wsb_present, reason }
@@ -991,7 +1061,8 @@ local ok, h, info = pcall(sbx.provision, {
     -- memory_mb    = 4096,
     -- debug        = true,       -- attach the debugger (false = run-only detonation)
     -- collect_etw  = true,
-    -- etw          = { ops = { "file.create", "network.connect" }, callstacks = false },
+    -- etw          = { ops = { "file.*", "network.connect" }, callstacks = false,
+    --                  buffer_kb = 1024, buffers = 512 },  -- see ETW ops below
     -- server_port  = 9000,
     -- working_directory = ...,
 })
@@ -1012,13 +1083,75 @@ end
 h:stop()
 ```
 
-**`provision` returns** `(handle, info)`. **`info` fields:** `server_url`,
-`guest_launch_command`, `guest_working_directory`, `io_dir`, `etw_out_file`,
-`etw_enabled`, `debug`.
+In **debug mode** `launch_command` is optional: omit it and drive `dbg:launch`
+yourself (the target is then reached through your mounts). Run-only mode requires
+it — the tracer is the launcher.
 
-**Handle methods:** `h:stop()` (idempotent), `h:server_url()`, `h:info()`
-(returns the same table, or `nil` once stopped), and `h:run_traced()` (run-only
-handles only — see below).
+**`provision` returns** `(handle, info)`. **`info` fields:** `id`, `server_url`,
+`guest_launch_command`, `guest_working_directory`, `io_dir`, `staged_bin_dir`,
+`etw_out_file`, `etw_enabled`, `debug`, `owned` (whether stopping the handle
+stops the VM — `false` for an `attach`ed one).
+
+**Handle methods:** `h:stop()` (idempotent), `h:id()`, `h:server_url()`,
+`h:info()` (the same table, or `nil` once stopped), `h:run_traced()` (run-only
+handles only — see below; **errors, with the tracer's own message, if the guest
+collector never started** instead of returning zero events), and the guest-desktop
+methods `h:exec`, `h:screenshot`, `h:list_windows`, `h:window_text` (see *Seeing
+the guest desktop* below).
+
+**Recovery and introspection** (module functions, no VM needed to call):
+- `sbx.list()` → ids of every sandbox running for this user.
+- `sbx.stop(id)` / `sbx.stop_all()` → stop one / all (the fix for a crashed
+  script that left the one-per-user VM occupied; `provision` names the running id
+  in its "already running" error).
+- `sbx.attach(id[, { server_port = 9000, io_dir = ..., guest_exe = ... }])` →
+  `(handle, info)` adopting a running VM **without owning it**: dropping the
+  handle leaves it up, `h:stop()` stops it. `info.server_url` is set when a
+  joybug server of this build answers on the port. `io_dir` (the host side of
+  the `C:\io` share) enables `h:exec`; `guest_exe` (the staged file name)
+  enables the desktop probes.
+- `sbx.ops()` → `{ all, default, groups, aliases }`; `sbx.expand_ops(list)` →
+  the canonical token list (errors on an unknown token). Same vocabulary as
+  `etw.ops()` below.
+
+### Seeing the guest desktop (screenshots, windows, control text)
+
+A payload that ends in "a form shows a string" gives it up without pixels: the
+handle launches the staged guest exe in its `--ui` role *inside* the guest's
+interactive session (plain Win32: `EnumWindows`, `WM_GETTEXT`, a `BitBlt` of the
+virtual screen encoded by GDI+) and returns the result through the `C:\io` share.
+
+```lua
+local code, out = h:exec([[start "" notepad.exe]], { run_as = "user" })  -- run_as: "user"|"system"
+for _, w in ipairs(h:list_windows()) do        -- every top-level + child window
+    print(w.hwnd, w.pid, w.class, w.title, w.visible, w.rect.left, w.rect.top)
+end
+local text = h:window_text(some_hwnd)           -- WM_GETTEXT: reads edit-box contents too
+local png  = h:screenshot()                     -- or h:screenshot([[C:\host\shot.png]])
+```
+
+`h:exec(cmd[, {run_as=}])` returns `(exit_code, output)` (captured through the
+share). The window list, text and screenshot all run as the interactive user, so
+the screenshot is the visible desktop, not a black session-0 frame.
+
+### Provisioning once, iterating (`jlua --sandbox`)
+
+Booting a VM costs a minute; pay it once. `jlua --sandbox` provisions a debug
+sandbox, connects `dbg` to the in-guest server, and drops into the REPL with the
+sandbox as `h` and its details as `sbx_info`:
+
+```
+jlua --sandbox --command "C:\path\target.exe" --mount C:\path
+jlua --sandbox --guest-bin-dir C:\build --io-dir C:\tmp\io --etw-ops "file.*" --stacks
+```
+
+Options: `--guest-bin-dir` (default: the folder of the running jlua.exe — jlua is
+itself a valid guest), `--guest-exe`, `--io-dir`, `--mount <path>[:rw|:ro]`
+(repeatable), `--memory-mb`, `--etw-ops <csv>`, `--stacks`, `--keep-sandbox`
+(leave the VM running on exit; reconnect later with `sbx.attach(id)`). In the
+REPL, relaunch the target with `dbg:launch(sbx_info.guest_launch_command)` and run
+`dofile("script.lua")` against the live guest as many times as you like. Ctrl+C
+stops the VM so a hard kill never leaves it occupied.
 
 **Sandbox + ETW, no UAC.** Collecting ETW *inside* the sandbox needs no UAC prompt
 — kernel ETW runs as the sandbox's built-in admin. Provision **run-only**
@@ -1085,13 +1218,54 @@ instead; you are a debugger. Note these ops are noisy (a process opening *itself
 for a routine query is common), which is why they are not in the default set.
 See `tests/lua/sandbox/audit_open_process.lua`.
 
+**ETW ops: the vocabulary, groups and wildcards.** `etw = { ops = {...} }` accepts
+canonical `kind.op` tokens, a `kind.*` (or bare `kind`) group, `all` / `*`, and
+the alias `registry.query` → `registry.query_value`. Unknown tokens are refused
+up front (before any VM boots), naming the offender and the valid set. Enumerate
+them with `sbx.ops()` / `etw.ops()` (`{ all, default, groups, aliases }`) or
+expand a list with `sbx.expand_ops{...}`. The kinds and their ops:
+
+| kind | ops |
+|---|---|
+| `process` | `start` `stop` `thread_start` `thread_stop` `image_load` `image_unload` |
+| `file` | `create` `write` `delete` `rename` `open` `read` `close` `dir_enum` |
+| `registry` | `create_key` `set_value` `delete_key` `delete_value` `open_key` `query_value` `query_key` `enum_key` `enum_value` |
+| `network` | `connect` `accept` `send` `recv` `disconnect` `retransmit` `udp_send` `udp_recv` |
+| `audit` | `open_process` `open_thread` |
+
+The **default** set (no `ops`) is `process.start/stop`, the four file
+modifications, the four registry modifications, and `network.connect/accept` —
+modifications plus process and network, no reads or queries.
+
+**Loss accounting (never silent again).** ETW drops events when its buffers
+overrun; a registry-heavy target with everything enabled once lost ~88% of its
+capture with no warning. The tracer now sizes its buffers generously
+(overridable with `buffer_kb` / `buffers`) and polls the session's drop counters:
+when they grow it writes a `{ kind = "tracer", op = "lost", events_lost,
+buffers_lost }` record (and a stderr warning), and at the end a `tracer.stats`
+summary (`events_written`, `events_lost`, `buffers_lost`). A `tracer.start`
+record marks the session coming up — its absence is how `h:run_traced()` knows
+the collector never ran. These fields ride on the event tables:
+`message`, `events_lost`, `buffers_lost`, `events_written`.
+
+**Symbolized callstacks (`callstacks = true`).** Each event's raw return
+addresses stay in `stack`, and a parallel `frames` array resolves them:
+`"<image>+0x<rva>"` for a frame inside a known module, `"kernel"` for a
+kernel-mode frame, the bare address otherwise. The module map is built from the
+tree's image loads and seeded from a toolhelp snapshot when a process joins, so
+it covers attach mode and WOW64 targets. Which events carry usable user frames is
+provider-dependent: `file.create` and `process.start` typically do; `file.write`
+and `network.*` are logged in a deferred (DPC) context and carry only kernel
+frames.
+
 **`sbx.events(io_dir, out_file[, from_seq])`** returns a list of event tables
 (`seq`, `time`, `kind`, `op`, `pid`, `ts`, `image`, `ppid`, `path`, `size`,
-`dest`, `exit`, `stack`, `target_pid`, `access`, `status`); pass `from_seq` to
-page past events already seen. It
-shares the incremental reader used by [`etw`](#host-etw-tracing-etw) below — a
-repeated poll of the same file seeks from where the last read ended rather than
-rescanning it. (`time` is `ts` formatted as `HH:MM:SS.mmm` UTC.)
+`dest`, `exit`, `stack`, `frames`, `target_pid`, `access`, `status`, plus the
+tracer-record fields `message`, `events_lost`, `buffers_lost`, `events_written`);
+pass `from_seq` to page past events already seen. It shares the incremental reader
+used by [`etw`](#host-etw-tracing-etw) below — a repeated poll of the same file
+seeks from where the last read ended rather than rescanning it. (`time` is `ts`
+formatted as `HH:MM:SS.mmm` UTC.)
 
 ### Host ETW Tracing (`etw`)
 
@@ -1145,5 +1319,14 @@ h:stop()                                               -- drain + exit (attach m
   any JSONL), `etw.done(path)`, `etw.time(ts)` (FILETIME 100 ns ticks →
   `HH:MM:SS.mmm` UTC time-of-day).
 
+- **Op vocabulary:** `etw.ops()` → `{ all, default, groups, aliases }`;
+  `etw.expand_ops{ "file.*", "registry.query" }` → the canonical list (errors on
+  an unknown token). Same tokens/groups as the sandbox ETW table above.
+- **Buffer sizing:** `ops` accepts `buffer_kb` and `buffers` alongside
+  `callstacks`, for a firehose capture that would otherwise drop events (the
+  tracer writes `tracer.lost` / `tracer.stats` records when it does).
+
 Event tables carry: `seq`, `time`, `kind`, `op`, `pid`, `ts`, `image`, `ppid`,
-`path`, `size`, `dest`, `exit`, `stack`.
+`path`, `size`, `dest`, `exit`, `stack`, `frames` (symbolized `stack`), and the
+audit/tracer fields `target_pid`, `access`, `status`, `message`, `events_lost`,
+`buffers_lost`, `events_written`.

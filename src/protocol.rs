@@ -2,6 +2,52 @@ pub use serde::{Serialize, Deserialize};
 
 pub use self::request_response::*;
 
+/// Identity of the wire format, derived at compile time from the source of
+/// every module the protocol's types are defined in. Two builds can talk only
+/// when their fingerprints match; the handshake (`DebuggerRequest::Hello`)
+/// compares them so a host driving a guest server built from another revision
+/// fails immediately and loudly instead of hanging on a request the guest can't
+/// decode. Deliberately conservative: any edit to these files — even a comment —
+/// changes it, so it never has to be bumped by hand.
+pub const PROTOCOL_FINGERPRINT: u64 = fingerprint::compute();
+
+mod fingerprint {
+    const SOURCES: &[&[u8]] = &[
+        include_bytes!("protocol.rs"),
+        include_bytes!("interfaces.rs"),
+        include_bytes!("pe_types.rs"),
+    ];
+
+    /// FNV-1a over the concatenated sources, evaluated at compile time.
+    pub const fn compute() -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut f = 0;
+        while f < SOURCES.len() {
+            let bytes = SOURCES[f];
+            let mut i = 0;
+            while i < bytes.len() {
+                hash ^= bytes[i] as u64;
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                i += 1;
+            }
+            // Separator so moving bytes between files changes the hash too.
+            hash ^= 0xff;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            f += 1;
+        }
+        hash
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn fingerprint_is_stable_and_nonzero() {
+            assert_ne!(super::compute(), 0);
+            assert_eq!(super::compute(), super::super::PROTOCOL_FINGERPRINT);
+        }
+    }
+}
+
 pub mod request_response {
     use super::*;
 
@@ -908,6 +954,26 @@ pub mod request_response {
         FreezeValueStop {
             freeze_id: u64,
         },
+        /// Protocol handshake, sent by a client as its first request. Appended
+        /// last so older peers keep their variant indices: an old server fails
+        /// to decode it (and closes), which the client reports as a revision
+        /// mismatch instead of hanging on a later request (RETRO B2).
+        Hello {
+            /// [`PROTOCOL_FINGERPRINT`] of the client's build.
+            fingerprint: u64,
+            /// Free-form client name (e.g. `jlua`, `joybug-ui`), for the server log.
+            client: String,
+        },
+        /// `VirtualAllocEx` a fresh committed region in the debuggee (read-write,
+        /// or read-write-execute when `executable`); answers `MemoryAllocated`.
+        /// The region is never freed by the server: a thread may be stopped
+        /// inside code placed there (an import-hook stub), so freeing is the
+        /// caller's, or the process's exit's, business.
+        AllocateMemory {
+            pid: u32,
+            size: usize,
+            executable: bool,
+        },
     }
 
     /// Where a coverage target came from, so a UI can tell a PDB-named function
@@ -1162,6 +1228,16 @@ pub mod request_response {
         FreezeValueStarted {
             freeze_id: u64,
         },
+        /// Reply to [`DebuggerRequest::Hello`]. Appended last (see there).
+        Hello {
+            fingerprint: u64,
+            /// Server name, e.g. `joybug-core`.
+            server: String,
+            /// `CARGO_PKG_VERSION` of the server build.
+            version: String,
+        },
+        /// Reply to [`DebuggerRequest::AllocateMemory`]: the region's base.
+        MemoryAllocated { address: u64 },
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone)]

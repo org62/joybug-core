@@ -4,8 +4,8 @@ use tracing::{error, trace, warn, debug};
 use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE, HANDLE};
 use windows_sys::Win32::System::Diagnostics::Debug::{FlushInstructionCache, ReadProcessMemory, WriteProcessMemory};
 use windows_sys::Win32::System::Memory::{
-    VirtualProtectEx, VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD,
-    PAGE_NOACCESS,
+    VirtualAllocEx, VirtualProtectEx, VirtualQueryEx, MEMORY_BASIC_INFORMATION, MEM_COMMIT,
+    MEM_RESERVE, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE,
 };
 use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, PROCESS_QUERY_INFORMATION};
 
@@ -350,13 +350,26 @@ pub(super) fn write_memory_internal(
             ));
         }
         let mut bytes_written = 0;
-        let ok = WriteProcessMemory(
+        let write = |written: &mut usize| WriteProcessMemory(
             handle,
             address as *mut std::ffi::c_void,
             data.as_ptr() as *const std::ffi::c_void,
             data.len(),
-            &mut bytes_written,
+            written,
         );
+        let mut ok = write(&mut bytes_written);
+        if ok == 0 || bytes_written != data.len() {
+            // WriteProcessMemory relaxes protection itself for an executable page
+            // (so code breakpoints land), but not for a plain read-only data page
+            // — writing an IAT slot to hook an import fails with ERROR_NOACCESS.
+            // Flip the page to RW, retry, and restore the original protection.
+            let mut old_protect = 0u32;
+            if VirtualProtectEx(handle, address as *const _, data.len(), PAGE_READWRITE, &mut old_protect) != 0 {
+                ok = write(&mut bytes_written);
+                let mut ignored = 0u32;
+                VirtualProtectEx(handle, address as *const _, data.len(), old_protect, &mut ignored);
+            }
+        }
         if ok == 0 || bytes_written != data.len() {
             let error = GetLastError();
             let error_str = utils::error_message(error);
@@ -367,6 +380,10 @@ pub(super) fn write_memory_internal(
             )));
         }
         trace!(bytes_written, "WriteProcessMemory succeeded");
+        // Best-effort: keep code caches coherent after patching executable
+        // memory (a stub or inline patch written through the debug handle is
+        // executed next, and ARM64 caches are not coherent with stores).
+        FlushInstructionCache(handle, address as *const std::ffi::c_void, data.len());
         Ok(())
     }
 }
@@ -404,13 +421,49 @@ pub(super) fn write_memory_unlocked(
             )));
         }
         let res = write_memory_internal(handle, address, data);
-        if res.is_ok() {
-            // Best-effort: keep code caches coherent after patching executable memory.
-            FlushInstructionCache(handle, address as *const std::ffi::c_void, data.len());
-        }
         windows_sys::Win32::Foundation::CloseHandle(handle);
         res
     }
+}
+
+pub(super) fn allocate_memory(
+    platform: &WindowsPlatform,
+    pid: u32,
+    size: usize,
+    executable: bool,
+) -> Result<u64, PlatformError> {
+    trace!(pid, size, executable, "WindowsPlatform::allocate_memory called");
+    match platform.get_process(pid) {
+        Ok(process) => allocate_memory_internal(process.handle(), size, executable),
+        Err(_) => unsafe {
+            let handle = OpenProcess(PROCESS_VM_OPERATION, 0, pid);
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                let error = GetLastError();
+                return Err(PlatformError::OsError(format!(
+                    "OpenProcess(PROCESS_VM_OPERATION) failed: {} ({})",
+                    error,
+                    utils::error_message(error)
+                )));
+            }
+            let res = allocate_memory_internal(handle, size, executable);
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+            res
+        },
+    }
+}
+
+fn allocate_memory_internal(handle: HANDLE, size: usize, executable: bool) -> Result<u64, PlatformError> {
+    let protect = if executable { PAGE_EXECUTE_READWRITE } else { PAGE_READWRITE };
+    let base = unsafe { VirtualAllocEx(handle, std::ptr::null(), size, MEM_COMMIT | MEM_RESERVE, protect) };
+    if base.is_null() {
+        let error = unsafe { GetLastError() };
+        return Err(PlatformError::OsError(format!(
+            "VirtualAllocEx({size} bytes) failed: {} ({})",
+            error,
+            utils::error_message(error)
+        )));
+    }
+    Ok(base as u64)
 }
 
 pub(super) fn read_wide_string(
@@ -422,11 +475,14 @@ pub(super) fn read_wide_string(
     let mut buffer = Vec::new();
 
     if let Some(len) = max_len {
-        // Length is known, read exactly that many bytes.
+        // Length is known: read exactly that many characters; a NUL inside the
+        // window still terminates the string (decode_wide_until_nul).
         let bytes_to_read = len * 2;
         buffer = platform.read_memory(pid, address, bytes_to_read)?;
     } else {
-        // Length is unknown, read in chunks until null terminator.
+        // Length is unknown, read in chunks until the null terminator. The chunk
+        // size is even, so every chunk starts on a character boundary and the
+        // u16-aligned scan below never sees a torn character.
         const CHUNK_SIZE: usize = 64; // read 64 bytes at a time
         let mut total_read_bytes = 0;
         const MAX_TOTAL_READ: usize = 4096 * 2; // safety break at 8KB
@@ -437,12 +493,12 @@ pub(super) fn read_wide_string(
                 break; // End of memory
             }
 
-            // Check for null terminator (two consecutive null bytes for UTF-16)
-            if let Some(null_pos_bytes) = chunk.windows(2).position(|w| w == [0, 0]) {
-                buffer.extend_from_slice(&chunk[..null_pos_bytes]);
+            // Only the new chunk needs scanning (it starts on a character
+            // boundary); the decode below cuts at the terminator.
+            let terminated = wide_nul_position(&chunk).is_some();
+            buffer.extend_from_slice(&chunk);
+            if terminated {
                 break;
-            } else {
-                buffer.extend_from_slice(&chunk);
             }
 
             total_read_bytes += chunk.len();
@@ -453,13 +509,79 @@ pub(super) fn read_wide_string(
         }
     }
 
-    // Decode UTF-16LE
-    let wide_chars: Vec<u16> = buffer.chunks_exact(2)
+    // Trim surrounding whitespace at the public boundary (long-standing
+    // behavior; some callers pass a length-counted buffer that includes a
+    // trailing CRLF). The B1 fix is the terminator handling in
+    // `decode_wide_until_nul`, which is orthogonal to trimming.
+    Ok(decode_wide_until_nul(&buffer).trim().to_string())
+}
+
+/// Byte offset of the first NUL *character* (a `[0, 0]` pair on a u16 boundary)
+/// in a UTF-16LE buffer. A byte-pair search (`windows(2)`) is wrong here: it also
+/// matches the high byte of the last ASCII character followed by the low byte
+/// of the terminator, which sits on an odd offset and cuts that character off.
+fn wide_nul_position(bytes: &[u8]) -> Option<usize> {
+    bytes.chunks_exact(2).position(|c| c == [0, 0]).map(|i| i * 2)
+}
+
+/// Decode a UTF-16LE buffer up to (not including) its first NUL character. A
+/// trailing odd byte is ignored; whitespace is data and is preserved.
+pub(crate) fn decode_wide_until_nul(bytes: &[u8]) -> String {
+    let end = wide_nul_position(bytes).unwrap_or(bytes.len());
+    let wide_chars: Vec<u16> = bytes[..end]
+        .chunks_exact(2)
         .map(|a| u16::from_le_bytes([a[0], a[1]]))
         .collect();
+    String::from_utf16_lossy(&wide_chars)
+}
 
-    let result = String::from_utf16_lossy(&wide_chars);
-    Ok(result.trim().to_string())
+#[cfg(test)]
+mod wide_string_tests {
+    use super::decode_wide_until_nul;
+
+    fn utf16(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    #[test]
+    fn keeps_the_last_character_before_the_terminator() {
+        // "UnholyDragon\0": the retro's B1 — the old byte-pair scan matched the
+        // `00 00` straddling 'n' and the NUL and returned "UnholyDrago".
+        let mut bytes = utf16("UnholyDragon");
+        bytes.extend_from_slice(&[0, 0]);
+        assert_eq!(decode_wide_until_nul(&bytes), "UnholyDragon");
+    }
+
+    #[test]
+    fn stops_at_the_first_nul_and_ignores_what_follows() {
+        let mut bytes = utf16("a.ex");
+        bytes.extend_from_slice(&[0, 0]);
+        bytes.extend(utf16("junk"));
+        assert_eq!(decode_wide_until_nul(&bytes), "a.ex");
+    }
+
+    #[test]
+    fn no_terminator_decodes_everything_and_drops_a_torn_byte() {
+        let mut bytes = utf16("abc");
+        bytes.push(0x41); // half of a character
+        assert_eq!(decode_wide_until_nul(&bytes), "abc");
+    }
+
+    #[test]
+    fn whitespace_is_preserved() {
+        let mut bytes = utf16("  padded  ");
+        bytes.extend_from_slice(&[0, 0]);
+        assert_eq!(decode_wide_until_nul(&bytes), "  padded  ");
+    }
+
+    #[test]
+    fn a_nul_low_byte_inside_a_character_is_not_a_terminator() {
+        // U+0100 is `00 01` on the wire: its low byte is zero, and the character
+        // before it ends in `00` too — a byte-pair scan would stop here.
+        let mut bytes = utf16("aĀb");
+        bytes.extend_from_slice(&[0, 0]);
+        assert_eq!(decode_wide_until_nul(&bytes), "aĀb");
+    }
 }
 
 pub(super) fn query_memory_region_unlocked(

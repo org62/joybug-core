@@ -28,6 +28,125 @@ pub const DEFAULT_OPS: &[&str] = &[
     "network.accept",
 ];
 
+/// Every op token the tracer can emit, grouped by kind in the order the tracer
+/// documents them. The single source of truth for `--capture` validation, the
+/// `kind.*`/`all` groups ([`expand_ops`]) and the `sbx.ops()`/`etw.ops()`
+/// introspection calls. A drift test in this module checks that the tracer's
+/// gates and this list never disagree.
+pub const ALL_OPS: &[&str] = &[
+    "process.start",
+    "process.stop",
+    "process.thread_start",
+    "process.thread_stop",
+    "process.image_load",
+    "process.image_unload",
+    "file.create",
+    "file.write",
+    "file.delete",
+    "file.rename",
+    "file.open",
+    "file.read",
+    "file.close",
+    "file.dir_enum",
+    "registry.create_key",
+    "registry.set_value",
+    "registry.delete_key",
+    "registry.delete_value",
+    "registry.open_key",
+    "registry.query_value",
+    "registry.query_key",
+    "registry.enum_key",
+    "registry.enum_value",
+    "network.connect",
+    "network.accept",
+    "network.send",
+    "network.recv",
+    "network.disconnect",
+    "network.retransmit",
+    "network.udp_send",
+    "network.udp_recv",
+    "audit.open_process",
+    "audit.open_thread",
+];
+
+/// The event kinds (`kind` field values) — each is also a group token.
+pub const OP_KINDS: &[&str] = &["process", "file", "registry", "network", "audit"];
+
+/// Historical spellings still accepted by [`expand_ops`], mapped to the
+/// canonical token. `registry.query` never round-tripped (it emitted
+/// `op:"query_value"`, RETRO B7); the canonical name now matches the emitted op.
+pub const OP_ALIASES: &[(&str, &str)] = &[("registry.query", "registry.query_value")];
+
+/// Expand a user-supplied op list into canonical tokens: `all`/`*` → every op;
+/// `<kind>` or `<kind>.*` → that kind's ops; aliases → their canonical token;
+/// a canonical token → itself. Output is deduplicated and in [`ALL_OPS`] order.
+/// Unknown tokens are an error naming them and the valid vocabulary — better a
+/// refused capture than one that silently records nothing.
+pub fn expand_ops<S: AsRef<str>>(tokens: &[S]) -> std::result::Result<Vec<String>, String> {
+    let mut wanted: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+    let mut unknown: Vec<String> = Vec::new();
+    for raw in tokens {
+        let t = raw.as_ref().trim().to_ascii_lowercase();
+        if t.is_empty() {
+            continue;
+        }
+        if t == "all" || t == "*" {
+            wanted.extend(ALL_OPS.iter().copied());
+            continue;
+        }
+        let group = t.strip_suffix(".*").unwrap_or(&t);
+        if OP_KINDS.contains(&group) {
+            let prefix = format!("{group}.");
+            wanted.extend(ALL_OPS.iter().copied().filter(|op| op.starts_with(&prefix)));
+            continue;
+        }
+        if let Some((_, canonical)) = OP_ALIASES.iter().find(|(alias, _)| *alias == t) {
+            wanted.insert(canonical);
+            continue;
+        }
+        match ALL_OPS.iter().find(|op| **op == t) {
+            Some(op) => {
+                wanted.insert(op);
+            }
+            None => unknown.push(raw.as_ref().trim().to_string()),
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(format!(
+            "unknown ETW op token(s): {}. Valid tokens: {}; groups: {}, all",
+            unknown.join(", "),
+            ALL_OPS.join(", "),
+            OP_KINDS.iter().map(|k| format!("{k}.*")).collect::<Vec<_>>().join(", "),
+        ));
+    }
+    Ok(ALL_OPS.iter().filter(|op| wanted.contains(*op)).map(|op| op.to_string()).collect())
+}
+
+/// A loaded module of a traced process, for symbolizing stack frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleRange {
+    pub base: u64,
+    pub size: u64,
+    /// File name only (`unholydragon.exe`), lower-cased.
+    pub name: String,
+}
+
+/// First address of the kernel half of the canonical address space on every
+/// 64-bit Windows architecture. A frame at or above it is kernel code.
+const KERNEL_SPACE: u64 = 0xFFFF_8000_0000_0000;
+
+/// Render one raw return address against a module list: `name+0x<rva>` inside a
+/// known module, `kernel` for a kernel-mode frame, otherwise the bare address.
+pub fn symbolize_frame(addr: u64, modules: &[ModuleRange]) -> String {
+    if addr >= KERNEL_SPACE {
+        return "kernel".to_string();
+    }
+    match modules.iter().find(|m| addr >= m.base && addr < m.base.saturating_add(m.size)) {
+        Some(m) => format!("{}+0x{:x}", m.name, addr - m.base),
+        None => format!("0x{addr:x}"),
+    }
+}
+
 /// One event captured by the guest tracer.
 ///
 /// Fields are populated per `kind`/`op`; unused ones are `None`/default.
@@ -65,6 +184,22 @@ pub struct TraceEvent {
     /// Captured callstack as hex return addresses (`--stacks`); None otherwise.
     #[serde(default)]
     pub stack: Option<Vec<String>>,
+    /// `stack`, resolved frame by frame to `module+0xrva` / `kernel` / bare
+    /// address (see [`symbolize_frame`]). Parallel to `stack`.
+    #[serde(default)]
+    pub frames: Option<Vec<String>>,
+    /// `tracer.error` / `tracer.lost`: human-readable detail.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// `tracer.lost` / `tracer.stats`: cumulative events ETW dropped.
+    #[serde(default)]
+    pub events_lost: Option<u64>,
+    /// `tracer.lost` / `tracer.stats`: cumulative buffers ETW dropped.
+    #[serde(default)]
+    pub buffers_lost: Option<u64>,
+    /// `tracer.stats`: events the tracer wrote to this file.
+    #[serde(default)]
+    pub events_written: Option<u64>,
     /// The process acted upon (audit events): the process opened, or the owner
     /// of the thread opened. Distinct from `pid`, which is the actor.
     #[serde(default)]
@@ -166,15 +301,22 @@ pub fn format_access_mask(mask: u32, thread: bool) -> String {
     parts.join("|")
 }
 
+/// The `op` of a tracer control record (`kind = "tracer"`: `start`, `done`,
+/// `error`, `lost`, `stats`, `tree_timeout`), or `None` for any other line.
+/// Parsed rather than substring-matched so field order and path contents can't
+/// confuse it.
+pub fn tracer_record(line: &str) -> Option<String> {
+    let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if v.get("kind").and_then(|k| k.as_str()) != Some("tracer") {
+        return None;
+    }
+    v.get("op").and_then(|o| o.as_str()).map(str::to_string)
+}
+
 /// Whether `line` is the tracer's `tracer/done` terminal marker (written when
-/// its target exits), parsed rather than substring-matched so field order and
-/// path contents can't confuse it.
+/// its target exits).
 pub fn is_tracer_done(line: &str) -> bool {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-        return false;
-    };
-    v.get("kind").and_then(|k| k.as_str()) == Some("tracer")
-        && v.get("op").and_then(|o| o.as_str()) == Some("done")
+    tracer_record(line).as_deref() == Some("done")
 }
 
 impl Sandbox {
@@ -256,5 +398,128 @@ mod access_mask_tests {
         assert_eq!(format_access_mask(0x0010_0400, false), "QUERY_INFORMATION|SYNCHRONIZE");
         // An unmapped bit survives as hex instead of vanishing.
         assert_eq!(format_access_mask(0x0400_0010, false), "VM_READ|0x4000000");
+    }
+}
+
+#[cfg(test)]
+mod ops_tests {
+    use super::*;
+
+    fn v(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn default_ops_are_all_canonical() {
+        for op in DEFAULT_OPS {
+            assert!(ALL_OPS.contains(op), "{op} missing from ALL_OPS");
+        }
+        assert_eq!(expand_ops(DEFAULT_OPS).unwrap(), v(DEFAULT_OPS));
+    }
+
+    #[test]
+    fn all_and_star_expand_to_everything() {
+        assert_eq!(expand_ops(&["all"]).unwrap(), v(ALL_OPS));
+        assert_eq!(expand_ops(&["*"]).unwrap(), v(ALL_OPS));
+    }
+
+    #[test]
+    fn kind_groups_expand_in_canonical_order_and_dedupe() {
+        let got = expand_ops(&["registry.*", "file.write", "file", "registry.set_value"]).unwrap();
+        let expected: Vec<String> = ALL_OPS
+            .iter()
+            .filter(|op| op.starts_with("file.") || op.starts_with("registry."))
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn registry_query_alias_round_trips_to_query_value() {
+        assert_eq!(expand_ops(&["registry.query"]).unwrap(), v(&["registry.query_value"]));
+        assert_eq!(expand_ops(&["registry.query_value"]).unwrap(), v(&["registry.query_value"]));
+    }
+
+    #[test]
+    fn unknown_tokens_are_refused_and_named() {
+        let err = expand_ops(&["file.create", "file.wriet", "bogus"]).unwrap_err();
+        assert!(err.contains("file.wriet"), "{err}");
+        assert!(err.contains("bogus"), "{err}");
+        assert!(err.contains("file.create"), "the valid vocabulary is listed: {err}");
+    }
+
+    #[test]
+    fn empty_and_whitespace_expand_to_nothing() {
+        assert!(expand_ops(&["", "  "]).unwrap().is_empty());
+        assert!(expand_ops::<&str>(&[]).unwrap().is_empty());
+    }
+
+    /// Drift guard: every `kind.op` token literal in the tracer source must be
+    /// in ALL_OPS, and every ALL_OPS token must be gated somewhere in the
+    /// tracer — so adding an op to one side without the other fails here.
+    #[test]
+    fn tracer_source_and_all_ops_agree() {
+        let src = include_str!("tracer.rs");
+        let mut in_source = std::collections::BTreeSet::new();
+        let mut rest = src;
+        while let Some(start) = rest.find('"') {
+            let after = &rest[start + 1..];
+            let Some(end) = after.find('"') else { break };
+            let lit = &after[..end];
+            if let Some((kind, op)) = lit.split_once('.') {
+                if OP_KINDS.contains(&kind)
+                    && !op.is_empty()
+                    && op.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+                {
+                    in_source.insert(lit.to_string());
+                }
+            }
+            rest = &after[end + 1..];
+        }
+        let all: std::collections::BTreeSet<String> = ALL_OPS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(in_source, all, "tracer.rs token literals vs ALL_OPS");
+    }
+
+    #[test]
+    fn tracer_records_are_recognised() {
+        assert_eq!(tracer_record(r#"{"kind":"tracer","op":"start"}"#).as_deref(), Some("start"));
+        assert_eq!(tracer_record(r#"{"kind":"tracer","op":"lost","events_lost":5}"#).as_deref(), Some("lost"));
+        assert_eq!(tracer_record(r#"{"kind":"file","op":"create"}"#), None);
+        assert_eq!(tracer_record("not json"), None);
+        assert!(is_tracer_done(r#"{"op":"done","kind":"tracer"}"#));
+    }
+
+    #[test]
+    fn lost_and_stats_records_parse_into_trace_event() {
+        let lost = TraceEvent::from_json_line(
+            r#"{"kind":"tracer","op":"lost","events_lost":42,"buffers_lost":1,"message":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(lost.events_lost, Some(42));
+        assert_eq!(lost.buffers_lost, Some(1));
+        assert_eq!(lost.message.as_deref(), Some("x"));
+        let stats = TraceEvent::from_json_line(
+            r#"{"kind":"tracer","op":"stats","events_written":10,"events_lost":0,"buffers_lost":0}"#,
+        )
+        .unwrap();
+        assert_eq!(stats.events_written, Some(10));
+        let ev = TraceEvent::from_json_line(
+            r#"{"kind":"file","op":"create","pid":1,"ts":0,"stack":["0x1"],"frames":["a.exe+0x1"]}"#,
+        )
+        .unwrap();
+        assert_eq!(ev.frames.unwrap(), vec!["a.exe+0x1".to_string()]);
+    }
+
+    #[test]
+    fn frames_resolve_to_module_kernel_or_bare() {
+        let mods = vec![
+            ModuleRange { base: 0x400000, size: 0x29d000, name: "unholydragon.exe".into() },
+            ModuleRange { base: 0x7ff8_0000_0000, size: 0x1000, name: "ntdll.dll".into() },
+        ];
+        assert_eq!(symbolize_frame(0x4a554f, &mods), "unholydragon.exe+0xa554f");
+        assert_eq!(symbolize_frame(0x7ff8_0000_0010, &mods), "ntdll.dll+0x10");
+        assert_eq!(symbolize_frame(0xfffff802_1234_5678, &mods), "kernel");
+        assert_eq!(symbolize_frame(0x69d000, &mods), "0x69d000");
+        assert_eq!(symbolize_frame(0x400000 + 0x29d000, &mods), "0x69d000", "end is exclusive");
     }
 }

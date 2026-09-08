@@ -42,4 +42,38 @@ assert(#more == 1, "incremental read should yield exactly 1, got " .. #more)
 assert(more[1].seq == 3 and more[1].kind == "network", "incremental row shape")
 
 os.remove(path)
+
+-- Op vocabulary introspection (RETRO B7/F10).
+assert(type(etw.ops) == "function", "etw.ops should be a function")
+local ops = etw.ops()
+assert(type(ops.all) == "table" and #ops.all > 20, "ops.all should list every token")
+assert(type(ops.default) == "table" and #ops.default > 0, "ops.default should be non-empty")
+assert(type(ops.groups) == "table", "ops.groups should be a table")
+assert(ops.aliases and ops.aliases["registry.query"] == "registry.query_value",
+    "registry.query should alias registry.query_value")
+
+-- Group + alias expansion.
+local reg = etw.expand_ops({ "registry.*" })
+assert(#reg > 0, "registry.* should expand to the registry tokens")
+for _, op in ipairs(reg) do
+    assert(op:sub(1, 9) == "registry.", "registry.* expanded to a non-registry op: " .. op)
+end
+assert(etw.expand_ops({ "registry.query" })[1] == "registry.query_value",
+    "the alias should expand to the canonical token")
+-- Unknown tokens are refused, not silently dropped.
+local ok = pcall(etw.expand_ops, { "file.wriet" })
+assert(not ok, "an unknown op token should raise an error")
+
+-- A tracer control record parses with its extra fields exposed.
+local lost_path = os.tmpname() .. "-etw-lost.jsonl"
+local lf = assert(io.open(lost_path, "w"))
+lf:write('{"kind":"tracer","op":"lost","events_lost":42,"buffers_lost":1,"message":"dropped","ts":116444736000000000}\n')
+lf:close()
+local le = etw.events(lost_path)
+assert(#le == 1 and le[1].op == "lost", "lost record should read back")
+assert(le[1].events_lost == 42, "events_lost should be exposed")
+assert(le[1].buffers_lost == 1, "buffers_lost should be exposed")
+assert(le[1].message == "dropped", "message should be exposed")
+os.remove(lost_path)
+
 return { passed = true }

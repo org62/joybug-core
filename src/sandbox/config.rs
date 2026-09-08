@@ -2,9 +2,22 @@
 //! mechanism has no dependency on any host application's config shapes. Callers
 //! (the Tauri app, `jlua`) map their own settings onto [`ProvisionConfig`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use winsandbox::RunningSandbox;
+
+/// Port the in-guest server listens on unless a caller overrides it.
+pub const DEFAULT_SERVER_PORT: u16 = 9000;
+/// Guest memory unless a caller overrides it.
+pub const DEFAULT_MEMORY_MB: u32 = 4096;
+/// Basename of the tracer's output file unless a caller overrides it.
+pub const DEFAULT_ETW_OUT_FILE: &str = "events.jsonl";
+
+/// The default `symbols_dir` for an `io_dir`: a `symbols` sibling, so the PDB
+/// cache outlives any one session's io folder.
+pub fn default_symbols_dir(io_dir: &Path) -> PathBuf {
+    io_dir.parent().map(|p| p.join("symbols")).unwrap_or_else(|| io_dir.join("symbols"))
+}
 
 // ETW capture config lives in `crate::etw` (available under the `etw` feature,
 // which `sandbox` implies) so it is usable for host tracing without a sandbox.
@@ -58,7 +71,9 @@ pub struct ProvisionConfig {
     pub etw: EtwCaptureSpec,
     /// Pass `--offline` to the guest server (never download symbols).
     pub symbol_offline: bool,
-    /// Host-facing launch command; rewritten to guest paths via `mounts`.
+    /// Host-facing launch command; rewritten to guest paths via `mounts`. May
+    /// be empty in debug mode (the script launches whatever it likes through
+    /// `dbg:launch`); run-only mode requires it — the tracer is the launcher.
     pub launch_command: String,
     /// Host-facing working directory; rewritten to guest paths via `mounts`.
     pub working_directory: Option<String>,
@@ -93,6 +108,31 @@ pub struct SandboxHandle {
     pub etw: EtwCaptureSpec,
     /// Guest-side filename of the dual-role exe, carried for the same reason.
     pub guest_exe: String,
+    /// Host folder actually shared as the guest's `C:\joybug`: a per-session
+    /// snapshot of the caller's `guest_bin_dir` (see `stage_guest_bin`), so the
+    /// caller's folder is never held open by the VM. Empty for an attached
+    /// handle.
+    pub staged_bin_dir: PathBuf,
+}
+
+impl SandboxHandle {
+    /// The sandbox GUID (`wsb --id`).
+    pub fn id(&self) -> &str {
+        self.sandbox.id()
+    }
+
+    /// Whether dropping this handle stops the VM (false for `attach`ed handles).
+    pub fn owns_vm(&self) -> bool {
+        self.sandbox.owns_vm()
+    }
+}
+
+impl Drop for SandboxHandle {
+    fn drop(&mut self) {
+        // The inner guard stops the VM (if owned); forget it for the Ctrl
+        // handler either way.
+        super::unregister_live(self.sandbox.id());
+    }
 }
 
 /// Windows Sandbox availability at the mechanism level (OS build + `wsb.exe`).

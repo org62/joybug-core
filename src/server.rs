@@ -64,6 +64,23 @@ where
         let handle_start = Instant::now();
 
         let resp = match req {
+            // ---------- Protocol handshake ----------
+            DebuggerRequest::Hello { fingerprint, client } => {
+                let ours = crate::protocol::PROTOCOL_FINGERPRINT;
+                if fingerprint == ours {
+                    info!(%client, "client handshake ok (protocol {ours:016x})");
+                } else {
+                    // Answer anyway so the client can print both sides; it will
+                    // disconnect. Serving it would only produce decode errors.
+                    warn!(%client, "client protocol fingerprint {fingerprint:016x} != ours {ours:016x}");
+                }
+                DebuggerResponse::Hello {
+                    fingerprint: ours,
+                    server: "joybug-core".to_string(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                }
+            }
+
             // ---------- Server-side dispatch hooks (platform-specific locking) ----------
             DebuggerRequest::Continue { pid, tid, pass_exception } => {
                 match P::server_continue(&platform, pid, tid, pass_exception) {
@@ -218,6 +235,13 @@ where
                 let p = platform.read().unwrap();
                 match p.write_memory(pid, address, &data) {
                     Ok(_) => DebuggerResponse::WriteAck,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::AllocateMemory { pid, size, executable } => {
+                let p = platform.read().unwrap();
+                match p.allocate_memory(pid, size, executable) {
+                    Ok(address) => DebuggerResponse::MemoryAllocated { address },
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }

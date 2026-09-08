@@ -418,6 +418,9 @@ pub trait PlatformAPI: Send + Sync {
     fn launch(&mut self, command: &str, debug_children: bool, working_directory: Option<&str>, environment: Option<&[(String, String)]>) -> Result<Option<crate::protocol::DebugEvent>, PlatformError>;
     fn read_memory(&self, pid: u32, address: u64, size: usize) -> Result<Vec<u8>, PlatformError>;
     fn write_memory(&self, pid: u32, address: u64, data: &[u8]) -> Result<(), PlatformError>;
+    /// Commit a fresh region of `size` bytes in the process (RW, or RWX when
+    /// `executable`) and return its base.
+    fn allocate_memory(&self, pid: u32, size: usize, executable: bool) -> Result<u64, PlatformError>;
     fn read_wide_string(&self, pid: u32, address: u64, max_len: Option<usize>) -> Result<String, PlatformError>;
     fn get_thread_context(&self, pid: u32, tid: u32) -> Result<crate::protocol::ThreadContext, PlatformError>;
     fn set_thread_context(&self, pid: u32, tid: u32, context: crate::protocol::ThreadContext) -> Result<(), PlatformError>;

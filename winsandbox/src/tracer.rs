@@ -4,14 +4,22 @@
 //!
 //! This is a *library* module, not a binary. It runs inside a Windows Sandbox as
 //! SYSTEM, and on the host (elevated) for sandbox-less tracing — but in both
-//! cases the process hosting it is the Joybug app's own exe, which dispatches
-//! into [`run`] when it sees the collector's flags. There is no separate
-//! `guest-tracer.exe` to build, stage, or keep in sync with the app.
+//! cases the process hosting it is a joybug executable (`joybug-core.exe`,
+//! `jlua.exe`, or the Joybug app) that dispatches into [`run`] when it sees the
+//! collector's `--out` flag. There is no separate tracer binary to build,
+//! stage, or keep in sync.
 //!
 //! Argument form (as built by [`crate::Sandbox`] callers and `joybug_core::etw`):
 //!   --out <file> [--discover] [--tree-timeout <secs>] -- <program> [args...]
 //!   --out <file> [--discover] [--tree-timeout <secs>] --attach-pid <pid>
 //!   --out <file> --attach-pid <pid> --control <file>   (resident)
+//!   common: [--capture <csv>] [--stacks] [--buffer-kb <n>] [--buffers <n>]
+//!
+//! ## Control records
+//! Besides events, the JSONL carries `kind:"tracer"` records a host driver can
+//! act on: `start` (the ETW session is up — its absence means the collector
+//! never ran), `lost` (ETW dropped events; see [`crate::etw_stats`]),
+//! `tree_timeout`, `error`, `stats` and the terminal `done`.
 //!
 //! Two modes: it can *spawn* a target (`-- <program>`) and root the traced tree
 //! at that child, or *attach* to an already-running process tree (`--attach-pid`,
@@ -51,9 +59,10 @@ use ferrisetw::native::ExtendedDataItem;
 use ferrisetw::parser::Parser;
 use ferrisetw::provider::{Provider, TraceFlags};
 use ferrisetw::schema_locator::SchemaLocator;
-use ferrisetw::trace::UserTrace;
+use ferrisetw::trace::{TraceProperties, UserTrace};
 use ferrisetw::EventRecord;
-use crate::{PendingStart, ProcessTree};
+use crate::etw_stats::{query_session, SessionStats};
+use crate::{symbolize_frame, ModuleRange, PendingStart, ProcessTree};
 
 const KERNEL_PROCESS: &str = "22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716";
 const KERNEL_FILE: &str = "EDD08927-9CC4-4E65-B970-C2560FB5C289";
@@ -72,13 +81,15 @@ const KERNEL_AUDIT: &str = "E02A841C-75A3-4FA7-AFC8-AE09CF9B7F23";
 ///   file.create file.write file.delete file.rename file.open
 ///   file.read file.close file.dir_enum
 ///   registry.create_key registry.set_value registry.delete_key
-///   registry.delete_value registry.open_key registry.query
+///   registry.delete_value registry.open_key registry.query_value
 ///   registry.query_key registry.enum_key registry.enum_value
 ///   network.connect network.accept network.send network.recv
 ///   network.disconnect network.retransmit network.udp_send network.udp_recv
 ///   audit.open_process audit.open_thread
 /// The default (no `--capture` flag) = the historical set: modifications +
-/// process + network, no reads/queries. `--capture <csv>` sets an explicit set.
+/// process + network, no reads/queries. `--capture <csv>` sets an explicit set;
+/// the canonical list is [`crate::ALL_OPS`], groups/aliases via
+/// [`crate::expand_ops`].
 #[derive(Clone)]
 struct Capture(HashSet<String>);
 
@@ -91,18 +102,19 @@ impl Default for Capture {
 }
 
 impl Capture {
-    /// Parse an explicit `--capture` csv of `kind.op` tokens.
-    fn parse(spec: &str) -> Self {
-        Capture(
-            spec.split(',')
-                .map(|t| t.trim())
-                .filter(|t| !t.is_empty())
-                .map(|t| t.to_string())
-                .collect(),
-        )
+    /// Parse an explicit `--capture` csv: canonical `kind.op` tokens, `kind.*`
+    /// groups, `all`, and the documented aliases (see [`crate::expand_ops`]).
+    /// An unknown token is an error, never silently ignored.
+    fn parse(spec: &str) -> Result<Self, String> {
+        let tokens: Vec<&str> = spec.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
+        Ok(Capture(crate::expand_ops(&tokens)?.into_iter().collect()))
     }
     fn has(&self, op: &str) -> bool {
         self.0.contains(op)
+    }
+    /// The enabled tokens, in canonical order (for the `tracer.start` record).
+    fn sorted(&self) -> Vec<&'static str> {
+        crate::ALL_OPS.iter().copied().filter(|op| self.0.contains(*op)).collect()
     }
 }
 
@@ -131,18 +143,97 @@ struct State {
     /// `--stacks` was requested — lets `dispatch` skip scanning every event's
     /// extended data when no stacks were armed in the first place.
     stacks: bool,
+    /// Loaded modules per tracked pid, for symbolizing `--stacks` frames. Fed by
+    /// ImageLoad/ImageUnload (always delivered for the tree, whether or not
+    /// `process.image_load` is emitted) and seeded from a toolhelp snapshot
+    /// when a pid joins the tree, which covers attach mode where the loads
+    /// pre-date the session.
+    modules: HashMap<u32, Vec<ModuleRange>>,
+    /// Last ETW loss counters reported, so `lost` records are written on change
+    /// only — never per event.
+    last_stats: SessionStats,
 }
 
 impl State {
     fn emit(&mut self, mut v: serde_json::Value) {
         if let Some(stack) = &self.pending_stack {
             if let Some(obj) = v.as_object_mut() {
-                let frames: Vec<String> = stack.iter().map(|a| format!("0x{a:x}")).collect();
-                obj.insert("stack".to_string(), serde_json::json!(frames));
+                let raw: Vec<String> = stack.iter().map(|a| format!("0x{a:x}")).collect();
+                // Resolve against the acting process's module list. Kernel frames
+                // and unknown user addresses keep a compact marker; the raw
+                // addresses stay in `stack` for consumers that want them.
+                let pid = obj.get("pid").and_then(|p| p.as_u64()).map(|p| p as u32);
+                let empty = Vec::new();
+                let mods = pid.and_then(|p| self.modules.get(&p)).unwrap_or(&empty);
+                let frames: Vec<String> = stack.iter().map(|a| symbolize_frame(*a, mods)).collect();
+                obj.insert("stack".to_string(), serde_json::json!(raw));
+                obj.insert("frames".to_string(), serde_json::json!(frames));
             }
         }
         let _ = writeln!(self.writer, "{v}");
         self.count += 1;
+    }
+
+    /// Compare fresh session counters against the last report and write a
+    /// `tracer.lost` record when ETW has dropped more since. Returns whether it
+    /// did. A stderr warning goes with it: silent truncation is the worst
+    /// failure mode of a behaviour tracer.
+    fn note_stats(&mut self, stats: SessionStats) {
+        let grew = stats.events_lost > self.last_stats.events_lost
+            || stats.buffers_lost() > self.last_stats.buffers_lost();
+        if grew {
+            let delta = stats.events_lost.saturating_sub(self.last_stats.events_lost);
+            let message = format!(
+                "ETW dropped {} event(s) so far ({delta} new; {} buffer(s) lost): the capture is \
+                 truncated — trim the op set, or raise --buffer-kb / --buffers",
+                stats.events_lost,
+                stats.buffers_lost()
+            );
+            eprintln!("{message}");
+            self.pending_stack = None;
+            self.emit(serde_json::json!({
+                "kind": "tracer", "op": "lost",
+                "events_lost": stats.events_lost,
+                "buffers_lost": stats.buffers_lost(),
+                "delta": delta,
+                "message": message,
+            }));
+            let _ = self.writer.flush();
+        }
+        self.last_stats = stats;
+    }
+
+    /// Seed `pid`'s module list from a toolhelp snapshot (attach mode: the
+    /// image loads happened before the session existed). ImageLoad events keep
+    /// it current from here on. A no-op without `--stacks`, the only consumer of
+    /// the module map — and a foreign-process snapshot is not cheap.
+    fn seed_modules(&mut self, pid: u32) {
+        if !self.stacks {
+            return;
+        }
+        if let Some(mods) = snapshot_modules(pid) {
+            self.modules.entry(pid).or_default().extend(mods);
+        }
+    }
+
+    fn note_image_load(&mut self, pid: u32, base: u64, size: u64, path: &str) {
+        if !self.stacks {
+            return;
+        }
+        let name = module_name(path);
+        let list = self.modules.entry(pid).or_default();
+        if !list.iter().any(|m| m.base == base) {
+            list.push(ModuleRange { base, size, name });
+        }
+    }
+
+    fn note_image_unload(&mut self, pid: u32, base: u64) {
+        if !self.stacks {
+            return;
+        }
+        if let Some(list) = self.modules.get_mut(&pid) {
+            list.retain(|m| m.base != base);
+        }
     }
     /// Emit only the first time this (op, path) is seen. Kernel-File repeats
     /// NameDelete/NameCreate on cache churn; we want one line per change.
@@ -156,7 +247,7 @@ impl State {
     /// resolves from it (see `ProcessTree::set_root`).
     fn set_root(&mut self, root: u32) {
         let resolved = self.tree.set_root(root);
-        self.emit_starts(resolved);
+        self.adopt(root, resolved);
     }
 
     /// Re-root the traced tree at a new pid (resident mode, after a debuggee
@@ -168,6 +259,17 @@ impl State {
         self.file_names.clear();
         self.key_paths.clear();
         self.emitted.clear();
+        self.modules.clear();
+        self.adopt(root, resolved);
+    }
+
+    /// Bookkeeping for a (re-)rooted tree: seed the module maps of the root and
+    /// every buffered child, then emit those children's starts.
+    fn adopt(&mut self, root: u32, resolved: Vec<PendingStart>) {
+        self.seed_modules(root);
+        for ps in &resolved {
+            self.seed_modules(ps.child);
+        }
         self.emit_starts(resolved);
     }
 
@@ -256,9 +358,18 @@ pub fn run(args: impl Iterator<Item = String>) -> ! {
     let mut discover = false;
     let mut attach_pid: Option<u32> = None;
     let mut target: Vec<String> = Vec::new();
-    let mut capture = Capture::default();
+    // Parsed after the output file exists, so a bad token becomes a
+    // `tracer.error` record the host can read back, not just a stderr line
+    // `wsb exec` would discard.
+    let mut capture_spec: Option<String> = None;
     let mut stacks = false;
     let mut session_name = String::from("SbxGuestTracer");
+    // ETW buffer pool. ferrisetw's default (32 KB buffers, kernel-chosen count)
+    // overran on a registry-heavy target and dropped 88% of the events silently
+    // (RETRO B8); these defaults give the session real headroom and both are
+    // overridable. Memory cost is buffer_kb * buffers at the high-water mark.
+    let mut buffer_kb: u32 = DEFAULT_BUFFER_KB;
+    let mut buffers: u32 = DEFAULT_BUFFERS;
     // Resident-mode control file: when set, the tracer stays alive across target
     // exits and re-targets (or stops) on commands written here by the host —
     // letting one elevated tracer serve many debuggee restarts with a single UAC.
@@ -282,8 +393,15 @@ pub fn run(args: impl Iterator<Item = String>) -> ! {
                 tree_timeout_secs = v.parse().expect("--tree-timeout must be seconds");
             }
             "--capture" => {
-                let v = args.next().expect("--capture needs a value");
-                capture = Capture::parse(&v);
+                capture_spec = Some(args.next().expect("--capture needs a value"));
+            }
+            "--buffer-kb" => {
+                let v = args.next().expect("--buffer-kb needs a value");
+                buffer_kb = v.parse().expect("--buffer-kb must be a number");
+            }
+            "--buffers" => {
+                let v = args.next().expect("--buffers needs a value");
+                buffers = v.parse().expect("--buffers must be a number");
             }
             "--attach-pid" => {
                 let v = args.next().expect("--attach-pid needs a value");
@@ -315,10 +433,25 @@ pub fn run(args: impl Iterator<Item = String>) -> ! {
         writer: BufWriter::new(file),
         discover,
         count: 0,
-        capture,
+        capture: Capture::default(),
         pending_stack: None,
         stacks,
+        modules: HashMap::new(),
+        last_stats: SessionStats::default(),
     }));
+    if let Some(spec) = capture_spec {
+        match Capture::parse(&spec) {
+            Ok(c) => state.lock().unwrap().capture = c,
+            Err(e) => fatal(&state, 2, format!("bad --capture: {e}")),
+        }
+    }
+    let mode = if control.is_some() {
+        "resident"
+    } else if attach_pid.is_some() {
+        "attach"
+    } else {
+        "spawn"
+    };
 
     // Keywords: process 0x70 = PROCESS|THREAD|IMAGE (so thread + image/DLL
     // events are delivered, gated per-op);
@@ -326,7 +459,13 @@ pub fn run(args: impl Iterator<Item = String>) -> ! {
     // registry 0 = all (we need Create/Open events to resolve key paths);
     // network 0x30 = IPv4|IPv6.
     let trace = UserTrace::new()
-        .named(session_name)
+        .named(session_name.clone())
+        .set_trace_properties(TraceProperties {
+            buffer_size: buffer_kb.max(4),
+            min_buffer: (buffers / 4).max(2),
+            max_buffer: buffers.max(2),
+            ..TraceProperties::default()
+        })
         .enable(provider(KERNEL_PROCESS, Kind::Process, &state, 0x70, stacks))
         .enable(provider(KERNEL_FILE, Kind::File, &state, 0x1F90, stacks))
         .enable(provider(KERNEL_REGISTRY, Kind::Registry, &state, 0, stacks))
@@ -338,18 +477,41 @@ pub fn run(args: impl Iterator<Item = String>) -> ! {
         Err(e) => fatal(&state, 4, format!("failed to start ETW trace (need SYSTEM/admin): {e:?}")),
     };
 
+    // The session is up: say so. A host that finds no `tracer.start` in the
+    // output knows the collector never ran (wrong guest binary, RETRO B3) rather
+    // than that the target was merely quiet.
+    {
+        let mut s = state.lock().unwrap();
+        let ops = s.capture.sorted();
+        s.emit(serde_json::json!({
+            "kind": "tracer", "op": "start",
+            "session": session_name, "mode": mode,
+            "ops": ops, "stacks": stacks,
+            "buffer_kb": buffer_kb, "buffers": buffers,
+        }));
+        let _ = s.writer.flush();
+    }
+
     std::thread::sleep(Duration::from_millis(800));
 
     // Periodic flush so a host tailing the shared output file sees events while
     // the target is still running (the writer is otherwise only flushed at exit).
+    // The same thread polls the session's loss counters every few ticks.
     let flush_stop = Arc::new(AtomicBool::new(false));
     let flush_handle = {
         let st = Arc::clone(&state);
         let stop = Arc::clone(&flush_stop);
+        let session = session_name.clone();
         std::thread::spawn(move || {
+            let mut tick: u32 = 0;
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(500));
+                tick += 1;
+                let stats = if tick % STATS_POLL_TICKS == 0 { query_session(&session) } else { None };
                 if let Ok(mut s) = st.lock() {
+                    if let Some(stats) = stats {
+                        s.note_stats(stats);
+                    }
                     let _ = s.writer.flush();
                 }
             }
@@ -411,18 +573,80 @@ pub fn run(args: impl Iterator<Item = String>) -> ! {
     };
 
     std::thread::sleep(Duration::from_millis(1500)); // drain trailing events
+    // Final counters, read while the session still exists.
+    let final_stats = query_session(&session_name);
     let _ = trace.stop();
     flush_stop.store(true, Ordering::Relaxed);
     let _ = flush_handle.join();
 
     let mut s = state.lock().unwrap();
+    s.pending_stack = None;
+    if let Some(stats) = final_stats {
+        s.note_stats(stats);
+    }
+    let stats = s.last_stats;
+    let written = s.count;
+    s.emit(serde_json::json!({
+        "kind": "tracer", "op": "stats",
+        "events_written": written,
+        "events_lost": stats.events_lost,
+        "buffers_lost": stats.buffers_lost(),
+        "buffers_written": stats.buffers_written,
+        "buffers": stats.number_of_buffers,
+        "buffer_kb": stats.buffer_size_kb,
+    }));
     // A terminal marker so a host driver can detect the tracer exited (e.g. a
     // standalone ETW session ending when its target exits).
-    s.pending_stack = None;
     s.emit(serde_json::json!({ "kind": "tracer", "op": "done" }));
     let _ = s.writer.flush();
-    eprintln!("wrote {} events to {out_path}", s.count);
+    eprintln!("wrote {} events to {out_path} ({} lost by ETW)", s.count, stats.events_lost);
     std::process::exit(exit_code);
+}
+
+/// Default ETW buffer size (KB) and buffer-pool cap. See `run`.
+const DEFAULT_BUFFER_KB: u32 = 512;
+const DEFAULT_BUFFERS: u32 = 256;
+/// Poll the session's loss counters every N flush ticks (500 ms each).
+const STATS_POLL_TICKS: u32 = 4;
+
+/// File name of an image path, lower-cased, for `frames` (`\Device\...\x.exe`
+/// from ETW or a plain path from toolhelp).
+fn module_name(path: &str) -> String {
+    path.rsplit(['\\', '/']).next().unwrap_or(path).to_ascii_lowercase()
+}
+
+/// The modules currently mapped in `pid` (both bitnesses of a WOW64 process),
+/// or `None` if the snapshot failed — e.g. the process is already gone.
+fn snapshot_modules(pid: u32) -> Option<Vec<ModuleRange>> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W,
+        TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32,
+    };
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid).ok()?;
+        let mut entry = MODULEENTRY32W {
+            dwSize: std::mem::size_of::<MODULEENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        if Module32FirstW(snap, &mut entry).is_ok() {
+            loop {
+                let len = entry.szModule.iter().position(|&c| c == 0).unwrap_or(entry.szModule.len());
+                let name = String::from_utf16_lossy(&entry.szModule[..len]).to_ascii_lowercase();
+                out.push(ModuleRange {
+                    base: entry.modBaseAddr as usize as u64,
+                    size: entry.modBaseSize as u64,
+                    name,
+                });
+                if Module32NextW(snap, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+        Some(out)
+    }
 }
 
 /// Resident-mode control loop: poll `path` for one-line commands from the host
@@ -686,12 +910,26 @@ fn on_process(record: &EventRecord, p: &Parser, task: &str, s: &mut State) -> bo
             ("image_unload", "process.image_unload")
         };
         let owner = u32p(p, "ProcessID").unwrap_or_else(|| record.process_id());
-        if s.tree.contains(owner) && s.capture.has(token) {
-            s.emit(serde_json::json!({
-                "kind": "process", "op": op, "ts": record.raw_timestamp(),
-                "pid": owner, "path": strp(p, "ImageName"),
-                "base": u64p(p, "ImageBase"), "size": u64p(p, "ImageSize"),
-            }));
+        // Parse the image fields only when something consumes them — the
+        // module map (which symbolizes `--stacks` frames) or the emitted
+        // event — and once for both. The default capture wants neither, and
+        // this runs per DLL load across the whole tree.
+        let want_emit = s.tree.contains(owner) && s.capture.has(token);
+        if want_emit || (s.stacks && s.tree.contains(owner)) {
+            let base = u64p(p, "ImageBase");
+            let size = u64p(p, "ImageSize");
+            let path = strp(p, "ImageName");
+            if id == 5 || task.eq_ignore_ascii_case("ImageLoad") {
+                s.note_image_load(owner, base.unwrap_or(0), size.unwrap_or(0), path.as_deref().unwrap_or(""));
+            } else {
+                s.note_image_unload(owner, base.unwrap_or(0));
+            }
+            if want_emit {
+                s.emit(serde_json::json!({
+                    "kind": "process", "op": op, "ts": record.raw_timestamp(),
+                    "pid": owner, "path": path, "base": base, "size": size,
+                }));
+            }
         }
         return true;
     }
@@ -711,12 +949,15 @@ fn on_process(record: &EventRecord, p: &Parser, task: &str, s: &mut State) -> bo
                 image: strp(p, "ImageName"),
                 session: u32p(p, "SessionID"),
             };
-            if s.tree.note_start(ps) && s.capture.has("process.start") {
-                s.emit(serde_json::json!({
-                    "kind": "process", "op": "start", "ts": record.raw_timestamp(),
-                    "pid": cpid, "ppid": parent,
-                    "image": strp(p, "ImageName"), "session": u32p(p, "SessionID"),
-                }));
+            if s.tree.note_start(ps) {
+                s.seed_modules(cpid);
+                if s.capture.has("process.start") {
+                    s.emit(serde_json::json!({
+                        "kind": "process", "op": "start", "ts": record.raw_timestamp(),
+                        "pid": cpid, "ppid": parent,
+                        "image": strp(p, "ImageName"), "session": u32p(p, "SessionID"),
+                    }));
+                }
             }
         }
         return true;
@@ -725,11 +966,14 @@ fn on_process(record: &EventRecord, p: &Parser, task: &str, s: &mut State) -> bo
         let pid = u32p(p, "ProcessID").unwrap_or_else(|| record.process_id());
         // `note_stop` also drops the pid from the tree, so a later reuse of the
         // same number by an unrelated process isn't misattributed to this run.
-        if s.tree.note_stop(pid) && s.capture.has("process.stop") {
-            s.emit(serde_json::json!({
-                "kind": "process", "op": "stop", "ts": record.raw_timestamp(),
-                "pid": pid, "exit": u32p(p, "ExitCode"), "image": strp(p, "ImageName"),
-            }));
+        if s.tree.note_stop(pid) {
+            if s.capture.has("process.stop") {
+                s.emit(serde_json::json!({
+                    "kind": "process", "op": "stop", "ts": record.raw_timestamp(),
+                    "pid": pid, "exit": u32p(p, "ExitCode"), "image": strp(p, "ImageName"),
+                }));
+            }
+            s.modules.remove(&pid);
         }
         return true;
     }
@@ -975,9 +1219,10 @@ fn on_registry(record: &EventRecord, p: &Parser, opcode: &str, s: &mut State) ->
     }
     // Value queries (RegQueryValue) — a "read". Opcode "QueryValueKey" / id 7.
     // Not deduped: a program re-reading a value over time is meaningful, but this
-    // is noisy, so it's opt-in via the `registry.query` token.
+    // is noisy, so it's opt-in via the `registry.query_value` token (the emitted
+    // op; `registry.query` is accepted as an alias).
     if opcode == "QueryValueKey" || id == 7 {
-        if s.capture.has("registry.query") {
+        if s.capture.has("registry.query_value") {
             let path = format!("{}\\{}", key_path(s, p), strp(p, "ValueName").unwrap_or_default());
             s.emit(json_reg("query_value", ts, pid, &path, u32p(p, "DataSize")));
         }

@@ -79,7 +79,7 @@ impl LuaUserData for EtwHandle {
             let from = from_seq.unwrap_or(cur.seq);
             let (rows, new_cur) = etw::read_events(&this.out, from, cur);
             *this.cursor.borrow_mut() = new_cur;
-            rows_to_table(lua, &rows)
+            rows_to_table(lua, rows)
         });
 
         methods.add_method("done", |_lua, this, ()| Ok(etw::tracer_done(&this.out)));
@@ -115,13 +115,52 @@ fn default_tracer_exe() -> mlua::Result<PathBuf> {
     std::env::current_exe().map_err(mlua::Error::external)
 }
 
-/// Build the capture spec (`ops` + `callstacks`) from top-level option fields.
-fn capture_from(opts: &LuaTable) -> mlua::Result<EtwCaptureSpec> {
+/// Build the capture spec (`ops`, `callstacks`, `buffer_kb`, `buffers`) from an
+/// options table (the top-level `etw.start`/`etw.spawn` table, or the `etw = {}`
+/// sub-table of `sbx.provision`). Unknown op tokens are refused here, before
+/// anything is launched. Shared with `sbx`.
+pub(crate) fn capture_from(opts: &LuaTable) -> mlua::Result<EtwCaptureSpec> {
     let ops = match opts.get::<Option<LuaTable>>("ops")? {
         Some(list) => list.sequence_values::<String>().collect::<mlua::Result<Vec<_>>>()?,
         None => Vec::new(),
     };
-    Ok(EtwCaptureSpec { ops, callstacks: opts.get::<Option<bool>>("callstacks")?.unwrap_or(false) })
+    let spec = EtwCaptureSpec {
+        ops,
+        callstacks: opts.get::<Option<bool>>("callstacks")?.unwrap_or(false),
+        buffer_kb: opts.get::<Option<u32>>("buffer_kb")?,
+        buffers: opts.get::<Option<u32>>("buffers")?,
+    };
+    spec.validate().map_err(mlua::Error::external)?;
+    Ok(spec)
+}
+
+/// `{ all = {...}, default = {...}, groups = {...}, aliases = { old = new } }`
+/// — the tracer's op vocabulary, for scripts that want to enumerate it instead
+/// of grepping the source. Shared by `etw.ops()` and `sbx.ops()`.
+pub(crate) fn ops_table(lua: &Lua) -> mlua::Result<LuaTable> {
+    let t = lua.create_table()?;
+    let all = lua.create_table()?;
+    for op in etw::ALL_OPS {
+        all.push(*op)?;
+    }
+    t.set("all", all)?;
+    let default = lua.create_table()?;
+    for op in etw::DEFAULT_OPS {
+        default.push(*op)?;
+    }
+    t.set("default", default)?;
+    let groups = lua.create_table()?;
+    for kind in etw::OP_KINDS {
+        groups.push(format!("{kind}.*"))?;
+    }
+    groups.push("all")?;
+    t.set("groups", groups)?;
+    let aliases = lua.create_table()?;
+    for (alias, canonical) in etw::OP_ALIASES {
+        aliases.set(*alias, *canonical)?;
+    }
+    t.set("aliases", aliases)?;
+    Ok(t)
 }
 
 /// Common config decode for `etw.start`/`etw.spawn` (everything but the mode).
@@ -218,8 +257,26 @@ pub fn register_etw_functions(lua: &Lua) -> mlua::Result<()> {
     // etw.time(ts) -> "HH:MM:SS.mmm" (FILETIME 100ns ticks -> UTC time-of-day)
     etw_tbl.set("time", lua.create_function(|_lua, ts: i64| Ok(etw::filetime_to_hms(ts)))?)?;
 
+    // etw.ops() -> { all, default, groups, aliases }
+    etw_tbl.set("ops", lua.create_function(|lua, ()| ops_table(lua))?)?;
+
+    // etw.expand_ops({ "file.*", "registry.query" }) -> canonical list (errors on unknown)
+    etw_tbl.set("expand_ops", lua.create_function(expand_ops_lua)?)?;
+
     lua.globals().set("etw", etw_tbl)?;
     Ok(())
+}
+
+/// `expand_ops(list) -> list`: the canonical op tokens for a user-supplied
+/// list (errors on an unknown token). Shared by the `etw` and `sbx` tables.
+pub(crate) fn expand_ops_lua(lua: &Lua, list: LuaTable) -> mlua::Result<LuaTable> {
+    let tokens = list.sequence_values::<String>().collect::<mlua::Result<Vec<_>>>()?;
+    let expanded = etw::expand_ops(&tokens).map_err(mlua::Error::external)?;
+    let t = lua.create_table()?;
+    for op in expanded {
+        t.push(op)?;
+    }
+    Ok(t)
 }
 
 /// Default control-file path for an attached tracer: `<out>.control.txt`.
@@ -242,37 +299,44 @@ pub(crate) fn events_to_table(lua: &Lua, path: &Path, from_seq: u64) -> mlua::Re
     let stored = cursors().lock().unwrap().get(path).copied().unwrap_or_default();
     let (rows, new_cur) = etw::read_events(path, from_seq, stored);
     cursors().lock().unwrap().insert(path.to_path_buf(), new_cur);
-    rows_to_table(lua, &rows)
+    rows_to_table(lua, rows)
 }
 
-/// Convert a slice of (seq, event) into a Lua array of event tables.
-fn rows_to_table(lua: &Lua, rows: &[(u64, TraceEvent)]) -> mlua::Result<LuaTable> {
+/// Convert (seq, event) rows into a Lua array of event tables, consuming the
+/// events so their strings move into Lua rather than being cloned.
+fn rows_to_table(lua: &Lua, rows: Vec<(u64, TraceEvent)>) -> mlua::Result<LuaTable> {
     let out = lua.create_table()?;
     for (seq, ev) in rows {
-        out.push(event_table(lua, *seq, ev)?)?;
+        out.push(event_table(lua, seq, ev)?)?;
     }
     Ok(out)
 }
 
 /// One ETW event as a Lua table (paths prettified like the app's viewer, plus a
 /// formatted `time` alongside the raw `ts`). Shared with `sbx.events`.
-pub(crate) fn event_table(lua: &Lua, seq: u64, ev: &TraceEvent) -> mlua::Result<LuaTable> {
+pub(crate) fn event_table(lua: &Lua, seq: u64, ev: TraceEvent) -> mlua::Result<LuaTable> {
     let t = lua.create_table()?;
     t.set("seq", seq)?;
     t.set("time", etw::filetime_to_hms(ev.ts))?;
-    t.set("kind", ev.kind.clone())?;
-    t.set("op", ev.op.clone())?;
+    t.set("kind", ev.kind)?;
+    t.set("op", ev.op)?;
     t.set("pid", ev.pid)?;
     t.set("ts", ev.ts)?;
-    t.set("image", ev.image.clone())?;
+    t.set("image", ev.image)?;
     t.set("ppid", ev.ppid)?;
     t.set("path", ev.path.as_deref().map(etw::pretty_path))?;
     t.set("size", ev.size)?;
-    t.set("dest", ev.dest.clone())?;
+    t.set("dest", ev.dest)?;
     t.set("exit", ev.exit)?;
-    t.set("stack", ev.stack.clone())?;
+    t.set("stack", ev.stack)?;
+    t.set("frames", ev.frames)?;
     t.set("target_pid", ev.target_pid)?;
-    t.set("access", ev.access.clone())?;
+    t.set("access", ev.access)?;
     t.set("status", ev.status)?;
+    // Tracer control records (`kind == "tracer"`).
+    t.set("message", ev.message)?;
+    t.set("events_lost", ev.events_lost)?;
+    t.set("buffers_lost", ev.buffers_lost)?;
+    t.set("events_written", ev.events_written)?;
     Ok(t)
 }

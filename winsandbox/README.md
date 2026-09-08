@@ -129,12 +129,25 @@ let events: Vec<TraceEvent> =
 - **The tracer launches the target itself** so it knows the root PID, then
   follows the process tree via `ProcessStart` events (a child of a tracked pid
   becomes tracked). Everything is filtered to that tree.
-- **Static CRT is mandatory.** The base sandbox image has no VC++ runtime, so
-  binaries are built with `+crt-static` (`.cargo/config.toml`); otherwise a
-  pushed `.exe` dies with `STATUS_DLL_NOT_FOUND` (`0xC0000135`).
+- **The base sandbox image has no VC++ runtime.** The collector is a mode of a
+  joybug executable, which links the CRT dynamically, so the sandbox driver
+  (`joybug_core::sandbox`) stages `vcruntime140*.dll` / `msvcp140.dll` next to
+  the guest exe; without them a pushed `.exe` dies with `STATUS_DLL_NOT_FOUND`
+  (`0xC0000135`).
 - **Network events lie about the PID.** They're logged in a deferred (DPC)
   context, so the event's process id is System — the real pid is the `PID`
   event property. Filtering on the wrong one silently drops every connection.
+- **Loss is accounted, not silent.** ETW drops events when its buffers overrun.
+  The tracer sizes the session's buffers generously (overridable with
+  `--buffer-kb` / `--buffers`) and polls `EventsLost` / `RealTimeBuffersLost`
+  (`etw_stats::query_session`, via `ControlTraceW(EVENT_TRACE_CONTROL_QUERY)`):
+  when they grow it writes a `tracer/lost` record and a stderr warning, and a
+  `tracer/stats` summary at the end. A `tracer/start` record marks the session
+  coming up, so a host can tell "collector never ran" from "target was quiet".
+- **Symbolized stacks.** With `--stacks`, each event's raw return addresses are
+  kept in `stack` and resolved in a parallel `frames` array
+  (`module+0xrva` / `kernel` / bare address) from a per-pid module map fed by
+  image-load events and a toolhelp snapshot when a process joins the tree.
 - **File name resolution.** Write events carry only a file-object pointer, so
   the tracer keeps an object→name map built from Create events. "New file" is
   the `CreateNewFile` event; `NameCreate` is a name-cache access, not a creation.

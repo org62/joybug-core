@@ -167,9 +167,88 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::TypeResult { layout } => format!("TypeResult ({})", layout.as_ref().map(|l| l.name.as_str()).unwrap_or("none")),
         DebuggerResponse::TebAddress { .. } => "TebAddress".to_string(),
         DebuggerResponse::PebAddress { .. } => "PebAddress".to_string(),
+        DebuggerResponse::Hello { server, version, .. } => format!("Hello({server} {version})"),
+        DebuggerResponse::MemoryAllocated { address } => format!("MemoryAllocated(0x{address:x})"),
     };
     debug!("Received response: {}", summary);
     Ok(resp)
+}
+
+/// What the server said in reply to our `Hello`.
+#[derive(Debug, Clone)]
+pub struct ServerHello {
+    pub fingerprint: u64,
+    pub server: String,
+    pub version: String,
+}
+
+/// How long the handshake may take. Generous for a guest VM's first request
+/// (cold symbol init), but short enough that a peer that never answers — an
+/// older server stuck on a frame it cannot decode — is reported, not waited on.
+pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Perform the protocol handshake on a fresh connection: send `Hello`, require a
+/// matching `Hello` back within [`HANDSHAKE_TIMEOUT`]. Every failure mode of a
+/// host↔guest revision mismatch lands here with a specific message instead of
+/// surfacing later as a hung request (RETRO B2):
+///  * an older server cannot decode `Hello`, logs an error and closes → EOF;
+///  * a server that answers with anything but `Hello` is not speaking this
+///    protocol;
+///  * a `Hello` with a different fingerprint is a different build.
+/// The read timeout is cleared afterwards — a debug-loop connection legitimately
+/// blocks for arbitrarily long between events.
+pub fn handshake(stream: &mut FramedJsonStream, client_name: &str) -> anyhow::Result<ServerHello> {
+    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    let result = handshake_inner(stream, client_name);
+    // Restore blocking reads whatever happened; a failed handshake drops the
+    // stream anyway.
+    let _ = stream.set_read_timeout(None);
+    result
+}
+
+fn handshake_inner(stream: &mut FramedJsonStream, client_name: &str) -> anyhow::Result<ServerHello> {
+    let ours = crate::protocol::PROTOCOL_FINGERPRINT;
+    stream.send(&DebuggerRequest::Hello { fingerprint: ours, client: client_name.to_string() })?;
+    let resp: DebuggerResponse = match stream.receive() {
+        Ok(r) => r,
+        Err(e) => {
+            let kind = e.root_cause().downcast_ref::<std::io::Error>().map(|io| io.kind());
+            return Err(match kind {
+                Some(std::io::ErrorKind::UnexpectedEof)
+                | Some(std::io::ErrorKind::ConnectionReset)
+                | Some(std::io::ErrorKind::ConnectionAborted) => anyhow::anyhow!(
+                    "the server closed the connection during the protocol handshake: it is \
+                     running a different joybug-core revision (our protocol fingerprint is \
+                     {ours:016x}) — rebuild it, or re-stage the guest binary from this build"
+                ),
+                Some(std::io::ErrorKind::WouldBlock) | Some(std::io::ErrorKind::TimedOut) => {
+                    anyhow::anyhow!(
+                        "no reply to the protocol handshake within {}s: the server is not a \
+                         joybug-core debug server, or is a revision that does not answer Hello",
+                        HANDSHAKE_TIMEOUT.as_secs()
+                    )
+                }
+                _ => anyhow::anyhow!("protocol handshake failed: {e}"),
+            });
+        }
+    };
+    match resp {
+        DebuggerResponse::Hello { fingerprint, server, version } => {
+            if fingerprint != ours {
+                anyhow::bail!(
+                    "protocol mismatch: this client is {ours:016x} (joybug-core {}) but the \
+                     server '{server}' is {fingerprint:016x} (version {version}) — the two are \
+                     built from different revisions; re-stage the guest binary from this build",
+                    env!("CARGO_PKG_VERSION")
+                );
+            }
+            Ok(ServerHello { fingerprint, server, version })
+        }
+        other => anyhow::bail!(
+            "protocol mismatch: the server answered the handshake with {other:?} instead of \
+             Hello — it is not speaking this joybug-core revision's protocol"
+        ),
+    }
 }
 
 struct SteppingInfo<S> {
@@ -189,6 +268,8 @@ pub enum BreakpointDecision {
 /// Debug session with state management
 pub struct DebugSession<S> {
     pub stream: Mutex<FramedJsonStream>,
+    /// What the server identified itself as in the handshake.
+    pub server_hello: ServerHello,
     pub state: S,
     on_initial_breakpoint: Option<Box<dyn FnMut(&mut Self, u32, u32, u64) -> anyhow::Result<()> + Send + 'static>>,
     single_shot_handlers:
@@ -225,6 +306,23 @@ pub struct DebugSession<S> {
 /// waiting for the next event is never torn down while the server is alive.
 const KEEPALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Tune a fresh client connection: disable Nagle (latency — a request/response
+/// protocol of small frames stalls ~40-200ms per exchange under Nagle+delayed
+/// ACK over a real link to a sandbox guest) and enable TCP keepalive (detect a
+/// silently-dropped connection instead of only noticing on the next request).
+/// Safe on every connection, including an idle debug-loop one. Shared by
+/// [`DebugSession`] and the Lua `DebugClient`.
+pub(crate) fn configure_client_socket(stream: &TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        warn!("Failed to set TCP_NODELAY: {}", e);
+    }
+    let ka = socket2::TcpKeepalive::new().with_time(KEEPALIVE_IDLE);
+    let sock = socket2::SockRef::from(stream);
+    if let Err(e) = sock.set_tcp_keepalive(&ka) {
+        warn!("Failed to enable TCP keepalive: {}", e);
+    }
+}
+
 /// Triage a response to a request whose success answer is a bare `Ack`.
 /// Shared by `DebugSession::ack_request` and the Lua bindings, which talk to
 /// different client types but need identical Ack / Error / unexpected handling.
@@ -240,10 +338,12 @@ impl<S> DebugSession<S> {
     pub fn new(state: S, addr: Option<&str>) -> anyhow::Result<Self> {
         let addr = addr.unwrap_or("127.0.0.1:9000");
         let stream = TcpStream::connect(addr)?;
-        Self::configure_socket(&stream);
-        let framed_stream = FramedJsonStream::new(stream);
+        crate::protocol_io::configure_client_socket(&stream);
+        let mut framed_stream = FramedJsonStream::new(stream);
+        let server_hello = handshake(&mut framed_stream, "joybug-core client")?;
         Ok(Self {
             stream: Mutex::new(framed_stream),
+            server_hello,
             state,
             on_initial_breakpoint: None,
             single_shot_handlers: HashMap::new(),
@@ -262,23 +362,6 @@ impl<S> DebugSession<S> {
         })
     }
 
-    /// Tune the client connection: disable Nagle (latency) and enable keepalive
-    /// (dead-peer detection).
-    fn configure_socket(stream: &TcpStream) {
-        // Disable Nagle's algorithm. This is a request/response protocol with
-        // small framed messages; Nagle interacting with the peer's delayed-ACK
-        // stalls each exchange by ~40-200ms over a real TCP link (host ↔ sandbox
-        // guest) — invisible on loopback, but the dominant per-command cost when
-        // debugging into a VM. TCP_NODELAY sends each frame immediately.
-        if let Err(e) = stream.set_nodelay(true) {
-            warn!("Failed to set TCP_NODELAY: {}", e);
-        }
-        let ka = socket2::TcpKeepalive::new().with_time(KEEPALIVE_IDLE);
-        let sock = socket2::SockRef::from(stream);
-        if let Err(e) = sock.set_tcp_keepalive(&ka) {
-            warn!("Failed to enable TCP keepalive: {}", e);
-        }
-    }
 
     /// Bound how long a single request waits for its response. Intended for
     /// request/response (OOB) clients — NOT the debug-loop connection, which

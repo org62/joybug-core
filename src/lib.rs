@@ -28,6 +28,12 @@ pub mod env_block;
 pub mod etw;
 /// Windows Sandbox run mode (host-side VM orchestration).
 pub mod sandbox;
+/// The embedded "this exe can be a sandbox guest" record and its reader.
+pub mod guest_marker;
+/// The guest side of the sandbox desktop probes (`--ui` role).
+pub mod guest_desktop;
+/// Raw-argv guest role dispatch shared by every guest-capable binary.
+pub mod guest_roles;
 
 #[cfg(windows)]
 pub type PlatformImpl = windows_platform::WindowsPlatform;

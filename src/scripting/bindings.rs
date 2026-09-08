@@ -8,10 +8,12 @@ use std::cell::RefCell;
 use mlua::prelude::*;
 
 use crate::interfaces::{Architecture, ModuleSymbol};
+use crate::pe_types::{ImportDescriptorInfo, ImportItem, ImportKind, ModuleExtraInfo};
 use crate::protocol::*;
 
 use super::colors;
 use super::debug_client::*;
+use super::opt;
 use super::repl::Repl;
 
 /// Wrapper around DebugClient stored as Lua UserData.
@@ -151,11 +153,14 @@ impl LuaUserData for LuaDebugClient {
                 let (continue_pid, continue_tid) = match &action {
                     EventAction::InitialBreakpoint { pid, tid, address, has_handler, repl_on_break } => {
                         if *has_handler {
-                            let key = this.inner.borrow().handlers.on_initial_breakpoint.as_ref()
-                                .map(|k| lua.registry_value::<LuaFunction>(k)).transpose()?;
-                            if let Some(func) = key {
-                                func.call::<()>((*pid, *tid, *address))?;
-                            }
+                            call_hook(lua, &this.inner, |h| h.on_initial_breakpoint.as_ref(), (*pid, *tid, *address))?;
+                        }
+                        // A CHILD's initial breakpoint also fires on_child_ready
+                        // (RETRO F6): root_pid was set by prepare_event on this
+                        // very event, so pid != root means a child.
+                        let is_child = this.inner.borrow().root_pid != Some(*pid);
+                        if is_child {
+                            call_hook(lua, &this.inner, |h| h.on_child_ready.as_ref(), (*pid, *tid, *address))?;
                         }
                         let wants_repl = this.inner.borrow().wants_repl;
                         if wants_repl {
@@ -179,11 +184,7 @@ impl LuaUserData for LuaDebugClient {
                                 let decision: Option<String> = func.call((*pid, *tid, *address))?;
                                 handled = true;
                                 if decision.as_deref() == Some("remove") {
-                                    let mut client = this.inner.borrow_mut();
-                                    client.handlers.breakpoint_handlers.remove(address);
-                                    let _ = client.send_and_receive(&DebuggerRequest::RemoveBreakpoint {
-                                        pid: *pid, addr: *address,
-                                    });
+                                    remove_sw_breakpoint(&mut this.inner.borrow_mut(), *pid, *address);
                                 }
                             }
                         }
@@ -423,33 +424,11 @@ impl LuaUserData for LuaDebugClient {
         methods.add_method("set_breakpoint", |lua, this, (pid, addr_or_sym, handler): (u32, LuaValue, Option<LuaFunction>)| {
             let mut client = this.inner.borrow_mut();
             let addr = resolve_addr_or_sym(&mut client, addr_or_sym)?;
-
-            let resp = client.send_and_receive(&DebuggerRequest::SetBreakpoint {
-                pid, addr, tid: None,
-            }).map_err(|e| mlua::Error::external(e))?;
-            match resp {
-                DebuggerResponse::Ack => {}
-                DebuggerResponse::Error { message } => {
-                    return Err(mlua::Error::external(
-                        anyhow::anyhow!("SetBreakpoint failed: {}", message),
-                    ));
-                }
-                _ => {}
-            }
-
-            // Register Lua handler if provided
-            if let Some(func) = handler {
-                let key = lua.create_registry_value(func)?;
-                client.handlers.breakpoint_handlers.insert(addr, key);
-            }
-
-            Ok(addr)
+            set_sw_breakpoint(lua, &mut client, pid, addr, handler)
         });
 
         methods.add_method("remove_breakpoint", |_lua, this, (pid, addr): (u32, u64)| {
-            let mut client = this.inner.borrow_mut();
-            client.handlers.breakpoint_handlers.remove(&addr);
-            let _ = client.send_and_receive(&DebuggerRequest::RemoveBreakpoint { pid, addr });
+            remove_sw_breakpoint(&mut this.inner.borrow_mut(), pid, addr);
             Ok(())
         });
 
@@ -564,17 +543,15 @@ impl LuaUserData for LuaDebugClient {
         });
 
         methods.add_method("write_memory", |_lua, this, (pid, addr, data): (u32, u64, LuaString)| {
-            let mut client = this.inner.borrow_mut();
-            let resp = client.send_and_receive(&DebuggerRequest::WriteMemory {
-                pid, address: addr, data: data.as_bytes().to_vec(),
-            }).map_err(|e| mlua::Error::external(e))?;
-            match resp {
-                DebuggerResponse::WriteAck => Ok(()),
-                DebuggerResponse::Error { message } => Err(mlua::Error::external(
-                    anyhow::anyhow!("WriteMemory failed: {}", message),
-                )),
-                _ => Ok(()),
-            }
+            write_bytes(&mut this.inner.borrow_mut(), pid, addr, &data.as_bytes())
+        });
+
+        // dbg:allocate_memory(pid, size[, executable]) -> address
+        // A fresh committed region in the debuggee (VirtualAllocEx), read-write
+        // or, with `executable`, RWX — for staging shellcode, stubs or buffers
+        // to pass to the target. Never freed by the debugger.
+        methods.add_method("allocate_memory", |_lua, this, (pid, size, executable): (u32, usize, Option<bool>)| {
+            allocate_memory(&mut this.inner.borrow_mut(), pid, size, executable.unwrap_or(false))
         });
 
         // ---- Value freeze (server-side continuous write) ----
@@ -693,40 +670,16 @@ impl LuaUserData for LuaDebugClient {
             let mut client = this.inner.borrow_mut();
             let pid = pid.or(client.current_pid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current pid")))?;
             let tid = tid.or(client.current_tid).ok_or_else(|| mlua::Error::external(anyhow::anyhow!("No current tid")))?;
-            let resp = client.send_and_receive(&DebuggerRequest::GetThreadContext { pid, tid })
-                .map_err(|e| mlua::Error::external(e))?;
-            match resp {
-                DebuggerResponse::ThreadContext { context } => {
-                    context_to_lua_table(lua, &context)
-                }
-                DebuggerResponse::Error { message } => Err(mlua::Error::external(
-                    anyhow::anyhow!("GetThreadContext failed: {}", message),
-                )),
-                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
-            }
+            let context = get_thread_context(&mut client, pid, tid)?;
+            context_to_lua_table(lua, &context)
         });
 
         methods.add_method("set_context", |_lua, this, (pid, tid, ctx_table): (u32, u32, LuaTable)| {
             let mut client = this.inner.borrow_mut();
-            // First get the current context to use as a base
-            let resp = client.send_and_receive(&DebuggerRequest::GetThreadContext { pid, tid })
-                .map_err(|e| mlua::Error::external(e))?;
-            let original = match resp {
-                DebuggerResponse::ThreadContext { context } => context,
-                _ => return Err(mlua::Error::external(anyhow::anyhow!("Failed to get current context"))),
-            };
-
+            // The current context is the base; the table overrides fields.
+            let original = get_thread_context(&mut client, pid, tid)?;
             let new_ctx = lua_table_to_context(&ctx_table, &original)?;
-            let resp = client.send_and_receive(&DebuggerRequest::SetThreadContext {
-                pid, tid, context: new_ctx,
-            }).map_err(|e| mlua::Error::external(e))?;
-            match resp {
-                DebuggerResponse::SetContextAck => Ok(()),
-                DebuggerResponse::Error { message } => Err(mlua::Error::external(
-                    anyhow::anyhow!("SetThreadContext failed: {}", message),
-                )),
-                _ => Ok(()),
-            }
+            set_thread_context(&mut client, pid, tid, new_ctx)
         });
 
         methods.add_method("get_arguments", |lua, this, (pid, tid, count): (u32, u32, usize)| {
@@ -1240,40 +1193,21 @@ impl LuaUserData for LuaDebugClient {
         // ---- Module/Thread/Process listing ----
 
         methods.add_method("list_modules", |lua, this, pid: u32| {
-            let mut client = this.inner.borrow_mut();
-            let resp = client.send_and_receive(&DebuggerRequest::ListModules { pid })
-                .map_err(|e| mlua::Error::external(e))?;
-            match resp {
-                DebuggerResponse::ModuleList { modules: mods } => {
-                    let table = lua.create_table()?;
-                    for (i, m) in mods.iter().enumerate() {
-                        table.set(i + 1, module_to_lua_table(lua, m)?)?;
-                    }
-                    Ok(table)
-                }
-                DebuggerResponse::Error { message } => Err(mlua::Error::external(
-                    anyhow::anyhow!("ListModules failed: {}", message),
-                )),
-                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            let mods = list_modules_of(&mut this.inner.borrow_mut(), pid)?;
+            let table = lua.create_table()?;
+            for (i, m) in mods.iter().enumerate() {
+                table.set(i + 1, module_to_lua_table(lua, m)?)?;
             }
+            Ok(table)
         });
 
         // Instruction-set architecture of the debuggee: "x86" (WOW64), "x64" or "arm64".
         methods.add_method("arch", |_lua, this, pid: u32| {
-            let mut client = this.inner.borrow_mut();
-            let resp = client.send_and_receive(&DebuggerRequest::GetProcessArchitecture { pid })
-                .map_err(|e| mlua::Error::external(e))?;
-            match resp {
-                DebuggerResponse::ProcessArchitecture { arch } => Ok(match arch {
-                    crate::interfaces::Architecture::X86 => "x86",
-                    crate::interfaces::Architecture::X64 => "x64",
-                    crate::interfaces::Architecture::Arm64 => "arm64",
-                }.to_string()),
-                DebuggerResponse::Error { message } => Err(mlua::Error::external(
-                    anyhow::anyhow!("GetProcessArchitecture failed: {}", message),
-                )),
-                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
-            }
+            Ok(match process_arch(&mut this.inner.borrow_mut(), pid)? {
+                Architecture::X86 => "x86",
+                Architecture::X64 => "x64",
+                Architecture::Arm64 => "arm64",
+            }.to_string())
         });
 
         methods.add_method("list_threads", |lua, this, pid: u32| {
@@ -1444,52 +1378,42 @@ impl LuaUserData for LuaDebugClient {
 
         methods.add_method("get_module_info", |lua, this, (pid, base): (u32, u64)| {
             let mut client = this.inner.borrow_mut();
-            let resp = client.send_and_receive(&DebuggerRequest::GetModuleExtraInfo {
-                pid, module_base: base,
-            }).map_err(|e| mlua::Error::external(e))?;
-            match resp {
-                DebuggerResponse::ModuleExtraInfo { info } => {
-                    let table = lua.create_table()?;
-                    table.set("nt_signature", info.nt_headers.Signature as u64)?;
-                    table.set("entry_point", info.nt_headers.OptionalHeader.AddressOfEntryPoint as u64)?;
-                    table.set("image_base", info.nt_headers.OptionalHeader.ImageBase)?;
-                    table.set("size_of_image", info.nt_headers.OptionalHeader.SizeOfImage as u64)?;
-                    // Sections
-                    let sections = lua.create_table()?;
-                    for (i, sec) in info.sections.iter().enumerate() {
-                        let st = lua.create_table()?;
-                        st.set("name", sec.name_string())?;
-                        st.set("virtual_address", sec.VirtualAddress as u64)?;
-                        st.set("virtual_size", sec.VirtualSize as u64)?;
-                        st.set("raw_data_size", sec.SizeOfRawData as u64)?;
-                        sections.set(i + 1, st)?;
-                    }
-                    table.set("sections", sections)?;
-                    // TLS callbacks (RVAs)
-                    let tls = lua.create_table()?;
-                    for (i, rva) in info.tls_callbacks.iter().enumerate() {
-                        tls.set(i + 1, *rva as u64)?;
-                    }
-                    table.set("tls_callbacks", tls)?;
-                    // Runtime functions (Exception Directory)
-                    if let Some(ref rfs) = info.runtime_functions {
-                        let rf_table = lua.create_table()?;
-                        for (i, rf) in rfs.iter().enumerate() {
-                            let entry = lua.create_table()?;
-                            entry.set("begin_address", rf.BeginAddress as u64)?;
-                            entry.set("end_address", rf.EndAddress as u64)?;
-                            entry.set("unwind_data", rf.UnwindData as u64)?;
-                            rf_table.set(i + 1, entry)?;
-                        }
-                        table.set("runtime_functions", rf_table)?;
-                    }
-                    Ok(table)
-                }
-                DebuggerResponse::Error { message } => Err(mlua::Error::external(
-                    anyhow::anyhow!("GetModuleExtraInfo failed: {}", message),
-                )),
-                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            let info = module_extra_info(&mut client, pid, base)?;
+            let table = lua.create_table()?;
+            table.set("nt_signature", info.nt_headers.Signature as u64)?;
+            table.set("entry_point", info.nt_headers.OptionalHeader.AddressOfEntryPoint as u64)?;
+            table.set("image_base", info.nt_headers.OptionalHeader.ImageBase)?;
+            table.set("size_of_image", info.nt_headers.OptionalHeader.SizeOfImage as u64)?;
+            // Sections
+            let sections = lua.create_table()?;
+            for (i, sec) in info.sections.iter().enumerate() {
+                let st = lua.create_table()?;
+                st.set("name", sec.name_string())?;
+                st.set("virtual_address", sec.VirtualAddress as u64)?;
+                st.set("virtual_size", sec.VirtualSize as u64)?;
+                st.set("raw_data_size", sec.SizeOfRawData as u64)?;
+                sections.set(i + 1, st)?;
             }
+            table.set("sections", sections)?;
+            // TLS callbacks (RVAs)
+            let tls = lua.create_table()?;
+            for (i, rva) in info.tls_callbacks.iter().enumerate() {
+                tls.set(i + 1, *rva as u64)?;
+            }
+            table.set("tls_callbacks", tls)?;
+            // Runtime functions (Exception Directory)
+            if let Some(ref rfs) = info.runtime_functions {
+                let rf_table = lua.create_table()?;
+                for (i, rf) in rfs.iter().enumerate() {
+                    let entry = lua.create_table()?;
+                    entry.set("begin_address", rf.BeginAddress as u64)?;
+                    entry.set("end_address", rf.EndAddress as u64)?;
+                    entry.set("unwind_data", rf.UnwindData as u64)?;
+                    rf_table.set(i + 1, entry)?;
+                }
+                table.set("runtime_functions", rf_table)?;
+            }
+            Ok(table)
         });
 
         // ---- Tracing & Emulation ----
@@ -2052,6 +1976,16 @@ impl LuaUserData for LuaDebugClient {
             Ok(this.inner.borrow().current_pid)
         });
 
+        // dbg:server_info() -> { server, version, fingerprint } from the handshake.
+        methods.add_method("server_info", |lua, this, ()| {
+            let client = this.inner.borrow();
+            let t = lua.create_table()?;
+            t.set("server", client.server_hello.server.clone())?;
+            t.set("version", client.server_hello.version.clone())?;
+            t.set("fingerprint", format!("{:016x}", client.server_hello.fingerprint))?;
+            Ok(t)
+        });
+
         methods.add_method("tid", |_lua, this, ()| {
             Ok(this.inner.borrow().current_tid)
         });
@@ -2174,7 +2108,389 @@ impl LuaUserData for LuaDebugClient {
             Ok(())
         });
 
+        // ---- Per-child hook (RETRO F6) ----
+
+        // Fires at a child process's initial breakpoint (pid != root). The place
+        // to re-resolve the child's IAT and re-arm breakpoints under
+        // dbg:launch(cmd, true); on_initial_breakpoint still fires for every
+        // process including the root.
+        methods.add_method("on_child_ready", |lua, this, func: LuaFunction| {
+            let key = lua.create_registry_value(func)?;
+            this.inner.borrow_mut().handlers.on_child_ready = Some(key);
+            Ok(())
+        });
+
+        // ---- Imports / import-aware breakpoints (RETRO F7) ----
+
+        // dbg:imports(pid[, module_base]) -> { { dll, name, ordinal, iat_va, target }, ... }
+        // The debuggee's own import table, with each IAT slot's CURRENT target
+        // (the resolved API address). `module_base` defaults to the process's
+        // main image. `target` is read through the slot at the debuggee's
+        // pointer width, so it is unambiguous even in a WOW64 process where the
+        // 32- and 64-bit kernel32 are both mapped.
+        methods.add_method("imports", |lua, this, (pid, module_base): (u32, Option<u64>)| {
+            let mut client = this.inner.borrow_mut();
+            let base = match module_base {
+                Some(b) => b,
+                None => main_module_base(&mut client, pid)?,
+            };
+            let ptr_size = process_arch(&mut client, pid)?.pointer_size();
+            let info = module_extra_info(&mut client, pid, base)?;
+            let out = lua.create_table()?;
+            for desc in &info.imports {
+                // One read per descriptor: its slots are one contiguous thunk
+                // array, so this is a few hundred bytes instead of a round trip
+                // per import.
+                let slots = read_iat_span(&mut client, pid, base, desc, ptr_size);
+                for entry in &desc.entries {
+                    let (name, ordinal) = match &entry.kind {
+                        ImportKind::Item(ImportItem::ByName { name, .. }) => (Some(name.clone()), None),
+                        ImportKind::Item(ImportItem::ByOrdinal { ordinal }) => (None, Some(*ordinal)),
+                        ImportKind::Error(_) => continue,
+                    };
+                    let t = lua.create_table()?;
+                    t.set("dll", desc.dll_name.clone())?;
+                    t.set("name", name)?;
+                    t.set("ordinal", ordinal)?;
+                    t.set("iat_va", base + entry.iat_rva as u64)?;
+                    t.set("target", slots.get(entry.iat_rva))?;
+                    out.push(t)?;
+                }
+            }
+            Ok(out)
+        });
+
+        // dbg:set_breakpoint_import(pid, "kernel32!CreateProcessW" | "CreateProcessW"[, handler]) -> stub, target
+        // Hook the import through the debuggee's OWN import table: the IAT slot
+        // is pointed at a private stub (`jmp [target]`) that carries a software
+        // breakpoint, so the break fires only for calls made through this
+        // module's slot. (A breakpoint at the API itself fires process-wide —
+        // every module and the loader hit it.) Resolving through the slot is
+        // also unambiguous under WOW64. The match is case-insensitive; a
+        // "dll!name" form also filters by importing DLL. Returns the breakpoint
+        // (stub) address — what the handler receives — and the slot's original
+        // target. Removing the breakpoint (by handler decision or
+        // `remove_breakpoint`) points the slot back at the target.
+        methods.add_method("set_breakpoint_import", |lua, this, (pid, spec, handler): (u32, String, Option<LuaFunction>)| {
+            let mut client = this.inner.borrow_mut();
+            let (dll_filter, func_name) = match spec.split_once('!') {
+                Some((d, f)) => (Some(d), f),
+                None => (None, spec.as_str()),
+            };
+            let base = main_module_base(&mut client, pid)?;
+            let arch = process_arch(&mut client, pid)?;
+            let ptr_size = arch.pointer_size();
+            let info = module_extra_info(&mut client, pid, base)?;
+            let iat_va = find_import_slot(&info, dll_filter, func_name)
+                .map(|rva| base + rva as u64)
+                .ok_or_else(|| mlua::Error::external(
+                    anyhow::anyhow!("import {spec:?} not found in the debuggee's import table"),
+                ))?;
+            // Already hooked: re-arm the existing stub with the new handler.
+            if let Some((stub, hook)) = client.import_hooks.iter().find(|(_, h)| h.iat_va == iat_va) {
+                let (stub, target) = (*stub, hook.target);
+                set_sw_breakpoint(lua, &mut client, pid, stub, handler)?;
+                return Ok((stub, target));
+            }
+            let target = read_memory_uint(&mut client, pid, iat_va, ptr_size)
+                .map_err(|e| mlua::Error::external(anyhow::anyhow!("read IAT slot: {e}")))?;
+            let stub = allocate_memory(&mut client, pid, 32, true)?;
+            write_bytes(&mut client, pid, stub, &jump_stub(arch, stub, target))?;
+            set_sw_breakpoint(lua, &mut client, pid, stub, handler)?;
+            // Redirect the slot last, so a call through it never reaches a stub
+            // without its breakpoint. WriteProcessMemory makes the read-only
+            // IAT page writable for the write.
+            write_bytes(&mut client, pid, iat_va, &stub.to_le_bytes()[..ptr_size])?;
+            client.import_hooks.insert(stub, ImportHook { iat_va, target, ptr_size });
+            Ok((stub, target))
+        });
+
+        // ---- Neutralise a call (RETRO F8) ----
+
+        // dbg:skip_call(pid, tid[, { ret = 0, args = N, conv = "stdcall"|"cdecl" }])
+        // Return from the current function WITHOUT executing it: pop the return
+        // address into the instruction pointer, adjust the stack for the callee's
+        // cleanup, and set the return-value register. The standard "neutralise
+        // this API" move in detonation work. Handles the arch and calling
+        // convention so the caller does not have to. Returns the return address.
+        //   x86 stdcall: eip=[esp]; esp += 4 + 4*args; eax=ret
+        //   x86 cdecl:   eip=[esp]; esp += 4;          eax=ret
+        //   x64:         rip=[rsp]; rsp += 8;           rax=ret   (caller cleans)
+        //   arm64:       pc=lr;                          x0=ret
+        methods.add_method("skip_call", |_lua, this, (pid, tid, opts): (u32, u32, Option<LuaTable>)| {
+            let opts = opts.as_ref();
+            let ret: u64 = opt(opts, "ret")?.unwrap_or(0);
+            let args: u32 = opt(opts, "args")?.unwrap_or(0);
+            let conv: Option<String> = opt(opts, "conv")?;
+            let callee_cleans = match conv.as_deref().unwrap_or("stdcall") {
+                "stdcall" => true,
+                "cdecl" => false,
+                other => return Err(mlua::Error::external(format!(
+                    "conv must be \"stdcall\" or \"cdecl\", got {other:?}"
+                ))),
+            };
+            let mut client = this.inner.borrow_mut();
+            let mut ctx = get_thread_context(&mut client, pid, tid)?;
+            let read_ra = |client: &mut DebugClient, sp: u64, size: usize| {
+                read_memory_uint(client, pid, sp, size)
+                    .map_err(|e| mlua::Error::external(anyhow::anyhow!("read return address: {e}")))
+            };
+            let ret_addr = match &mut ctx {
+                ThreadContext::Wow64RawContext(c) => {
+                    let sp = c.Esp as u64;
+                    let ra = read_ra(&mut client, sp, 4)?;
+                    let cleanup = if callee_cleans { 4 * args } else { 0 };
+                    c.Esp = (sp as u32).wrapping_add(4).wrapping_add(cleanup);
+                    c.Eip = ra as u32;
+                    c.Eax = ret as u32;
+                    ra
+                }
+                #[cfg(target_arch = "x86_64")]
+                ThreadContext::Win32RawContext(c) => {
+                    let sp = c.Rsp;
+                    let ra = read_ra(&mut client, sp, 8)?;
+                    // x64: the caller cleans the stack; only pop the return slot.
+                    c.Rsp = sp.wrapping_add(8);
+                    c.Rip = ra;
+                    c.Rax = ret;
+                    ra
+                }
+                #[cfg(target_arch = "aarch64")]
+                ThreadContext::Win32RawContext(c) => {
+                    // AArch64: return via the link register; x0 carries the value.
+                    let ra = unsafe { c.Anonymous.Anonymous.Lr };
+                    c.Pc = ra;
+                    unsafe { c.Anonymous.X[0] = ret; }
+                    ra
+                }
+            };
+            set_thread_context(&mut client, pid, tid, ctx)?;
+            Ok(ret_addr)
+        });
+
         // (In-process memory access is registered as globals via register_mem_functions)
+    }
+}
+
+/// Call the registry-held hook selected by `pick`, if one is registered. The
+/// client borrow is released before the Lua call so the hook can use `dbg`.
+fn call_hook(
+    lua: &Lua,
+    client: &RefCell<DebugClient>,
+    pick: impl FnOnce(&HandlerRegistry) -> Option<&LuaRegistryKey>,
+    args: (u32, u32, u64),
+) -> mlua::Result<()> {
+    let func = pick(&client.borrow().handlers)
+        .map(|k| lua.registry_value::<LuaFunction>(k))
+        .transpose()?;
+    if let Some(func) = func {
+        func.call::<()>(args)?;
+    }
+    Ok(())
+}
+
+/// Send a `SetBreakpoint`, register an optional Lua handler, and return the
+/// address. Shared by `set_breakpoint` and `set_breakpoint_import`.
+fn set_sw_breakpoint(
+    lua: &Lua,
+    client: &mut DebugClient,
+    pid: u32,
+    addr: u64,
+    handler: Option<LuaFunction>,
+) -> mlua::Result<u64> {
+    let resp = client
+        .send_and_receive(&DebuggerRequest::SetBreakpoint { pid, addr, tid: None })
+        .map_err(mlua::Error::external)?;
+    crate::protocol_io::expect_ack("SetBreakpoint", resp).map_err(mlua::Error::external)?;
+    if let Some(func) = handler {
+        let key = lua.create_registry_value(func)?;
+        client.handlers.breakpoint_handlers.insert(addr, key);
+    }
+    Ok(addr)
+}
+
+/// Remove a software breakpoint and forget its handler. If it was an import
+/// hook's stub, point the IAT slot back at the original target. The stub itself
+/// stays mapped: the thread that just hit it is stopped on it, and any other
+/// thread may be mid-flight through it.
+fn remove_sw_breakpoint(client: &mut DebugClient, pid: u32, addr: u64) {
+    client.handlers.breakpoint_handlers.remove(&addr);
+    let _ = client.send_and_receive(&DebuggerRequest::RemoveBreakpoint { pid, addr });
+    if let Some(hook) = client.import_hooks.remove(&addr) {
+        let _ = write_bytes(client, pid, hook.iat_va, &hook.target.to_le_bytes()[..hook.ptr_size]);
+    }
+}
+
+/// The RVA of the IAT slot importing `func` (case-insensitive), optionally only
+/// from a DLL matching `dll` ("kernel32" matches "KERNEL32.dll").
+fn find_import_slot(info: &ModuleExtraInfo, dll: Option<&str>, func: &str) -> Option<u32> {
+    info.imports
+        .iter()
+        .filter(|desc| {
+            dll.is_none_or(|want| {
+                let stem = desc.dll_name.rsplit_once('.').map(|(s, _)| s).unwrap_or(&desc.dll_name);
+                stem.eq_ignore_ascii_case(want) || desc.dll_name.eq_ignore_ascii_case(want)
+            })
+        })
+        .flat_map(|desc| &desc.entries)
+        .find(|entry| matches!(&entry.kind,
+            ImportKind::Item(ImportItem::ByName { name, .. }) if name.eq_ignore_ascii_case(func)))
+        .map(|entry| entry.iat_rva)
+}
+
+/// The current contents of one import descriptor's IAT slots, read in one
+/// request: `get(iat_rva)` is the pointer the slot holds now.
+struct IatSpan {
+    first_rva: u32,
+    ptr_size: usize,
+    bytes: Vec<u8>,
+}
+
+impl IatSpan {
+    fn get(&self, iat_rva: u32) -> Option<u64> {
+        let off = iat_rva.checked_sub(self.first_rva)? as usize;
+        let slot = self.bytes.get(off..off + self.ptr_size)?;
+        let mut buf = [0u8; 8];
+        buf[..self.ptr_size].copy_from_slice(slot);
+        Some(u64::from_le_bytes(buf))
+    }
+}
+
+fn read_iat_span(client: &mut DebugClient, pid: u32, base: u64, desc: &ImportDescriptorInfo, ptr_size: usize) -> IatSpan {
+    let rvas = desc.entries.iter().filter(|e| e.iat_rva != 0).map(|e| e.iat_rva);
+    let Some((first_rva, last_rva)) = rvas.fold(None, |acc: Option<(u32, u32)>, r| {
+        Some(acc.map_or((r, r), |(lo, hi)| (lo.min(r), hi.max(r))))
+    }) else {
+        return IatSpan { first_rva: 0, ptr_size, bytes: Vec::new() };
+    };
+    let size = (last_rva - first_rva) as usize + ptr_size;
+    let bytes = client
+        .send_and_receive(&DebuggerRequest::ReadMemory { pid, address: base + first_rva as u64, size })
+        .ok()
+        .and_then(|resp| match resp {
+            DebuggerResponse::MemoryData { data } => Some(data),
+            _ => None,
+        })
+        .unwrap_or_default();
+    IatSpan { first_rva, ptr_size, bytes }
+}
+
+/// Machine code for `jmp [target]` at `stub`, the body of an import-hook stub.
+/// It leaves the stack and every argument register untouched, so a breakpoint
+/// on it observes exactly the state the API would see at entry.
+fn jump_stub(arch: Architecture, stub: u64, target: u64) -> Vec<u8> {
+    let mut code = Vec::with_capacity(16);
+    match arch {
+        // jmp qword ptr [rip+0]; dq target
+        Architecture::X64 => {
+            code.extend_from_slice(&[0xFF, 0x25, 0, 0, 0, 0]);
+            code.extend_from_slice(&target.to_le_bytes());
+        }
+        // jmp dword ptr [stub+6]; dd target
+        Architecture::X86 => {
+            code.extend_from_slice(&[0xFF, 0x25]);
+            code.extend_from_slice(&((stub + 6) as u32).to_le_bytes());
+            code.extend_from_slice(&(target as u32).to_le_bytes());
+        }
+        // ldr x16, #8; br x16; dq target
+        Architecture::Arm64 => {
+            code.extend_from_slice(&0x5800_0050u32.to_le_bytes());
+            code.extend_from_slice(&0xD61F_0200u32.to_le_bytes());
+            code.extend_from_slice(&target.to_le_bytes());
+        }
+    }
+    code
+}
+
+/// The base of the process's main image, for defaulting the module of
+/// `imports` / `set_breakpoint_import`. Taken from the `ProcessCreated` event
+/// when the client saw one; otherwise (attached without the event) guessed as
+/// the lowest-based module whose name ends in `.exe`, falling back to the
+/// lowest-based module of all.
+fn main_module_base(client: &mut DebugClient, pid: u32) -> mlua::Result<u64> {
+    if let Some(&base) = client.main_image.get(&pid) {
+        return Ok(base);
+    }
+    let modules = list_modules_of(client, pid)?;
+    let is_exe = |name: &str| name.len() >= 4 && name[name.len() - 4..].eq_ignore_ascii_case(".exe");
+    let exe = modules.iter().filter(|m| is_exe(&m.name)).min_by_key(|m| m.base);
+    let chosen = exe.or_else(|| modules.iter().min_by_key(|m| m.base));
+    chosen
+        .map(|m| m.base)
+        .ok_or_else(|| mlua::Error::external(anyhow::anyhow!("process {pid} has no modules")))
+}
+
+/// `ListModules`, unwrapped.
+fn list_modules_of(client: &mut DebugClient, pid: u32) -> mlua::Result<Vec<ModuleInfo>> {
+    match client.send_and_receive(&DebuggerRequest::ListModules { pid }).map_err(mlua::Error::external)? {
+        DebuggerResponse::ModuleList { modules } => Ok(modules),
+        DebuggerResponse::Error { message } => Err(mlua::Error::external(anyhow::anyhow!("ListModules failed: {message}"))),
+        _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+    }
+}
+
+/// Fetch a module's PE extra info (imports, sections, ...).
+fn module_extra_info(client: &mut DebugClient, pid: u32, base: u64) -> mlua::Result<ModuleExtraInfo> {
+    let resp = client
+        .send_and_receive(&DebuggerRequest::GetModuleExtraInfo { pid, module_base: base })
+        .map_err(mlua::Error::external)?;
+    match resp {
+        DebuggerResponse::ModuleExtraInfo { info } => Ok(info),
+        DebuggerResponse::Error { message } => {
+            Err(mlua::Error::external(anyhow::anyhow!("GetModuleExtraInfo failed: {message}")))
+        }
+        _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+    }
+}
+
+/// The debuggee's instruction-set architecture (`X86` for a WOW64 process).
+fn process_arch(client: &mut DebugClient, pid: u32) -> mlua::Result<Architecture> {
+    match client.send_and_receive(&DebuggerRequest::GetProcessArchitecture { pid }).map_err(mlua::Error::external)? {
+        DebuggerResponse::ProcessArchitecture { arch } => Ok(arch),
+        DebuggerResponse::Error { message } => {
+            Err(mlua::Error::external(anyhow::anyhow!("GetProcessArchitecture failed: {message}")))
+        }
+        _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+    }
+}
+
+fn get_thread_context(client: &mut DebugClient, pid: u32, tid: u32) -> mlua::Result<ThreadContext> {
+    match client.send_and_receive(&DebuggerRequest::GetThreadContext { pid, tid }).map_err(mlua::Error::external)? {
+        DebuggerResponse::ThreadContext { context } => Ok(context),
+        DebuggerResponse::Error { message } => {
+            Err(mlua::Error::external(anyhow::anyhow!("GetThreadContext failed: {message}")))
+        }
+        _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+    }
+}
+
+fn set_thread_context(client: &mut DebugClient, pid: u32, tid: u32, context: ThreadContext) -> mlua::Result<()> {
+    match client.send_and_receive(&DebuggerRequest::SetThreadContext { pid, tid, context }).map_err(mlua::Error::external)? {
+        DebuggerResponse::Error { message } => {
+            Err(mlua::Error::external(anyhow::anyhow!("SetThreadContext failed: {message}")))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn write_bytes(client: &mut DebugClient, pid: u32, address: u64, data: &[u8]) -> mlua::Result<()> {
+    let req = DebuggerRequest::WriteMemory { pid, address, data: data.to_vec() };
+    match client.send_and_receive(&req).map_err(mlua::Error::external)? {
+        DebuggerResponse::Error { message } => {
+            Err(mlua::Error::external(anyhow::anyhow!("WriteMemory failed: {message}")))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn allocate_memory(client: &mut DebugClient, pid: u32, size: usize, executable: bool) -> mlua::Result<u64> {
+    let req = DebuggerRequest::AllocateMemory { pid, size, executable };
+    match client.send_and_receive(&req).map_err(mlua::Error::external)? {
+        DebuggerResponse::MemoryAllocated { address } => Ok(address),
+        DebuggerResponse::Error { message } => {
+            Err(mlua::Error::external(anyhow::anyhow!("AllocateMemory failed: {message}")))
+        }
+        _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
     }
 }
 

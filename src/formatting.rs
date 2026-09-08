@@ -161,6 +161,11 @@ impl std::fmt::Debug for DebuggerResponse {
             DebuggerResponse::PebAddress { address } => f.debug_struct("PebAddress")
                 .field("address", &format_args!("0x{:X}", address))
                 .finish(),
+            DebuggerResponse::Hello { fingerprint, server, version } => f.debug_struct("Hello")
+                .field("fingerprint", &format_args!("{:016x}", fingerprint))
+                .field("server", server)
+                .field("version", version)
+                .finish(),
             DebuggerResponse::FunctionDisassembly { instructions, function_start, function_end, function_name } => {
                 f.debug_struct("FunctionDisassembly")
                     .field("instructions_count", &instructions.len())
@@ -251,6 +256,10 @@ impl std::fmt::Debug for DebuggerResponse {
             DebuggerResponse::PdbMismatch(info) => {
                 f.debug_tuple("PdbMismatch").field(info).finish()
             }
+            DebuggerResponse::MemoryAllocated { address } => f
+                .debug_struct("MemoryAllocated")
+                .field("address", &format_args!("0x{address:x}"))
+                .finish(),
         }
     }
 }

@@ -657,6 +657,10 @@ impl PlatformAPI for WindowsPlatform {
         memory::write_memory(self, pid, address, data)
     }
 
+    fn allocate_memory(&self, pid: u32, size: usize, executable: bool) -> Result<u64, PlatformError> {
+        memory::allocate_memory(self, pid, size, executable)
+    }
+
     fn read_wide_string(&self, pid: u32, address: u64, max_len: Option<usize>) -> Result<String, PlatformError> {
         memory::read_wide_string(self, pid, address, max_len)
     }

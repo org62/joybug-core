@@ -14,7 +14,16 @@ pub mod etw;
 /// feature so the default build never pulls the winsandbox/`windows` deps.
 pub mod sbx;
 
-use mlua::Lua;
+use mlua::{FromLua, Lua, Table as LuaTable};
+
+/// Read `key` from an optional Lua options table (`nil` and a missing table
+/// both give `None`), so bindings can `opt(opts, "x")?.unwrap_or(default)`.
+pub(crate) fn opt<T: FromLua>(opts: Option<&LuaTable>, key: &str) -> mlua::Result<Option<T>> {
+    match opts {
+        Some(t) => t.get::<Option<T>>(key),
+        None => Ok(None),
+    }
+}
 
 /// Embedded Lua helper library (hex formatting, register printing, etc.)
 const LUA_HELPERS: &str = include_str!("lua_helpers.lua");

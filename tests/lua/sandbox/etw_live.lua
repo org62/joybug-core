@@ -5,11 +5,11 @@
 -- then enumerates the recorded events with `sbx.events`. This is the combination
 -- the app performs, driven entirely through the `sbx`/`etw` Lua API.
 --
--- Requires: the `sandbox` feature, Windows 11 24H2 + the "Windows Sandbox"
--- optional feature, and a folder holding `guest-tracer.exe` pointed at by
--- JOYBUG_SANDBOX_TEST_BINDIR. Gated on JOYBUG_SANDBOX_LIVE at the Rust layer so a
--- plain `cargo test` never boots a VM; here we also self-skip when the sandbox
--- isn't actually available so the test is safe to run anywhere.
+-- Requires: the `sandbox` feature and Windows 11 24H2 + the "Windows Sandbox"
+-- optional feature. The guest binary is joybug-core.exe itself (the harness
+-- injects its path as GUEST_EXE_PATH). Gated on JOYBUG_SANDBOX_LIVE at the Rust
+-- layer so a plain `cargo test` never boots a VM; here we also self-skip when
+-- the sandbox isn't actually available so the test is safe to run anywhere.
 
 local status = sbx.status()
 if not (status.supported and status.wsb_present) then
@@ -17,9 +17,9 @@ if not (status.supported and status.wsb_present) then
     return { passed = true, skipped = true }
 end
 
-local bindir = os.getenv("JOYBUG_SANDBOX_TEST_BINDIR")
-assert(bindir and #bindir > 0,
-    "set JOYBUG_SANDBOX_TEST_BINDIR to a folder containing guest-tracer.exe")
+assert(GUEST_EXE_PATH and #GUEST_EXE_PATH > 0, "GUEST_EXE_PATH not injected by the harness")
+local guest_dir, guest_exe = GUEST_EXE_PATH:match("^(.*)[\/]([^\/]+)$")
+assert(guest_dir, "could not split GUEST_EXE_PATH: " .. tostring(GUEST_EXE_PATH))
 
 -- Per-run I/O folder so a stale events file can't leak in.
 local io_dir = (os.getenv("TEMP") or "C:\\Windows\\Temp")
@@ -29,10 +29,11 @@ local io_dir = (os.getenv("TEMP") or "C:\\Windows\\Temp")
 -- start/stop) and writes a file (file create/write) inside the guest.
 local launch = 'cmd.exe /c "whoami & echo hi > %USERPROFILE%\\joybug-etw-test.txt"'
 
--- Provision run-only (debug = false): no in-guest server, no debugger — only the
--- static guest-tracer.exe is used, so no VC runtime needs staging in the guest.
+-- Provision run-only (debug = false): no in-guest server, no debugger — the
+-- guest exe runs only as the ETW collector.
 local ok, h, info = pcall(sbx.provision, {
-    guest_bin_dir  = bindir,
+    guest_bin_dir  = guest_dir,
+    guest_exe      = guest_exe,
     io_dir         = io_dir,
     launch_command = launch,
     debug          = false,   -- run-only: the tracer launches + observes the target

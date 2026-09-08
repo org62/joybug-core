@@ -14,9 +14,9 @@
 -- their access masks, and use the victim's own marker file as ground truth that
 -- the (invisible) cross-process write really happened.
 --
--- Requires: the `sandbox` feature, Windows 11 24H2 + the "Windows Sandbox"
--- optional feature, and JOYBUG_SANDBOX_TEST_BINDIR pointing at a folder holding
--- `guest-tracer.exe`. Gated on JOYBUG_SANDBOX_LIVE at the Rust layer.
+-- Requires: the `sandbox` feature and Windows 11 24H2 + the "Windows Sandbox"
+-- optional feature. The guest binary is joybug-core.exe (path injected as
+-- GUEST_EXE_PATH). Gated on JOYBUG_SANDBOX_LIVE at the Rust layer.
 
 local status = sbx.status()
 if not (status.supported and status.wsb_present) then
@@ -24,9 +24,9 @@ if not (status.supported and status.wsb_present) then
     return { passed = true, skipped = true }
 end
 
-local bindir = os.getenv("JOYBUG_SANDBOX_TEST_BINDIR")
-assert(bindir and #bindir > 0,
-    "set JOYBUG_SANDBOX_TEST_BINDIR to a folder containing guest-tracer.exe")
+assert(GUEST_EXE_PATH and #GUEST_EXE_PATH > 0, "GUEST_EXE_PATH not injected by the harness")
+local guest_dir, guest_exe = GUEST_EXE_PATH:match("^(.*)[\/]([^\/]+)$")
+assert(guest_dir, "could not split GUEST_EXE_PATH: " .. tostring(GUEST_EXE_PATH))
 
 assert(TEST_EXE and #TEST_EXE > 0, "TEST_EXE (open_remote.exe) was not injected")
 local exe_dir = TEST_EXE:match("^(.*)[\\/][^\\/]+$")
@@ -36,7 +36,8 @@ local io_dir = (os.getenv("TEMP") or "C:\\Windows\\Temp")
     .. "\\joybug-sbx-audit-" .. tostring(os.time())
 
 local ok, h, info = pcall(sbx.provision, {
-    guest_bin_dir  = bindir,
+    guest_bin_dir  = guest_dir,
+    guest_exe      = guest_exe,
     io_dir         = io_dir,
     mounts         = { { host_path = exe_dir, read_only = true } },
     launch_command = TEST_EXE .. " C:\\io",

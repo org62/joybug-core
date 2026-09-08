@@ -47,13 +47,17 @@ fn wsb_command() -> Command {
 }
 
 mod config;
+pub mod etw_stats;
 pub mod tracer;
 mod trace;
 mod tree;
 mod version;
 
 pub use config::{MappedFolder, SandboxConfig, Toggle};
-pub use trace::{format_access_mask, is_tracer_done, pretty_path, TraceEvent, DEFAULT_OPS};
+pub use trace::{
+    expand_ops, format_access_mask, is_tracer_done, pretty_path, symbolize_frame, tracer_record,
+    ModuleRange, TraceEvent, ALL_OPS, DEFAULT_OPS, OP_ALIASES, OP_KINDS,
+};
 pub use tree::{PendingStart, ProcessTree};
 pub use version::{ensure_supported, os_build, MIN_BUILD};
 
@@ -304,7 +308,7 @@ impl Sandbox {
 
     /// Convert this handle into an RAII guard that stops the sandbox on drop.
     pub fn into_guard(self) -> RunningSandbox {
-        RunningSandbox { sandbox: Some(self) }
+        RunningSandbox { sandbox: Some(self), stop_on_drop: true }
     }
 }
 
@@ -312,6 +316,10 @@ impl Sandbox {
 /// for all operations.
 pub struct RunningSandbox {
     sandbox: Option<Sandbox>,
+    /// Whether `Drop` runs `wsb stop`. False for a handle adopted from
+    /// [`Sandbox::list`] (see [`RunningSandbox::detached`]): the VM belongs to
+    /// whoever started it, so only an explicit `stop()` tears it down.
+    stop_on_drop: bool,
 }
 
 impl std::ops::Deref for RunningSandbox {
@@ -322,8 +330,22 @@ impl std::ops::Deref for RunningSandbox {
 }
 
 impl RunningSandbox {
-    /// Stop now and consume the guard, surfacing any error (unlike `drop`).
-    pub fn stop(mut self) -> Result<()> {
+    /// Wrap an already-running sandbox (e.g. one left behind by a crashed
+    /// driver and found via [`Sandbox::list`]) WITHOUT taking ownership of its
+    /// lifetime: dropping the guard leaves the VM up; [`RunningSandbox::stop`]
+    /// still stops it explicitly.
+    pub fn detached(sandbox: Sandbox) -> RunningSandbox {
+        RunningSandbox { sandbox: Some(sandbox), stop_on_drop: false }
+    }
+
+    /// Whether dropping this guard stops the VM.
+    pub fn owns_vm(&self) -> bool {
+        self.stop_on_drop
+    }
+
+    /// Stop now, surfacing any error (unlike `drop`). Idempotent: takes the
+    /// inner sandbox, so a later drop (or second call) is a no-op.
+    pub fn stop(&mut self) -> Result<()> {
         if let Some(s) = self.sandbox.take() {
             s.stop()?;
         }
@@ -334,7 +356,9 @@ impl RunningSandbox {
 impl Drop for RunningSandbox {
     fn drop(&mut self) {
         if let Some(s) = self.sandbox.take() {
-            let _ = s.stop();
+            if self.stop_on_drop {
+                let _ = s.stop();
+            }
         }
     }
 }

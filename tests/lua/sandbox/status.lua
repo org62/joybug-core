@@ -8,6 +8,20 @@ assert(type(sbx.provision) == "function", "sbx.provision should be a function")
 assert(type(sbx.connect) == "function", "sbx.connect should be a function")
 assert(type(sbx.events) == "function", "sbx.events should be a function")
 assert(type(sbx.status) == "function", "sbx.status should be a function")
+-- Recovery + introspection surface (RETRO B5/F10).
+assert(type(sbx.list) == "function", "sbx.list should be a function")
+assert(type(sbx.stop) == "function", "sbx.stop should be a function")
+assert(type(sbx.stop_all) == "function", "sbx.stop_all should be a function")
+assert(type(sbx.attach) == "function", "sbx.attach should be a function")
+assert(type(sbx.ops) == "function", "sbx.ops should be a function")
+
+-- sbx.list() works without a VM (returns an empty table on a clean machine).
+local running = sbx.list()
+assert(type(running) == "table", "sbx.list() should return a table")
+
+-- The op vocabulary matches etw.ops().
+local ops = sbx.ops()
+assert(type(ops.all) == "table" and #ops.all > 20, "sbx.ops().all should list every token")
 
 local s = sbx.status()
 assert(type(s) == "table", "status() should return a table")

@@ -19,6 +19,11 @@ use crate::protocol_io::{send_request, receive_response};
 /// Handler registry for Lua callback functions.
 pub struct HandlerRegistry {
     pub on_initial_breakpoint: Option<LuaRegistryKey>,
+    /// Fired at a CHILD process's initial breakpoint only (pid != root), so a
+    /// tree-debugging script can re-resolve imports and re-arm breakpoints in
+    /// each new process (RETRO F6). `on_initial_breakpoint` still fires for
+    /// every process, root included.
+    pub on_child_ready: Option<LuaRegistryKey>,
     pub breakpoint_handlers: HashMap<u64, LuaRegistryKey>,
     pub hw_breakpoint_handlers: HashMap<u64, LuaRegistryKey>,
     pub single_shot_handlers: HashMap<u64, LuaRegistryKey>,
@@ -36,6 +41,7 @@ impl HandlerRegistry {
     fn new() -> Self {
         Self {
             on_initial_breakpoint: None,
+            on_child_ready: None,
             breakpoint_handlers: HashMap::new(),
             hw_breakpoint_handlers: HashMap::new(),
             single_shot_handlers: HashMap::new(),
@@ -72,9 +78,22 @@ pub enum EventAction {
 }
 
 /// The Lua-facing debug client. Stored as Lua UserData.
+/// An import hooked by `dbg:set_breakpoint_import`: the IAT slot at `iat_va`
+/// (`ptr_size` bytes) was pointed at a stub carrying the breakpoint; `target`
+/// is what it held before, restored when the breakpoint is removed.
+pub struct ImportHook {
+    pub iat_va: u64,
+    pub target: u64,
+    pub ptr_size: usize,
+}
+
 pub struct DebugClient {
     stream: FramedJsonStream,
+    /// What the server identified itself as in the handshake.
+    pub server_hello: crate::protocol_io::ServerHello,
     pub handlers: HandlerRegistry,
+    /// Live import hooks, keyed by stub (= breakpoint) address.
+    pub import_hooks: HashMap<u64, ImportHook>,
     /// Current stopped pid (set on break events)
     pub current_pid: Option<u32>,
     /// Current stopped tid (set on break events)
@@ -85,21 +104,28 @@ pub struct DebugClient {
     pub wants_repl: bool,
     /// Root process PID
     pub root_pid: Option<u32>,
+    /// Main image base per pid, as reported by `ProcessCreated`.
+    pub main_image: HashMap<u32, u64>,
 }
 
 impl DebugClient {
     /// Connect to a joybug-core server.
     pub fn connect(addr: &str) -> anyhow::Result<Self> {
         let stream = TcpStream::connect(addr)?;
-        let framed = FramedJsonStream::new(stream);
+        crate::protocol_io::configure_client_socket(&stream);
+        let mut framed = FramedJsonStream::new(stream);
+        let server_hello = crate::protocol_io::handshake(&mut framed, "jlua")?;
         Ok(Self {
             stream: framed,
+            server_hello,
             handlers: HandlerRegistry::new(),
+            import_hooks: HashMap::new(),
             current_pid: None,
             current_tid: None,
             current_address: None,
             wants_repl: false,
             root_pid: None,
+            main_image: HashMap::new(),
         })
     }
 
@@ -255,6 +281,7 @@ impl DebugClient {
                 if self.root_pid.is_none() {
                     self.root_pid = Some(*pid);
                 }
+                self.main_image.insert(*pid, *base_of_image);
                 let has_handler = self.handlers.on_process_created.is_some();
                 EventAction::AutoContinue {
                     pid: *pid, tid: *tid,

@@ -1,7 +1,10 @@
 use clap::Parser;
-use joybug_core::SymbolConfig;
 
 /// Joybug debug server. Listens for `DebugSession` clients over TCP.
+///
+/// The same executable is a complete sandbox guest: launched with `--out` it
+/// is the ETW collector and with `--ui` the desktop probe (see
+/// `joybug_core::guest_roles`), so `sbx.provision` can stage it directly.
 #[derive(Parser, Debug)]
 #[command(name = "joybug-core", about = "Joybug debug server")]
 struct Args {
@@ -23,21 +26,17 @@ struct Args {
     offline: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing for logging
-    joybug_core::init_tracing();
-
+fn main() {
+    // Guest roles are decided on the raw argv before clap sees anything: the
+    // collector and the desktop probe parse their own argument lists.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(role) = joybug_core::guest_roles::from_argv(&argv) {
+        joybug_core::guest_roles::run(role, argv);
+    }
     let args = Args::parse();
-
-    println!("Starting joybug-core server on {}...", args.listen);
-
-    let cfg = SymbolConfig {
+    joybug_core::guest_roles::run_server(joybug_core::guest_roles::ServerArgs {
+        listen: args.listen,
         symbol_path: args.symbol_path,
         offline: args.offline,
-    };
-
-    joybug_core::server::serve(&args.listen, cfg).await?;
-
-    Ok(())
+    })
 }

@@ -8,9 +8,9 @@
 -- inside a `wsb exec` job object that dies with it, would kill the survivors
 -- outright. This test is what pins that behaviour down.
 --
--- Requires: the `sandbox` feature, Windows 11 24H2 + the "Windows Sandbox"
--- optional feature, and JOYBUG_SANDBOX_TEST_BINDIR pointing at a folder holding
--- `guest-tracer.exe`. Gated on JOYBUG_SANDBOX_LIVE at the Rust layer so a plain
+-- Requires: the `sandbox` feature and Windows 11 24H2 + the "Windows Sandbox"
+-- optional feature. The guest binary is joybug-core.exe (path injected as
+-- GUEST_EXE_PATH). Gated on JOYBUG_SANDBOX_LIVE at the Rust layer so a plain
 -- `cargo test` never boots a VM; here we also self-skip when the sandbox isn't
 -- actually available, so the script is safe to run anywhere.
 
@@ -22,9 +22,9 @@ if not (status.supported and status.wsb_present) then
     return { passed = true, skipped = true }
 end
 
-local bindir = os.getenv("JOYBUG_SANDBOX_TEST_BINDIR")
-assert(bindir and #bindir > 0,
-    "set JOYBUG_SANDBOX_TEST_BINDIR to a folder containing guest-tracer.exe")
+assert(GUEST_EXE_PATH and #GUEST_EXE_PATH > 0, "GUEST_EXE_PATH not injected by the harness")
+local guest_dir, guest_exe = GUEST_EXE_PATH:match("^(.*)[\/]([^\/]+)$")
+assert(guest_dir, "could not split GUEST_EXE_PATH: " .. tostring(GUEST_EXE_PATH))
 
 assert(TEST_EXE and #TEST_EXE > 0, "TEST_EXE (spawn_chain.exe) was not injected")
 local exe_dir = TEST_EXE:match("^(.*)[\\/][^\\/]+$")
@@ -41,7 +41,8 @@ local io_dir = (os.getenv("TEMP") or "C:\\Windows\\Temp")
 local launch = TEST_EXE .. " " .. GENERATIONS .. " C:\\io"
 
 local ok, h, info = pcall(sbx.provision, {
-    guest_bin_dir  = bindir,
+    guest_bin_dir  = guest_dir,
+    guest_exe      = guest_exe,
     io_dir         = io_dir,
     -- The chain exe is not guest-resident, so its folder has to be mapped in.
     mounts         = { { host_path = exe_dir, read_only = true } },
