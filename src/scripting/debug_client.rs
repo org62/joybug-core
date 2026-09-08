@@ -4,7 +4,7 @@
 //! this operates directly on FramedJsonStream, sending DebuggerRequest and
 //! receiving DebuggerResponse. Lua functions are stored via mlua::RegistryKey.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::TcpStream;
 
 use mlua::prelude::*;
@@ -106,6 +106,9 @@ pub struct DebugClient {
     pub root_pid: Option<u32>,
     /// Main image base per pid, as reported by `ProcessCreated`.
     pub main_image: HashMap<u32, u64>,
+    /// Processes seen created and not yet seen exited, for leftover-detach on
+    /// session end (see `DebugClient::detach_leftover_children`).
+    pub live_pids: HashSet<u32>,
 }
 
 impl DebugClient {
@@ -126,6 +129,7 @@ impl DebugClient {
             wants_repl: false,
             root_pid: None,
             main_image: HashMap::new(),
+            live_pids: HashSet::new(),
         })
     }
 
@@ -254,6 +258,7 @@ impl DebugClient {
                 }
             }
             DebugEvent::ProcessExited { pid, exit_code, tid } => {
+                self.live_pids.remove(pid);
                 let is_root = self.root_pid == Some(*pid);
                 let has_handler = self.handlers.on_process_exited.is_some();
                 EventAction::ProcessExited {
@@ -282,6 +287,7 @@ impl DebugClient {
                     self.root_pid = Some(*pid);
                 }
                 self.main_image.insert(*pid, *base_of_image);
+                self.live_pids.insert(*pid);
                 let has_handler = self.handlers.on_process_created.is_some();
                 EventAction::AutoContinue {
                     pid: *pid, tid: *tid,
@@ -342,6 +348,20 @@ impl DebugClient {
     pub fn finalize_exited_process(&mut self, pid: u32, tid: u32) {
         if let Err(e) = self.send_and_receive(&DebuggerRequest::FinalizeExitedProcess { pid, tid }) {
             tracing::debug!("FinalizeExitedProcess not acknowledged: {}", e);
+        }
+    }
+
+    /// Detach every still-live process except `root`, as the session ends. A
+    /// child left attached (e.g. the console host `CREATE_NEW_CONSOLE` adds to a
+    /// child-debugged tree) is killed when the server host exits; detaching
+    /// resumes it cleanly. Best-effort — the run is over either way.
+    pub fn detach_leftover_children(&mut self, root: u32) {
+        let leftovers: Vec<u32> = self.live_pids.iter().copied().filter(|&p| p != root).collect();
+        for pid in leftovers {
+            if let Err(e) = self.send_and_receive(&DebuggerRequest::Detach { pid }) {
+                tracing::debug!("Detach of leftover child {} not acknowledged: {}", pid, e);
+            }
+            self.live_pids.remove(&pid);
         }
     }
 

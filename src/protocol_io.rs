@@ -42,7 +42,7 @@ pub struct EmulationResultData {
     /// Memory snapshots read from emulator state after execution
     pub memory_snapshots: Vec<(u64, Vec<u8>)>,
 }
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 pub use std::net::TcpStream;
 use std::sync::Mutex;
 use crate::framed_json_stream::FramedJsonStream;
@@ -297,6 +297,11 @@ pub struct DebugSession<S> {
     /// PID of the root (first) process. Used in multi-process mode to distinguish
     /// root process exit (terminates session) from child process exit (auto-continues).
     root_pid: Option<u32>,
+    /// Processes seen created and not yet seen exited. On session end, any that
+    /// are still attached and alive (e.g. the console host `CREATE_NEW_CONSOLE`
+    /// adds to a child-debugged tree) are detached so they aren't killed when
+    /// the server host exits.
+    live_pids: HashSet<u32>,
 }
 
 /// TCP keepalive idle: proactively detect a silently-dropped connection (NAT /
@@ -359,6 +364,7 @@ impl<S> DebugSession<S> {
             exception_config: ExceptionConfig::default(),
             on_exception: None,
             root_pid: None,
+            live_pids: HashSet::new(),
         })
     }
 
@@ -738,6 +744,7 @@ impl<S> DebugSession<S> {
                 if self.root_pid.is_none() {
                     self.root_pid = Some(*pid);
                 }
+                self.live_pids.insert(*pid);
                 if let Some(ref mut handler) = on_process_created {
                     let name = image_file_name.as_deref().unwrap_or("<unknown>");
                     handler(self, *pid, *tid, name, *base_of_image)?;
@@ -749,6 +756,7 @@ impl<S> DebugSession<S> {
                 }
             }
             DebugEvent::ProcessExited { pid, exit_code, .. } => {
+                self.live_pids.remove(pid);
                 if let Some(ref mut handler) = on_process_exited {
                     handler(self, *pid, *exit_code)?;
                 }
@@ -829,6 +837,12 @@ impl<S> DebugSession<S> {
         // zombie behind if we just walk away.
         if let DebugEvent::ProcessExited { pid, tid, .. } = event {
             if self.root_pid.is_none_or(|root| root == *pid) {
+                // Detach any child still attached and alive (e.g. the console
+                // host CREATE_NEW_CONSOLE puts in a child-debugged tree). Left
+                // attached, it is killed when the server host process exits
+                // (the debugger default is kill-on-exit), which can abort a
+                // console handoff mid-flight; detaching resumes it cleanly.
+                self.detach_leftover_children(*pid);
                 // Best-effort: a server too old to know the request drops the
                 // connection, and we're tearing that down anyway.
                 let req = DebuggerRequest::FinalizeExitedProcess { pid: *pid, tid: *tid };
@@ -900,6 +914,20 @@ impl<S> DebugSession<S> {
         }
 
         Ok(true)
+    }
+
+    /// Detach every still-live process except `root`. Called once as the session
+    /// ends (on root exit); best-effort, since the connection is closing anyway.
+    fn detach_leftover_children(&mut self, root: u32) {
+        let leftovers: Vec<u32> = self.live_pids.iter().copied().filter(|&p| p != root).collect();
+        for pid in leftovers {
+            match self.send_and_receive(&DebuggerRequest::Detach { pid }) {
+                Ok(DebuggerResponse::Ack) => debug!("Detached leftover child {}", pid),
+                Ok(other) => debug!("Detach of leftover {}: unexpected response {:?}", pid, other),
+                Err(e) => debug!("Detach of leftover {} not acknowledged: {}", pid, e),
+            }
+            self.live_pids.remove(&pid);
+        }
     }
 
     pub fn list_processes(&mut self) -> anyhow::Result<Vec<ProcessInfo>> {

@@ -340,9 +340,14 @@ impl LuaUserData for LuaDebugClient {
 
                 if !should_continue {
                     // The root process's exit event is still outstanding; release it
-                    // so the dead target isn't kept alive by the server's handles.
+                    // so the dead target isn't kept alive by the server's handles,
+                    // and detach any child still attached and alive (e.g. the
+                    // console host CREATE_NEW_CONSOLE adds to a child-debugged
+                    // tree) so it isn't killed when the server host exits.
                     if exited_root {
-                        this.inner.borrow_mut().finalize_exited_process(continue_pid, continue_tid);
+                        let mut c = this.inner.borrow_mut();
+                        c.detach_leftover_children(continue_pid);
+                        c.finalize_exited_process(continue_pid, continue_tid);
                     }
                     break;
                 }

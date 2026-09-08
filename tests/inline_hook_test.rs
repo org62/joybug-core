@@ -4,6 +4,18 @@ use joybug_core::inline_hook::allocator::{CodeAllocator, WindowsCodeAllocator};
 use joybug_core::inline_hook::thread::NoopThreadFreezer;
 use joybug_core::inline_hook::{HookEngine, LuaHookEngine};
 use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::Mutex;
+
+// Every test in this binary that installs a hook mutates process-global state:
+// it patches live `.text` (with a `NoopThreadFreezer`, so nothing suspends the
+// other test threads) and the Lua tests also share the global `HOOK_REGISTRY`
+// and run their detour callbacks on the calling thread. None of that is safe to
+// run in parallel, so all of them take this one lock and run serially. Poison-
+// tolerant (`into_inner`) so a genuine failure in one test surfaces as that one
+// failure, instead of poisoning the lock and cascading into misleading
+// `PoisonError` panics in the others. Matches `scripting_test.rs`'s
+// `SANDBOX_LOCK`.
+static HOOK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 type BinOp = extern "C" fn(i32, i32) -> i32;
 
@@ -69,6 +81,7 @@ extern "C" fn hooked_add(a: i32, b: i32) -> i32 {
 
 #[test]
 fn test_basic_hook_and_unhook() {
+    let _guard = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let allocator = WindowsCodeAllocator::new();
     let freezer = NoopThreadFreezer;
     let mut engine = HookEngine::new(allocator, freezer);
@@ -105,6 +118,7 @@ fn test_basic_hook_and_unhook() {
 
 #[test]
 fn test_allocator_near_allocation() {
+    let _guard = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut allocator = WindowsCodeAllocator::new();
     let target = test_add as *const u8 as usize;
 
@@ -125,12 +139,6 @@ fn test_allocator_near_allocation() {
     allocator.free(slot);
 }
 
-// Serialize Lua hook tests — the Lua VM and hook engine have shared global state
-// (HOOK_REGISTRY) and the detour stubs call into Lua from the calling thread,
-// so these tests cannot safely run in parallel.
-use std::sync::Mutex;
-static LUA_HOOK_LOCK: Mutex<()> = Mutex::new(());
-
 // Separate targets for each Lua hook test. Padded like `test_add` above.
 #[unsafe(no_mangle)]
 #[inline(never)]
@@ -148,7 +156,7 @@ extern "C" fn test_sub(a: i32, b: i32) -> i32 {
 
 #[test]
 fn test_lua_hook_basic() {
-    let _guard = LUA_HOOK_LOCK.lock().unwrap();
+    let _guard = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let lua = joybug_core::scripting::create_lua().expect("create lua");
 
     let mut engine = LuaHookEngine::new();
@@ -188,7 +196,7 @@ fn test_lua_hook_basic() {
 
 #[test]
 fn test_lua_hook_read_only() {
-    let _guard = LUA_HOOK_LOCK.lock().unwrap();
+    let _guard = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let lua = joybug_core::scripting::create_lua().expect("create lua");
     let mut engine = LuaHookEngine::new();
 
@@ -221,7 +229,7 @@ fn test_lua_hook_read_only() {
 
 #[test]
 fn test_lua_hook_memory_access() {
-    let _guard = LUA_HOOK_LOCK.lock().unwrap();
+    let _guard = HOOK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let lua = joybug_core::scripting::create_lua().expect("create lua");
     let mut engine = LuaHookEngine::new();
 
