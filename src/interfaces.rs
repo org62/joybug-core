@@ -100,6 +100,16 @@ impl Architecture {
         }
     }
 
+    /// Instruction alignment, in bytes: how far a decoder must step to stay
+    /// in sync after an undecodable position. x86 encodings can start on any
+    /// byte; ARM64 instructions are 4-byte words.
+    pub fn instruction_alignment(self) -> usize {
+        match self {
+            Architecture::X86 | Architecture::X64 => 1,
+            Architecture::Arm64 => 4,
+        }
+    }
+
     /// Width of a pointer in the target's address space.
     pub fn pointer_size(self) -> usize {
         match self {

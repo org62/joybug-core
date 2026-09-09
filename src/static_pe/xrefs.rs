@@ -1,9 +1,10 @@
 //! Cross-references and function-start recovery over a mapped image.
 //!
 //! Built from one linear sweep of the executable regions. Linear sweep is
-//! exact for fixed-width ARM64 and a good approximation for x86/x64, where
-//! data embedded in code sections can desynchronise the decoder for a few
-//! bytes (`db` placeholders resynchronise it).
+//! exact for fixed-width ARM64 (an undecodable word is skipped whole, so the
+//! sweep stays word-aligned) and a good approximation for x86/x64, where data
+//! embedded in code sections can desynchronise the decoder for a few bytes
+//! (`db` placeholders resynchronise it).
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -60,6 +61,114 @@ pub struct XrefIndex {
 /// Instructions per decode call during the sweep.
 const SWEEP_CHUNK: usize = 4096;
 
+/// A reference resolved from an ARM64 instruction pair (see [`Arm64Pairs`]).
+struct PairRef {
+    to: u64,
+    kind: XrefKind,
+    /// A `blr` through a materialised address (not a loaded slot): the
+    /// target is a function start.
+    direct_call: bool,
+}
+
+/// ARM64 has no absolute operands: an address is materialised as `adrp Xd,
+/// page` followed by `add Xd, Xd, #lo` (the address itself) or `ldr Xt, [Xd,
+/// #lo]` (a load through it, typically an IAT slot), then optionally used by
+/// `br`/`blr`. No single instruction carries the final target, so the sweep
+/// remembers the previous instruction's contribution and resolves the pair.
+/// Only *adjacent* instructions pair up: that is the only shape MSVC and LLVM
+/// emit for ILT thunks, import calls and global accesses, and it keeps false
+/// positives out without tracking register liveness.
+#[derive(Default)]
+struct Arm64Pairs {
+    /// `adrp` just seen: (destination register, page base).
+    page: Option<(String, u64)>,
+    /// Register holding a materialised address (`add`) or the contents of a
+    /// slot (`ldr`): (register, address, loaded-through-slot).
+    value: Option<(String, u64, bool)>,
+}
+
+impl Arm64Pairs {
+    fn step(&mut self, insn: &crate::interfaces::Instruction) -> Option<PairRef> {
+        // Any instruction that doesn't consume the pending state ends it.
+        let page = self.page.take();
+        let value = self.value.take();
+        let m = insn.mnemonic.to_ascii_lowercase();
+        let ops = insn.op_str.as_str();
+        match m.as_str() {
+            "adrp" => {
+                let reg = ops.split(',').next()?.trim();
+                let base = insn.addresses_to_symbolize.first().copied()
+                    .or_else(|| parse_imm(ops.rsplit(',').next()?.trim()))?;
+                self.page = Some((reg.to_string(), base));
+                None
+            }
+            "add" => {
+                let (reg, base) = page?;
+                let parts: Vec<&str> = ops.split(',').map(str::trim).collect();
+                if parts.len() != 3 || parts[1] != reg {
+                    return None;
+                }
+                let to = base.wrapping_add(parse_imm(parts[2])?);
+                self.value = Some((parts[0].to_string(), to, false));
+                Some(PairRef { to, kind: XrefKind::Immediate, direct_call: false })
+            }
+            "ldr" | "ldrb" | "ldrh" | "ldrsb" | "ldrsh" | "ldrsw" | "str" | "strb" | "strh" => {
+                let (reg, base) = page?;
+                let (rt, inner) = parse_mem(ops)?;
+                let mut it = inner.split(',').map(str::trim);
+                if it.next()? != reg {
+                    return None;
+                }
+                let lo = match it.next() { Some(s) => parse_imm(s)?, None => 0 };
+                if it.next().is_some() {
+                    return None;
+                }
+                let to = base.wrapping_add(lo);
+                if m == "ldr" && rt.starts_with('x') {
+                    self.value = Some((rt.to_string(), to, true));
+                }
+                Some(PairRef { to, kind: XrefKind::DataRef, direct_call: false })
+            }
+            "br" | "blr" => {
+                let (reg, to, via_slot) = value?;
+                if ops.trim() != reg {
+                    return None;
+                }
+                let call = m == "blr";
+                Some(PairRef {
+                    to,
+                    kind: if call { XrefKind::Call } else { XrefKind::Jump },
+                    direct_call: call && !via_slot,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// `#0x1f0`, `#496`, `#-8` → value (negatives wrap, for `wrapping_add`).
+fn parse_imm(s: &str) -> Option<u64> {
+    let s = s.strip_prefix('#')?;
+    let (neg, s) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let v = match s.strip_prefix("0x") {
+        Some(h) => u64::from_str_radix(h, 16).ok()?,
+        None => s.parse::<u64>().ok()?,
+    };
+    Some(if neg { v.wrapping_neg() } else { v })
+}
+
+/// `x16, [x16, #0x9f0]` → (`x16`, `x16, #0x9f0`). Rejects pre/post-indexed
+/// forms (`[x0], #8`, `[x0, #8]!`), whose base register is modified.
+fn parse_mem(ops: &str) -> Option<(&str, &str)> {
+    let (rt, rest) = ops.split_once(',')?;
+    let rest = rest.trim();
+    let inner = rest.strip_prefix('[')?.strip_suffix(']')?;
+    Some((rt.trim(), inner))
+}
+
 impl XrefIndex {
     pub fn build(image: &MappedImage, arch: Architecture) -> XrefIndex {
         let disasm = match CapstoneDisassembler::new() {
@@ -69,9 +178,11 @@ impl XrefIndex {
         let mut refs: Vec<Xref> = Vec::new();
         let mut call_targets = BTreeSet::new();
         let in_image = |a: u64| image.contains(a);
+        let is_arm64 = arch == Architecture::Arm64;
 
         for (region_va, bytes) in image.code_regions() {
             let mut offset = 0usize;
+            let mut pairs = Arm64Pairs::default();
             while offset < bytes.len() {
                 let Ok(insns) = disasm.disassemble(arch, &bytes[offset..], region_va + offset as u64, SWEEP_CHUNK) else { break };
                 if insns.is_empty() {
@@ -100,6 +211,24 @@ impl XrefIndex {
                     } else if let Some(to) = insn.mem_ref.filter(|a| in_image(*a)) {
                         refs.push(Xref { from, to, kind: XrefKind::DataRef });
                         seen.push(to);
+                    }
+
+                    if is_arm64 {
+                        if let Some(p) = pairs.step(insn) {
+                            if in_image(p.to) && !seen.contains(&p.to) {
+                                refs.push(Xref { from, to: p.to, kind: p.kind });
+                                seen.push(p.to);
+                                if p.direct_call {
+                                    call_targets.insert(p.to);
+                                }
+                            }
+                        }
+                        // An `adrp` immediate is a 4 KiB page base, not a
+                        // reference to whatever happens to start there; the
+                        // precise address comes from the pair above.
+                        if insn.mnemonic.eq_ignore_ascii_case("adrp") {
+                            continue;
+                        }
                     }
 
                     for &imm in &insn.addresses_to_symbolize {
@@ -270,4 +399,89 @@ pub fn collect_functions(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interfaces::Instruction;
+
+    fn insn(mnemonic: &str, op_str: &str, page: Option<u64>) -> Instruction {
+        Instruction {
+            mnemonic: mnemonic.into(),
+            op_str: op_str.into(),
+            addresses_to_symbolize: page.into_iter().collect(),
+            ..Default::default()
+        }
+    }
+
+    // MSVC's incremental-link thunk: `adrp x16, page; add x16, x16, #lo; br x16`.
+    #[test]
+    fn arm64_adrp_add_br_is_an_immediate_then_a_jump() {
+        let mut p = Arm64Pairs::default();
+        assert!(p.step(&insn("adrp", "x16, #0x140003000", Some(0x140003000))).is_none());
+        let add = p.step(&insn("add", "x16, x16, #0xad0", None)).unwrap();
+        assert_eq!((add.to, add.kind), (0x140003ad0, XrefKind::Immediate));
+        let br = p.step(&insn("br", "x16", None)).unwrap();
+        assert_eq!((br.to, br.kind, br.direct_call), (0x140003ad0, XrefKind::Jump, false));
+        // The state is consumed: a second `br` resolves nothing.
+        assert!(p.step(&insn("br", "x16", None)).is_none());
+    }
+
+    // An import call: `adrp x16, page; ldr x16, [x16, #slot]; blr x16` —
+    // the data reference and the call both name the IAT slot, and a call
+    // through a slot is not function-start evidence.
+    #[test]
+    fn arm64_adrp_ldr_blr_references_the_slot() {
+        let mut p = Arm64Pairs::default();
+        p.step(&insn("adrp", "x16, #0x140005000", Some(0x140005000)));
+        let ldr = p.step(&insn("ldr", "x16, [x16, #0x9f0]", None)).unwrap();
+        assert_eq!((ldr.to, ldr.kind), (0x1400059f0, XrefKind::DataRef));
+        let blr = p.step(&insn("blr", "x16", None)).unwrap();
+        assert_eq!((blr.to, blr.kind, blr.direct_call), (0x1400059f0, XrefKind::Call, false));
+    }
+
+    #[test]
+    fn arm64_blr_through_materialised_address_is_a_direct_call() {
+        let mut p = Arm64Pairs::default();
+        p.step(&insn("adrp", "x8, #0x140001000", Some(0x140001000)));
+        p.step(&insn("add", "x8, x8, #0x120", None));
+        let blr = p.step(&insn("blr", "x8", None)).unwrap();
+        assert!(blr.direct_call);
+        assert_eq!(blr.to, 0x140001120);
+    }
+
+    #[test]
+    fn arm64_pairs_require_adjacency_and_matching_registers() {
+        let mut p = Arm64Pairs::default();
+        p.step(&insn("adrp", "x8, #0x140012000", Some(0x140012000)));
+        // A different base register is not the pair.
+        assert!(p.step(&insn("add", "x0, x9, #0x18", None)).is_none());
+        // ...and the `adrp` is forgotten after the intervening instruction.
+        assert!(p.step(&insn("add", "x0, x8, #0x18", None)).is_none());
+
+        p.step(&insn("adrp", "x8, #0x140012000", Some(0x140012000)));
+        p.step(&insn("add", "x0, x8, #0x18", None));
+        assert!(p.step(&insn("mov", "x1, x0", None)).is_none());
+        assert!(p.step(&insn("br", "x0", None)).is_none());
+
+        // Global data through a page: `adrp x8, page; ldr w8, [x8, #off]`.
+        p.step(&insn("adrp", "x8, #0x140012000", Some(0x140012000)));
+        let ldr = p.step(&insn("ldr", "w8, [x8, #0x30]", None)).unwrap();
+        assert_eq!((ldr.to, ldr.kind), (0x140012030, XrefKind::DataRef));
+        // A `w` load is not a pointer: nothing to branch through.
+        assert!(p.step(&insn("br", "x8", None)).is_none());
+    }
+
+    #[test]
+    fn arm64_operand_parsing() {
+        assert_eq!(parse_imm("#0x1f0"), Some(0x1f0));
+        assert_eq!(parse_imm("#496"), Some(496));
+        assert_eq!(parse_imm("#-8"), Some(8u64.wrapping_neg()));
+        assert_eq!(parse_imm("x0"), None);
+        assert_eq!(parse_mem("x16, [x16, #0x9f0]"), Some(("x16", "x16, #0x9f0")));
+        assert_eq!(parse_mem("w8, [x8]"), Some(("w8", "x8")));
+        assert_eq!(parse_mem("x0, [x1], #8"), None);
+        assert_eq!(parse_mem("x0, [x1, #8]!"), None);
+    }
 }

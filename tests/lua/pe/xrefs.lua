@@ -13,7 +13,13 @@ assert(#to_enc >= 1, "xtea_encrypt has at least one caller")
 local main_fn = img:disassemble_function(main.va)
 local function in_main(a) return a >= main_fn.start and a < main_fn["end"] end
 -- Debug builds link incrementally, so main reaches xtea_encrypt through an
--- ILT `jmp` thunk: follow one level of jump xrefs back to the real caller.
+-- ILT thunk: follow one level of jump xrefs back to the real caller. On x86
+-- the thunk is a single `jmp f`; on arm64 it is `adrp x16; add x16; br x16`,
+-- the jump xref sits on the `br`, and main calls the thunk's first word.
+local function thunk_entries(jump_from)
+    if img:arch() == "arm64" then return { jump_from, jump_from - 8 } end
+    return { jump_from }
+end
 local from_main, seen = false, {}
 for _, x in ipairs(to_enc) do
     assert(x.to == enc.va, "xref target is the function")
@@ -22,9 +28,11 @@ for _, x in ipairs(to_enc) do
     seen[#seen + 1] = x.kind .. "@" .. hex(x.from)
     if in_main(x.from) then from_main = true end
     if x.kind == "jump" then
-        for _, y in ipairs(img:xrefs_to(x.from)) do
-            seen[#seen + 1] = "  via " .. y.kind .. "@" .. hex(y.from)
-            if in_main(y.from) then from_main = true end
+        for _, entry in ipairs(thunk_entries(x.from)) do
+            for _, y in ipairs(img:xrefs_to(entry)) do
+                seen[#seen + 1] = "  via " .. y.kind .. "@" .. hex(y.from)
+                if in_main(y.from) then from_main = true end
+            end
         end
     end
 end
@@ -48,8 +56,16 @@ for _, imp in ipairs(img:imports()) do
             -- The referencing instruction really is an indirect call/jmp/load
             -- through the slot.
             local row = img:disassemble(xs[1].from, 1)[1]
-            assert(row.mem_ref == imp.iat_va or row.jump_target == imp.iat_va,
-                "referencing instruction operand is the IAT slot: " .. row.mnemonic .. " " .. row.operands)
+            if img:arch() == "arm64" then
+                -- The slot's page comes from the preceding `adrp`; the xref is
+                -- recorded on the load that adds the page offset.
+                local prev = img:disassemble(xs[1].from - 4, 1)[1]
+                assert(prev.mnemonic == "adrp" and row.mnemonic == "ldr",
+                    "adrp + ldr through the IAT slot: " .. prev.mnemonic .. " / " .. row.mnemonic .. " " .. row.operands)
+            else
+                assert(row.mem_ref == imp.iat_va or row.jump_target == imp.iat_va,
+                    "referencing instruction operand is the IAT slot: " .. row.mnemonic .. " " .. row.operands)
+            end
             break
         end
     end

@@ -1083,6 +1083,9 @@ img:resolve_address(va)                   -- "xtea_test!xtea_encrypt+0x1c" or ni
 Kinds: `"call"`, `"jump"` (direct targets, or the IAT slot of `call/jmp [slot]`), `"data"`
 (static memory operands), `"imm"` (immediates that fall inside the image, e.g. `push offset str`).
 On x86 a linear sweep can misdecode data embedded in code for a few bytes; ARM64 is exact.
+ARM64 has no absolute operands, so the sweep resolves adjacent `adrp`+`add` (an `"imm"` on the
+`add`) and `adrp`+`ldr`/`str` (a `"data"` reference on the load, e.g. an IAT slot) pairs, and a
+`br`/`blr` through the register right after them becomes the `"jump"`/`"call"`.
 
 ```lua
 img:xrefs_to(va)                          -- { {from, to, kind}, ... }
@@ -1098,6 +1101,8 @@ for _, f in ipairs(img:functions()) do print(hex(f.start), f["end"] and hex(f["e
 
 Debug builds link incrementally, so a call to `f` often lands on an `@ILT` `jmp f` thunk: the
 xref to `f` is then a `"jump"` from the thunk and the real caller is in `img:xrefs_to(thunk)`.
+On ARM64 the thunk is `adrp x16; add x16; br x16`: the `"jump"` is on the `br`, the thunk's
+entry (what callers reference) is 8 bytes earlier.
 
 **Emulation without a process** — the file is mapped at its base, the image gets a synthetic
 stack, a zero TEB page, and every IAT slot points at a stub the emulator recognises. Registers

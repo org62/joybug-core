@@ -321,6 +321,12 @@ impl DisassemblerProvider for CapstoneDisassembler {
         // buffer-tail guard below: a decode stall with fewer than this many
         // bytes left is buffer truncation, not a genuine bad byte.
         let max_ilen = arch.max_instruction_len();
+        // How far a stall skips: one byte on x86, one whole word on ARM64.
+        // Skipping a single byte of a fixed-width stream would leave every
+        // later decode misaligned, turning real code into plausible garbage
+        // (the ILT padding at the start of an ARM64 `.text` used to desync
+        // the whole xref sweep this way).
+        let skip = arch.instruction_alignment();
 
         Self::with_engine(arch, |engine| {
             let mut result: Vec<Instruction> = Vec::new();
@@ -328,8 +334,8 @@ impl DisassemblerProvider for CapstoneDisassembler {
 
             // Resync loop: Capstone's `disasm_count` silently stops at the first
             // undecodable byte and returns only what it decoded. Rather than
-            // truncate the whole listing there, we emit a 1-byte `db 0xXX`
-            // placeholder for the bad byte and resume decoding after it —
+            // truncate the whole listing there, we emit a `db` placeholder for
+            // the bad byte (word on ARM64) and resume decoding after it —
             // x64dbg/TitanEngine style — so valid code below a bad byte stays
             // visible and the UI can keep scrolling past it.
             while result.len() < count && offset < data.len() {
@@ -347,17 +353,17 @@ impl DisassemblerProvider for CapstoneDisassembler {
                     if data.len() - offset < max_ilen {
                         break;
                     }
-                    let bad = data[offset];
+                    let bad = &data[offset..offset + skip];
                     result.push(Instruction {
                         address: address + offset as u64,
-                        bytes: vec![bad],
+                        bytes: bad.to_vec(),
                         mnemonic: "db".to_string(),
-                        op_str: format!("0x{:02X}", bad),
-                        size: 1,
+                        op_str: bad.iter().map(|b| format!("0x{:02X}", b)).collect::<Vec<_>>().join(", "),
+                        size: skip,
                         is_invalid: true,
                         ..Default::default()
                     });
-                    offset += 1;
+                    offset += skip;
                     continue;
                 }
 
@@ -585,6 +591,40 @@ mod tests {
 
         // All 22 bytes accounted for: NOP + db + 20 NOPs.
         assert_eq!(instrs.len(), 22);
+    }
+
+    // On fixed-width ARM64 a stall must skip a whole word. Skipping one byte
+    // would decode the rest of the buffer at a misaligned offset, so the `bl`
+    // after the bad word would never be seen at its real address (this is how
+    // the zero-padded ILT at the start of an ARM64 `.text` used to hide every
+    // call in the image from the xref sweep).
+    #[test]
+    fn arm64_stall_skips_a_whole_word() {
+        let base = 0x140001000u64;
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&[0x1F, 0x20, 0x03, 0xD5]); // nop
+        bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // undecodable
+        bytes.extend_from_slice(&[0x00, 0x04, 0x00, 0x94]); // bl #0x1000
+        for _ in 0..4 {
+            bytes.extend_from_slice(&[0x1F, 0x20, 0x03, 0xD5]); // nop
+        }
+
+        let disasm = CapstoneDisassembler::new().unwrap();
+        let instrs = disasm.disassemble(Architecture::Arm64, &bytes, base, 64).unwrap();
+
+        assert_eq!(instrs[0].mnemonic, "nop");
+        assert!(instrs[1].is_invalid);
+        assert_eq!(instrs[1].mnemonic, "db");
+        assert_eq!(instrs[1].address, base + 4);
+        assert_eq!(instrs[1].size, 4);
+        assert_eq!(instrs[1].bytes, vec![0, 0, 0, 0]);
+
+        // Decoding resumed on the next word boundary: the call is intact.
+        assert_eq!(instrs[2].mnemonic, "bl");
+        assert_eq!(instrs[2].address, base + 8);
+        assert!(instrs[2].is_call);
+        assert_eq!(instrs[2].jump_target, Some(base + 8 + 0x1000));
+        assert_eq!(instrs.len(), 7);
     }
 
     // capstone-rs builds `Arm64OperandType` by transmuting capstone's raw
