@@ -4,6 +4,8 @@ pub mod protocol_io;
 pub mod interfaces;
 pub mod pe_types;
 pub mod pe_image;
+/// Offline PE analysis: disassembly, xrefs and process-less emulation of a file on disk.
+pub mod static_pe;
 pub mod windows_platform;
 pub mod server;
 pub mod framed_json_stream;

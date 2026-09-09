@@ -53,26 +53,21 @@ impl<'a> Emulator<'a> {
                     }
                 ).map_err(|e| EmulatorError::UnicornError(format!("sysenter hook failed: {:?}", e)))
             }
+            // Host-independent: Unicorn emulates x64 on an ARM64 host too (a
+            // PE file opened on such a host is emulated statically).
             Architecture::X64 => {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    self.emu.add_insn_sys_hook(
-                        X86Insn::SYSCALL,
-                        0, u64::MAX,
-                        move |emu| {
-                            let rip = emu.reg_read(RegisterX86::RIP).unwrap_or(0);
-                            let mut state = shared.write().unwrap();
-                            state.syscall_address = Some(rip);
-                            state.stop_requested = true;
-                            drop(state);
-                            emu.emu_stop().ok();
-                        }
-                    ).map_err(|e| EmulatorError::UnicornError(format!("syscall hook failed: {:?}", e)))
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    Err(EmulatorError::UnicornError("x64 syscall hook not supported on this platform".into()))
-                }
+                self.emu.add_insn_sys_hook(
+                    X86Insn::SYSCALL,
+                    0, u64::MAX,
+                    move |emu| {
+                        let rip = emu.reg_read(RegisterX86::RIP).unwrap_or(0);
+                        let mut state = shared.write().unwrap();
+                        state.syscall_address = Some(rip);
+                        state.stop_requested = true;
+                        drop(state);
+                        emu.emu_stop().ok();
+                    }
+                ).map_err(|e| EmulatorError::UnicornError(format!("syscall hook failed: {:?}", e)))
             }
             Architecture::Arm64 => {
                 const EXCP_SWI: u32 = 2;

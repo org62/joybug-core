@@ -542,3 +542,55 @@ impl std::fmt::Display for RuntimeFunction {
         )
     }
 }
+
+impl ModuleExtraInfo {
+    /// Binary-search the `.pdata` runtime functions for the entry containing
+    /// `rva`. Returns `(BeginAddress, EndAddress)` RVAs.
+    pub fn runtime_function_bounds(&self, rva: u32) -> Option<(u32, u32)> {
+        let funcs = self.runtime_functions.as_ref().filter(|f| !f.is_empty())?;
+        let idx = funcs
+            .binary_search_by(|rf| {
+                if rva < rf.BeginAddress {
+                    std::cmp::Ordering::Greater
+                } else if rva >= rf.EndAddress {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .ok()?;
+        Some((funcs[idx].BeginAddress, funcs[idx].EndAddress))
+    }
+
+    /// The RVA of the IAT slot importing `func` (case-insensitive; `"#12"`
+    /// for an ordinal), optionally only from a DLL matching `dll`
+    /// ("kernel32" matches "KERNEL32.dll").
+    pub fn find_import_slot(&self, dll: Option<&str>, func: &str) -> Option<u32> {
+        self.imports
+            .iter()
+            .filter(|desc| {
+                dll.is_none_or(|want| {
+                    crate::formatting::dll_stem(&desc.dll_name).eq_ignore_ascii_case(want)
+                        || desc.dll_name.eq_ignore_ascii_case(want)
+                })
+            })
+            .flat_map(|desc| &desc.entries)
+            .find(|entry| match &entry.kind {
+                ImportKind::Item(ImportItem::ByName { name, .. }) => name.eq_ignore_ascii_case(func),
+                ImportKind::Item(ImportItem::ByOrdinal { ordinal }) => {
+                    func.strip_prefix('#').and_then(|n| n.parse::<u16>().ok()) == Some(*ordinal)
+                }
+                ImportKind::Error(_) => false,
+            })
+            .map(|entry| entry.iat_rva)
+    }
+}
+
+/// Split `"kernel32!WriteFile"` into `(Some("kernel32"), "WriteFile")`; a bare
+/// `"WriteFile"` has no DLL filter.
+pub fn split_import_spec(spec: &str) -> (Option<&str>, &str) {
+    match spec.split_once('!') {
+        Some((d, f)) => (Some(d), f),
+        None => (None, spec),
+    }
+}

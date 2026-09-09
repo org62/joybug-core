@@ -78,6 +78,20 @@ impl Architecture {
         if cfg!(target_arch = "x86_64") { Architecture::X64 } else { Architecture::Arm64 }
     }
 
+    /// The instruction set for a PE `FileHeader.Machine` value. Anything else
+    /// (ARM32, Itanium, ...) has no decoder here.
+    pub fn from_machine(machine: u16) -> Option<Self> {
+        use windows_sys::Win32::System::SystemInformation::{
+            IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_I386,
+        };
+        match machine {
+            IMAGE_FILE_MACHINE_I386 => Some(Architecture::X86),
+            IMAGE_FILE_MACHINE_AMD64 => Some(Architecture::X64),
+            IMAGE_FILE_MACHINE_ARM64 => Some(Architecture::Arm64),
+            _ => None,
+        }
+    }
+
     /// Longest possible instruction encoding, in bytes (ARM64 is fixed-width).
     pub fn max_instruction_len(self) -> usize {
         match self {
@@ -127,6 +141,38 @@ pub const MAX_USER_ADDRESS: u64 = 0x0000_7FFF_FFFF_FFFF;
 pub fn backward_resync_window(arch: Architecture, count: usize) -> u64 {
     let max_ilen = arch.max_instruction_len() as u64;
     max_ilen * count as u64 + max_ilen
+}
+
+/// How to decode "the function containing `address`" given its `bounds`
+/// (`[start, end)`), as `(decode_start, decode_count, trim)`.
+///
+/// `trim = Some` means decode the WHOLE function from its start and keep only
+/// `[start, end)`. That is ideal for normal functions, but a large or MALFORMED
+/// bound (a corrupt `.pdata` reporting a multi-MB "function") would decode
+/// millions of instructions — tens of MB read, seconds of CPU, and a payload
+/// the UI can't render. It can also start so far below the address that the
+/// requested one isn't even in the result. So the whole-function path is taken
+/// only when the function fits `max_instructions` AND contains the address;
+/// otherwise decode a window of `max_instructions` anchored at the requested
+/// address (a known instruction boundary) and let the caller's scroll
+/// extension pull in the rest.
+pub fn function_decode_window(
+    bounds: Option<(u64, u64)>,
+    address: u64,
+    max_instructions: usize,
+) -> (u64, usize, Option<(u64, u64)>) {
+    match bounds {
+        Some((start, end)) => {
+            let estimated_count = (end.saturating_sub(start) as usize / 2).max(1);
+            let contains = address >= start && address < end;
+            if estimated_count <= max_instructions && contains {
+                (start, estimated_count, Some((start, end)))
+            } else {
+                (address, max_instructions, None)
+            }
+        }
+        None => (address, max_instructions, None),
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]

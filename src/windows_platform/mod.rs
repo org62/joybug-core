@@ -66,6 +66,10 @@ pub(crate) struct StepState {
 }
 
 pub(crate) use debugged_process::DebuggedProcess;
+// Shared with the offline `static_pe` analysis, which has no platform.
+pub(crate) use coverage_targets::name_for as symbol_name_at;
+pub(crate) use memory::decode_wide_until_nul;
+pub(crate) use symbol_manager::{matches_tokens, query_tokens};
 
 pub struct WindowsPlatform {
     /// Map of PID to DebuggedProcess for managing multiple processes
@@ -75,6 +79,7 @@ pub struct WindowsPlatform {
     /// Shared disassembler for all processes
     disassembler: Option<CapstoneDisassembler>,
 }
+
 
 impl WindowsPlatform {
     pub fn new() -> Self {
@@ -235,10 +240,12 @@ impl WindowsPlatform {
         exit_condition: Option<crate::protocol::TraceExitCondition>,
         memory_reads: &[(u64, usize)],
     ) -> Result<EmulationResult, PlatformError> {
-        let mut emulator = Emulator::from_debugger_state(self, pid, tid)
+        let target = crate::emulator::LiveTarget::new(self, pid, tid)
+            .map_err(|e| PlatformError::Other(e.to_string()))?;
+        let mut emulator = Emulator::from_context(&target, &target.context)
             .map_err(|e| PlatformError::Other(e.to_string()))?;
 
-        emulator.emulate_with_mode(self, max_instructions, mode, exit_condition, memory_reads)
+        emulator.emulate_with_mode(&target, max_instructions, mode, exit_condition, memory_reads)
             .map_err(|e| PlatformError::Other(e.to_string()))
     }
 
@@ -1234,25 +1241,6 @@ impl Stepper for WindowsPlatform {
         stepper::step(self, pid, tid, kind)
     }
 }
-
-/// Binary-search a module's `.pdata` runtime functions for the entry containing
-/// `rva`. Returns `(BeginAddress, EndAddress)` RVAs.
-fn runtime_function_bounds(info: &crate::pe_types::ModuleExtraInfo, rva: u32) -> Option<(u32, u32)> {
-    let funcs = info.runtime_functions.as_ref().filter(|f| !f.is_empty())?;
-    let idx = funcs
-        .binary_search_by(|rf| {
-            if rva < rf.BeginAddress {
-                std::cmp::Ordering::Greater
-            } else if rva >= rf.EndAddress {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        })
-        .ok()?;
-    Some((funcs[idx].BeginAddress, funcs[idx].EndAddress))
-}
-
 impl WindowsPlatform {
     /// Find function boundaries for an address using the exception directory (RuntimeFunction).
     /// Returns (function_start_va, function_end_va, function_name) if found.
@@ -1280,11 +1268,11 @@ impl WindowsPlatform {
         // Fall back to a file parse only when nothing is cached yet.
         let bounds = match process
             .module_manager()
-            .with_extra_info(module.base, |info| runtime_function_bounds(info, rva))
+            .with_extra_info(module.base, |info| info.runtime_function_bounds(rva))
         {
             Some(b) => b,
             None => match self.parse_module_extra_info(pid, module.base) {
-                Ok(info) => runtime_function_bounds(&info, rva),
+                Ok(info) => info.runtime_function_bounds(rva),
                 Err(_) => return Ok(None),
             },
         };
@@ -1301,11 +1289,7 @@ impl WindowsPlatform {
                 .ok()
                 .flatten()
                 .map(|(module_path, symbol, _offset)| {
-                    let module_name = std::path::Path::new(&module_path)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(&module_path)
-                        .to_string();
+                    let module_name = crate::formatting::module_stem(&module_path);
                     format!("{}!{}", module_name, symbol.name)
                 })
         } else {
@@ -1328,31 +1312,14 @@ impl WindowsPlatform {
         let bounds = self.find_function_bounds(pid, address)
             .ok()
             .flatten();
-
-        // `trim = Some` = decode the WHOLE function from its start and trim to
-        // [start, end). That's ideal for normal functions, but a large or
-        // MALFORMED bound (e.g. a corrupt `.pdata` reporting a multi-MB "function")
-        // would decode millions of instructions — tens of MB read, seconds of CPU
-        // on the paused command channel, and a payload the UI can't render (the
-        // observed multi-second freeze). It can also start so far below the PC that
-        // the requested address isn't even in the result. So: only take the
-        // whole-function path when it fits `max_instructions` AND actually contains
-        // the address; otherwise decode a bounded window anchored at the requested
-        // address (a known instruction boundary, always included) and let the UI
-        // scroll-extension pull in the rest.
-        let (disasm_start, disasm_count, func_start, func_end, func_name, trim) = match bounds {
-            Some((start, end, name)) => {
-                let func_size = end.saturating_sub(start) as usize;
-                let estimated_count = (func_size / 2).max(1);
-                let contains = address >= start && address < end;
-                if estimated_count <= max_instructions && contains {
-                    (start, estimated_count, Some(start), Some(end), name, Some((start, end)))
-                } else {
-                    (address, max_instructions, Some(start), Some(end), name, None)
-                }
-            }
-            None => (address, max_instructions, None, None, None, None),
+        let (func_start, func_end, func_name) = match &bounds {
+            Some((start, end, name)) => (Some(*start), Some(*end), name.clone()),
+            None => (None, None, None),
         };
+        // Whole-function decode when it fits, else a bounded window at the
+        // address — see `function_decode_window` for why.
+        let (disasm_start, disasm_count, trim) =
+            crate::interfaces::function_decode_window(bounds.map(|(s, e, _)| (s, e)), address, max_instructions);
 
         // Disassemble the chosen window
         let instructions = self.disassemble_memory(pid, disasm_start, disasm_count, arch)?;
@@ -1383,11 +1350,7 @@ impl WindowsPlatform {
         move |addr: u64| -> Option<crate::interfaces::SymbolInfo> {
             let sm = symbol_manager?;
             if let Ok(Some((module_path, symbol, offset))) = sm.try_resolve_address_to_symbol(&modules, addr) {
-                let module_name = std::path::Path::new(&module_path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(&module_path)
-                    .to_string();
+                let module_name = crate::formatting::module_stem(&module_path);
                 return Some(crate::interfaces::SymbolInfo { module_name, symbol_name: symbol.name, offset });
             }
             None
@@ -1471,11 +1434,7 @@ impl WindowsPlatform {
                 // than stalling the disassembly response behind symbol downloads.
                 // The UI re-requests disassembly once symbols finish loading.
                 if let Ok(Some((module_path, symbol, offset))) = symbol_manager.try_resolve_address_to_symbol(&modules, addr) {
-                    let module_name = std::path::Path::new(&module_path)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(&module_path)
-                        .to_string();
+                    let module_name = crate::formatting::module_stem(&module_path);
                     Some(crate::interfaces::SymbolInfo { module_name, symbol_name: symbol.name, offset })
                 } else { None }
             } else { None };

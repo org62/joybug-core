@@ -1059,3 +1059,36 @@ fn test_lua_file_sbx_guest_ui() {
     }
     run_lua_sandbox_test("sandbox/guest_ui.lua", None);
 }
+
+// ---------------------------------------------------------------------------
+// Offline PE analysis (`pe` global): no server, no process.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_lua_file_pe_open_and_read() {
+    let test_exe = common::get_test_program_path("xtea_test");
+    run_lua_test_file_no_server("pe/open_and_read.lua", Some(&test_exe));
+}
+
+#[test]
+fn test_lua_file_pe_disassembly() {
+    let test_exe = common::get_test_program_path("xtea_test");
+    run_lua_test_file_no_server("pe/disassembly.lua", Some(&test_exe));
+}
+
+#[test]
+fn test_lua_file_pe_xrefs() {
+    let test_exe = common::get_test_program_path("xtea_test");
+    run_lua_test_file_no_server("pe/xrefs.lua", Some(&test_exe));
+}
+
+#[test]
+fn test_lua_file_pe_emulate() {
+    let test_exe = common::get_test_program_path("xtea_test");
+    run_lua_test_file_no_server("pe/emulate.lua", Some(&test_exe));
+}
+
+#[test]
+fn test_lua_file_pe_pe32_system_dll() {
+    run_lua_test_file_no_server("pe/pe32_system_dll.lua", None);
+}

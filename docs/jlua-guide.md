@@ -1022,6 +1022,116 @@ dbg:hook(CreateFileW_addr, function(ctx)
 end)
 ```
 
+### Offline PE Analysis (`pe`)
+
+`pe.open()` reads a PE file from disk and gives you the static half of the debugger with **no
+process and no server**: disassembly, symbols, strings, byte-pattern search, cross-references,
+function recovery and emulation, all against the file laid out at its load base. It works in the
+plain REPL, in scripts, and inside `jlua --sandbox` against host paths — nothing here touches the
+guest.
+
+```lua
+local img = pe.open([[C:\samples\UnholyDragon.exe]])              -- ImageBase from the file
+local img = pe.open(path, { base = 0x400000, pdb = [[C:\syms\sample.pdb]] })
+
+img:arch()          -- "x86" | "x64" | "arm64"   (from the machine field, not the host)
+img:base()          -- load base;  img:size() SizeOfImage;  img:file_size()
+img:entry_point()   -- VA (0 if none);  img:module_name() "UnholyDragon"
+img:sections()      -- { {name, va, rva, vsize, raw, rsize, chars}, ... }
+img:imports()       -- { {dll, name, ordinal, iat_va}, ... }   (slot VAs, unresolved)
+img:exports()       -- { {ordinal, name, rva, va | forward}, ... }
+img:resources()     -- { {type="RT_MANIFEST"|"#24"|name, name, lang, va, rva, size, code_page}, ... }
+img:tls_callbacks() -- { va, ... }
+```
+
+**Addresses and memory** — reads come from the mapped image (sections at their virtual
+addresses, zero-filled tails), so a VA works even for bytes past a section's raw data:
+
+```lua
+img:va2off(va)  img:off2va(offset)                 -- VA <-> file offset via the section table
+img:read(va, len)                                  -- Lua string of mapped bytes
+img:read_u8(va) img:read_u16(va) img:read_u32(va) img:read_u64(va)
+img:read_string(va[, max_chars])                   -- NUL-terminated ASCII (whole string, no off-by-one)
+img:read_wstring(va[, max_chars])                  -- NUL-terminated UTF-16
+img:strings{ min = 6, encoding = "ascii"|"utf16"|"both", contains = "flare" }   -- hits with VAs
+img:strings{ ..., file = true }                    -- same, addressed by file offset
+img:find_bytes("ff 15 ?? ?? 69 00"[, max])         -- VAs where the masked pattern matches
+```
+
+**Disassembly** — the same decoder and instruction tables as `dbg:disassemble`, symbolised when
+a PDB is loaded:
+
+```lua
+img:disassemble(va[, n])                 -- n instructions from va
+img:disassemble_backward(va[, n])        -- n instructions ending exactly at va
+local fn = img:disassemble_function(va)  -- { instructions, start, end, name }
+-- Bounds come from .pdata (x64/ARM64) or from the recovered function list (x86).
+```
+
+**Symbols** — a PDB next to the file (or in the local symbol cache) loads on `pe.open`;
+`load_pdb()` may also download from the symbol server:
+
+```lua
+img:has_symbols()
+img:load_pdb()                 -- discover (server allowed);  img:load_pdb(path) explicit, GUID/age checked
+img:symbols("xtea"[, limit])   -- token search -> { {name, module, rva, va, is_function}, ... }
+img:find_symbol("xtea_encrypt")           -- exact (case-insensitive) or nil
+img:resolve_address(va)                   -- "xtea_test!xtea_encrypt+0x1c" or nil
+```
+
+**Cross-references** — built once per image from a linear sweep of the executable sections.
+Kinds: `"call"`, `"jump"` (direct targets, or the IAT slot of `call/jmp [slot]`), `"data"`
+(static memory operands), `"imm"` (immediates that fall inside the image, e.g. `push offset str`).
+On x86 a linear sweep can misdecode data embedded in code for a few bytes; ARM64 is exact.
+
+```lua
+img:xrefs_to(va)                          -- { {from, to, kind}, ... }
+img:xrefs_from(va)                        -- what the instruction at va references
+img:import_slot("kernel32!WriteFile")     -- VA of the IAT slot ("WriteFile" and "#12" work too)
+img:xrefs_to_import("kernel32!WriteFile") -- every `ff 15 [slot]` / `ff 25 [slot]` / load of the slot
+
+-- Function starts: .pdata, entry point, TLS callbacks, exports, PDB functions, direct call
+-- targets and (x86/x64) prologue patterns preceded by padding/ret. `end` is exact from .pdata,
+-- otherwise the next known start.
+for _, f in ipairs(img:functions()) do print(hex(f.start), f["end"] and hex(f["end"]), f.name, f.source) end
+```
+
+Debug builds link incrementally, so a call to `f` often lands on an `@ILT` `jmp f` thunk: the
+xref to `f` is then a `"jump"` from the thunk and the real caller is in `img:xrefs_to(thunk)`.
+
+**Emulation without a process** — the file is mapped at its base, the image gets a synthetic
+stack, a zero TEB page, and every IAT slot points at a stub the emulator recognises. Registers
+start at zero except the stack pointer (and `lr` on ARM64); the return address at `[sp]` / in
+`lr` is a sentinel, so a routine emulated from its entry ends with `ReturnedToCaller`.
+
+```lua
+local L = img:emu_layout()      -- { stack_base, stack_top, sp, teb, sentinel, stub_base }
+local v, k = L.sp - 0x200, L.sp - 0x100     -- scratch buffers on the synthetic stack
+local r = img:emulate(enc.va, {
+    max        = 20000,                       -- instruction budget (trace mode) / 3 s (other modes)
+    mode       = "basic",                     -- "basic" | "trace" | "block" | "syscall"
+    regs       = { rcx = v, rdx = k },        -- by name: rax/eax, x0, sp, ...; unset = 0
+    mem_writes = { { v, plaintext }, { k, key } },     -- plant bytes (image or stack)
+    mem_reads  = { { v, 8 } },                -- read back afterwards -> r.memory_snapshots
+    exit       = some_va,                     -- stop when this address is about to execute
+    imports    = "stop",                      -- default: stop at the first import call
+    -- imports = "skip", ret = 0              -- or return `ret` from every import and keep going
+    stack_size = 1024 * 1024,
+})
+print(r.stop_reason)         -- "ReturnedToCaller" | "ImportCall(kernel32!WriteFile@0x4a554f)" |
+                             -- "Syscall(0x..)" | "InstructionLimit" | "UnmappedMemory(0x..)" | ...
+print(hex(r.final_pc), r.regs.rax or r.regs.eax or (r.regs.x and r.regs.x[1]))
+if r.import then print("stopped at", r.import, "returning to", hex(r.return_address)) end
+```
+
+Same result shape as `dbg:emulate` (`final_pc`, `stop_reason`, `time_us`, `trace` in trace
+mode, `basic_blocks`, `memory_snapshots`, `stats`) plus `regs` (final registers in the shape
+`dbg:get_context` uses for the image's architecture — `x` is a 1-based table on ARM64 — so
+`regs(r.regs)` prints them). `instructions_executed` is exact only in `"trace"` mode — the other modes
+run whole translation blocks. `imports = "skip"` is exact on x64/ARM64 (caller cleans the
+stack); on x86 stdcall the callee would have popped its arguments, which cannot be known
+statically, so `esp` ends up low by the argument bytes.
+
 ### Windows Sandbox (`sbx`)
 
 > Requires a build with the `sandbox` feature and Windows 11 24H2+ with the

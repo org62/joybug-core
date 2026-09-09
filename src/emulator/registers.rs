@@ -184,9 +184,10 @@ pub fn write_arm64_registers<D>(
     Err(EmulatorError::RegisterError("ARM64 not supported on this platform".to_string()))
 }
 
-/// Read x64 (or, by its 32-bit names, x86) register by name
-pub fn read_x64_registers<D>(emu: &Unicorn<'_, D>, name: &str) -> Result<u64, EmulatorError> {
-    let reg = match name.to_uppercase().as_str() {
+/// The x86/x64 register named `name` (case-insensitive). Both widths are
+/// listed, so `eax` on an x64 target reads the low half of `rax`.
+fn x86_reg_by_name(name: &str) -> Result<RegisterX86, EmulatorError> {
+    Ok(match name.to_ascii_uppercase().as_str() {
         "RAX" => RegisterX86::RAX,
         "RBX" => RegisterX86::RBX,
         "RCX" => RegisterX86::RCX,
@@ -214,54 +215,103 @@ pub fn read_x64_registers<D>(emu: &Unicorn<'_, D>, name: &str) -> Result<u64, Em
         "EBP" => RegisterX86::EBP,
         "ESP" => RegisterX86::ESP,
         "EIP" => RegisterX86::EIP,
+        "FS_BASE" => RegisterX86::FS_BASE,
+        "GS_BASE" => RegisterX86::GS_BASE,
         _ => return Err(EmulatorError::RegisterError(format!("Unknown register: {}", name))),
-    };
-
-    emu.reg_read(reg)
-        .map_err(|e| EmulatorError::RegisterError(format!("{}: {:?}", name, e)))
+    })
 }
 
-/// Read ARM64 register by name
-pub fn read_arm64_registers<D>(emu: &Unicorn<'_, D>, name: &str) -> Result<u64, EmulatorError> {
-    let reg = match name.to_uppercase().as_str() {
-        "X0" => RegisterARM64::X0,
-        "X1" => RegisterARM64::X1,
-        "X2" => RegisterARM64::X2,
-        "X3" => RegisterARM64::X3,
-        "X4" => RegisterARM64::X4,
-        "X5" => RegisterARM64::X5,
-        "X6" => RegisterARM64::X6,
-        "X7" => RegisterARM64::X7,
-        "X8" => RegisterARM64::X8,
-        "X9" => RegisterARM64::X9,
-        "X10" => RegisterARM64::X10,
-        "X11" => RegisterARM64::X11,
-        "X12" => RegisterARM64::X12,
-        "X13" => RegisterARM64::X13,
-        "X14" => RegisterARM64::X14,
-        "X15" => RegisterARM64::X15,
-        "X16" => RegisterARM64::X16,
-        "X17" => RegisterARM64::X17,
-        "X18" => RegisterARM64::X18,
-        "X19" => RegisterARM64::X19,
-        "X20" => RegisterARM64::X20,
-        "X21" => RegisterARM64::X21,
-        "X22" => RegisterARM64::X22,
-        "X23" => RegisterARM64::X23,
-        "X24" => RegisterARM64::X24,
-        "X25" => RegisterARM64::X25,
-        "X26" => RegisterARM64::X26,
-        "X27" => RegisterARM64::X27,
-        "X28" => RegisterARM64::X28,
+/// The ARM64 register named `name` (case-insensitive): `x0`..`x30`, `fp`,
+/// `lr`, `sp`, `pc`, `nzcv`/`cpsr`.
+fn arm64_reg_by_name(name: &str) -> Result<RegisterARM64, EmulatorError> {
+    Ok(match name.to_ascii_uppercase().as_str() {
+        "X0" => RegisterARM64::X0, "X1" => RegisterARM64::X1, "X2" => RegisterARM64::X2,
+        "X3" => RegisterARM64::X3, "X4" => RegisterARM64::X4, "X5" => RegisterARM64::X5,
+        "X6" => RegisterARM64::X6, "X7" => RegisterARM64::X7, "X8" => RegisterARM64::X8,
+        "X9" => RegisterARM64::X9, "X10" => RegisterARM64::X10, "X11" => RegisterARM64::X11,
+        "X12" => RegisterARM64::X12, "X13" => RegisterARM64::X13, "X14" => RegisterARM64::X14,
+        "X15" => RegisterARM64::X15, "X16" => RegisterARM64::X16, "X17" => RegisterARM64::X17,
+        "X18" => RegisterARM64::X18, "X19" => RegisterARM64::X19, "X20" => RegisterARM64::X20,
+        "X21" => RegisterARM64::X21, "X22" => RegisterARM64::X22, "X23" => RegisterARM64::X23,
+        "X24" => RegisterARM64::X24, "X25" => RegisterARM64::X25, "X26" => RegisterARM64::X26,
+        "X27" => RegisterARM64::X27, "X28" => RegisterARM64::X28,
         "X29" | "FP" => RegisterARM64::X29,
         "X30" | "LR" => RegisterARM64::X30,
         "SP" => RegisterARM64::SP,
         "PC" => RegisterARM64::PC,
         "NZCV" | "CPSR" => RegisterARM64::NZCV,
         _ => return Err(EmulatorError::RegisterError(format!("Unknown register: {}", name))),
-    };
+    })
+}
 
-    emu.reg_read(reg)
+/// The 32-bit half of a 64-bit general register (`RAX` -> `EAX`); other
+/// registers map to themselves.
+fn narrow_to_32(reg: RegisterX86) -> RegisterX86 {
+    match reg {
+        RegisterX86::RAX => RegisterX86::EAX,
+        RegisterX86::RBX => RegisterX86::EBX,
+        RegisterX86::RCX => RegisterX86::ECX,
+        RegisterX86::RDX => RegisterX86::EDX,
+        RegisterX86::RSI => RegisterX86::ESI,
+        RegisterX86::RDI => RegisterX86::EDI,
+        RegisterX86::RBP => RegisterX86::EBP,
+        RegisterX86::RSP => RegisterX86::ESP,
+        RegisterX86::RIP => RegisterX86::EIP,
+        other => other,
+    }
+}
+
+/// The 64-bit register a 32-bit name aliases (`EAX` -> `RAX`); other
+/// registers map to themselves.
+fn widen_to_64(reg: RegisterX86) -> RegisterX86 {
+    match reg {
+        RegisterX86::EAX => RegisterX86::RAX,
+        RegisterX86::EBX => RegisterX86::RBX,
+        RegisterX86::ECX => RegisterX86::RCX,
+        RegisterX86::EDX => RegisterX86::RDX,
+        RegisterX86::ESI => RegisterX86::RSI,
+        RegisterX86::EDI => RegisterX86::RDI,
+        RegisterX86::EBP => RegisterX86::RBP,
+        RegisterX86::ESP => RegisterX86::RSP,
+        RegisterX86::EIP => RegisterX86::RIP,
+        other => other,
+    }
+}
+
+/// Read x64 (or, by its 32-bit names, x86) register by name
+pub fn read_x64_registers<D>(emu: &Unicorn<'_, D>, name: &str) -> Result<u64, EmulatorError> {
+    emu.reg_read(x86_reg_by_name(name)?)
         .map_err(|e| EmulatorError::RegisterError(format!("{}: {:?}", name, e)))
 }
 
+/// Read ARM64 register by name
+pub fn read_arm64_registers<D>(emu: &Unicorn<'_, D>, name: &str) -> Result<u64, EmulatorError> {
+    emu.reg_read(arm64_reg_by_name(name)?)
+        .map_err(|e| EmulatorError::RegisterError(format!("{}: {:?}", name, e)))
+}
+
+/// Write a register by name for any architecture — the initial state of a
+/// process-less emulation, where there is no `CONTEXT` to copy from. Names are
+/// case-insensitive: `rax`/`eax`, `rip`/`eip`, `rflags`/`eflags`, `x0`..`x30`,
+/// `fp`, `lr`, `sp`, `pc`, `nzcv`. Host-independent: Unicorn emulates every
+/// architecture everywhere.
+///
+/// A name of the "wrong" width aliases to the target's register: on an x64
+/// target `eax` writes the whole of `rax`; on an x86 target `rsp` writes
+/// `esp`, truncated. (A Mode32 Unicorn only implements the 32-bit register
+/// ids — writing `RSP` there is a silent no-op, leaving the stack pointer at
+/// 0 so the first push faults at 0xFFFFFFFC.)
+pub fn write_register_by_name<D>(
+    emu: &mut Unicorn<'_, D>,
+    arch: crate::interfaces::Architecture,
+    name: &str,
+    value: u64,
+) -> Result<(), EmulatorError> {
+    use crate::interfaces::Architecture;
+    let res = match arch {
+        Architecture::X86 => emu.reg_write(narrow_to_32(x86_reg_by_name(name)?), value & 0xFFFF_FFFF),
+        Architecture::X64 => emu.reg_write(widen_to_64(x86_reg_by_name(name)?), value),
+        Architecture::Arm64 => emu.reg_write(arm64_reg_by_name(name)?, value),
+    };
+    res.map_err(|e| EmulatorError::RegisterError(format!("{}: {:?}", name, e)))
+}

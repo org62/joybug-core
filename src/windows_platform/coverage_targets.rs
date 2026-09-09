@@ -574,7 +574,7 @@ fn classify_code_start(
 /// unnamed function start with the nearest symbol *below* it would attribute it
 /// to the previous function — worse than admitting the address has no name and
 /// letting the caller fall back to `sub_<addr>`.
-fn name_for(symbols: &[ModuleSymbol], rva: u32) -> Option<String> {
+pub(crate) fn name_for(symbols: &[ModuleSymbol], rva: u32) -> Option<String> {
     let idx = symbols.partition_point(|s| s.rva <= rva);
     let symbol = symbols.get(idx.checked_sub(1)?)?;
     (symbol.rva == rva).then(|| symbol.name.clone())

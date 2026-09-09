@@ -144,7 +144,7 @@ impl DebugClient {
                 // Extract just the filename from the full path
                 let module_name = module.rsplit(&['\\', '/'][..]).next().unwrap_or(&module);
                 // Strip extension
-                let module_short = module_name.rsplit_once('.').map(|(n, _)| n).unwrap_or(module_name);
+                let module_short = crate::formatting::dll_stem(module_name);
                 let off = offset.unwrap_or(0);
                 if off == 0 {
                     return format!("{}!{}", module_short, sym.name);
@@ -716,5 +716,109 @@ pub fn deref_entry_to_lua_table(lua: &Lua, entry: &DereferenceEntry) -> mlua::Re
         chain.set(i + 1, val_table)?;
     }
     table.set("chain", chain)?;
+    Ok(table)
+}
+
+/// The Lua spelling of an instruction set: "x86" (WOW64), "x64" or "arm64".
+pub fn arch_name(arch: crate::interfaces::Architecture) -> &'static str {
+    use crate::interfaces::Architecture;
+    match arch {
+        Architecture::X86 => "x86",
+        Architecture::X64 => "x64",
+        Architecture::Arm64 => "arm64",
+    }
+}
+
+/// `mem_reads` option of the emulate calls: a list of `{addr, size}` or
+/// `{address=, size=}` entries.
+pub fn memory_reads_from_lua(tbl: Option<&LuaTable>) -> mlua::Result<Vec<(u64, usize)>> {
+    let mut reads = Vec::new();
+    if let Some(tbl) = tbl {
+        for i in 1..=tbl.raw_len() {
+            let entry: LuaTable = tbl.get(i)?;
+            let addr: u64 = entry.get(1).or_else(|_| entry.get("address"))?;
+            let size: usize = entry.get(2).or_else(|_| entry.get("size"))?;
+            reads.push((addr, size));
+        }
+    }
+    Ok(reads)
+}
+
+/// The result table every emulate call returns (`dbg:emulate`, `img:emulate`):
+/// `final_pc`, `instructions_executed`, `stop_reason`, `time_us`,
+/// `pages_loaded`, `stats`, and — when non-empty — `basic_blocks` and
+/// `memory_snapshots = { {address, data}, ... }`.
+#[allow(clippy::too_many_arguments)]
+pub fn emulation_result_to_lua_table(
+    lua: &Lua,
+    final_pc: u64,
+    instructions_executed: usize,
+    stop_reason: &str,
+    time_us: u64,
+    pages_loaded: usize,
+    stats: &str,
+    basic_blocks: &[u64],
+    memory_snapshots: &[(u64, Vec<u8>)],
+) -> mlua::Result<LuaTable> {
+    let table = lua.create_table()?;
+    table.set("final_pc", final_pc)?;
+    table.set("instructions_executed", instructions_executed as u64)?;
+    table.set("stop_reason", stop_reason)?;
+    table.set("time_us", time_us)?;
+    table.set("pages_loaded", pages_loaded as u64)?;
+    table.set("stats", stats)?;
+    if !basic_blocks.is_empty() {
+        let bb = lua.create_table()?;
+        for (i, addr) in basic_blocks.iter().enumerate() {
+            bb.set(i + 1, *addr)?;
+        }
+        table.set("basic_blocks", bb)?;
+    }
+    if !memory_snapshots.is_empty() {
+        let snaps = lua.create_table()?;
+        for (i, (addr, data)) in memory_snapshots.iter().enumerate() {
+            let snap = lua.create_table()?;
+            snap.set("address", *addr)?;
+            snap.set("data", lua.create_string(data)?)?;
+            snaps.set(i + 1, snap)?;
+        }
+        table.set("memory_snapshots", snaps)?;
+    }
+    Ok(table)
+}
+
+/// A register file as a Lua table with the same keys `context_to_lua_table`
+/// uses for the architecture — so `regs(t)` and friends read it — named for
+/// `arch` (an x86 target reports `eax`..`eip`, not the x64 shape it travels in).
+pub fn register_snapshot_to_lua_table(lua: &Lua, regs: &RegisterSnapshot, arch: crate::interfaces::Architecture) -> mlua::Result<LuaTable> {
+    use crate::interfaces::Architecture;
+    let table = lua.create_table()?;
+    match regs {
+        RegisterSnapshot::X64(r) if arch == Architecture::X86 => {
+            for (n, v) in [("eax", r.rax), ("ebx", r.rbx), ("ecx", r.rcx), ("edx", r.rdx), ("esi", r.rsi), ("edi", r.rdi),
+                           ("ebp", r.rbp), ("esp", r.rsp), ("eip", r.rip), ("eflags", r.rflags)] {
+                table.set(n, v)?;
+            }
+        }
+        RegisterSnapshot::X64(r) => {
+            for (n, v) in [("rax", r.rax), ("rbx", r.rbx), ("rcx", r.rcx), ("rdx", r.rdx), ("rsi", r.rsi), ("rdi", r.rdi),
+                           ("rbp", r.rbp), ("rsp", r.rsp), ("r8", r.r8), ("r9", r.r9), ("r10", r.r10), ("r11", r.r11),
+                           ("r12", r.r12), ("r13", r.r13), ("r14", r.r14), ("r15", r.r15), ("rip", r.rip), ("rflags", r.rflags)] {
+                table.set(n, v)?;
+            }
+        }
+        RegisterSnapshot::Arm64(r) => {
+            let x_table = lua.create_table()?;
+            for (i, v) in r.x.iter().enumerate() {
+                x_table.set(i + 1, *v)?; // Lua 1-based, like context_to_lua_table
+            }
+            table.set("x", x_table)?;
+            table.set("fp", r.fp)?;
+            table.set("lr", r.lr)?;
+            table.set("sp", r.sp)?;
+            table.set("pc", r.pc)?;
+            table.set("cpsr", r.cpsr)?;
+        }
+    }
     Ok(table)
 }

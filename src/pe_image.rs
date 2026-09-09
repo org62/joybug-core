@@ -20,8 +20,11 @@ use std::path::Path;
 use pelite::pe64::{Pe, PeFile};
 use tracing::{debug, warn};
 
-const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
-const IMAGE_REL_BASED_DIR64: u8 = 10;
+pub(crate) const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+pub(crate) const IMAGE_SCN_MEM_READ: u32 = 0x4000_0000;
+pub(crate) const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+pub(crate) const IMAGE_REL_BASED_HIGHLOW: u8 = 3;
+pub(crate) const IMAGE_REL_BASED_DIR64: u8 = 10;
 
 /// A section's file/virtual-address mapping, parsed from a PE's section headers.
 pub struct SectionMap {

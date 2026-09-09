@@ -7,176 +7,45 @@ use unicorn_engine::unicorn_const::uc_error;
 use unicorn_engine::RegisterX86;
 
 use crate::interfaces::Architecture;
-use crate::interfaces::PlatformAPI;
 use crate::protocol::{EmulationMode, MemoryAccess, MemoryAccessType};
 
-use super::Emulator;
-use super::types::{StopReason, EmulationResult, format_symbol_with_offset};
+use super::{Emulator, ImportPolicy};
+use super::target::{EmuTarget, FetchIntercept};
+use super::types::{StopReason, EmulationResult};
 use super::error::EmulatorError;
 
+/// What the execution loop should do after an unmapped fetch was examined.
+enum FetchOutcome {
+    /// Not a synthetic address; fall through to the normal page loader.
+    NotIntercepted,
+    /// Handled (the import was skipped); keep emulating.
+    Continue,
+    /// Emulation is over.
+    Stop(StopReason),
+}
+
 impl<'a> Emulator<'a> {
-    /// Emulate up to max_instructions (simple loop, no mode-specific hooks)
-    pub fn emulate_instructions<P: PlatformAPI>(
-        &mut self,
-        platform: &P,
-        max_instructions: usize,
-    ) -> Result<EmulationResult, EmulatorError> {
-        use std::time::Instant;
-        let start_time = Instant::now();
-
-        let start_pc = self.get_pc()?;
-        let mut instructions_executed = 0;
-        let mut stop_reason = StopReason::InstructionLimit;
-
-        let pages_before = {
-            let state = self.shared_state.read().unwrap();
-            state.mapped_regions.len()
-        };
-
-        // Clear previous state
-        {
-            let mut state = self.shared_state.write().unwrap();
-            state.basic_blocks.clear();
-            state.basic_blocks.push(start_pc);
-            state.pending_memory_fault = None;
-            state.module_transition = None;
-            state.stop_requested = false;
-            state.last_instruction_addr = None;
-            state.last_instruction_size = None;
-            state.instruction_trace.clear();
-            state.register_trace.clear();
-            state.memory_trace.clear();
-            state.pending_write_ops.clear();
-            state.retrying_after_fault = false;
+    /// Classify an unmapped fetch at `addr` against the target's synthetic
+    /// addresses (import stubs, the return sentinel) and apply the import
+    /// policy. Both loops call this before trying to page `addr` in.
+    fn handle_fetch_intercept<T: EmuTarget>(&mut self, target: &T, addr: u64) -> FetchOutcome {
+        match target.intercept_fetch(addr) {
+            None => FetchOutcome::NotIntercepted,
+            Some(FetchIntercept::ReturnSentinel) => FetchOutcome::Stop(StopReason::ReturnedToCaller),
+            Some(FetchIntercept::Import(name)) => match self.import_policy {
+                ImportPolicy::Stop => {
+                    let from = self.return_address().unwrap_or(0);
+                    FetchOutcome::Stop(StopReason::ImportCall { name, from })
+                }
+                ImportPolicy::Skip { value } => match self.return_to_caller(value) {
+                    Ok(()) => {
+                        tracing::debug!("skipped import {} -> returned to 0x{:X}", name, self.get_pc().unwrap_or(0));
+                        FetchOutcome::Continue
+                    }
+                    Err(e) => FetchOutcome::Stop(StopReason::Error(format!("skip {}: {}", name, e))),
+                },
+            },
         }
-
-        // Pre-load initial code and stack regions
-        self.load_memory_region(platform, start_pc)?;
-        let sp = self.get_sp()?;
-        let _ = self.load_memory_region(platform, sp);
-
-        for _ in 0..max_instructions {
-            let pc_before = self.get_pc()?;
-
-            {
-                let mut state = self.shared_state.write().unwrap();
-                state.pending_memory_fault = None;
-            }
-
-            match self.emu.emu_start(pc_before, u64::MAX, 0, 1) {
-                Ok(()) => {
-                    instructions_executed += 1;
-                }
-                Err(err @ (uc_error::READ_UNMAPPED | uc_error::FETCH_UNMAPPED | uc_error::WRITE_UNMAPPED)) => {
-                    let pc_after = self.get_pc().unwrap_or(pc_before);
-                    if pc_after != pc_before {
-                        instructions_executed += 1;
-                    }
-
-                    let fault_addr = {
-                        let state = self.shared_state.read().unwrap();
-                        state.pending_memory_fault
-                    };
-
-                    if let Some(addr) = fault_addr {
-                        match self.load_memory_region(platform, addr) {
-                            Ok(()) => {
-                                if pc_after != pc_before {
-                                    continue;
-                                }
-                                continue;
-                            }
-                            Err(_) => {
-                                if self.try_pac_fetch_recovery(platform, addr, err == uc_error::FETCH_UNMAPPED) {
-                                    continue;
-                                }
-                                stop_reason = StopReason::UnmappedMemory(addr);
-                                break;
-                            }
-                        }
-                    } else {
-                        let sp = self.get_sp().unwrap_or(0);
-                        let _ = self.load_memory_region(platform, pc_after);
-                        if sp > 0 {
-                            let _ = self.load_memory_region(platform, sp);
-                            if sp >= 0x1000 {
-                                let _ = self.load_memory_region(platform, sp - 0x1000);
-                            }
-                        }
-                        if pc_after != pc_before {
-                            continue;
-                        }
-                        match self.emu.emu_start(pc_before, u64::MAX, 0, 1) {
-                            Ok(()) => {
-                                instructions_executed += 1;
-                            }
-                            Err(_e) => {
-                                stop_reason = StopReason::UnmappedMemory(pc_before);
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(uc_error::EXCEPTION) => {
-                    let pc_after = self.get_pc().unwrap_or(pc_before);
-                    if pc_after != pc_before {
-                        instructions_executed += 1;
-                        let _ = self.load_memory_region(platform, pc_after);
-                        let sp = self.get_sp().unwrap_or(0);
-                        if sp >= 0x1000 {
-                            let _ = self.load_memory_region(platform, sp - 0x1000);
-                        }
-                        continue;
-                    }
-                    let sp = self.get_sp().unwrap_or(0);
-                    if sp >= 0x1000 {
-                        let _ = self.load_memory_region(platform, sp - 0x1000);
-                    }
-                    match self.emu.emu_start(pc_before, u64::MAX, 0, 1) {
-                        Ok(()) => {
-                            instructions_executed += 1;
-                        }
-                        Err(e) => {
-                            stop_reason = StopReason::Error(format!("{:?}", e));
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    let pc_after = self.get_pc().unwrap_or(pc_before);
-                    if pc_after != pc_before {
-                        instructions_executed += 1;
-                    }
-                    stop_reason = StopReason::Error(format!("{:?}", e));
-                    break;
-                }
-            }
-
-            // Check for module transition
-            {
-                let state = self.shared_state.read().unwrap();
-                if let Some((from, to, addr)) = &state.module_transition {
-                    let symbol = platform.resolve_address_to_symbol(self.pid, *addr)
-                        .ok()
-                        .flatten()
-                        .map(|(_, sym, offset)| format_symbol_with_offset(sym, offset));
-                    stop_reason = StopReason::ModuleTransition {
-                        from: from.clone(),
-                        to: to.clone(),
-                        address: *addr,
-                        symbol,
-                    };
-                    break;
-                }
-                if state.stop_requested {
-                    stop_reason = StopReason::Stopped;
-                    break;
-                }
-            }
-        }
-
-        let emulation_time_us = start_time.elapsed().as_micros() as u64;
-        self.build_result(instructions_executed, stop_reason, emulation_time_us, pages_before, String::new(), &[])
     }
 
     /// Emulate with a specific mode that determines which hooks are installed
@@ -187,9 +56,9 @@ impl<'a> Emulator<'a> {
     /// - BasicBlock: BLOCK hook records basic block starts
     /// - ModuleTransition: Stop when execution moves to a different module
     /// - Syscall: Stop on first syscall instruction
-    pub fn emulate_with_mode<P: PlatformAPI>(
+    pub fn emulate_with_mode<T: EmuTarget>(
         &mut self,
-        platform: &P,
+        target: &T,
         max_instructions: usize,
         mode: EmulationMode,
         exit_condition: Option<crate::protocol::TraceExitCondition>,
@@ -242,9 +111,9 @@ impl<'a> Emulator<'a> {
 
         // Pre-load initial code and stack regions
         let preload_start = std::time::Instant::now();
-        self.load_memory_region(platform, start_pc)?;
+        self.load_memory_region(target, start_pc)?;
         let sp = self.get_sp()?;
-        let _ = self.load_memory_region(platform, sp);
+        let _ = self.load_memory_region(target, sp);
         let preload_us = preload_start.elapsed().as_micros() as u64;
         let preload_pages = {
             let state = self.shared_state.read().unwrap();
@@ -388,6 +257,19 @@ impl<'a> Emulator<'a> {
                     };
 
                     if let Some(addr) = fault_addr {
+                        // Synthetic addresses (import stubs, the return
+                        // sentinel) are never pageable — classify them first.
+                        if err == uc_error::FETCH_UNMAPPED {
+                            match self.handle_fetch_intercept(target, addr) {
+                                FetchOutcome::NotIntercepted => {}
+                                FetchOutcome::Continue => continue,
+                                FetchOutcome::Stop(reason) => {
+                                    stop_reason = reason;
+                                    break;
+                                }
+                            }
+                        }
+
                         // For ModuleTransition mode, check if we're loading from a different module
                         if mode == EmulationMode::ModuleTransition {
                             let transition = {
@@ -408,17 +290,14 @@ impl<'a> Emulator<'a> {
                             };
 
                             if let Some((from, to, at_addr)) = transition {
-                                let symbol = platform.resolve_address_to_symbol(self.pid, at_addr)
-                                    .ok()
-                                    .flatten()
-                                    .map(|(_, sym, offset)| format_symbol_with_offset(sym, offset));
+                                let symbol = target.symbolize(at_addr);
                                 stop_reason = StopReason::ModuleTransition { from, to, address: at_addr, symbol };
                                 break;
                             }
                         }
 
                         let load_start = std::time::Instant::now();
-                        match self.load_memory_region(platform, addr) {
+                        match self.load_memory_region(target, addr) {
                             Ok(()) => {
                                 page_load_time_us += load_start.elapsed().as_micros() as u64;
                                 page_load_count += 1;
@@ -426,7 +305,7 @@ impl<'a> Emulator<'a> {
                             }
                             Err(_) => {
                                 page_load_time_us += load_start.elapsed().as_micros() as u64;
-                                if self.try_pac_fetch_recovery(platform, addr, err == uc_error::FETCH_UNMAPPED) {
+                                if self.try_pac_fetch_recovery(target, addr, err == uc_error::FETCH_UNMAPPED) {
                                     continue;
                                 }
                                 stop_reason = StopReason::UnmappedMemory(addr);
@@ -436,9 +315,9 @@ impl<'a> Emulator<'a> {
                     } else {
                         let load_start = std::time::Instant::now();
                         let sp = self.get_sp().unwrap_or(0);
-                        let _ = self.load_memory_region(platform, pc_after);
+                        let _ = self.load_memory_region(target, pc_after);
                         if sp > 0 && sp >= 0x1000 {
-                            let _ = self.load_memory_region(platform, sp - 0x1000);
+                            let _ = self.load_memory_region(target, sp - 0x1000);
                         }
                         page_load_time_us += load_start.elapsed().as_micros() as u64;
                         page_load_count += 1;
@@ -493,7 +372,7 @@ impl<'a> Emulator<'a> {
                             instructions_executed = traced;
                             remaining = remaining.saturating_sub(delta);
                         }
-                        let _ = self.load_memory_region(platform, pc_after);
+                        let _ = self.load_memory_region(target, pc_after);
                         continue;
                     }
 
@@ -505,7 +384,7 @@ impl<'a> Emulator<'a> {
                         break;
                     }
                     // PC didn't move - this is a real exception
-                    self.log_exception_details(platform, pc_before);
+                    self.log_exception_details(target, pc_before);
                     stop_reason = StopReason::Error("EXCEPTION".into());
                     break;
                 }
@@ -573,7 +452,7 @@ impl<'a> Emulator<'a> {
     }
 
     /// Log detailed diagnostics for a CPU exception (PC didn't move).
-    fn log_exception_details<P: PlatformAPI>(&self, platform: &P, pc: u64) {
+    fn log_exception_details<T: EmuTarget>(&self, target: &T, pc: u64) {
         let fault_addr = {
             let state = self.shared_state.read().unwrap();
             state.pending_memory_fault
@@ -612,13 +491,11 @@ impl<'a> Emulator<'a> {
             rflags
         );
 
-        if let Ok(insns) = platform.disassemble_memory(self.pid, pc, 1, self.architecture) {
-            if let Some(insn) = insns.first() {
-                tracing::warn!(
-                    "Faulting instruction: {} {}",
-                    insn.mnemonic, insn.op_str
-                );
-            }
+        if let Some(insn) = target.disassemble_one(pc) {
+            tracing::warn!(
+                "Faulting instruction: {} {}",
+                insn.mnemonic, insn.op_str
+            );
         }
 
         let rdi_page = rdi & !0xFFF;
@@ -635,17 +512,17 @@ impl<'a> Emulator<'a> {
         }
 
         if rdi != 0 {
-            match platform.query_memory_region(self.pid, rdi) {
-                Ok(region) => {
+            match target.region(rdi) {
+                Some(region) => {
                     tracing::warn!(
-                        "RDI 0x{:X} in real process: base=0x{:X} size=0x{:X} prot={} state={}",
-                        rdi, region.base_address, region.region_size,
-                        Self::prot_to_str(Self::windows_protect_to_unicorn(region.protect)),
-                        Self::state_to_str(region.state)
+                        "RDI 0x{:X} in target: base=0x{:X} size=0x{:X} prot={} committed={}",
+                        rdi, region.base, region.size,
+                        Self::prot_to_str(region.prot),
+                        region.committed
                     );
                 }
-                Err(e) => {
-                    tracing::warn!("RDI 0x{:X} query failed: {}", rdi, e);
+                None => {
+                    tracing::warn!("RDI 0x{:X} is not mapped in the target", rdi);
                 }
             }
         }

@@ -9,6 +9,22 @@ pub fn module_basename_lower(path: &str) -> String {
     path.rsplit(['\\', '/']).next().unwrap_or(path).to_lowercase()
 }
 
+/// File stem of a module path, the way symbols are qualified
+/// ("C:\\x\\kernel32.dll" -> "kernel32"). Falls back to the input unchanged.
+pub fn module_stem(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path)
+        .to_string()
+}
+
+/// An import descriptor's DLL name without its extension ("KERNEL32.dll" ->
+/// "KERNEL32"), the form `dll!func` specs use.
+pub fn dll_stem(dll_name: &str) -> &str {
+    dll_name.rsplit_once('.').map(|(s, _)| s).unwrap_or(dll_name)
+}
+
 // Memory region formatting utilities
 #[cfg(windows)]
 pub mod memory {

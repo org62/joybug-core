@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use unicorn_engine::{RegisterARM64, RegisterX86, Unicorn};
 
-use crate::interfaces::{Architecture, ModuleSymbol};
+use crate::interfaces::Architecture;
 use crate::protocol::{Arm64RegisterSnapshot, MemoryAccess, RegisterSnapshot, X64RegisterSnapshot};
 
 /// Memory region info for lazy loading
@@ -16,7 +16,7 @@ pub(super) struct MappedRegion {
 
 /// Module boundary info for transition detection
 #[derive(Debug, Clone)]
-pub(super) struct ModuleBoundary {
+pub struct ModuleBoundary {
     pub name: String,
     pub base: u64,
     pub end: u64,
@@ -47,6 +47,8 @@ pub struct EmulationResult {
     pub stats_text: String,
     /// Memory snapshots read from emulator state after execution
     pub memory_snapshots: Vec<(u64, Vec<u8>)>,
+    /// The register file when emulation stopped.
+    pub final_registers: RegisterSnapshot,
 }
 
 /// Why emulation stopped
@@ -70,6 +72,13 @@ pub enum StopReason {
     Stopped,
     /// Reached specified exit address
     ReachedAddress(u64),
+    /// Emulated code called an import through its IAT (process-less targets
+    /// only): `name` is `dll!function`, `from` the address that would execute
+    /// next in the caller (the return address).
+    ImportCall { name: String, from: u64 },
+    /// The emulated routine returned past its entry frame (process-less
+    /// targets plant a sentinel return address under the initial stack pointer).
+    ReturnedToCaller,
 }
 
 impl std::fmt::Display for StopReason {
@@ -89,6 +98,8 @@ impl std::fmt::Display for StopReason {
             StopReason::Syscall { address } => write!(f, "Syscall(0x{:X})", address),
             StopReason::Stopped => write!(f, "Stopped"),
             StopReason::ReachedAddress(addr) => write!(f, "ReachedAddress(0x{:X})", addr),
+            StopReason::ImportCall { name, from } => write!(f, "ImportCall({}@0x{:X})", name, from),
+            StopReason::ReturnedToCaller => write!(f, "ReturnedToCaller"),
         }
     }
 }
@@ -147,14 +158,26 @@ impl EmulatorSharedState {
             retrying_after_fault: false,
         }
     }
+
+    /// Record `[base, base+size)` as mapped, one entry per page, so the
+    /// on-demand loader never tries to map it again.
+    pub fn note_mapped(&mut self, base: u64, size: u64) {
+        const PAGE_SIZE: u64 = 0x1000;
+        let mut page = base & !(PAGE_SIZE - 1);
+        let end = base.saturating_add(size);
+        while page < end {
+            self.mapped_regions.insert(page, MappedRegion { base: page, size: PAGE_SIZE });
+            page += PAGE_SIZE;
+        }
+    }
 }
 
 /// Format a symbol with optional offset as a string
-pub(super) fn format_symbol_with_offset(sym: ModuleSymbol, offset: u64) -> String {
+pub(crate) fn format_symbol_with_offset(name: &str, offset: u64) -> String {
     if offset == 0 {
-        sym.name
+        name.to_string()
     } else {
-        format!("{}+0x{:x}", sym.name, offset)
+        format!("{}+0x{:x}", name, offset)
     }
 }
 

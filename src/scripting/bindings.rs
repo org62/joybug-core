@@ -1208,11 +1208,7 @@ impl LuaUserData for LuaDebugClient {
 
         // Instruction-set architecture of the debuggee: "x86" (WOW64), "x64" or "arm64".
         methods.add_method("arch", |_lua, this, pid: u32| {
-            Ok(match process_arch(&mut this.inner.borrow_mut(), pid)? {
-                Architecture::X86 => "x86",
-                Architecture::X64 => "x64",
-                Architecture::Arm64 => "arm64",
-            }.to_string())
+            Ok(arch_name(process_arch(&mut this.inner.borrow_mut(), pid)?))
         });
 
         methods.add_method("list_threads", |lua, this, pid: u32| {
@@ -1453,32 +1449,10 @@ impl LuaUserData for LuaDebugClient {
 
         methods.add_method("emulate", |lua, this, (pid, tid, max, mode_str, exit_addr, mem_reads_tbl): (u32, u32, Option<usize>, Option<String>, Option<u64>, Option<LuaTable>)| {
             let mut client = this.inner.borrow_mut();
-            let mode = match mode_str.as_deref().unwrap_or("basic") {
-                "basic" => EmulationMode::Basic,
-                "trace" => EmulationMode::InstructionTrace,
-                "block" => EmulationMode::BasicBlock,
-                "module" => EmulationMode::ModuleTransition,
-                "syscall" => EmulationMode::Syscall,
-                s => return Err(mlua::Error::external(
-                    anyhow::anyhow!("Invalid emulation mode: '{}'", s),
-                )),
-            };
+            let mode: EmulationMode = mode_str.as_deref().unwrap_or("basic").parse()
+                .map_err(|e: String| mlua::Error::external(anyhow::anyhow!(e)))?;
             let exit_condition = exit_addr.map(TraceExitCondition::ReachAddress);
-
-            // Parse memory_reads: table of {address, size} pairs
-            let memory_reads = if let Some(tbl) = mem_reads_tbl {
-                let mut reads = Vec::new();
-                for i in 1..=tbl.raw_len() {
-                    if let Ok(entry) = tbl.get::<LuaTable>(i) {
-                        let addr: u64 = entry.get(1).or_else(|_| entry.get("address"))?;
-                        let size: usize = entry.get(2).or_else(|_| entry.get("size"))?;
-                        reads.push((addr, size));
-                    }
-                }
-                reads
-            } else {
-                vec![]
-            };
+            let memory_reads = memory_reads_from_lua(mem_reads_tbl.as_ref())?;
 
             let resp = client.send_and_receive(&DebuggerRequest::EmulateInstructions {
                 pid, tid,
@@ -1497,31 +1471,10 @@ impl LuaUserData for LuaDebugClient {
                     Ok(table)
                 }
                 DebuggerResponse::EmulationResult { final_pc, instructions_executed, stop_reason, emulation_time_us, pages_loaded, basic_blocks, stats_text, memory_snapshots } => {
-                    let table = lua.create_table()?;
-                    table.set("final_pc", final_pc)?;
-                    table.set("instructions_executed", instructions_executed as u64)?;
-                    table.set("stop_reason", stop_reason)?;
-                    table.set("time_us", emulation_time_us)?;
-                    table.set("pages_loaded", pages_loaded as u64)?;
-                    table.set("stats", stats_text)?;
-                    if !basic_blocks.is_empty() {
-                        let bb = lua.create_table()?;
-                        for (i, addr) in basic_blocks.iter().enumerate() {
-                            bb.set(i + 1, *addr)?;
-                        }
-                        table.set("basic_blocks", bb)?;
-                    }
-                    if !memory_snapshots.is_empty() {
-                        let snaps = lua.create_table()?;
-                        for (i, (addr, data)) in memory_snapshots.iter().enumerate() {
-                            let snap = lua.create_table()?;
-                            snap.set("address", *addr)?;
-                            snap.set("data", lua.create_string(data)?)?;
-                            snaps.set(i + 1, snap)?;
-                        }
-                        table.set("memory_snapshots", snaps)?;
-                    }
-                    Ok(table)
+                    emulation_result_to_lua_table(
+                        lua, final_pc, instructions_executed, &stop_reason, emulation_time_us, pages_loaded,
+                        &stats_text, &basic_blocks, &memory_snapshots,
+                    )
                 }
                 DebuggerResponse::Error { message } => Err(mlua::Error::external(
                     anyhow::anyhow!("Emulate failed: {}", message),
@@ -2178,15 +2131,12 @@ impl LuaUserData for LuaDebugClient {
         // `remove_breakpoint`) points the slot back at the target.
         methods.add_method("set_breakpoint_import", |lua, this, (pid, spec, handler): (u32, String, Option<LuaFunction>)| {
             let mut client = this.inner.borrow_mut();
-            let (dll_filter, func_name) = match spec.split_once('!') {
-                Some((d, f)) => (Some(d), f),
-                None => (None, spec.as_str()),
-            };
+            let (dll_filter, func_name) = crate::pe_types::split_import_spec(&spec);
             let base = main_module_base(&mut client, pid)?;
             let arch = process_arch(&mut client, pid)?;
             let ptr_size = arch.pointer_size();
             let info = module_extra_info(&mut client, pid, base)?;
-            let iat_va = find_import_slot(&info, dll_filter, func_name)
+            let iat_va = info.find_import_slot(dll_filter, func_name)
                 .map(|rva| base + rva as u64)
                 .ok_or_else(|| mlua::Error::external(
                     anyhow::anyhow!("import {spec:?} not found in the debuggee's import table"),
@@ -2324,23 +2274,6 @@ fn remove_sw_breakpoint(client: &mut DebugClient, pid: u32, addr: u64) {
     if let Some(hook) = client.import_hooks.remove(&addr) {
         let _ = write_bytes(client, pid, hook.iat_va, &hook.target.to_le_bytes()[..hook.ptr_size]);
     }
-}
-
-/// The RVA of the IAT slot importing `func` (case-insensitive), optionally only
-/// from a DLL matching `dll` ("kernel32" matches "KERNEL32.dll").
-fn find_import_slot(info: &ModuleExtraInfo, dll: Option<&str>, func: &str) -> Option<u32> {
-    info.imports
-        .iter()
-        .filter(|desc| {
-            dll.is_none_or(|want| {
-                let stem = desc.dll_name.rsplit_once('.').map(|(s, _)| s).unwrap_or(&desc.dll_name);
-                stem.eq_ignore_ascii_case(want) || desc.dll_name.eq_ignore_ascii_case(want)
-            })
-        })
-        .flat_map(|desc| &desc.entries)
-        .find(|entry| matches!(&entry.kind,
-            ImportKind::Item(ImportItem::ByName { name, .. }) if name.eq_ignore_ascii_case(func)))
-        .map(|entry| entry.iat_rva)
 }
 
 /// The current contents of one import descriptor's IAT slots, read in one

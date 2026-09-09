@@ -13,6 +13,8 @@ pub mod etw;
 /// In-process Windows Sandbox bindings (`sbx` global). Behind the `sandbox`
 /// feature so the default build never pulls the winsandbox/`windows` deps.
 pub mod sbx;
+/// Offline PE analysis bindings (`pe` global).
+pub mod pe;
 
 use mlua::{FromLua, Lua, Table as LuaTable};
 
@@ -52,6 +54,9 @@ pub fn create_lua() -> mlua::Result<Lua> {
 
     // Register the in-process Windows Sandbox table (sbx.provision, etc.).
     sbx::register_sbx_functions(&lua)?;
+
+    // Register the offline PE table (pe.open -> image object).
+    pe::register_pe_functions(&lua)?;
 
     Ok(lua)
 }

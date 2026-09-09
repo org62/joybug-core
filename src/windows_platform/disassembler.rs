@@ -71,41 +71,41 @@ impl CapstoneDisassembler {
 
 /// Detect if mnemonic is a jump instruction (x86/x64 or arm64)
 fn is_jump_mnemonic(mnemonic: &str, arch: Architecture) -> bool {
-    let mnemonic_lower = mnemonic.to_lowercase();
+    // Capstone emits lowercase mnemonics; compared allocation-free because
+    // this runs per decoded instruction (the xref sweep decodes whole images).
+    let m = mnemonic.as_bytes();
     match arch {
         Architecture::X86 | Architecture::X64 => {
             // x64 jumps: jmp, jcc (ja, jae, jb, jbe, jc, je, jg, jge, jl, jle, jna, jnae, jnb, jnbe, jnc, jne, jng, jnge, jnl, jnle, jno, jnp, jns, jnz, jo, jp, jpe, jpo, js, jz)
             // Also: loop, loope, loopne, jcxz, jecxz, jrcxz
-            mnemonic_lower.starts_with('j')
-                || mnemonic_lower.starts_with("loop")
+            m.first().is_some_and(|c| c.eq_ignore_ascii_case(&b'j'))
+                || m.get(..4).is_some_and(|p| p.eq_ignore_ascii_case(b"loop"))
         }
         Architecture::Arm64 => {
             // ARM64 branches: b, b.cond (b.eq, b.ne, etc.), cbz, cbnz, tbz, tbnz
-            mnemonic_lower == "b"
-                || mnemonic_lower.starts_with("b.")
-                || mnemonic_lower == "cbz"
-                || mnemonic_lower == "cbnz"
-                || mnemonic_lower == "tbz"
-                || mnemonic_lower == "tbnz"
+            mnemonic.eq_ignore_ascii_case("b")
+                || m.get(..2).is_some_and(|p| p.eq_ignore_ascii_case(b"b."))
+                || mnemonic.eq_ignore_ascii_case("cbz")
+                || mnemonic.eq_ignore_ascii_case("cbnz")
+                || mnemonic.eq_ignore_ascii_case("tbz")
+                || mnemonic.eq_ignore_ascii_case("tbnz")
         }
     }
 }
 
 /// Detect if mnemonic is a call instruction
 fn is_call_mnemonic(mnemonic: &str, arch: Architecture) -> bool {
-    let mnemonic_lower = mnemonic.to_lowercase();
     match arch {
-        Architecture::X86 | Architecture::X64 => mnemonic_lower == "call",
-        Architecture::Arm64 => mnemonic_lower == "bl" || mnemonic_lower == "blr",
+        Architecture::X86 | Architecture::X64 => mnemonic.eq_ignore_ascii_case("call"),
+        Architecture::Arm64 => mnemonic.eq_ignore_ascii_case("bl") || mnemonic.eq_ignore_ascii_case("blr"),
     }
 }
 
 /// Detect if mnemonic is a return instruction
 fn is_ret_mnemonic(mnemonic: &str, arch: Architecture) -> bool {
-    let mnemonic_lower = mnemonic.to_lowercase();
     match arch {
-        Architecture::X86 | Architecture::X64 => mnemonic_lower == "ret" || mnemonic_lower == "retf" || mnemonic_lower == "retn",
-        Architecture::Arm64 => mnemonic_lower == "ret",
+        Architecture::X86 | Architecture::X64 => ["ret", "retf", "retn"].iter().any(|r| mnemonic.eq_ignore_ascii_case(r)),
+        Architecture::Arm64 => mnemonic.eq_ignore_ascii_case("ret"),
     }
 }
 

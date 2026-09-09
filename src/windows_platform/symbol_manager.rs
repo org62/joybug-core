@@ -1406,11 +1406,7 @@ impl SymbolManager {
 
 /// Extract module name (without path or extension) from a full path.
 fn extract_module_name(module_path: &str) -> String {
-    std::path::Path::new(module_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(module_path)
-        .to_string()
+    crate::formatting::module_stem(module_path)
 }
 
 

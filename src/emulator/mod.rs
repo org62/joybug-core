@@ -4,6 +4,11 @@
 //! - Basic block prediction
 //! - Module transition detection
 //! - Condition-based search
+//!
+//! The emulator is agnostic about where its memory comes from: an
+//! [`EmuTarget`] supplies pages, modules and the TEB on demand. A paused
+//! debuggee thread ([`LiveTarget`]) and a PE file on disk
+//! (`static_pe::StaticTarget`) are both targets.
 
 use std::sync::{Arc, RwLock};
 
@@ -12,7 +17,7 @@ use unicorn_engine::{
     Unicorn, RegisterX86, RegisterARM64,
 };
 
-use crate::interfaces::{Architecture, PlatformAPI, MAX_USER_ADDRESS};
+use crate::interfaces::{Architecture, MAX_USER_ADDRESS};
 use crate::protocol::ThreadContext;
 
 mod error;
@@ -21,45 +26,73 @@ mod types;
 mod memory;
 mod hooks;
 mod execution;
+pub mod target;
 
 pub use error::EmulatorError;
-pub use types::{EmulationResult, StopReason};
-use types::{ModuleBoundary, EmulatorSharedState};
+pub use types::{EmulationResult, StopReason, ModuleBoundary};
+pub(crate) use types::format_symbol_with_offset;
+pub use target::{EmuRegion, EmuTarget, FetchIntercept, LiveTarget};
+pub use registers::write_register_by_name;
+use types::{EmulatorSharedState, snapshot_from_unicorn};
 use registers::{write_x64_registers, write_x86_registers, write_arm64_registers, read_x64_registers, read_arm64_registers};
+
+/// What to do when emulated code calls through an import stub (only a
+/// process-less target has those; a live target resolves imports for real).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImportPolicy {
+    /// Stop with `StopReason::ImportCall` naming the import.
+    #[default]
+    Stop,
+    /// Return to the caller immediately with `value` in the return register.
+    /// Exact on x64/ARM64 (caller cleans the stack); on x86 stdcall the callee
+    /// would have popped its arguments, which cannot be known statically, so
+    /// `esp` ends up low by the argument bytes.
+    Skip { value: u64 },
+}
 
 /// CPU Emulator that initializes from debugger state
 pub struct Emulator<'a> {
     emu: Unicorn<'a, Arc<RwLock<EmulatorSharedState>>>,
     architecture: Architecture,
-    pid: u32,
     shared_state: Arc<RwLock<EmulatorSharedState>>,
+    import_policy: ImportPolicy,
 }
 
 impl<'a> Emulator<'a> {
-    /// Create a new emulator from debugger state
-    pub fn from_debugger_state<P: PlatformAPI>(
-        platform: &P,
-        pid: u32,
-        tid: u32,
+    /// An emulator over `target` whose registers come from `context`.
+    pub fn from_context<T: EmuTarget>(target: &T, context: &ThreadContext) -> Result<Self, EmulatorError> {
+        let mut this = Self::new(target)?;
+        match this.architecture {
+            Architecture::X86 => write_x86_registers(&mut this.emu, context)?,
+            Architecture::X64 => write_x64_registers(&mut this.emu, context)?,
+            Architecture::Arm64 => write_arm64_registers(&mut this.emu, context)?,
+        }
+        this.set_current_module(context.get_pc());
+        Ok(this)
+    }
+
+    /// An emulator over `target` with registers given by name (`"rcx"`,
+    /// `"esp"`, `"x0"`, ...); unspecified registers are zero. `pc` is where
+    /// execution starts.
+    pub fn with_registers<T: EmuTarget>(
+        target: &T,
+        pc: u64,
+        registers: &[(String, u64)],
     ) -> Result<Self, EmulatorError> {
-        let context = platform.get_thread_context(pid, tid)
-            .map_err(|e| EmulatorError::PlatformError(e.to_string()))?;
+        let mut this = Self::new(target)?;
+        for (name, value) in registers {
+            write_register_by_name(&mut this.emu, this.architecture, name, *value)?;
+        }
+        this.set_pc(pc)?;
+        this.set_current_module(pc);
+        Ok(this)
+    }
 
-        let architecture = Self::detect_architecture(&context);
-
-        let modules_info = platform.list_modules(pid)
-            .map_err(|e| EmulatorError::PlatformError(e.to_string()))?;
-
-        let modules: Vec<ModuleBoundary> = modules_info
-            .iter()
-            .map(|m| ModuleBoundary {
-                name: m.name.clone(),
-                base: m.base,
-                end: m.base + m.size.unwrap_or(0x1000),
-            })
-            .collect();
-
-        let shared_state = Arc::new(RwLock::new(EmulatorSharedState::new(modules)));
+    /// Bare emulator: Unicorn for the target's architecture, the fault hook,
+    /// the module map and the segment base. No registers written yet.
+    fn new<T: EmuTarget>(target: &T) -> Result<Self, EmulatorError> {
+        let architecture = target.arch();
+        let shared_state = Arc::new(RwLock::new(EmulatorSharedState::new(target.modules())));
 
         let (arch, mode) = match architecture {
             Architecture::X86 => (Arch::X86, Mode::MODE_32),
@@ -87,117 +120,57 @@ impl<'a> Emulator<'a> {
             }
         ).map_err(|e| EmulatorError::UnicornError(format!("mem hook failed: {:?}", e)))?;
 
-        // For x64, set up GS segment base for TEB access
-        #[cfg(target_arch = "x86_64")]
-        if matches!(architecture, Architecture::X64) {
-            Self::setup_x64_segments(&mut emu, platform, pid, tid)?;
-        }
-
-        // For a WOW64 thread, `fs:` addresses the 32-bit TEB.
-        if matches!(architecture, Architecture::X86) {
-            Self::setup_x86_segments(&mut emu, platform, pid, tid)?;
-        }
-
-        // Write registers from context
-        match architecture {
-            Architecture::X86 => write_x86_registers(&mut emu, &context)?,
-            Architecture::X64 => write_x64_registers(&mut emu, &context)?,
-            Architecture::Arm64 => write_arm64_registers(&mut emu, &context)?,
-        }
-
-        // Set current module based on PC
-        let pc = context.get_pc();
-        {
-            let mut state = shared_state.write().unwrap();
-            state.current_module = state.modules.iter()
-                .find(|m| pc >= m.base && pc < m.end)
-                .map(|m| m.name.clone());
-        }
-
-        Ok(Self {
+        let mut this = Self {
             emu,
             architecture,
-            pid,
             shared_state,
-        })
+            import_policy: ImportPolicy::Stop,
+        };
+        this.setup_segments(target)?;
+        Ok(this)
     }
 
-    fn detect_architecture(context: &ThreadContext) -> Architecture {
-        context.architecture()
+    /// How import-stub calls are handled (process-less targets only).
+    pub fn set_import_policy(&mut self, policy: ImportPolicy) {
+        self.import_policy = policy;
     }
 
-    /// Set up the 32-bit FS base: the WOW64 thread's 32-bit TEB
-    /// (`get_teb_address` reports that one for an x86 target).
-    fn setup_x86_segments<D, P: PlatformAPI>(
-        emu: &mut Unicorn<'_, D>,
-        platform: &P,
-        pid: u32,
-        tid: u32,
-    ) -> Result<(), EmulatorError> {
-        use windows_sys::Win32::System::Memory::MEM_COMMIT;
+    fn set_current_module(&self, pc: u64) {
+        let mut state = self.shared_state.write().unwrap();
+        state.current_module = state.modules.iter()
+            .find(|m| pc >= m.base && pc < m.end)
+            .map(|m| m.name.clone());
+    }
 
-        match platform.get_teb_address(pid, tid) {
-            Ok(teb32) => {
-                tracing::debug!("Setting FS_BASE to TEB32 address: 0x{:08X}", teb32);
-                emu.reg_write(RegisterX86::FS_BASE, teb32)
-                    .map_err(|e| EmulatorError::UnicornError(format!("FS_BASE write failed: {:?}", e)))?;
-                if let Ok(region) = platform.query_memory_region(pid, teb32) {
-                    let size = Self::align_size(region.region_size);
-                    let prot = Self::windows_protect_to_unicorn(region.protect);
-                    if emu.mem_map(region.base_address, size, prot).is_ok() && region.state == MEM_COMMIT {
-                        if let Ok(data) = platform.read_memory(pid, region.base_address, region.region_size as usize) {
-                            let _ = emu.mem_write(region.base_address, &data);
-                        }
+    /// Point the thread-local segment at the TEB and pre-load it: `fs` for a
+    /// 32-bit thread (the WOW64 TEB32), `gs` for x64. ARM64 reaches its TEB
+    /// through x18, which the context carries.
+    fn setup_segments<T: EmuTarget>(&mut self, target: &T) -> Result<(), EmulatorError> {
+        let seg = match self.architecture {
+            Architecture::X86 => RegisterX86::FS_BASE,
+            Architecture::X64 => RegisterX86::GS_BASE,
+            Architecture::Arm64 => return Ok(()),
+        };
+        let Some(teb) = target.teb_address() else { return Ok(()) };
+        tracing::debug!("Setting {:?} to TEB address: 0x{:X}", seg, teb);
+        self.emu.reg_write(seg, teb)
+            .map_err(|e| EmulatorError::UnicornError(format!("{:?} write failed: {:?}", seg, e)))?;
+        if let Some(region) = target.region(teb) {
+            let size = Self::align_size(region.size);
+            if self.emu.mem_map(region.base, size, region.prot).is_ok() {
+                tracing::trace!(
+                    "Unicorn mem_map (TEB): base=0x{:X} size=0x{:X} prot={}",
+                    region.base, size, Self::prot_to_str(region.prot)
+                );
+                if region.committed {
+                    if let Some(data) = target.read(region.base, region.size as usize) {
+                        let _ = self.emu.mem_write(region.base, &data);
                     }
                 }
-            }
-            Err(e) => {
-                tracing::warn!("Could not get TEB32 address: {}. FS segment access will fail.", e);
-            }
-        }
-        Ok(())
-    }
-
-    /// Set up x64 segment bases (GS for TEB)
-    #[cfg(target_arch = "x86_64")]
-    fn setup_x64_segments<D, P: PlatformAPI>(
-        emu: &mut Unicorn<'_, D>,
-        platform: &P,
-        pid: u32,
-        tid: u32,
-    ) -> Result<(), EmulatorError> {
-        use windows_sys::Win32::System::Memory::MEM_COMMIT;
-
-        match platform.get_teb_address(pid, tid) {
-            Ok(teb_address) => {
-                tracing::debug!("Setting GS_BASE to TEB address: 0x{:016X}", teb_address);
-                emu.reg_write(RegisterX86::GS_BASE, teb_address)
-                    .map_err(|e| EmulatorError::UnicornError(format!("GS_BASE write failed: {:?}", e)))?;
-
-                if let Ok(region) = platform.query_memory_region(pid, teb_address) {
-                    let size = Self::align_size(region.region_size);
-                    let prot = Self::windows_protect_to_unicorn(region.protect);
-
-                    if emu.mem_map(region.base_address, size, prot).is_ok() {
-                        tracing::trace!(
-                            "Unicorn mem_map (TEB): base=0x{:X} size=0x{:X} prot={}",
-                            region.base_address, size, Self::prot_to_str(prot)
-                        );
-                        if region.state == MEM_COMMIT {
-                            if let Ok(data) = platform.read_memory(pid, region.base_address, region.region_size as usize) {
-                                let _ = emu.mem_write(region.base_address, &data);
-                                tracing::debug!("Pre-loaded TEB region: 0x{:016X} - 0x{:016X} ({} bytes)",
-                                    region.base_address, region.base_address + region.region_size, region.region_size);
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Could not get TEB address: {}. GS segment access will fail.", e);
+                let mut state = self.shared_state.write().unwrap();
+                state.note_mapped(region.base, size);
             }
         }
-
         Ok(())
     }
 
@@ -249,9 +222,9 @@ impl<'a> Emulator<'a> {
     ///
     /// `is_fetch` distinguishes the faulting access: only an instruction fetch
     /// can be repaired this way, since the repair moves PC.
-    pub(super) fn try_pac_fetch_recovery<P: PlatformAPI>(
+    pub(super) fn try_pac_fetch_recovery<T: EmuTarget>(
         &mut self,
-        platform: &P,
+        target: &T,
         fault_addr: u64,
         is_fetch: bool,
     ) -> bool {
@@ -259,7 +232,7 @@ impl<'a> Emulator<'a> {
         if !is_fetch || self.architecture != Architecture::Arm64 || stripped == fault_addr {
             return false;
         }
-        if self.load_memory_region(platform, stripped).is_err() || self.set_pc(stripped).is_err() {
+        if self.load_memory_region(target, stripped).is_err() || self.set_pc(stripped).is_err() {
             return false;
         }
         tracing::debug!("PAC fetch recovery: 0x{:X} -> 0x{:X}", fault_addr, stripped);
@@ -282,6 +255,51 @@ impl<'a> Emulator<'a> {
                     .map_err(|e| EmulatorError::UnicornError(format!("{:?}", e)))
             }
         }
+    }
+
+    fn set_sp(&mut self, value: u64) -> Result<(), EmulatorError> {
+        let res = match self.architecture {
+            Architecture::X86 => self.emu.reg_write(RegisterX86::ESP, value),
+            Architecture::X64 => self.emu.reg_write(RegisterX86::RSP, value),
+            Architecture::Arm64 => self.emu.reg_write(RegisterARM64::SP, value),
+        };
+        res.map_err(|e| EmulatorError::UnicornError(format!("{:?}", e)))
+    }
+
+    /// The address the current callee would return to: `[sp]` on x86/x64,
+    /// `lr` on ARM64.
+    pub(super) fn return_address(&self) -> Result<u64, EmulatorError> {
+        match self.architecture {
+            Architecture::X86 | Architecture::X64 => {
+                let sp = self.get_sp()?;
+                let ptr = self.architecture.pointer_size();
+                let bytes = self.emu.mem_read_as_vec(sp, ptr)
+                    .map_err(|e| EmulatorError::UnicornError(format!("read return address at 0x{:X}: {:?}", sp, e)))?;
+                let mut buf = [0u8; 8];
+                buf[..ptr].copy_from_slice(&bytes);
+                Ok(u64::from_le_bytes(buf))
+            }
+            Architecture::Arm64 => self.read_register("LR"),
+        }
+    }
+
+    /// Perform the return the callee would have done, with `value` as the
+    /// return value: the "skip this call" move. On x86/x64 this pops the
+    /// return address; on ARM64 it comes from `lr`.
+    pub(super) fn return_to_caller(&mut self, value: u64) -> Result<(), EmulatorError> {
+        let ret_addr = self.return_address()?;
+        let (ret_reg, pop) = match self.architecture {
+            Architecture::X86 => (RegisterX86::EAX as i32, true),
+            Architecture::X64 => (RegisterX86::RAX as i32, true),
+            Architecture::Arm64 => (RegisterARM64::X0 as i32, false),
+        };
+        if pop {
+            let sp = self.get_sp()?;
+            self.set_sp(sp + self.architecture.pointer_size() as u64)?;
+        }
+        self.emu.reg_write(ret_reg, value)
+            .map_err(|e| EmulatorError::UnicornError(format!("{:?}", e)))?;
+        self.set_pc(ret_addr)
     }
 
     /// Read a register by name (for condition checking)
@@ -308,8 +326,9 @@ impl<'a> Emulator<'a> {
         memory_reads: &[(u64, usize)],
     ) -> Result<EmulationResult, EmulatorError> {
         let final_pc = self.get_pc()?;
+        let final_registers = snapshot_from_unicorn(&self.emu, self.architecture, final_pc);
         let state = self.shared_state.read().unwrap();
-        let pages_loaded = state.mapped_regions.len() - pages_before;
+        let pages_loaded = state.mapped_regions.len().saturating_sub(pages_before);
 
         let memory_snapshots: Vec<(u64, Vec<u8>)> = memory_reads.iter()
             .filter_map(|&(addr, size)| {
@@ -329,6 +348,7 @@ impl<'a> Emulator<'a> {
             memory_trace: state.memory_trace.clone(),
             stats_text,
             memory_snapshots,
+            final_registers,
         })
     }
 }

@@ -324,6 +324,23 @@ pub mod request_response {
         Syscall,
     }
 
+    impl std::str::FromStr for EmulationMode {
+        type Err = String;
+
+        /// Accepts the variant name (`"InstructionTrace"`, the UI's spelling)
+        /// and the short lowercase form the Lua API uses (`"trace"`).
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s {
+                "Basic" | "basic" => Ok(EmulationMode::Basic),
+                "InstructionTrace" | "trace" => Ok(EmulationMode::InstructionTrace),
+                "BasicBlock" | "block" => Ok(EmulationMode::BasicBlock),
+                "ModuleTransition" | "module" => Ok(EmulationMode::ModuleTransition),
+                "Syscall" | "syscall" => Ok(EmulationMode::Syscall),
+                other => Err(format!("Invalid emulation mode: '{}'", other)),
+            }
+        }
+    }
+
     #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
     pub enum ScanValueType {
         U8, U16, U32, U64, F32, F64,
