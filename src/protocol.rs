@@ -1298,6 +1298,11 @@ pub mod request_response {
             image_file_name: Option<String>,
             base_of_image: u64,
             size_of_image: Option<u64>,
+            /// Start address of the initial thread (`lpStartAddress` of
+            /// `CREATE_PROCESS_DEBUG_INFO`), the same value a `ThreadCreated`
+            /// carries for every later thread. 0 when the OS reports none.
+            #[serde(default)]
+            start_address: u64,
         },
         ThreadCreated {
             pid: u32,

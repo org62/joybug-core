@@ -11,8 +11,9 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use crate::interfaces::{
-    align_backward_instructions, backward_resync_window, function_decode_window, Architecture, DisassemblerError,
-    DisassemblerProvider, Instruction, ModuleSymbol, SymbolConfig, SymbolInfo, SymbolProvider,
+    align_backward_instructions, backward_resync_window, decode_function_listing, Architecture,
+    DisassemblerError, DisassemblerProvider, Instruction, ModuleSymbol, SymbolConfig, SymbolInfo,
+    SymbolProvider,
 };
 use crate::pe_image::{rva_to_offset_loose, SectionMap};
 use crate::pe_types::{split_import_spec, ImportItem, ImportKind, ModuleExtraInfo};
@@ -418,11 +419,7 @@ impl PeImage {
             }
         }
         let name = bounds.and_then(|(s, _)| self.resolve_va(s)).filter(|s| s.offset == 0).map(|s| s.format_symbol());
-        let (start, count, trim) = function_decode_window(bounds, va, max_instructions);
-        let mut instrs = self.disassemble(start, count)?;
-        if let Some((s, e)) = trim {
-            instrs.retain(|i| i.address >= s && i.address < e);
-        }
+        let instrs = decode_function_listing(bounds, va, max_instructions, |start, count| self.disassemble(start, count))?;
         let (fs, fe) = bounds.map(|(s, e)| (Some(s), Some(e))).unwrap_or((None, None));
         Ok((instrs, fs, fe, name))
     }

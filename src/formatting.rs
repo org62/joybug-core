@@ -382,9 +382,9 @@ impl std::fmt::Display for DebugEvent {
             DebugEvent::SingleShotBreakpoint { pid, tid, address } => {
                 write!(f, "SingleShotBreakpoint(pid={}, tid={}, address=0x{:X})", pid, tid, address)
             }
-            DebugEvent::ProcessCreated { pid, tid, image_file_name, base_of_image, size_of_image } => {
-                write!(f, "ProcessCreated(pid={}, tid={}, image={}, base=0x{:X}, size={:X?})", 
-                    pid, tid, image_file_name.as_deref().unwrap_or("<unknown>"), base_of_image, size_of_image)
+            DebugEvent::ProcessCreated { pid, tid, image_file_name, base_of_image, size_of_image, start_address } => {
+                write!(f, "ProcessCreated(pid={}, tid={}, image={}, base=0x{:X}, size={:X?}, start=0x{:X})",
+                    pid, tid, image_file_name.as_deref().unwrap_or("<unknown>"), base_of_image, size_of_image, start_address)
             }
             DebugEvent::ThreadCreated { pid, tid, start_address } => {
                 write!(f, "ThreadCreated(pid={}, tid={}, start=0x{:X})", pid, tid, start_address)

@@ -782,6 +782,12 @@ fn test_lua_file_disassembly_function() {
 }
 
 #[test]
+fn test_lua_file_disassembly_mid_instruction() {
+    let test_exe = common::get_test_program_path("disassembly_test");
+    run_lua_test_file("disassembly/mid_instruction.lua", Some(&test_exe));
+}
+
+#[test]
 fn test_lua_file_disassembly_non_module() {
     let test_exe = common::get_test_program_path("disassembly_test");
     run_lua_test_file("disassembly/non_module_memory.lua", Some(&test_exe));

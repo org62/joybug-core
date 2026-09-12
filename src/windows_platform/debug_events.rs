@@ -269,6 +269,7 @@ pub(super) fn handle_create_process_event(
         image_file_name: Some(image_file_name),
         base_of_image: info.lpBaseOfImage as u64,
         size_of_image: size_of_image,
+        start_address: info.lpStartAddress.map_or(0, |addr| addr as usize as u64),
     })
 }
 

@@ -1317,25 +1317,14 @@ impl WindowsPlatform {
             None => (None, None, None),
         };
         // Whole-function decode when it fits, else a bounded window at the
-        // address — see `function_decode_window` for why.
-        let (disasm_start, disasm_count, trim) =
-            crate::interfaces::function_decode_window(bounds.map(|(s, e, _)| (s, e)), address, max_instructions);
-
-        // Disassemble the chosen window
-        let instructions = self.disassemble_memory(pid, disasm_start, disasm_count, arch)?;
-
-        let filtered_instructions = if let Some((start, end)) = trim {
-            instructions
-                .into_iter()
-                .filter(|i| i.address >= start && i.address < end)
-                .collect()
-        } else {
-            // Windowed decode from the requested address: cap the count, don't
-            // trim by bounds (the head is the requested address by construction).
-            instructions.into_iter().take(max_instructions).collect()
-        };
-
-        Ok((filtered_instructions, func_start, func_end, func_name))
+        // address — see `decode_function_listing` for why.
+        let instructions = crate::interfaces::decode_function_listing(
+            bounds.map(|(s, e, _)| (s, e)),
+            address,
+            max_instructions,
+            |start, count| self.disassemble_memory(pid, start, count, arch),
+        )?;
+        Ok((instructions, func_start, func_end, func_name))
     }
 
     /// Non-blocking symbol resolver over a snapshot of the process's module

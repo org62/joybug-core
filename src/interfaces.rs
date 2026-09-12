@@ -165,7 +165,8 @@ pub fn backward_resync_window(arch: Architecture, count: usize) -> u64 {
 /// only when the function fits `max_instructions` AND contains the address;
 /// otherwise decode a window of `max_instructions` anchored at the requested
 /// address (a known instruction boundary) and let the caller's scroll
-/// extension pull in the rest.
+/// extension pull in the rest. [`decode_function_listing`] applies the window
+/// and handles the one case it cannot express: a mid-instruction `address`.
 pub fn function_decode_window(
     bounds: Option<(u64, u64)>,
     address: u64,
@@ -183,6 +184,36 @@ pub fn function_decode_window(
         }
         None => (address, max_instructions, None),
     }
+}
+
+/// Decode "the function containing `address`" through `decode(start, count)`:
+/// choose the window with [`function_decode_window`], trim a whole-function
+/// decode to its bounds, cap a windowed one at `max_instructions`.
+///
+/// A whole-function decode only ever yields real instruction boundaries, and
+/// its `start <= address < end` test is satisfied by a MID-INSTRUCTION address
+/// too (overlapping code, a jump into another instruction's immediate) — the
+/// aligned listing then has no row at `address` at all. Decode literally from
+/// `address` in that case: an unaligned view is exactly what a caller asking
+/// for that byte wants.
+pub fn decode_function_listing<E>(
+    bounds: Option<(u64, u64)>,
+    address: u64,
+    max_instructions: usize,
+    mut decode: impl FnMut(u64, usize) -> Result<Vec<Instruction>, E>,
+) -> Result<Vec<Instruction>, E> {
+    let (start, count, trim) = function_decode_window(bounds, address, max_instructions);
+    let mut instructions = decode(start, count)?;
+    match trim {
+        Some((s, e)) => {
+            instructions.retain(|i| i.address >= s && i.address < e);
+            if !instructions.iter().any(|i| i.address == address) {
+                instructions = decode(address, max_instructions)?;
+            }
+        }
+        None => instructions.truncate(max_instructions),
+    }
+    Ok(instructions)
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]

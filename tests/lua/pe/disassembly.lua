@@ -44,4 +44,24 @@ assert(has_ret, "listing reaches the function's ret")
 -- The listing is symbolised: the rows at the symbol carry it.
 assert(fn.instructions[1].symbol == "xtea_test!xtea_encrypt", "row symbol, got " .. tostring(fn.instructions[1].symbol))
 
+-- An address INSIDE an instruction still decodes there. The whole-function
+-- decode above is anchored at the function start and only ever yields real
+-- boundaries, and `start <= va < end` is satisfied by a mid-instruction va too
+-- — so without a fallback the caller gets a listing that omits what it asked
+-- for. The count is derived from the function's size so the whole-function
+-- branch is definitely the one taken (a small count already anchors at `va`
+-- and would make this vacuous).
+local count = fn["end"] - fn.start
+local host = nil
+for _, i in ipairs(fn.instructions) do if i.size >= 2 then host = i break end end
+assert(host, "expected a multi-byte instruction to hide an address inside")
+local mid = host.address + 1
+for _, i in ipairs(fn.instructions) do
+    assert(i.address ~= mid, "mid should not be a boundary: " .. hex(mid))
+end
+local unaligned = img:disassemble_function(mid, count).instructions
+assert(#unaligned > 0, "unaligned decode returned nothing at " .. hex(mid))
+assert(unaligned[1].address == mid,
+    "expected first row at " .. hex(mid) .. ", got " .. hex(unaligned[1].address))
+
 return { passed = true }
