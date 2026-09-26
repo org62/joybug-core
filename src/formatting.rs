@@ -247,8 +247,8 @@ impl std::fmt::Debug for DebuggerResponse {
                     .field("total_count", total_count)
                     .finish()
             }
-            DebuggerResponse::PebHideResult { report } => {
-                f.debug_struct("PebHideResult")
+            DebuggerResponse::PebNormalizeResult { report } => {
+                f.debug_struct("PebNormalizeResult")
                     .field("peb_address", &format_args!("0x{:X}", report.peb_address))
                     .field("applied", &report.applied)
                     .field("failures", &report.failures)

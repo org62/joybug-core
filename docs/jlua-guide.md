@@ -790,37 +790,42 @@ dbg:run()
 
 `pid` is optional on all three methods and defaults to the current process.
 
-### Anti-Anti-Debug
+### PEB Normalization
 
-Defeat common anti-debug probes by patching well-known fields in the target's PEB.
-Apply once on the initial breakpoint — the kernel doesn't re-write these fields, so
-a single hide is enough for static checks.
+Restore the PEB fields Windows leaves in their "debugger attached" state so the
+target runs the way it would with no debugger. This is not debugger hiding — it
+removes side effects the debugger's presence imposes on the target. The biggest
+one is the process heap: under a debugger the loader enables the debug heap, whose
+exhaustive per-allocation verification can slow an allocation-heavy target by
+orders of magnitude; restoring `HEAP.Flags` removes that penalty. `BeingDebugged`
+(what `IsDebuggerPresent` reports) is restored too, because code that reads it
+takes a different path when it thinks a debugger is attached — crash reporters
+change their behavior, and exception handlers may fire a breakpoint (`int3`)
+straight away instead of running their normal logic. Restoring it lets you
+reproduce an issue as it happens without a debugger present.
+
+Apply once on the initial breakpoint — the kernel doesn't re-write these fields.
 
 ```lua
--- Enable every technique (BeingDebugged, NtGlobalFlag, primary HEAP flags,
--- RTL_USER_PROCESS_PARAMETERS window fields, spoof OSBuildNumber=19045).
-local report = dbg:hide_peb(pid)                    -- nil opts ≡ { all = true }
-local report = dbg:hide_peb(pid, { all = true })
+-- Restore every field (BeingDebugged, primary HEAP flags).
+local report = dbg:normalize_peb(pid)                 -- nil opts ≡ { all = true }
+local report = dbg:normalize_peb(pid, { all = true })
 
--- Or pick specific techniques (missing keys = false).
-local report = dbg:hide_peb(pid, {
-    being_debugged  = true,
-    nt_global_flag  = true,
-    heap_flags      = true,
-    startup_info    = false,
-    os_build_number = false,
+-- Or pick specific fields (missing keys = false).
+local report = dbg:normalize_peb(pid, {
+    being_debugged = true,
+    heap_flags     = true,
 })
 
 -- Report shape:
---   report.peb_address    -- u64, target's PEB base (0 if WOW64 was skipped)
---   report.applied        -- list of technique names that were written
---   report.failures       -- list of { technique = "...", error = "..." }
---   report.wow64_skipped  -- true if the target is a 32-bit WOW64 process
+--   report.peb_address    -- u64, target's PEB base (0 if it could not be resolved)
+--   report.applied        -- list of field names that were written
+--   report.failures       -- list of { field = "...", error = "..." }
 ```
 
-WOW64 (32-bit on 64-bit Windows) targets are detected and skipped — the offsets in
-this module target the 64-bit native PEB layout. Returns `wow64_skipped = true`
-with no writes performed.
+WOW64 (32-bit on 64-bit Windows) targets have both their PEBs patched — the 32-bit
+one the target's own code reads and the 64-bit one the loader keeps — each with its
+own layout. WOW64 field names in the report carry a `32`/`64` suffix.
 
 ### Drop into REPL
 

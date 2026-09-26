@@ -728,10 +728,10 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
-            DebuggerRequest::HidePeb { pid, options } => {
+            DebuggerRequest::NormalizePeb { pid, options } => {
                 let p = platform.read().unwrap();
-                match crate::anti_anti_debug::peb::hide_peb(&*p, pid, &options) {
-                    Ok(report) => DebuggerResponse::PebHideResult { report },
+                match crate::peb_normalize::peb::normalize_peb(&*p, pid, &options) {
+                    Ok(report) => DebuggerResponse::PebNormalizeResult { report },
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }

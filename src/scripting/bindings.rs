@@ -1997,31 +1997,28 @@ impl LuaUserData for LuaDebugClient {
             Ok(table)
         });
 
-        // ---- Anti-anti-debug ----
+        // ---- PEB normalization ----
 
-        methods.add_method("hide_peb", |lua, this, (pid, opts_tbl): (u32, Option<LuaTable>)| {
+        methods.add_method("normalize_peb", |lua, this, (pid, opts_tbl): (u32, Option<LuaTable>)| {
             // Parse opts table: missing keys = false; `{ all = true }` = enable all.
-            let mut options = crate::anti_anti_debug::PebHideOptions::default();
+            let mut options = crate::peb_normalize::PebNormalizeOptions::default();
             if let Some(tbl) = opts_tbl {
                 let all: bool = tbl.get("all").unwrap_or(false);
                 if all {
-                    options = crate::anti_anti_debug::PebHideOptions::all();
+                    options = crate::peb_normalize::PebNormalizeOptions::all();
                 } else {
                     options.being_debugged  = tbl.get("being_debugged").unwrap_or(false);
                     options.heap_flags      = tbl.get("heap_flags").unwrap_or(false);
-                    options.nt_global_flag  = tbl.get("nt_global_flag").unwrap_or(false);
-                    options.startup_info    = tbl.get("startup_info").unwrap_or(false);
-                    options.os_build_number = tbl.get("os_build_number").unwrap_or(false);
                 }
             } else {
-                options = crate::anti_anti_debug::PebHideOptions::all();
+                options = crate::peb_normalize::PebNormalizeOptions::all();
             }
 
             let mut client = this.inner.borrow_mut();
-            let resp = client.send_and_receive(&DebuggerRequest::HidePeb { pid, options })
+            let resp = client.send_and_receive(&DebuggerRequest::NormalizePeb { pid, options })
                 .map_err(|e| mlua::Error::external(e))?;
             match resp {
-                DebuggerResponse::PebHideResult { report } => {
+                DebuggerResponse::PebNormalizeResult { report } => {
                     let t = lua.create_table()?;
                     t.set("peb_address", report.peb_address)?;
                     let applied = lua.create_table()?;
@@ -2032,7 +2029,7 @@ impl LuaUserData for LuaDebugClient {
                     let failures = lua.create_table()?;
                     for (i, (name, msg)) in report.failures.iter().enumerate() {
                         let row = lua.create_table()?;
-                        row.set("technique", name.clone())?;
+                        row.set("field", name.clone())?;
                         row.set("error", msg.clone())?;
                         failures.set(i + 1, row)?;
                     }
@@ -2040,7 +2037,7 @@ impl LuaUserData for LuaDebugClient {
                     Ok(t)
                 }
                 DebuggerResponse::Error { message } => Err(mlua::Error::external(
-                    anyhow::anyhow!("HidePeb failed: {}", message),
+                    anyhow::anyhow!("NormalizePeb failed: {}", message),
                 )),
                 _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
             }

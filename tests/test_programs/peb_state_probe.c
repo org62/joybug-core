@@ -1,21 +1,21 @@
-// anti_debug_test.c
+// peb_state_probe.c
 //
-// A minimal "protected" program that looks for a debugger using only the
-// indicators that live inside the PEB -- exactly the ones the joybug-core
-// anti-anti-debug (hide_peb) feature neutralizes. It prints every value it
-// observes and returns a detection bitmask as its process exit code:
+// A minimal program that reads the PEB-resident fields Windows leaves in their
+// "debugger attached" state -- exactly the ones the joybug-core PEB
+// normalization (normalize_peb) feature restores. It prints every value it
+// observes and returns a bitmask as its process exit code:
 //
 //   bit0 (0x1) = IsDebuggerPresent() / PEB.BeingDebugged
-//   bit1 (0x2) = PEB.NtGlobalFlag debug bits
-//   bit2 (0x4) = process-heap Flags/ForceFlags debug markers
+//   bit1 (0x2) = process-heap Flags/ForceFlags debug markers
 //
-// Exit code 0 means no debugger is observable via the PEB (i.e. hide_peb
-// successfully cleaned everything). A non-zero code names which indicator
-// leaked.
+// Exit code 0 means the PEB looks like a normally launched process (i.e.
+// normalize_peb restored everything). A non-zero code names which field still
+// carries the debugger-launched value.
 //
-// Deliberately does NOT use CheckRemoteDebuggerPresent /
-// NtQueryInformationProcess: those read kernel state that hide_peb does not
-// touch, so they would always report "detected" and make the test meaningless.
+// Only reads fields normalize_peb touches, so the test stays meaningful:
+// kernel-backed queries (CheckRemoteDebuggerPresent /
+// NtQueryInformationProcess) are out of scope and would always report the live
+// debugger.
 
 #include <windows.h>
 #include <stdio.h>
@@ -25,14 +25,8 @@
 // hardcoded layout rather than depending on SDK struct definitions.
 #define PEB_BEING_DEBUGGED   0x02
 #define PEB_PROCESS_HEAP     0x30
-#define PEB_NT_GLOBAL_FLAG   0xBC
 #define HEAP_FLAGS           0x70
 #define HEAP_FORCE_FLAGS     0x74
-
-// NtGlobalFlag bits set by the loader for a debugged process:
-//   FLG_HEAP_ENABLE_TAIL_CHECK (0x10) | FLG_HEAP_ENABLE_FREE_CHECK (0x20)
-//   | FLG_HEAP_VALIDATE_PARAMETERS (0x40)
-#define NT_GLOBAL_FLAG_DEBUG_BITS 0x70
 
 // Normal, non-debug heap Flags value.
 #define HEAP_GROWABLE 0x2
@@ -49,7 +43,6 @@ int main(void) {
 
     int is_debugger_present = (int)IsDebuggerPresent();
     unsigned char being_debugged = *(unsigned char *)(peb + PEB_BEING_DEBUGGED);
-    unsigned long nt_global_flag = *(unsigned long *)(peb + PEB_NT_GLOBAL_FLAG);
 
     unsigned char *heap = *(unsigned char **)(peb + PEB_PROCESS_HEAP);
     unsigned long heap_flags = *(unsigned long *)(heap + HEAP_FLAGS);
@@ -59,20 +52,16 @@ int main(void) {
     if (is_debugger_present || being_debugged != 0) {
         mask |= 0x1;
     }
-    if ((nt_global_flag & NT_GLOBAL_FLAG_DEBUG_BITS) != 0) {
+    if (heap_force_flags != 0 || (heap_flags & ~(unsigned long)HEAP_GROWABLE) != 0) {
         mask |= 0x2;
     }
-    if (heap_force_flags != 0 || (heap_flags & ~(unsigned long)HEAP_GROWABLE) != 0) {
-        mask |= 0x4;
-    }
 
-    printf("anti_debug_test: PEB=%p\n", (void *)peb);
+    printf("peb_state_probe: PEB=%p\n", (void *)peb);
     printf("  IsDebuggerPresent   = %d\n", is_debugger_present);
     printf("  PEB.BeingDebugged   = %u\n", (unsigned)being_debugged);
-    printf("  PEB.NtGlobalFlag    = 0x%lx\n", nt_global_flag);
     printf("  Heap.Flags          = 0x%lx\n", heap_flags);
     printf("  Heap.ForceFlags     = 0x%lx\n", heap_force_flags);
-    printf("  detection mask      = 0x%x %s\n", mask, mask == 0 ? "(clean)" : "(debugger detected)");
+    printf("  detection mask      = 0x%x %s\n", mask, mask == 0 ? "(clean)" : "(debugger-launched values present)");
     fflush(stdout);
 
     return mask;

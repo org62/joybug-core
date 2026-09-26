@@ -940,11 +940,11 @@ fn test_lua_file_coverage_targets() {
     run_lua_test_file("breakpoints/coverage_targets.lua", None);
 }
 
-// --- anti-anti-debug ---
+// --- PEB normalization ---
 
 #[test]
-fn test_lua_file_hide_peb() {
-    run_lua_test_file("anti_anti_debug/hide_peb.lua", None);
+fn test_lua_file_normalize_peb() {
+    run_lua_test_file("peb_normalize/normalize_peb.lua", None);
 }
 
 // --- host ETW (etw bindings; requires the `etw` feature) ---

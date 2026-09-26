@@ -941,10 +941,10 @@ pub mod request_response {
         StringScanReset {
             results_path: String,
         },
-        // Anti-anti-debug
-        HidePeb {
+        // PEB normalization
+        NormalizePeb {
             pid: u32,
-            options: crate::anti_anti_debug::PebHideOptions,
+            options: crate::peb_normalize::PebNormalizeOptions,
         },
         // Value freeze: a server-side thread continuously writes `data` to `address`
         // so the client doesn't have to stream repeated writes over the protocol.
@@ -1237,9 +1237,9 @@ pub mod request_response {
             #[serde(default)]
             instructions_executed: usize,
         },
-        // Anti-anti-debug
-        PebHideResult {
-            report: crate::anti_anti_debug::PebHideReport,
+        // PEB normalization
+        PebNormalizeResult {
+            report: crate::peb_normalize::PebNormalizeReport,
         },
         // Value freeze
         FreezeValueStarted {

@@ -210,7 +210,7 @@ fn main() {
         let _ = compile_test_program(&manifest_dir, &out_dir, "freeze_chain_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "pointer_bench_target", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "parent_child_test", None);
-        let _ = compile_test_program(&manifest_dir, &out_dir, "anti_debug_test", None);
+        let _ = compile_test_program(&manifest_dir, &out_dir, "peb_state_probe", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "bp_race_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "cov_race_test", None);
         let _ = compile_test_program(&manifest_dir, &out_dir, "tls_test", None);

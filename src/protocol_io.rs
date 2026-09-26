@@ -152,8 +152,8 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::PointerScanResults { paths, total_count } => format!("PointerScanResults ({}/{} returned)", paths.len(), total_count),
         DebuggerResponse::StringScanResult { match_count, capped, .. } => format!("StringScanResult ({} strings{})", match_count, if *capped { ", capped" } else { "" }),
         DebuggerResponse::StringScanResults { strings, total_count } => format!("StringScanResults ({}/{} returned)", strings.len(), total_count),
-        DebuggerResponse::PebHideResult { report } => format!(
-            "PebHideResult (peb=0x{:X}, applied={}, failed={})",
+        DebuggerResponse::PebNormalizeResult { report } => format!(
+            "PebNormalizeResult (peb=0x{:X}, applied={}, failed={})",
             report.peb_address, report.applied.len(), report.failures.len(),
         ),
         DebuggerResponse::FreezeValueStarted { freeze_id } => format!("FreezeValueStarted (id={})", freeze_id),
@@ -1840,20 +1840,20 @@ impl<S> DebugSession<S> {
         }
     }
 
-    /// Apply anti-anti-debug PEB patches to the target process. See
-    /// [`crate::anti_anti_debug::peb::hide_peb`] for the field-by-field semantics.
-    pub fn hide_peb(
+    /// Restore the target's PEB fields to their non-debugged state. See
+    /// [`crate::peb_normalize::peb::normalize_peb`] for the field-by-field semantics.
+    pub fn normalize_peb(
         &mut self,
         pid: u32,
-        options: crate::anti_anti_debug::PebHideOptions,
-    ) -> anyhow::Result<crate::anti_anti_debug::PebHideReport> {
-        let req = DebuggerRequest::HidePeb { pid, options };
+        options: crate::peb_normalize::PebNormalizeOptions,
+    ) -> anyhow::Result<crate::peb_normalize::PebNormalizeReport> {
+        let req = DebuggerRequest::NormalizePeb { pid, options };
         match self.send_and_receive(&req)? {
-            DebuggerResponse::PebHideResult { report } => Ok(report),
+            DebuggerResponse::PebNormalizeResult { report } => Ok(report),
             DebuggerResponse::Error { message } => {
-                Err(anyhow::anyhow!("Failed to hide PEB: {}", message))
+                Err(anyhow::anyhow!("Failed to normalize PEB: {}", message))
             }
-            other => Err(anyhow::anyhow!("Unexpected response to HidePeb: {:?}", other)),
+            other => Err(anyhow::anyhow!("Unexpected response to NormalizePeb: {:?}", other)),
         }
     }
 

@@ -12,7 +12,7 @@ mod common;
 
 use common::{try_get_test_program_path, TestServer};
 use joybug_core::interfaces::Architecture;
-use joybug_core::anti_anti_debug::PebHideOptions;
+use joybug_core::peb_normalize::PebNormalizeOptions;
 use joybug_core::protocol::{EmulationMode, StepAction, StepKind, ThreadContext};
 use joybug_core::protocol_io::{
     BreakpointDecision, DebugSession, EmulateResult, HardwareBreakpointSize, HardwareBreakpointType,
@@ -368,9 +368,9 @@ fn wow64_freeze_through_pointer_chain() {
     assert!(state.ok);
 }
 
-/// PEB hiding on a WOW64 target patches both the 32-bit and 64-bit PEBs.
+/// PEB normalization on a WOW64 target patches both the 32-bit and 64-bit PEBs.
 #[test]
-fn wow64_hide_peb_patches_both_pebs() {
+fn wow64_normalize_peb_patches_both_pebs() {
     let Some(exe) = fixture() else { return };
     let server = TestServer::spawn();
     let addr = server.address().to_string();
@@ -383,8 +383,8 @@ fn wow64_hide_peb_patches_both_pebs() {
         .on_initial_breakpoint(|session, pid, _tid, _address| {
             let peb32 = session.get_peb_address(pid)?;
             assert!(peb32 < 0x1_0000_0000, "32-bit PEB {:#x} must be in the low 4 GB", peb32);
-            let report = session.hide_peb(pid, PebHideOptions { being_debugged: true, nt_global_flag: true, ..Default::default() })?;
-            println!("hide_peb applied: {:?}", report.applied);
+            let report = session.normalize_peb(pid, PebNormalizeOptions { being_debugged: true, heap_flags: true })?;
+            println!("normalize_peb applied: {:?}", report.applied);
             // BeingDebugged cleared in the 32-bit PEB the target's own code reads.
             let bd = session.read_memory(pid, peb32 + 0x02, 1)?[0];
             session.state.being_debugged_after = Some(bd);

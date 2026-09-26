@@ -327,9 +327,11 @@ Reference test: [`tests/lua/sandbox/etw_live.lua`](../tests/lua/sandbox/etw_live
 - **Import hooks vs API breakpoints.** `set_breakpoint(pid, "kernel32!CreateProcessW")` fires
   for every caller in the process, loader included. `set_breakpoint_import` hooks one
   module's IAT slot and is unambiguous under WOW64.
-- **Anti-debug.** `dbg:hide_peb(pid)` at the initial breakpoint clears the classic PEB checks
-  (BeingDebugged, NtGlobalFlag, heap flags). Time-based and exception-based checks need
-  breakpoints or emulation.
+- **PEB normalization.** `dbg:normalize_peb(pid)` at the initial breakpoint restores the PEB
+  fields Windows leaves in their "debugger attached" state (BeingDebugged, process-heap flags)
+  so the target runs like a normally launched process — no debug-heap slowdown, and code that
+  reads `IsDebuggerPresent` (crash reporters, exception handlers that would fire an `int3`) takes
+  its normal path. Not evasion; it's about reproducing behavior as it happens without a debugger.
 - **Handlers are Lua closures** — accumulate results in upvalues and print after `dbg:run()`
   returns, or print inside; both work.
 - **Emulation stops at imports by default** (`ImportCall(...)`). Pass `imports = "skip"` with
