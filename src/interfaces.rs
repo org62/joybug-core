@@ -358,6 +358,13 @@ pub trait SymbolProvider: Send + Sync {
         module_path: &str,
         rva: u32,
     ) -> Result<Option<ModuleSymbol>, SymbolError>;
+
+    /// The debug file (PDB, DWARF file) the module's symbols came from, once
+    /// loaded; `None` when symbols came from the module itself or nothing is
+    /// loaded. Line tables and types are parsed from it on demand.
+    fn debug_file_path(&self, _module_path: &str) -> Option<String> {
+        None
+    }
 }
 
 pub trait DisassemblerProvider: Send + Sync {
@@ -720,8 +727,16 @@ pub trait PlatformAPI: Send + Sync {
             .collect()
     }
 
-    /// Write a minidump of the process to `path` (a path on the machine running
-    /// the platform). Returns the file size in bytes.
+    /// Replace the set of POSIX signals reported as `Exception` events (see
+    /// `DebuggerRequest::SetReportedSignals`). Nothing to do where there are
+    /// no signals.
+    fn set_reported_signals(&mut self, _signals: &[u32]) -> Result<(), PlatformError> {
+        Ok(())
+    }
+
+    /// Write a dump of the process to `path` (a path on the machine running
+    /// the platform): a minidump on Windows, an ELF core file on Linux.
+    /// Returns the file size in bytes.
     fn write_minidump(&self, _pid: u32, _path: &str, _kind: MinidumpKind) -> Result<u64, PlatformError> {
         Err(PlatformError::NotImplemented)
     }

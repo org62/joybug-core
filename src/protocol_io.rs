@@ -981,6 +981,11 @@ impl<S> DebugSession<S> {
         }
     }
 
+    /// Which POSIX signals the server reports as exceptions (Linux targets).
+    pub fn set_reported_signals(&mut self, signals: &[u32]) -> anyhow::Result<()> {
+        self.ack_request(DebuggerRequest::SetReportedSignals { signals: signals.to_vec() }, "SetReportedSignals")
+    }
+
     pub fn close_remote_handle(&mut self, pid: u32, handle: u64) -> anyhow::Result<()> {
         self.ack_request(DebuggerRequest::CloseRemoteHandle { pid, handle }, "CloseRemoteHandle")
     }
@@ -1767,6 +1772,17 @@ impl<S> DebugSession<S> {
                 "Unexpected response to ReadMemory: {:?}",
                 other
             )),
+        }
+    }
+
+    /// Map `size` bytes of fresh read/write (optionally executable) memory in
+    /// the target; returns the base address.
+    pub fn allocate_memory(&mut self, pid: u32, size: usize, executable: bool) -> anyhow::Result<u64> {
+        let req = DebuggerRequest::AllocateMemory { pid, size, executable };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::MemoryAllocated { address } => Ok(address),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to allocate memory: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to AllocateMemory: {:?}", other)),
         }
     }
 

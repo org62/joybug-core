@@ -118,7 +118,15 @@ fn main() {
     let script = args.script.clone().or(args.script_pos.clone());
 
     if args.sandbox {
+        #[cfg(windows)]
         sandbox_mode(&args, script.as_deref());
+        #[cfg(not(windows))]
+        {
+            let _ = &script;
+            eprintln!("--sandbox needs Windows Sandbox and is only supported on Windows");
+            exit(2);
+        }
+        #[cfg(windows)]
         return;
     }
 
@@ -208,6 +216,7 @@ fn session_lua(args: &Args, server_addr: &str) -> mlua::Lua {
 /// globals, and drop into the REPL (or run `-s script`). Provision once, iterate
 /// against the live guest as long as you like — the boot cost is paid a single
 /// time (RETRO F3). On exit the VM is stopped unless `--keep-sandbox`.
+#[cfg(windows)]
 fn sandbox_mode(args: &Args, script: Option<&std::path::Path>) {
     use joybug_core::sandbox;
 

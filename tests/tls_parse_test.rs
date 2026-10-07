@@ -1,3 +1,5 @@
+#![cfg(windows)]
+
 // Verifies PE parsing surfaces the entry point and TLS callbacks
 // (ModuleExtraInfo.tls_callbacks) without needing a live debug session.
 mod common;

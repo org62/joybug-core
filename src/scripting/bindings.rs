@@ -41,6 +41,9 @@ impl LuaUserData for LuaDebugClient {
                 Some(t) => Some(t.pairs::<String, String>().collect::<mlua::Result<Vec<_>>>()?),
                 None => None,
             };
+            // A new launch is a new process tree: the first process it reports
+            // is the root, whatever an earlier launch on this client left behind.
+            client.root_pid = None;
             // Launch just sends the request. Events start flowing through the stream.
             // Call dbg:run() to enter the event loop.
             client.send_request_only(&DebuggerRequest::Launch {
@@ -1249,6 +1252,43 @@ impl LuaUserData for LuaDebugClient {
             }
         });
 
+        // POSIX signals to report as exceptions (Linux targets): numbers or
+        // names (`"SIGUSR1"`, `"usr1"`). Replaces the previous set.
+        methods.add_method("set_reported_signals", |_lua, this, signals: Vec<LuaValue>| {
+            let mut numbers = Vec::with_capacity(signals.len());
+            for value in signals {
+                let signo = match &value {
+                    LuaValue::Integer(n) => u32::try_from(*n).ok(),
+                    LuaValue::Number(n) => Some(*n as u32),
+                    LuaValue::String(s) => crate::posix_signals::signal_by_name(&s.to_string_lossy()),
+                    _ => None,
+                };
+                let signo = signo
+                    .filter(|n| (1..=crate::posix_signals::SIGNAL_MAX).contains(n))
+                    .ok_or_else(|| mlua::Error::external(anyhow::anyhow!("not a signal: {:?}", value)))?;
+                numbers.push(signo);
+            }
+            let mut client = this.inner.borrow_mut();
+            ack_method("SetReportedSignals", client.send_and_receive(&DebuggerRequest::SetReportedSignals { signals: numbers }))
+        });
+
+        // Write a dump of the stopped target on the server's machine: a
+        // minidump on Windows, an ELF core file on Linux. `kind` is "mini"
+        // (default) or "full". Returns the file size in bytes.
+        methods.add_method("write_dump", |_lua, this, (pid, path, kind): (u32, String, Option<String>)| {
+            let kind = match kind.as_deref() {
+                None | Some("mini") => crate::protocol::MinidumpKind::Mini,
+                Some("full") => crate::protocol::MinidumpKind::Full,
+                Some(other) => return Err(mlua::Error::external(anyhow::anyhow!("dump kind must be \"mini\" or \"full\", got {:?}", other))),
+            };
+            let mut client = this.inner.borrow_mut();
+            match client.send_and_receive(&DebuggerRequest::WriteMinidump { pid, path, kind }).map_err(mlua::Error::external)? {
+                DebuggerResponse::MinidumpWritten { size_bytes } => Ok(size_bytes),
+                DebuggerResponse::Error { message } => Err(mlua::Error::external(anyhow::anyhow!("WriteMinidump failed: {}", message))),
+                other => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response to WriteMinidump: {:?}", other))),
+            }
+        });
+
         methods.add_method("close_remote_handle", |_lua, this, (pid, handle): (u32, u64)| {
             let mut client = this.inner.borrow_mut();
             ack_method("CloseRemoteHandle", client.send_and_receive(&DebuggerRequest::CloseRemoteHandle { pid, handle }))
@@ -2045,6 +2085,7 @@ impl LuaUserData for LuaDebugClient {
 
         // ---- Inline hooks ----
 
+        #[cfg(windows)]
         methods.add_method("hook", |lua, _this, (addr, callback): (u64, LuaFunction)| {
             let mut engine = HOOK_ENGINE.lock().unwrap();
             let (hook_id, trampoline) = engine.hook(addr as *const u8, lua, callback)
@@ -2056,6 +2097,7 @@ impl LuaUserData for LuaDebugClient {
             Ok(table)
         });
 
+        #[cfg(windows)]
         methods.add_method("unhook", |_lua, _this, addr: u64| {
             let mut engine = HOOK_ENGINE.lock().unwrap();
             engine.unhook(addr)
@@ -2526,7 +2568,6 @@ pub fn register_mem_functions(lua: &Lua) -> mlua::Result<()> {
 
 /// Register memory formatting functions as Lua globals.
 pub fn register_memory_formatters(lua: &mlua::Lua) -> mlua::Result<()> {
-    #[cfg(windows)]
     {
         use crate::formatting::memory;
         lua.globals().set("mem_state", lua.create_function(|_, state: u32| {

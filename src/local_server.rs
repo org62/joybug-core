@@ -17,20 +17,19 @@ pub struct LocalServer {
 }
 
 impl LocalServer {
-    /// Start a local debug server with the default `WindowsPlatform` backend.
+    /// Start a local debug server with the default [`crate::PlatformImpl`] backend.
     /// Panics on failure; use `start()` for a non-panicking variant.
     pub fn spawn() -> Self {
         Self::start().expect("Failed to start local debug server")
     }
 
-    /// Start a local debug server with the default `WindowsPlatform` backend.
+    /// Start a local debug server with the default [`crate::PlatformImpl`] backend.
     pub fn start() -> Result<Self, String> {
         Self::start_with(crate::PlatformImpl::new())
     }
 
     /// Start a local debug server with the default backend and an explicit symbol
     /// configuration (symbol path / offline mode).
-    #[cfg(windows)]
     pub fn start_with_config(cfg: crate::interfaces::SymbolConfig) -> Result<Self, String> {
         Self::start_with(crate::PlatformImpl::new_with_config(cfg))
     }

@@ -11,7 +11,7 @@ use crate::interfaces::{Architecture, Instruction};
 use crate::protocol::{EmulationMode, TraceExitCondition};
 
 use super::mapped::PAGE_SIZE;
-use super::PeImage;
+use super::StaticImage;
 
 /// The synthetic address space a run gets, so a script can place its inputs
 /// (`mem_writes` into the stack, registers pointing at them) before the run.
@@ -98,7 +98,7 @@ impl EmulateSpec {
 /// pulls one page at a time, so a run touches a handful of pages of a
 /// multi-megabyte image and never duplicates the rest.
 pub struct StaticTarget<'a> {
-    image: &'a PeImage,
+    image: &'a StaticImage,
     layout: EmuLayout,
     /// Page address -> the page's contents, for image/stack pages written
     /// before the run.
@@ -110,7 +110,7 @@ pub struct StaticTarget<'a> {
 impl<'a> StaticTarget<'a> {
     /// Build the target for `spec` with the run's initial stack pointer `sp`
     /// (the return sentinel is planted at `[sp]` on x86/x64).
-    fn new(image: &'a PeImage, spec: &EmulateSpec, sp: u64) -> Result<Self, EmulatorError> {
+    fn new(image: &'a StaticImage, spec: &EmulateSpec, sp: u64) -> Result<Self, EmulatorError> {
         let arch = image.arch();
         let mapped = image.mapped();
         let layout = emu_layout(arch, spec.stack_size);
@@ -263,7 +263,7 @@ impl EmuTarget for StaticTarget<'_> {
 }
 
 /// Run `spec` against `image` with no process behind it.
-pub fn emulate(image: &PeImage, spec: &EmulateSpec) -> Result<EmulationResult, EmulatorError> {
+pub fn emulate(image: &StaticImage, spec: &EmulateSpec) -> Result<EmulationResult, EmulatorError> {
     let mapped = image.mapped();
     if mapped.region_at(spec.va).is_none() {
         return Err(EmulatorError::PlatformError(format!(

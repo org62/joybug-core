@@ -33,7 +33,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 /// The argv flag that selects this role.
-pub const ROLE_FLAG: &str = "--ui";
+pub const ROLE_FLAG: &str = crate::guest_roles::DESKTOP_UI_ROLE_FLAG;
 
 /// One window (top-level or child) in the interactive session. The wire shape
 /// between guest and host (`--ui windows` writes a JSON array of these).

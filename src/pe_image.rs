@@ -118,6 +118,37 @@ impl OriginalModuleImage {
             }
         };
 
+        // An ELF module (Linux): its allocated sections map file bytes to RVAs
+        // just like PE section headers, and code is never rewritten at load
+        // (PIE text is RIP-relative; relocations land in data/GOT), so the
+        // file bytes compare as-is.
+        if bytes.starts_with(b"\x7FELF") {
+            return match crate::elf::info::module_extra_info(Path::new(path)) {
+                Ok(info) => {
+                    let sections: Vec<SectionMap> = info.sections.iter().map(SectionMap::from).collect();
+                    let code_ranges: Vec<(u32, u32)> = info
+                        .sections
+                        .iter()
+                        .filter(|s| s.Characteristics & IMAGE_SCN_MEM_EXECUTE != 0)
+                        .map(|s| (s.VirtualAddress, s.VirtualAddress.wrapping_add(s.VirtualSize)))
+                        .collect();
+                    debug!("pe_image: built ELF image for '{}' base=0x{:X} code_ranges={}", path, base, code_ranges.len());
+                    Self {
+                        base,
+                        image_size: info.nt_headers.OptionalHeader.SizeOfImage as u64,
+                        bytes,
+                        sections,
+                        code_ranges,
+                        unavailable: false,
+                    }
+                }
+                Err(e) => {
+                    debug!("pe_image: ELF parse failed for '{}': {}", path, e);
+                    Self::unavailable(base)
+                }
+            };
+        }
+
         // Parse headers/sections/relocs from an immutable borrow, collect what we
         // need, then drop the borrow before mutating `bytes` for relocations.
         struct Parsed {

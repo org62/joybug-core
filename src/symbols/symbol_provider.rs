@@ -1,3 +1,4 @@
+#![cfg_attr(not(windows), allow(dead_code))]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::fs::File;
@@ -19,7 +20,7 @@ use tokio::runtime::{Runtime, Builder};
 
 use crate::interfaces::{Address, LineEntry, ModuleSymbol, ResolvedSymbol, SourceFileEntry, SymbolConfig, SymbolError, SymbolProvider};
 use crate::protocol::PdbMismatchInfo;
-use crate::windows_platform::symbol_manager::{matches_tokens, query_tokens};
+use crate::symbols::symbol_manager::{matches_tokens, query_tokens};
 
 // --- PDB Identifier Logic (adapted from src/windows/symbols/pe_reader.rs) ---
 
@@ -347,7 +348,7 @@ fn correct_line_number_overflow(lines: &mut [LineEntry]) {
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -527,6 +528,10 @@ fn insert_symbol(
 }
 
 impl SymbolProvider for WindowsSymbolProvider {
+    fn debug_file_path(&self, module_path: &str) -> Option<String> {
+        self.pdb_path_for(module_path)
+    }
+
     fn load_symbols_for_module(
         &mut self,
         module_path_str: &str,

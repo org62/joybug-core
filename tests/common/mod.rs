@@ -1,45 +1,45 @@
-#![cfg(windows)]
-
 #[allow(unused_imports)]
 pub use joybug_core::local_server::LocalServer as TestServer;
 use joybug_core::interfaces::{Architecture, InstructionFormatter, ResolvedSymbol};
 use joybug_core::protocol::ModuleInfo;
 use joybug_core::protocol_io::DebugSession;
 
-/// Get the path to a compiled test program exe built by build.rs.
+/// Get the path to a compiled test program built by build.rs.
 #[allow(dead_code)]
 /// Searches OUT_DIR first, then falls back to scanning target/{debug,release}/build/*/out/.
 pub fn get_test_program_path(name: &str) -> String {
     try_get_test_program_path(name).unwrap_or_else(|| {
         panic!(
-            "Could not find {}.exe. Make sure to build the project first.",
-            name
+            "Could not find {}{}. Make sure to build the project first.",
+            name,
+            std::env::consts::EXE_SUFFIX
         )
     })
 }
 
-/// [`get_test_program_path`] that returns `None` instead of panicking — for
+/// [`get_test_program_path`] that returns `None` instead of panicking - for
 /// fixtures build.rs may legitimately skip (the 32-bit `*32.exe` programs
 /// need an x86 cross toolchain).
 #[allow(dead_code)]
 pub fn try_get_test_program_path(name: &str) -> Option<String> {
-    let out_dir = std::env::var("OUT_DIR").unwrap_or_else(|_| {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        format!("{}\\target\\debug\\build", manifest_dir)
-    });
+    use std::path::{Path, PathBuf};
+    let file_name = format!("{}{}", name, std::env::consts::EXE_SUFFIX);
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out_dir = std::env::var("OUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| manifest_dir.join("target").join("debug").join("build"));
 
-    let expected_path = format!("{}\\{}.exe", out_dir, name);
-    if std::path::Path::new(&expected_path).exists() {
-        return Some(expected_path);
+    let expected_path = out_dir.join(&file_name);
+    if expected_path.exists() {
+        return Some(expected_path.to_string_lossy().to_string());
     }
 
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
     for profile in &["debug", "release"] {
-        let search_dir = format!("{}\\target\\{}\\build", manifest_dir, profile);
+        let search_dir = manifest_dir.join("target").join(profile).join("build");
         if let Ok(entries) = std::fs::read_dir(&search_dir) {
             for entry in entries.flatten() {
                 if entry.path().is_dir() {
-                    let candidate = entry.path().join("out").join(format!("{}.exe", name));
+                    let candidate = entry.path().join("out").join(&file_name);
                     if candidate.exists() {
                         return Some(candidate.to_string_lossy().to_string());
                     }
@@ -66,6 +66,7 @@ pub fn module_file_name_matches(image_name: &str, target: &str) -> bool {
 /// `module_base + BeginAddress` for each. Returns an empty vec (with a WARN
 /// print) when the module has no extra info or no exception directory.
 #[allow(dead_code)]
+#[cfg(windows)]
 pub fn runtime_function_entry_vas<T>(
     session: &mut DebugSession<T>,
     pid: u32,

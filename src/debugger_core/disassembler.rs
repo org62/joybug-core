@@ -2,6 +2,7 @@ use crate::interfaces::{Architecture, DisassemblerError, DisassemblerProvider, I
 use capstone::prelude::*;
 use capstone::arch::ArchDetail;
 use capstone::arch::x86::X86OperandType;
+use capstone::RegAccessType;
 use capstone::RegId;
 use std::cell::RefCell;
 
@@ -66,6 +67,33 @@ impl CapstoneDisassembler {
             }
             f(engine_opt.as_ref().unwrap())
         })
+    }
+
+    /// Win32 `EXCEPTION_RECORD.ExceptionInformation[0]` for a fault raised by
+    /// the instruction at `code` (its first bytes): 0 = read, 1 = write,
+    /// 8 = instruction fetch. Windows gets this from the page-fault error code;
+    /// a Linux `SIGSEGV` carries no access type, so it is recovered from the
+    /// instruction's memory operands. An instruction fetch is the fault
+    /// address being the PC itself. Unknown or undecodable → read.
+    pub fn x86_fault_access_kind(&self, arch: Architecture, code: &[u8], pc: u64, fault_address: u64) -> u64 {
+        if fault_address == pc {
+            return 8;
+        }
+        if !arch.is_x86_family() {
+            return 0;
+        }
+        let writes = Self::with_engine(arch, |engine| {
+            let insns = engine.disasm_count(code, pc, 1).map_err(|e| DisassemblerError::CapstoneError(e.to_string()))?;
+            let Some(insn) = insns.iter().next() else { return Ok(false) };
+            let detail = engine.insn_detail(insn).map_err(|e| DisassemblerError::CapstoneError(e.to_string()))?;
+            let ArchDetail::X86Detail(x86) = detail.arch_detail() else { return Ok(false) };
+            Ok(x86.operands().any(|op| {
+                matches!(op.op_type, X86OperandType::Mem(_))
+                    && matches!(op.access, Some(RegAccessType::WriteOnly) | Some(RegAccessType::ReadWrite))
+            }))
+        })
+        .unwrap_or(false);
+        if writes { 1 } else { 0 }
     }
 }
 

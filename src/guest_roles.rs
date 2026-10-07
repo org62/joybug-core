@@ -22,6 +22,11 @@
 use crate::SymbolConfig;
 use clap::{Args as _, FromArgMatches as _};
 
+/// The desktop-probe role flag (`--ui <mode>`). Defined here, not in
+/// `guest_desktop`, because the sniff must work on every OS while the probe
+/// itself is Windows-only.
+pub const DESKTOP_UI_ROLE_FLAG: &str = "--ui";
+
 /// Which guest role an invocation is.
 pub enum GuestRole {
     /// ETW collector; it parses the whole argument list itself.
@@ -70,7 +75,7 @@ pub fn from_argv(argv: &[String]) -> Option<GuestRole> {
     // Any binary that dispatches guest roles can be a sandbox guest: keep its
     // identity record linked in (see `guest_marker`).
     crate::guest_marker::touch();
-    if argv.first().map(String::as_str) == Some(crate::guest_desktop::ROLE_FLAG) {
+    if argv.first().map(String::as_str) == Some(DESKTOP_UI_ROLE_FLAG) {
         return Some(GuestRole::DesktopUi);
     }
     if argv.iter().any(|a| a == "--out") {
@@ -92,8 +97,18 @@ pub fn from_argv(argv: &[String]) -> Option<GuestRole> {
 /// Run the role to completion and exit the process.
 pub fn run(role: GuestRole, argv: Vec<String>) -> ! {
     match role {
+        #[cfg(windows)]
         GuestRole::Tracer => crate::etw::run_collector(argv.into_iter()),
+        #[cfg(windows)]
         GuestRole::DesktopUi => crate::guest_desktop::run_cli(argv.into_iter()),
+        #[cfg(not(windows))]
+        GuestRole::Tracer | GuestRole::DesktopUi => {
+            // The ETW collector and the desktop probe only exist inside a
+            // Windows Sandbox guest; there is nothing to run here.
+            let _ = argv;
+            eprintln!("this guest role is only supported on Windows");
+            std::process::exit(2)
+        }
         GuestRole::Server(args) => run_server(args),
     }
 }

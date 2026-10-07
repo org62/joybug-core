@@ -154,7 +154,7 @@ pub mod request_response {
 
     impl RegisterSnapshot {
         /// Create from Windows CONTEXT (x64)
-        #[cfg(all(windows, target_arch = "x86_64"))]
+        #[cfg(target_arch = "x86_64")]
         pub fn from_context(ctx: &super::CONTEXT) -> Self {
             RegisterSnapshot::X64(X64RegisterSnapshot {
                 rax: ctx.Rax,
@@ -179,7 +179,7 @@ pub mod request_response {
         }
 
         /// Create from Windows CONTEXT (ARM64)
-        #[cfg(all(windows, target_arch = "aarch64"))]
+        #[cfg(target_arch = "aarch64")]
         pub fn from_context(ctx: &super::CONTEXT) -> Self {
             unsafe {
                 let x_regs = ctx.Anonymous.X;
@@ -804,7 +804,17 @@ pub mod request_response {
             pattern: Vec<u8>,
             max_results: usize,
         },
-        /// Write a minidump of `pid` to `path` on the server machine.
+        /// Which POSIX signals the server reports as an `Exception` (code
+        /// `posix_signals::signal_exception_code`) instead of delivering them
+        /// to the target unseen. Replaces the previous set; applies to every
+        /// process the server debugs, now and later. The fault signals
+        /// (SIGSEGV, SIGFPE, ...) are always reported, as their NTSTATUS. A
+        /// no-op on a platform without signals.
+        SetReportedSignals {
+            signals: Vec<u32>,
+        },
+        /// Write a dump of `pid` to `path` on the server machine: a minidump
+        /// on Windows, an ELF core file on Linux.
         WriteMinidump {
             pid: u32,
             path: String,
@@ -1747,9 +1757,7 @@ pub mod request_response {
     /// WOW64 process, on either host. Consumers go through the accessors below
     /// rather than matching the variant, so the per-host `#[cfg]` lives here only.
     pub enum ThreadContext {
-        #[cfg(windows)]
         Win32RawContext(crate::protocol::CONTEXT),
-        #[cfg(windows)]
         Wow64RawContext(crate::protocol::WOW64_CONTEXT),
     }
 
@@ -1884,7 +1892,6 @@ pub mod request_response {
         pub fn get_sp(&self) -> u64 { self.sp() }
     }
 
-    #[cfg(windows)]
     impl Clone for ThreadContext {
         fn clone(&self) -> Self {
             match self {
@@ -1907,7 +1914,6 @@ pub mod request_response {
     const NATIVE_CONTEXT_TAG: &str = "Win32RawContext";
     const WOW64_CONTEXT_TAG: &str = "Wow64RawContext";
 
-    #[cfg(windows)]
     impl serde::Serialize for ThreadContext {
         fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
         where
@@ -1925,7 +1931,6 @@ pub mod request_response {
         }
     }
 
-    #[cfg(windows)]
     impl<'de> serde::Deserialize<'de> for ThreadContext {
         fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
         where
@@ -2033,13 +2038,15 @@ pub mod request_response {
     }
 }
 
-#[cfg(windows)]
+// Not `cfg(windows)`: windows-sys declares these plain-old-data structs for
+// every OS (they are gated by target_arch), and `ThreadContext` carries them
+// unconditionally. The Windows platform fills them from GetThreadContext; a
+// non-Windows platform may still produce the same layout.
 pub use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, WOW64_CONTEXT};
 
 /// Byte-image (de)serialization of the plain-old-data context structs. The
 /// size is the discriminator's safety net: a blob of the wrong length is
 /// rejected rather than reinterpreted.
-#[cfg(windows)]
 pub mod windows_context_serde {
     use super::{CONTEXT, WOW64_CONTEXT};
 

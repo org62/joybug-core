@@ -554,6 +554,13 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::SetReportedSignals { signals } => {
+                let mut p = platform.write().unwrap();
+                match p.set_reported_signals(&signals) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::WriteMinidump { pid, path, kind } => {
                 let p = platform.read().unwrap();
                 match p.write_minidump(pid, &path, kind) {

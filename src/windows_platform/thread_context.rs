@@ -11,6 +11,7 @@ use super::{utils, AlignedContext};
 use crate::interfaces::{Architecture, PlatformError};
 use crate::protocol::ThreadContext;
 use crate::windows_platform::DebuggedProcess;
+use super::win_ops::WinProcess;
 use tracing::{debug, error, trace};
 use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
 use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -31,9 +32,8 @@ fn last_os_error(what: &str) -> PlatformError {
     PlatformError::OsError(format!("{} failed: {} ({})", what, error, error_str))
 }
 
-fn thread_handle(process: &DebuggedProcess, tid: u32) -> Result<HANDLE, PlatformError> {
-    process
-        .thread_manager()
+fn thread_handle(os: &WinProcess, tid: u32) -> Result<HANDLE, PlatformError> {
+    os.threads()
         .get_thread_handle(tid)
         .ok_or_else(|| PlatformError::OsError(format!("No handle for thread {}", tid)))
 }
@@ -78,9 +78,17 @@ pub(super) fn get_thread_context(
     pid: u32,
     tid: u32,
 ) -> Result<ThreadContext, PlatformError> {
+    get_thread_context_os(&process.os, pid, tid)
+}
+
+pub(super) fn get_thread_context_os(
+    os: &WinProcess,
+    pid: u32,
+    tid: u32,
+) -> Result<ThreadContext, PlatformError> {
     trace!(pid, tid, "WindowsPlatform::get_thread_context called");
-    let handle = thread_handle(process, tid)?;
-    match process.architecture() {
+    let handle = thread_handle(os, tid)?;
+    match os.architecture() {
         Architecture::X86 => match get_wow64_context(handle) {
             Ok(ctx) => Ok(ThreadContext::Wow64RawContext(ctx)),
             // A thread with no 32-bit half — the 64-bit break-in thread that
@@ -104,8 +112,17 @@ pub(super) fn set_thread_context(
     tid: u32,
     context: ThreadContext,
 ) -> Result<(), PlatformError> {
+    set_thread_context_os(&process.os, pid, tid, context)
+}
+
+pub(super) fn set_thread_context_os(
+    os: &WinProcess,
+    pid: u32,
+    tid: u32,
+    context: ThreadContext,
+) -> Result<(), PlatformError> {
     trace!(pid, tid, "WindowsPlatform::set_thread_context called");
-    let handle = thread_handle(process, tid)?;
+    let handle = thread_handle(os, tid)?;
     match context {
         ThreadContext::Win32RawContext(ctx) => set_native_context(handle, &ctx),
         ThreadContext::Wow64RawContext(ctx) => {
@@ -138,7 +155,7 @@ pub(super) fn clear_native_single_step(
     process: &DebuggedProcess,
     tid: u32,
 ) -> Result<(), PlatformError> {
-    let handle = thread_handle(process, tid)?;
+    let handle = thread_handle(&process.os, tid)?;
     let mut ctx = ThreadContext::Win32RawContext(get_native_context(handle)?);
     ctx.set_single_step(false);
     match ctx {

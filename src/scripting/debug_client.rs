@@ -475,7 +475,6 @@ impl DebugClient {
 pub fn context_to_lua_table(lua: &Lua, ctx: &ThreadContext) -> mlua::Result<LuaTable> {
     let table = lua.create_table()?;
     match ctx {
-        #[cfg(windows)]
         ThreadContext::Wow64RawContext(c) => {
             table.set("eax", c.Eax)?;
             table.set("ebx", c.Ebx)?;
@@ -488,7 +487,6 @@ pub fn context_to_lua_table(lua: &Lua, ctx: &ThreadContext) -> mlua::Result<LuaT
             table.set("eip", c.Eip)?;
             table.set("eflags", c.EFlags)?;
         }
-        #[cfg(windows)]
         ThreadContext::Win32RawContext(c) => {
             #[cfg(target_arch = "x86_64")]
             {
@@ -533,7 +531,6 @@ pub fn context_to_lua_table(lua: &Lua, ctx: &ThreadContext) -> mlua::Result<LuaT
 }
 
 /// Convert a Lua table back to a ThreadContext (for set_context).
-#[cfg(windows)]
 pub fn lua_table_to_context(table: &LuaTable, original: &ThreadContext) -> mlua::Result<ThreadContext> {
     {
         {

@@ -1,6 +1,8 @@
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
 use crate::interfaces::PlatformError;
 use crate::pe_types::{DosHeader as SerDosHeader, ImageFileHeader as SerImageFileHeader, ImageOptionalHeader as SerImageOptionalHeader, ImageDataDirectory as SerImageDataDirectory, NtHeaders as SerNtHeaders, ModuleExtraInfo, ImportDescriptorInfo, ImportEntry, ImportItem, ImportKind, ExportInfo, ExportEntry, ExportKind, RuntimeFunction};
-use super::WindowsPlatform;
+#[cfg(windows)]
+use crate::windows_platform::WindowsPlatform;
 use pelite::pe64::exception_arm64::Arm64ExceptionExt;
 // The pe64 `Pe` trait is only needed for the exception directory, which is
 // read on the `Wrap::T64` arm; everything else goes through the format-agnostic
@@ -10,6 +12,7 @@ use pelite::{PeFile, Wrap};
 use tracing::trace;
 use windows_sys::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_ARM64;
 
+#[cfg(windows)]
 impl WindowsPlatform {
 
     pub(crate) fn parse_module_extra_info(&self, pid: u32, module_base: u64) -> Result<ModuleExtraInfo, PlatformError> {
@@ -224,9 +227,9 @@ pub fn parse_module_extra_info_from_bytes(file_bytes: &[u8]) -> Result<ModuleExt
                                 Ok(exp) => {
                                     let name = index_to_name.get(&index).cloned();
                                     let kind = match exp {
-                                        pelite::pe::exports::Export::Symbol(rva) if *rva == 0 => continue, // unused ordinal slot
-                                        pelite::pe::exports::Export::Symbol(rva) => ExportKind::Symbol { rva: *rva },
-                                        pelite::pe::exports::Export::Forward(fwd) => ExportKind::Forward { target: fwd.to_string() },
+                                        pelite::pe64::exports::Export::Symbol(rva) if *rva == 0 => continue, // unused ordinal slot
+                                        pelite::pe64::exports::Export::Symbol(rva) => ExportKind::Symbol { rva: *rva },
+                                        pelite::pe64::exports::Export::Forward(fwd) => ExportKind::Forward { target: fwd.to_string() },
                                     };
                                     entries.push(ExportEntry { ordinal, name, kind });
                                 }
@@ -306,7 +309,7 @@ pub fn parse_module_extra_info_from_bytes(file_bytes: &[u8]) -> Result<ModuleExt
         };
 
         // Return dos + complete nt headers + sections + imports + exports + runtime functions + tls
-        let info = ModuleExtraInfo { dos_header, nt_headers, sections, imports, exports, runtime_functions, tls_callbacks };
+        let info = ModuleExtraInfo { dos_header, nt_headers, sections, imports, exports, runtime_functions, tls_callbacks, elf: None };
         Ok(info)
 }
 

@@ -119,6 +119,37 @@ dbg:on_thread_exited(function(pid, tid, exit_code) end)
 dbg:on_dll_unloaded(function(pid, tid, base) end)
 ```
 
+### Signals (Linux targets)
+
+The fault signals (SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT, SIGSYS) always reach
+`on_exception`, under the NTSTATUS a Windows target would raise. Every other signal is
+delivered to the target unseen unless it is listed here:
+
+```lua
+dbg:set_reported_signals({ "SIGUSR1", "SIGINT", 15 })  -- names or numbers; replaces the set
+dbg:set_reported_signals({})                           -- back to the default
+
+dbg:on_exception(function(pid, tid, code, addr, first_chance)
+    if code == 0x4C53000A then      -- 0x4C530000 | signal number: SIGUSR1
+        return "pass"               -- deliver it; nil drops it; "stop" opens the REPL
+    end
+end)
+```
+
+Passing a signal that nobody handles would kill the target, so it stops once more first, as a
+second-chance exception (`first_chance == false`); passing that delivers it.
+
+### Dumps
+
+```lua
+local bytes = dbg:write_dump(pid, "/tmp/target.core")          -- "mini" (default)
+local bytes = dbg:write_dump(pid, "/tmp/target.core", "full")  -- every readable mapping
+```
+
+Writes a minidump on Windows and an ELF core file on Linux (opens in gdb/lldb), on the
+server's machine, from a stopped target. On Linux "mini" keeps what the process could have
+written (stacks, heap, data) plus each file mapping's first page; code comes from the binaries.
+
 ### Breakpoints
 
 ```lua
@@ -476,7 +507,14 @@ for _, p in ipairs(objs.privileges) do     -- {name=, state="disabled"|"enabled"
 end
 -- objs.desktop_window: GetDesktopWindow(); objs.warnings: per-section failures
 
-dbg:close_remote_handle(pid, handle)            -- close a handle inside the target
+-- On a Linux target the same call lists file descriptors: `handle` is the
+-- descriptor number, `type_name` is File/Directory/Pipe/Socket/eventfd/...,
+-- `granted_access` the open(2) flags, `attributes` has 0x2 when the descriptor
+-- survives an exec, and `name` is the path or the socket's endpoints
+-- ("TCP 127.0.0.1:8080 (LISTEN)"). `privileges` are the capabilities
+-- ("enabled" = effective, "disabled" = permitted only); `windows` is empty.
+
+dbg:close_remote_handle(pid, handle)            -- close a handle inside the target (Linux: close(fd), target must be stopped)
 dbg:set_privilege(pid, "SeDebugPrivilege", true) -- enable/disable a token privilege
 dbg:set_window_enabled(pid, hwnd, false)        -- EnableWindow on a target window
 
@@ -1033,7 +1071,14 @@ end)
 process and no server**: disassembly, symbols, strings, byte-pattern search, cross-references,
 function recovery and emulation, all against the file laid out at its load base. It works in the
 plain REPL, in scripts, and inside `jlua --sandbox` against host paths — nothing here touches the
-guest.
+guest. `elf.open(path[, { base = ..., debug = "/path/prog.debug" }])` does the same for an ELF
+file and returns the same kind of object (`img:format()` says `"pe"` or `"elf"`): its allocated
+sections are `sections()`, the dynamic symbol table is `exports()`, the GOT slots are `imports()`
+(attributed to the `DT_NEEDED` set as a whole), `.eh_frame` is the exception directory, its own
+`.symtab`/`.dynsym` are loaded as symbols at open, and `load_pdb(path)` takes a separate ELF
+debug file (an unstripped copy, `objcopy --only-keep-debug`). `resources()` and
+`tls_callbacks()` are empty for ELF. A position-independent image with no link-time base is laid
+out at `0x555555554000` unless `base` is given.
 
 ```lua
 local img = pe.open([[C:\samples\UnholyDragon.exe]])              -- ImageBase from the file

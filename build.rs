@@ -1,9 +1,14 @@
+// Everything the build script does is Windows-only (MSVC fixtures, CRT link
+// flags, the LIBCLANG_PATH check); on other hosts it is a no-op.
+#[cfg(windows)]
 use std::env;
+#[cfg(windows)]
 use std::path::Path;
 
 /// Compile a test program with MSVC
 /// Returns true if compilation succeeded, false if skipped (cl.exe not available)
 /// If fixed_base is Some, the executable will be linked with that base address
+#[cfg(windows)]
 fn compile_test_program(manifest_dir: &str, out_dir: &str, name: &str, fixed_base: Option<u64>) -> bool {
     compile_test_program_with(manifest_dir, out_dir, name, fixed_base, &[])
 }
@@ -11,6 +16,7 @@ fn compile_test_program(manifest_dir: &str, out_dir: &str, name: &str, fixed_bas
 /// [`compile_test_program`] plus extra `cl.exe` flags, for the rare program that
 /// needs them (e.g. `/MT` for a target that must run somewhere with no VC++
 /// redistributable, like inside a bare Windows Sandbox image).
+#[cfg(windows)]
 fn compile_test_program_with(
     manifest_dir: &str,
     out_dir: &str,
@@ -124,6 +130,7 @@ fn compile_test_program_with(
 /// locates for the `i686-pc-windows-msvc` target — the tool's environment
 /// carries the x86 INCLUDE/LIB paths, so no vcvars shell is needed. Skips
 /// (warning, not error) when no x86 toolchain is installed.
+#[cfg(windows)]
 fn compile_test_program_x86(manifest_dir: &str, out_dir: &str, name: &str) -> bool {
     let src = Path::new(manifest_dir).join("tests").join("test_programs").join(format!("{}.c", name));
     if !src.exists() {
@@ -178,13 +185,58 @@ fn main() {
         println!("cargo:rustc-link-lib=ucrtd");
     }
 
-    // Require LIBCLANG_PATH to be set (needed for bindgen in dependencies like capstone-sys)
+    // Require LIBCLANG_PATH to be set (needed for bindgen in dependencies like
+    // capstone-sys). Windows only: there bindgen can't find libclang.dll on its
+    // own; on Linux the distro's libclang is on the loader path.
+    #[cfg(windows)]
     if env::var("LIBCLANG_PATH").is_err() {
         panic!(
             "LIBCLANG_PATH environment variable is not set.\n\
              Please set it to the path containing libclang.dll, e.g.:\n\
              set LIBCLANG_PATH=C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\VC\\Tools\\Llvm\\ARM64\\bin"
         );
+    }
+
+    // Linux test programs: gcc/clang via the `cc` crate, frame pointers kept
+    // and DWARF 5 line tables for the unwinder and line-info tests. Failures
+    // are warnings, not errors, like the MSVC fixtures.
+    #[cfg(target_os = "linux")]
+    {
+        let out_dir = std::env::var("OUT_DIR").unwrap();
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let programs = std::path::Path::new(&manifest_dir).join("tests").join("test_programs").join("linux");
+        println!("cargo:rerun-if-changed=tests/test_programs/linux");
+        println!("cargo:rerun-if-changed=tests/test_programs/portable.h");
+        let compiler = cc::Build::new().get_compiler();
+        for name in ["hello", "threads", "segv", "sleeper", "forker", "signals", "fds"] {
+            let src = programs.join(format!("{name}.c"));
+            let out = std::path::Path::new(&out_dir).join(name);
+            let mut cmd = compiler.to_command();
+            cmd.args(["-g", "-gdwarf-5", "-O0", "-fno-omit-frame-pointer", "-no-pie", "-pthread"])
+                .arg("-o")
+                .arg(&out)
+                .arg(&src);
+            match cmd.output() {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => println!(
+                    "cargo:warning=compiling test program {name} failed: {}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+                Err(e) => println!("cargo:warning=failed to run the C compiler for {name}: {e}"),
+            }
+        }
+        // A PIE build of hello too, to exercise the load-bias arithmetic.
+        let mut cmd = compiler.to_command();
+        cmd.args(["-g", "-gdwarf-5", "-O0", "-fno-omit-frame-pointer", "-pie", "-fPIE"])
+            .arg("-o")
+            .arg(std::path::Path::new(&out_dir).join("hello_pie"))
+            .arg(programs.join("hello.c"));
+        if let Ok(o) = cmd.output() {
+            if !o.status.success() {
+                println!("cargo:warning=compiling hello_pie failed: {}", String::from_utf8_lossy(&o.stderr));
+            }
+        }
     }
 
     // Only compile test programs on Windows

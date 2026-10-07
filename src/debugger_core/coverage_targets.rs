@@ -23,6 +23,7 @@ use crate::protocol::{CoverageTarget, CoverageTargetSource, MemoryRegionInfo};
 use tracing::{info, trace, warn};
 
 use super::disassembler::CapstoneDisassembler;
+use crate::symbols::symbol_manager::SymbolManager;
 
 const MEM_COMMIT: u32 = 0x1000;
 const PAGE_NOACCESS: u32 = 0x01;
@@ -580,14 +581,19 @@ pub(crate) fn name_for(symbols: &[ModuleSymbol], rva: u32) -> Option<String> {
     (symbol.rva == rva).then(|| symbol.name.clone())
 }
 
-impl super::WindowsPlatform {
-    /// See [`crate::interfaces::PlatformAPI::enumerate_coverage_targets`].
-    pub(super) fn enumerate_coverage_targets_impl(
-        &self,
-        pid: u32,
-        module_path: &str,
-        sources: &[CoverageTargetSource],
-    ) -> Result<Vec<CoverageTarget>, PlatformError> {
+/// See [`crate::interfaces::PlatformAPI::enumerate_coverage_targets`]. OS-neutral:
+/// the platform supplies modules, memory regions and reads; the function
+/// table (`.pdata` / `.eh_frame`) and symbols come from the symbol manager.
+pub fn enumerate_coverage_targets<P: PlatformAPI + ?Sized>(
+    platform: &P,
+    symbol_manager: &SymbolManager,
+    disassembler: &CapstoneDisassembler,
+    arch: Architecture,
+    pid: u32,
+    module_path: &str,
+    sources: &[CoverageTargetSource],
+) -> Result<Vec<CoverageTarget>, PlatformError> {
+    {
         // Empty means "everything"; otherwise only what was asked for. Symbols
         // are still read when no symbol tier is requested — they name the
         // `.pdata` targets — but the code-sanity sweep, which is the expensive
@@ -596,19 +602,13 @@ impl super::WindowsPlatform {
         let wants_function_symbols = wants(CoverageTargetSource::FunctionSymbol);
         let wants_validated = wants(CoverageTargetSource::ValidatedSymbol);
 
-        let modules = self.modules_for(pid);
+        let modules = platform.list_modules(pid)?;
         let module = modules
             .iter()
             .find(|m| m.name.eq_ignore_ascii_case(module_path))
             .ok_or_else(|| PlatformError::Other(format!("Module not loaded: {}", module_path)))?;
         let base = module.base;
         let module_end = base + module.size.unwrap_or(0);
-        let arch = self.get_process(pid)?.architecture();
-
-        let symbol_manager = self
-            .symbol_manager
-            .as_ref()
-            .ok_or_else(|| PlatformError::Other("Symbol manager unavailable".to_string()))?;
 
         // `.pdata` first: it needs no symbols at all.
         let ranges = symbol_manager.runtime_function_ranges(&module.name);
@@ -631,12 +631,8 @@ impl super::WindowsPlatform {
             }
         };
 
-        let regions = self.enumerate_memory_regions(pid)?;
-        let image = self.snapshot_executable_image(pid, &regions, base, module_end);
-        let disassembler = self
-            .disassembler
-            .as_ref()
-            .ok_or_else(|| PlatformError::Other("Disassembler unavailable".to_string()))?;
+        let regions = platform.enumerate_memory_regions(pid)?;
+        let image = snapshot_executable_image(platform, pid, &regions, base, module_end);
 
         // Address -> source. `.pdata` wins ties: it is the stronger claim, and
         // the UI shows where each row came from.
@@ -720,16 +716,18 @@ impl super::WindowsPlatform {
         );
         Ok(result)
     }
+}
 
-    /// Read the module's committed executable memory into one local buffer per
-    /// region, so the sanity sweep never crosses the process boundary.
-    fn snapshot_executable_image(
-        &self,
-        pid: u32,
-        regions: &[MemoryRegionInfo],
-        base: u64,
-        module_end: u64,
-    ) -> ExecImage {
+/// Read the module's committed executable memory into one local buffer per
+/// region, so the sanity sweep never crosses the process boundary.
+fn snapshot_executable_image<P: PlatformAPI + ?Sized>(
+    platform: &P,
+    pid: u32,
+    regions: &[MemoryRegionInfo],
+    base: u64,
+    module_end: u64,
+) -> ExecImage {
+    {
         let mut chunks: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut total = 0usize;
         for region in regions {
@@ -747,7 +745,7 @@ impl super::WindowsPlatform {
                 warn!(pid, start, len, "Skipping executable region: coverage snapshot budget exhausted");
                 continue;
             }
-            match self.read_memory(pid, start, len) {
+            match platform.read_memory(pid, start, len) {
                 Ok(bytes) => {
                     total += bytes.len();
                     chunks.push((start, bytes));

@@ -408,6 +408,94 @@ pub struct ModuleExtraInfo {
     /// RVAs of the module's TLS callbacks (empty if the module has none).
     #[serde(default)]
     pub tls_callbacks: Vec<u32>,
+    /// For an ELF module, its headers as they really are. The PE-shaped
+    /// fields above are synthesized from them for the consumers that read
+    /// those (region badges, module-entry breakpoints, address mapping); a
+    /// viewer shows these instead. (No `skip_serializing_if`: the protocol is
+    /// bincode, where a skipped field shifts every field after it.)
+    #[serde(default)]
+    pub elf: Option<ElfInfo>,
+}
+
+// ---------------- ELF (native headers of an ELF module) ----------------
+
+/// The ELF file header, program headers, section headers, `.dynamic`
+/// entries and identity notes of a module. Addresses are link-time VAs;
+/// `min_vaddr` is the image's link-time base (`rva = va - min_vaddr`).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ElfInfo {
+    pub header: ElfHeader,
+    pub program_headers: Vec<ElfProgramHeader>,
+    pub sections: Vec<ElfSectionHeader>,
+    pub dynamic: Vec<ElfDynamicEntry>,
+    /// `DT_NEEDED` names, in table order.
+    pub needed: Vec<String>,
+    pub soname: Option<String>,
+    pub interp: Option<String>,
+    pub rpath: Option<String>,
+    pub runpath: Option<String>,
+    /// `.note.gnu.build-id`, hex.
+    pub build_id: Option<String>,
+    /// `.gnu_debuglink` file name.
+    pub debuglink: Option<String>,
+    pub min_vaddr: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ElfHeader {
+    pub class: u8,
+    pub data: u8,
+    pub os_abi: u8,
+    pub abi_version: u8,
+    pub e_type: u16,
+    pub e_machine: u16,
+    pub e_version: u32,
+    pub e_entry: u64,
+    pub e_phoff: u64,
+    pub e_shoff: u64,
+    pub e_flags: u32,
+    pub e_ehsize: u16,
+    pub e_phentsize: u16,
+    pub e_phnum: u16,
+    pub e_shentsize: u16,
+    pub e_shnum: u16,
+    pub e_shstrndx: u16,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ElfProgramHeader {
+    pub p_type: u32,
+    pub p_flags: u32,
+    pub p_offset: u64,
+    pub p_vaddr: u64,
+    pub p_paddr: u64,
+    pub p_filesz: u64,
+    pub p_memsz: u64,
+    pub p_align: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ElfSectionHeader {
+    pub name: String,
+    pub sh_type: u32,
+    pub sh_flags: u64,
+    pub sh_addr: u64,
+    pub sh_offset: u64,
+    pub sh_size: u64,
+    pub sh_link: u32,
+    pub sh_info: u32,
+    pub sh_addralign: u64,
+    pub sh_entsize: u64,
+}
+
+/// One `.dynamic` entry; `string` is the value resolved through `.dynstr`
+/// for the tags that name one (`DT_NEEDED`, `DT_SONAME`, `DT_RPATH`, ...).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ElfDynamicEntry {
+    pub tag: u64,
+    pub value: u64,
+    #[serde(default)]
+    pub string: Option<String>,
 }
 
 // ---------------- Imports (for PE Import Directory) ----------------

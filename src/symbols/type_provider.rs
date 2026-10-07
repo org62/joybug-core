@@ -1,3 +1,4 @@
+#![cfg_attr(not(windows), allow(dead_code))]
 //! PDB type (TPI stream) parsing.
 //!
 //! Mirrors `symbol_provider`'s `parse_pdb_to_*` free functions: the whole TPI
@@ -14,11 +15,12 @@ use tracing::trace;
 
 use crate::interfaces::SymbolError;
 use crate::protocol::{TypeClass, TypeEnumValue, TypeLayout, TypeMember, TypeRef, UdtKind};
-use crate::windows_platform::symbol_provider::open_pdb;
+use crate::symbols::symbol_provider::open_pdb;
 
-/// Owned representation of one TPI record. Indices are raw `TypeIndex` values (u32).
+/// Owned representation of one type record (a PDB TPI record, or a DWARF DIE
+/// on Linux). Indices are raw `TypeIndex` values / DIE offsets (u32).
 #[derive(Debug, Clone)]
-enum OwnedType {
+pub(crate) enum OwnedType {
     Primitive {
         name: &'static str,
         /// Size of the value itself (not the pointer, if `pointer` is set).
@@ -70,10 +72,10 @@ enum OwnedType {
 }
 
 #[derive(Debug, Clone)]
-struct OwnedMember {
-    name: String,
-    field_type: u32,
-    offset: u32,
+pub(crate) struct OwnedMember {
+    pub(crate) name: String,
+    pub(crate) field_type: u32,
+    pub(crate) offset: u32,
 }
 
 /// Browse-list entry for one named type. Module identity isn't known to the PDB;
@@ -419,23 +421,6 @@ pub(crate) fn parse_pdb_to_types(pdb_path: &Path) -> Result<ModuleTypeInfo, Symb
         }
     }
 
-    // Build the browse list from the name index so each type appears once.
-    let mut summaries: Vec<TypeSummaryEntry> = Vec::new();
-    for (name, &index) in &by_name {
-        let (size, kind) = match types.get(&index) {
-            Some(OwnedType::Udt { size, kind, .. }) => (*size, *kind),
-            Some(OwnedType::Enum { .. }) => (0, UdtKind::Enum),
-            _ => continue,
-        };
-        summaries.push(TypeSummaryEntry {
-            name: name.clone(),
-            size,
-            kind,
-            index,
-        });
-    }
-    summaries.sort_by(|a, b| a.name.cmp(&b.name));
-
     trace!(
         path = %pdb_path.display(),
         records = types.len(),
@@ -443,11 +428,25 @@ pub(crate) fn parse_pdb_to_types(pdb_path: &Path) -> Result<ModuleTypeInfo, Symb
         "Parsed PDB type information"
     );
 
-    Ok(ModuleTypeInfo {
-        types,
-        by_name,
-        summaries,
-    })
+    Ok(ModuleTypeInfo::from_records(types, by_name))
+}
+
+impl ModuleTypeInfo {
+    /// Assemble the module's type info from its records and name index,
+    /// building the browse list (one entry per named type) from the latter.
+    pub(crate) fn from_records(types: HashMap<u32, OwnedType>, by_name: HashMap<String, u32>) -> Self {
+        let mut summaries: Vec<TypeSummaryEntry> = Vec::new();
+        for (name, &index) in &by_name {
+            let (size, kind) = match types.get(&index) {
+                Some(OwnedType::Udt { size, kind, .. }) => (*size, *kind),
+                Some(OwnedType::Enum { .. }) => (0, UdtKind::Enum),
+                _ => continue,
+            };
+            summaries.push(TypeSummaryEntry { name: name.clone(), size, kind, index });
+        }
+        summaries.sort_by(|a, b| a.name.cmp(&b.name));
+        Self { types, by_name, summaries }
+    }
 }
 
 fn convert_type_data(data: TypeData<'_>) -> OwnedType {

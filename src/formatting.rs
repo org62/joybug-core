@@ -12,11 +12,38 @@ pub fn module_basename_lower(path: &str) -> String {
 /// File stem of a module path, the way symbols are qualified
 /// ("C:\\x\\kernel32.dll" -> "kernel32"). Falls back to the input unchanged.
 pub fn module_stem(path: &str) -> String {
-    std::path::Path::new(path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(path)
-        .to_string()
+    // By string, not `std::path`: the path is the target's, and a Linux host
+    // does not split on `\`.
+    let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    // A shared object's version tail is part of its name, not an extension:
+    // `libc.so.6` is `libc` (so `libc!write` matches), `ld-linux-x86-64.so.2`
+    // is `ld-linux-x86-64`. Windows names never contain `.so`.
+    if let Some(idx) = name.find(".so") {
+        if name[idx + 3..].is_empty() || name[idx + 3..].starts_with('.') {
+            return name[..idx].to_string();
+        }
+    }
+    match name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem,
+        _ => name,
+    }
+    .to_string()
+}
+
+#[cfg(test)]
+mod module_stem_tests {
+    use super::module_stem;
+
+    #[test]
+    fn windows_and_linux_names() {
+        assert_eq!(module_stem(r"C:\Windows\System32\ntdll.dll"), "ntdll");
+        assert_eq!(module_stem("/usr/bin/hello"), "hello");
+        assert_eq!(module_stem("/lib/x86_64-linux-gnu/libc.so.6"), "libc");
+        assert_eq!(module_stem("/lib64/ld-linux-x86-64.so.2"), "ld-linux-x86-64");
+        assert_eq!(module_stem("/usr/lib/libfoo.so"), "libfoo");
+        assert_eq!(module_stem("[vdso]"), "[vdso]");
+        assert_eq!(module_stem("a.b.c.exe"), "a.b.c");
+    }
 }
 
 /// An import descriptor's DLL name without its extension ("KERNEL32.dll" ->
@@ -25,8 +52,9 @@ pub fn dll_stem(dll_name: &str) -> &str {
     dll_name.rsplit_once('.').map(|(s, _)| s).unwrap_or(dll_name)
 }
 
-// Memory region formatting utilities
-#[cfg(windows)]
+// Memory region formatting utilities. Not `cfg(windows)`: it only uses the
+// windows-sys PAGE_*/MEM_* constants, which exist on every OS, and the region
+// protocol speaks Win32 protection values on all platforms.
 pub mod memory {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE,
@@ -297,19 +325,18 @@ impl std::fmt::Debug for ModuleInfo {
 impl std::fmt::Debug for ThreadContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            #[cfg(windows)]
             ThreadContext::Wow64RawContext(ctx) => write!(f,
                 "eax=0x{:08X} ebx=0x{:08X} ecx=0x{:08X} edx=0x{:08X} esi=0x{:08X} edi=0x{:08X} esp=0x{:08X} ebp=0x{:08X} eip=0x{:08X} eflags=0x{:08X}",
                 ctx.Eax, ctx.Ebx, ctx.Ecx, ctx.Edx, ctx.Esi, ctx.Edi, ctx.Esp, ctx.Ebp, ctx.Eip, ctx.EFlags
             ),
-            #[cfg(all(windows, target_arch = "x86_64"))]
+            #[cfg(target_arch = "x86_64")]
             ThreadContext::Win32RawContext(ctx) => write!(f,
                 "rax=0x{:016X} rbx=0x{:016X} rcx=0x{:016X} rdx=0x{:016X} rsi=0x{:016X} rdi=0x{:016X} rsp=0x{:016X} rbp=0x{:016X} r8=0x{:016X} r9=0x{:016X} r10=0x{:016X} r11=0x{:016X} r12=0x{:016X} r13=0x{:016X} r14=0x{:016X} r15=0x{:016X} rip=0x{:016X}",
                 ctx.Rax, ctx.Rbx, ctx.Rcx, ctx.Rdx, ctx.Rsi, ctx.Rdi,
                 ctx.Rsp, ctx.Rbp, ctx.R8, ctx.R9, ctx.R10, ctx.R11,
                 ctx.R12, ctx.R13, ctx.R14, ctx.R15, ctx.Rip
             ),
-            #[cfg(all(windows, target_arch = "aarch64"))]
+            #[cfg(target_arch = "aarch64")]
             ThreadContext::Win32RawContext(ctx) => unsafe { write!(f,
                 "X0:   {:016X}   X1:   {:016X}   X2:   {:016X}   \n\
                  X3:   {:016X}   X4:   {:016X}   X5:   {:016X}   \n\
@@ -336,7 +363,7 @@ impl std::fmt::Debug for ThreadContext {
                 ctx.Anonymous.X[30], ctx.Sp, ctx.Pc,
                 ctx.Cpsr,
             ) },
-            #[cfg(not(any(all(windows, target_arch = "x86_64"), all(windows, target_arch = "aarch64"))))]
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             #[allow(unreachable_patterns)]
             _ => write!(f, "ThreadContext(<unsupported platform>)"),
         }

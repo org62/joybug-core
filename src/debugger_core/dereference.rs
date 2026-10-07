@@ -1,6 +1,25 @@
-use crate::interfaces::{Architecture, PlatformError, SymbolInfo, MAX_USER_ADDRESS};
+//! Pointer telescoping: follow a chain of pointers from an address and
+//! classify what each step points at (string, instruction, pointer, value).
+
+use crate::interfaces::{Architecture, PlatformAPI, PlatformError, SymbolInfo, MAX_USER_ADDRESS};
 use crate::protocol::{DereferenceEntry, DereferenceValue, MemoryRegionInfo};
 use std::collections::HashSet;
+
+/// What the telescoping needs from a process: bytes and the region map.
+pub trait MemoryReader {
+    fn read(&self, address: u64, len: usize) -> Result<Vec<u8>, PlatformError>;
+    fn regions(&self) -> Result<Vec<MemoryRegionInfo>, PlatformError>;
+}
+
+/// Any platform, for one process id.
+impl<P: PlatformAPI + ?Sized> MemoryReader for (&P, u32) {
+    fn read(&self, address: u64, len: usize) -> Result<Vec<u8>, PlatformError> {
+        self.0.read_memory(self.1, address, len)
+    }
+    fn regions(&self) -> Result<Vec<MemoryRegionInfo>, PlatformError> {
+        self.0.enumerate_memory_regions(self.1)
+    }
+}
 
 /// Maximum depth for pointer chain traversal
 const MAX_CHAIN_DEPTH: usize = 8;
@@ -81,8 +100,8 @@ fn is_executable(regions: &[MemoryRegionInfo], address: u64) -> bool {
 ///
 /// If `symbol_resolver` is provided, instruction operands will be symbolized.
 /// `probe_start`: see `PlatformAPI::dereference`.
-pub(super) fn dereference<F>(
-    pid: u32,
+pub fn dereference<F>(
+    reader: &dyn MemoryReader,
     address: u64,
     count: usize,
     reference_base: Option<u64>,
@@ -94,8 +113,8 @@ where
     F: Fn(u64) -> Option<SymbolInfo>,
 {
     // Query all memory regions once upfront, then telescope against that snapshot.
-    let regions = super::memory::enumerate_memory_regions_unlocked(pid)?;
-    dereference_with_regions(pid, address, count, reference_base, probe_start, arch, &symbol_resolver, &regions)
+    let regions = reader.regions()?;
+    dereference_with_regions(reader, address, count, reference_base, probe_start, arch, &symbol_resolver, &regions)
 }
 
 /// Dereference many independent addresses in one go, enumerating the process's
@@ -107,8 +126,8 @@ where
 /// address means ~16 full address-space walks per step. Enumerating once here
 /// collapses that to a single walk. Regions are stable while the target is
 /// paused, so the shared snapshot is correct for all addresses.
-pub(super) fn dereference_batch<F>(
-    pid: u32,
+pub fn dereference_batch<F>(
+    reader: &dyn MemoryReader,
     addresses: &[u64],
     count: usize,
     reference_base: Option<u64>,
@@ -119,17 +138,17 @@ pub(super) fn dereference_batch<F>(
 where
     F: Fn(u64) -> Option<SymbolInfo>,
 {
-    let regions = super::memory::enumerate_memory_regions_unlocked(pid)?;
+    let regions = reader.regions()?;
     addresses
         .iter()
-        .map(|&address| dereference_with_regions(pid, address, count, reference_base, probe_start, arch, &symbol_resolver, &regions))
+        .map(|&address| dereference_with_regions(reader, address, count, reference_base, probe_start, arch, &symbol_resolver, &regions))
         .collect()
 }
 
 /// Core telescoping over a pre-enumerated region snapshot (no memory-region
 /// query — the caller supplies `regions`). Shared by the single and batch paths.
 fn dereference_with_regions<F>(
-    pid: u32,
+    reader: &dyn MemoryReader,
     address: u64,
     count: usize,
     reference_base: Option<u64>,
@@ -150,7 +169,7 @@ where
         let slot_addr = address.wrapping_add((i * pointer_size) as u64);
         let offset = (slot_addr as i64).wrapping_sub(base as i64);
 
-        let chain = build_dereference_chain(pid, slot_addr, probe_start, arch, symbol_resolver, regions)?;
+        let chain = build_dereference_chain(reader, slot_addr, probe_start, arch, symbol_resolver, regions)?;
 
         entries.push(DereferenceEntry {
             address: slot_addr,
@@ -164,7 +183,7 @@ where
 
 /// Build the dereference chain for a single address
 fn build_dereference_chain<F>(
-    pid: u32,
+    reader: &dyn MemoryReader,
     start_address: u64,
     probe_start: bool,
     arch: Architecture,
@@ -187,10 +206,10 @@ where
     // NOT a pointer — its own address is just where the value lives — so callers
     // pass `probe_start = false` and only the stored value is telescoped.
     if probe_start {
-        if let Some(s) = try_read_string(pid, start_address, regions) {
+        if let Some(s) = try_read_string(reader, start_address, regions) {
             return Ok(vec![DereferenceValue::String(s)]);
         }
-        if let Some((instr, symbol)) = try_read_instruction(pid, start_address, arch, symbol_resolver, regions) {
+        if let Some((instr, symbol)) = try_read_instruction(reader, start_address, arch, symbol_resolver, regions) {
             return Ok(vec![DereferenceValue::Instruction(instr, symbol)]);
         }
     }
@@ -210,7 +229,7 @@ where
         }
 
         // Try to read the value at current address
-        let value = match read_pointer(pid, current_addr, pointer_size) {
+        let value = match read_pointer(reader, current_addr, pointer_size) {
             Ok(v) => v,
             Err(_) => {
                 // Memory read failed - end of chain
@@ -223,9 +242,9 @@ where
 
         if !can_read_target {
             // Not a dereferenceable pointer - check for string/instruction or output as Value
-            if let Some(s) = try_read_string(pid, value, regions) {
+            if let Some(s) = try_read_string(reader, value, regions) {
                 chain.push(DereferenceValue::String(s));
-            } else if let Some((instr, symbol)) = try_read_instruction(pid, value, arch, symbol_resolver, regions) {
+            } else if let Some((instr, symbol)) = try_read_instruction(reader, value, arch, symbol_resolver, regions) {
                 chain.push(DereferenceValue::Instruction(instr, symbol));
             } else {
                 chain.push(DereferenceValue::Value(value));
@@ -241,13 +260,13 @@ where
         chain.push(DereferenceValue::Pointer(value, symbol_str));
 
         // Check if the target is a string
-        if let Some(s) = try_read_string(pid, value, regions) {
+        if let Some(s) = try_read_string(reader, value, regions) {
             chain.push(DereferenceValue::String(s));
             break;
         }
 
         // Check if the target is executable code
-        if let Some((instr, symbol)) = try_read_instruction(pid, value, arch, symbol_resolver, regions) {
+        if let Some((instr, symbol)) = try_read_instruction(reader, value, arch, symbol_resolver, regions) {
             chain.push(DereferenceValue::Instruction(instr, symbol));
             break;
         }
@@ -260,8 +279,8 @@ where
 }
 
 /// Read a pointer-sized value from memory
-fn read_pointer(pid: u32, address: u64, size: usize) -> Result<u64, PlatformError> {
-    let data = super::memory::read_memory_unlocked(pid, address, size)?;
+fn read_pointer(reader: &dyn MemoryReader, address: u64, size: usize) -> Result<u64, PlatformError> {
+    let data = reader.read(address, size)?;
     if data.len() < size {
         return Err(PlatformError::Other("Partial read".to_string()));
     }
@@ -276,19 +295,19 @@ fn read_pointer(pid: u32, address: u64, size: usize) -> Result<u64, PlatformErro
 }
 
 /// Try to read a string at the given address
-fn try_read_string(pid: u32, address: u64, regions: &[MemoryRegionInfo]) -> Option<String> {
+fn try_read_string(reader: &dyn MemoryReader, address: u64, regions: &[MemoryRegionInfo]) -> Option<String> {
     // Check if the address is in a readable memory region
     if !is_readable(regions, address) {
         return None;
     }
 
     // First try ASCII string
-    if let Some(s) = try_read_ascii_string(pid, address) {
+    if let Some(s) = try_read_ascii_string(reader, address) {
         return Some(s);
     }
 
     // Then try UTF-16 string
-    if let Some(s) = try_read_utf16_string(pid, address) {
+    if let Some(s) = try_read_utf16_string(reader, address) {
         return Some(s);
     }
 
@@ -296,8 +315,8 @@ fn try_read_string(pid: u32, address: u64, regions: &[MemoryRegionInfo]) -> Opti
 }
 
 /// Try to read an ASCII string at the given address
-fn try_read_ascii_string(pid: u32, address: u64) -> Option<String> {
-    let data = super::memory::read_memory_unlocked(pid, address, MAX_STRING_LEN).ok()?;
+fn try_read_ascii_string(reader: &dyn MemoryReader, address: u64) -> Option<String> {
+    let data = reader.read(address, MAX_STRING_LEN).ok()?;
 
     if data.is_empty() {
         return None;
@@ -328,8 +347,8 @@ fn try_read_ascii_string(pid: u32, address: u64) -> Option<String> {
 
 /// Try to read a UTF-16 string at the given address
 /// Only accepts ASCII-range characters (English text) to avoid false positives
-fn try_read_utf16_string(pid: u32, address: u64) -> Option<String> {
-    let data = super::memory::read_memory_unlocked(pid, address, MAX_STRING_LEN * 2).ok()?;
+fn try_read_utf16_string(reader: &dyn MemoryReader, address: u64) -> Option<String> {
+    let data = reader.read(address, MAX_STRING_LEN * 2).ok()?;
 
     if data.len() < 4 {
         return None;
@@ -365,7 +384,7 @@ fn try_read_utf16_string(pid: u32, address: u64) -> Option<String> {
 /// Try to disassemble an instruction at the given address
 /// Returns (disassembly_text, optional_symbol)
 fn try_read_instruction<F>(
-    pid: u32,
+    reader: &dyn MemoryReader,
     address: u64,
     arch: Architecture,
     symbol_resolver: &Option<F>,
@@ -382,13 +401,13 @@ where
     // Read enough bytes for one instruction (max instruction size)
     let max_instr_size = arch.max_instruction_len();
 
-    let data = super::memory::read_memory_unlocked(pid, address, max_instr_size).ok()?;
+    let data = reader.read(address, max_instr_size).ok()?;
     if data.is_empty() {
         return None;
     }
 
     // Try to disassemble using capstone
-    use crate::windows_platform::disassembler::CapstoneDisassembler;
+    use super::disassembler::CapstoneDisassembler;
     use crate::interfaces::DisassemblerProvider;
 
     let disasm = CapstoneDisassembler::new().ok()?;

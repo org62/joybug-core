@@ -74,10 +74,30 @@ unicorn-engine = { git = "https://github.com/expend20/unicorn", branch = "AVX2-p
 hexpatch-keystone = "0.9"
 mlua = { version = "0.10", features = ["lua54", "send", "vendored"] }
 rustyline = "15"
-# Windows Sandbox control (wsb.exe wrapper + ETW tracer driver). Always compiled
-# in - there is no feature flag; `sbx.status()` reports at runtime whether the
-# host can actually boot a VM.
+# ELF + DWARF parsing (the offline ELF image, the Linux symbol backend): on
+# every OS, so an ELF file opens in the viewer on Windows too. All three were
+# already in the lock via symsrv/addr2line.
+object = { version = "0.36", default-features = false, features = ["read_core", "elf", "std", "compression"] }
+gimli = { version = "0.31", default-features = false, features = ["read", "std"] }
+# Separate ELF debug files: `.gnu_debuglink` CRC, debuginfod downloads (the TLS
+# flavour symsrv already pulls in).
+crc32fast = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+rustc-demangle = "0.1"
+
+# Windows Sandbox control (wsb.exe wrapper + ETW tracer driver). No feature flag
+# on Windows - always compiled in; `sbx.status()` reports at runtime whether the
+# host can actually boot a VM. It is a `cfg(windows)` dependency because its own
+# deps (`windows`, `ferrisetw`) only build there; the `etw`/`sandbox` modules
+# that use it are gated the same way in lib.rs.
+[target.'cfg(windows)'.dependencies]
 winsandbox = { path = "winsandbox" }
+
+# The Linux (ptrace) backend: raw ptrace/procfs through libc, shell-style
+# command-line splitting for `launch`.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+shlex = "1"
 
 [build-dependencies]
 cc = "1.0"

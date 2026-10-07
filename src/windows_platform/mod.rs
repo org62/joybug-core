@@ -1,46 +1,81 @@
+//! The Windows debugger backend. The module is compiled on every OS: the
+//! pure-Rust parts (Capstone disassembler, PDB/PE symbol parsing, module
+//! header parsing, coverage-target naming) are shared with the offline
+//! `static_pe` analysis and the UI, which exist on Linux too. Only the parts
+//! that touch Win32 process/thread/memory APIs - and `WindowsPlatform` itself -
+//! are `cfg(windows)`.
+
+#[cfg(windows)]
 mod utils;
-mod module_manager;
+#[cfg(windows)]
 mod thread_manager;
+#[cfg(windows)]
 mod thread_control;
+#[cfg(windows)]
 pub mod process;
+#[cfg(windows)]
 pub mod debug_events;
+#[cfg(windows)]
 mod memory;
+#[cfg(windows)]
 mod thread_context;
-mod symbol_manager;
-mod symbol_provider;
-mod type_provider;
-pub mod disassembler;
+// Live in `crate::symbols`; aliased so the `symbol_manager::` paths below and the
+// re-exports `static_pe` and the UI import keep resolving.
+#[cfg_attr(not(windows), allow(unused_imports))]
+pub(crate) use crate::symbols::{symbol_manager, symbol_provider, type_provider};
+/// Compiled in `debugger_core`; the path is kept for `static_pe` and the UI.
+pub use crate::debugger_core::disassembler;
+#[cfg(windows)]
 mod callstack;
+#[cfg(windows)]
 mod stepper;
+#[cfg(windows)]
 mod debugged_process;
-mod module_extra;
+#[cfg(windows)]
+mod win_ops;
+pub(crate) use crate::symbols::module_extra;
 pub use module_extra::parse_module_extra_info_from_bytes;
 pub use symbol_provider::{WindowsSymbolProvider, parse_pdb_matching_pe, extract_pdb_identifier_from_file, PdbIdentifier};
-mod coverage_targets;
+#[cfg(windows)]
 mod dbghelp;
-mod dereference;
+#[cfg(windows)]
 mod tracer;
+#[cfg(windows)]
 mod hardware_breakpoints;
+#[cfg(windows)]
 mod process_objects;
 
+#[cfg(windows)]
 use crate::interfaces::{PlatformAPI, PlatformError, ModuleSymbol, ResolvedSymbol, SymbolError, Architecture, DisassemblerError, Instruction, DisassemblerProvider, Stepper};
 // no-op
+#[cfg(windows)]
 use crate::protocol::{MinidumpKind, ModuleInfo, ProcessInfo, ProcessObjects, ThreadInfo, StepKind};
+#[cfg(windows)]
 use crate::emulator::{Emulator, EmulationResult};
+#[cfg(windows)]
 use symbol_manager::SymbolManager;
 pub use crate::interfaces::SymbolConfig;
+#[cfg(windows)]
 use disassembler::CapstoneDisassembler;
+#[cfg(windows)]
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-use tracing::{trace, info, warn, error};
+#[cfg(windows)]
+use tracing::{trace, info, error};
+#[cfg(windows)]
 use std::collections::HashMap;
 
 // Safe wrapper for HANDLE that automatically closes it
+#[cfg(windows)]
 #[derive(Debug)]
 pub(crate) struct HandleSafe(pub HANDLE);
+#[cfg(windows)]
 unsafe impl Send for HandleSafe {}
+#[cfg(windows)]
 unsafe impl Sync for HandleSafe {}
 
+#[cfg(windows)]
 impl Drop for HandleSafe {
     fn drop(&mut self) {
         if !self.0.is_null() && self.0 as isize != -1 {
@@ -50,27 +85,26 @@ impl Drop for HandleSafe {
 }
 
 // Aligned wrapper for CONTEXT structure
+#[cfg(windows)]
 #[repr(align(16))]
 struct AlignedContext {
     context: CONTEXT,
 }
 
 // Stepping state tracking
-#[derive(Debug, Clone)]
-pub(crate) struct StepState {
-    pub(crate) kind: StepKind,
-    /// If set, a hardware breakpoint DR index that needs re-arming after the step completes.
-    /// Only read on x86_64 (DR-register based HW breakpoints).
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    pub(crate) deferred_hw_bp_rearm: Option<u8>,
-}
+// Stepping state tracking lives in the shared core; re-exported for the
+// `super::StepState` paths in this module.
+#[cfg(windows)]
+pub(crate) use crate::debugger_core::stepping::StepState;
 
+#[cfg(windows)]
 pub(crate) use debugged_process::DebuggedProcess;
 // Shared with the offline `static_pe` analysis, which has no platform.
-pub(crate) use coverage_targets::name_for as symbol_name_at;
-pub(crate) use memory::decode_wide_until_nul;
+pub(crate) use crate::debugger_core::coverage_targets::name_for as symbol_name_at;
+pub(crate) use crate::debugger_core::strings::decode_wide_until_nul;
 pub(crate) use symbol_manager::{matches_tokens, query_tokens};
 
+#[cfg(windows)]
 pub struct WindowsPlatform {
     /// Map of PID to DebuggedProcess for managing multiple processes
     processes: HashMap<u32, DebuggedProcess>,
@@ -81,6 +115,7 @@ pub struct WindowsPlatform {
 }
 
 
+#[cfg(windows)]
 impl WindowsPlatform {
     pub fn new() -> Self {
         Self::new_with_config(SymbolConfig::default())
@@ -121,30 +156,6 @@ impl WindowsPlatform {
     fn symbols(&self) -> Result<&SymbolManager, SymbolError> {
         self.symbol_manager.as_ref()
             .ok_or_else(|| SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()))
-    }
-
-    /// Attribute a watchpoint trap instruction pointer to the accessing
-    /// instruction. On x86 the hardware traps *after* the access, so the accessor
-    /// is the instruction ending exactly at `raw_rip`. Uses the shared backward
-    /// disassembler (self-resynchronizing decode) to find the instruction ending at
-    /// `raw_rip`. ARM64 reports the exact faulting PC. Falls back to `raw_rip` when
-    /// no instruction ends exactly there (misaligned/undecodable window).
-    fn attribute_watchpoint_accessor(&self, pid: u32, raw_rip: u64) -> u64 {
-        if cfg!(target_arch = "aarch64") || raw_rip < 16 {
-            return raw_rip;
-        }
-        // Use the cheap self-resync decode, not the anchored `disassemble_backward`
-        // override: this runs on every watchpoint trap in an auto-continue trace
-        // loop, and the anchored path can decode kilobytes from the function start
-        // (with symbol/line enrichment) just to yield one instruction.
-        match self.disassemble_backward_resync(pid, raw_rip, 1, Architecture::X64) {
-            Ok(ins) => ins
-                .last()
-                .filter(|i| i.address + i.size as u64 == raw_rip)
-                .map(|i| i.address)
-                .unwrap_or(raw_rip),
-            Err(_) => raw_rip,
-        }
     }
 
     /// Find a module by base address in `pid`'s module list.
@@ -429,6 +440,7 @@ impl WindowsPlatform {
     }
 }
 
+#[cfg(windows)]
 impl PlatformAPI for WindowsPlatform {
     fn attach(&mut self, pid: u32) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
         process::attach(self, pid)
@@ -448,17 +460,7 @@ impl PlatformAPI for WindowsPlatform {
 
     fn set_single_shot_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError> {
         let process = self.get_process_mut(pid)?;
-        let process_handle = process.handle();
-
-        // `int3` on x86/x64, `BRK #0` on ARM64; save exactly the bytes it overwrites.
-        let breakpoint_bytes = process.breakpoint_instruction_bytes();
-        let original_bytes = memory::read_memory_internal(process_handle, addr, breakpoint_bytes.len())?;
-
-        // Store the original bytes
-        process.insert_single_shot_breakpoint(addr, original_bytes);
-        
-        // Write the breakpoint instruction
-        memory::write_memory_internal(process_handle, addr, &breakpoint_bytes)
+        crate::debugger_core::breakpoints::arm_single_shot(&mut process.book.bps, &process.os, pid, addr)
     }
 
     fn continue_exec(&mut self, pid: u32, tid: u32) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
@@ -471,17 +473,7 @@ impl PlatformAPI for WindowsPlatform {
     fn set_breakpoint(&mut self, pid: u32, addr: u64, tid: Option<u32>) -> Result<(), PlatformError> {
         trace!(pid, addr, "WindowsPlatform::set_breakpoint called");
         let process = self.get_process_mut(pid)?;
-        let process_handle = process.handle();
-
-        if process.is_persistent_breakpoint(addr) {
-            return Ok(());
-        }
-
-        let breakpoint_bytes = process.breakpoint_instruction_bytes();
-        let original_bytes = memory::read_memory_internal(process_handle, addr, breakpoint_bytes.len())?;
-
-        process.insert_persistent_breakpoint(addr, original_bytes, tid);
-        memory::write_memory_internal(process_handle, addr, &breakpoint_bytes)
+        crate::debugger_core::breakpoints::arm_persistent(&mut process.book.bps, &process.os, pid, addr, tid)
     }
 
     fn remove_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError> {
@@ -491,38 +483,15 @@ impl PlatformAPI for WindowsPlatform {
     }
 
     fn enumerate_coverage_targets(&self, pid: u32, module_path: &str, sources: &[crate::protocol::CoverageTargetSource]) -> Result<Vec<crate::protocol::CoverageTarget>, PlatformError> {
-        self.enumerate_coverage_targets_impl(pid, module_path, sources)
+        let arch = self.get_process(pid)?.architecture();
+        let symbol_manager = self.symbol_manager.as_ref().ok_or_else(|| PlatformError::Other("Symbol manager unavailable".to_string()))?;
+        let disassembler = self.disassembler.as_ref().ok_or_else(|| PlatformError::Other("Disassembler unavailable".to_string()))?;
+        crate::debugger_core::coverage_targets::enumerate_coverage_targets(self, symbol_manager, disassembler, arch, pid, module_path, sources)
     }
 
     fn start_code_coverage(&mut self, pid: u32, addrs: &[u64], limit: u64) -> Result<(), PlatformError> {
-        trace!(pid, count = addrs.len(), limit, "WindowsPlatform::start_code_coverage called");
         let process = self.get_process_mut(pid)?;
-        let process_handle = process.handle();
-        let bp_bytes = process.breakpoint_instruction_bytes();
-        let bp_len = bp_bytes.len();
-        let mut armed = 0usize;
-        for &addr in addrs {
-            // Skip addresses already covered by a user/persistent breakpoint so we
-            // never collide with (or double-handle) an existing INT3.
-            if process.is_persistent_breakpoint(addr) {
-                continue;
-            }
-            let original_bytes = match memory::read_memory_internal(process_handle, addr, bp_len) {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(pid, addr, error = %e, "Skipping coverage breakpoint: failed to read original bytes");
-                    continue;
-                }
-            };
-            if let Err(e) = memory::write_memory_internal(process_handle, addr, &bp_bytes) {
-                warn!(pid, addr, error = %e, "Failed to write coverage breakpoint byte");
-                continue;
-            }
-            process.arm_coverage(addr, original_bytes, limit);
-            armed += 1;
-        }
-        trace!(pid, armed, requested = addrs.len(), "Coverage breakpoints armed");
-        Ok(())
+        crate::debugger_core::coverage::start_code_coverage(&mut process.book, &process.os, pid, addrs, limit)
     }
 
     fn get_code_coverage(&self, pid: u32) -> Result<Vec<crate::protocol::CoverageHit>, PlatformError> {
@@ -538,32 +507,21 @@ impl PlatformAPI for WindowsPlatform {
     }
 
     fn start_watchpoint_trace(&mut self, pid: u32, addr: u64, bp_type: crate::protocol::HardwareBreakpointType, size: crate::protocol::HardwareBreakpointSize) -> Result<(), PlatformError> {
-        trace!(pid, addr, ?bp_type, ?size, "WindowsPlatform::start_watchpoint_trace called");
-        // Arm the underlying hardware watchpoint (allocates a DR slot, applies to
-        // all threads), then mark it as a silent access trace.
-        self.set_hardware_breakpoint(pid, addr, bp_type, size)?;
-        self.get_process_mut(pid)?.arm_watchpoint_trace(addr);
-        info!(pid, addr, "Hardware access trace started");
-        Ok(())
+        let process = self.get_process_mut(pid)?;
+        crate::debugger_core::watchpoints::start_trace(&mut process.book, &process.os, pid, addr, bp_type, size)
     }
 
     fn get_watchpoint_accesses(&self, pid: u32, addr: u64) -> Result<Vec<crate::protocol::WatchpointAccess>, PlatformError> {
         let mut accesses = self.get_process(pid)?.watchpoint_snapshot(addr);
         for a in &mut accesses {
-            a.accessor = self.attribute_watchpoint_accessor(pid, a.accessor_raw_rip);
+            a.accessor = crate::debugger_core::watchpoints::attribute_accessor(self, pid, a.accessor_raw_rip);
         }
         Ok(accesses)
     }
 
     fn stop_watchpoint_trace(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError> {
-        trace!(pid, addr, "WindowsPlatform::stop_watchpoint_trace called");
-        // Remove the hardware watchpoint; ignore "no breakpoint" so stop is
-        // idempotent even if it was already cleared (e.g. module unload).
-        if let Err(e) = self.remove_hardware_breakpoint(pid, addr) {
-            warn!(pid, addr, error = %e, "stop_watchpoint_trace: hardware watchpoint already gone");
-        }
-        self.get_process_mut(pid)?.clear_watchpoint_trace(addr);
-        Ok(())
+        let process = self.get_process_mut(pid)?;
+        crate::debugger_core::watchpoints::stop_trace(&mut process.book, &process.os, pid, addr)
     }
 
     fn set_hardware_breakpoint(
@@ -573,83 +531,13 @@ impl PlatformAPI for WindowsPlatform {
         bp_type: crate::protocol::HardwareBreakpointType,
         size: crate::protocol::HardwareBreakpointSize,
     ) -> Result<u8, PlatformError> {
-        trace!(pid, addr, ?bp_type, ?size, "WindowsPlatform::set_hardware_breakpoint called");
         let process = self.get_process_mut(pid)?;
-
-        // Check for duplicate
-        if process.has_hardware_breakpoint_at(addr) {
-            return Err(PlatformError::Other(format!(
-                "Hardware breakpoint already exists at 0x{:X}", addr
-            )));
-        }
-
-        // A WOW64 target's debug registers are 32-bit: no 8-byte length, no
-        // address above 4 GB.
-        let arch = process.architecture();
-        if arch == Architecture::X86 {
-            if size == crate::protocol::HardwareBreakpointSize::Byte8 {
-                return Err(PlatformError::Other("32-bit targets have no 8-byte hardware breakpoint length".into()));
-            }
-            if addr > u32::MAX as u64 {
-                return Err(PlatformError::Other(format!("0x{:X} is outside the 32-bit address space", addr)));
-            }
-        }
-
-        // Allocate a free debug register slot from the appropriate bank
-        let dr_index = process.find_free_debug_register(bp_type)
-            .ok_or_else(|| PlatformError::Other(
-                "No free hardware debug register slot available for this breakpoint type".to_string()
-            ))?;
-
-        // Apply to all threads (skip threads that fail — they may be exiting or
-        // in a kernel transition where GetThreadContext returns ERROR_GEN_FAILURE)
-        let thread_handles = process.thread_manager().all_thread_handles();
-        let mut applied_count = 0u32;
-        for (tid, handle) in &thread_handles {
-            match hardware_breakpoints::apply_single_hw_bp_to_thread_for(arch, *handle, dr_index, addr, bp_type, size) {
-                Ok(()) => applied_count += 1,
-                Err(e) => {
-                    warn!(tid, addr, error = %e, "Failed to apply HW BP to thread (may have exited or be in kernel transition)");
-                }
-            }
-        }
-        if applied_count == 0 && !thread_handles.is_empty() {
-            return Err(PlatformError::Other(format!(
-                "Failed to set hardware breakpoint: could not apply to any of {} threads", thread_handles.len()
-            )));
-        }
-
-        // Store in process state
-        process.add_hardware_breakpoint(debugged_process::InternalHardwareBreakpoint {
-            address: addr,
-            bp_type,
-            size,
-            dr_index,
-            is_active: true,
-        });
-
-        info!(pid, addr, dr_index, "Hardware breakpoint set");
-        Ok(dr_index)
+        crate::debugger_core::hw_breakpoints::set_hardware_breakpoint(&mut process.book, &process.os, pid, addr, bp_type, size)
     }
 
     fn remove_hardware_breakpoint(&mut self, pid: u32, addr: u64) -> Result<(), PlatformError> {
-        trace!(pid, addr, "WindowsPlatform::remove_hardware_breakpoint called");
         let process = self.get_process_mut(pid)?;
-
-        let bp = process.remove_hardware_breakpoint_by_addr(addr)
-            .ok_or_else(|| PlatformError::Other(format!(
-                "No hardware breakpoint at 0x{:X}", addr
-            )))?;
-
-        // Clear from all threads
-        let arch = process.architecture();
-        let thread_handles = process.thread_manager().all_thread_handles();
-        for (_tid, handle) in &thread_handles {
-            let _ = hardware_breakpoints::clear_hw_bp_from_thread_for(arch, *handle, bp.dr_index, bp.bp_type);
-        }
-
-        info!(pid, addr, dr_index = bp.dr_index, "Hardware breakpoint removed");
-        Ok(())
+        crate::debugger_core::hw_breakpoints::remove_hardware_breakpoint(&mut process.book, &process.os, pid, addr)
     }
 
     fn launch(&mut self, command: &str, debug_children: bool, working_directory: Option<&str>, environment: Option<&[(String, String)]>) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
@@ -669,7 +557,7 @@ impl PlatformAPI for WindowsPlatform {
     }
 
     fn read_wide_string(&self, pid: u32, address: u64, max_len: Option<usize>) -> Result<String, PlatformError> {
-        memory::read_wide_string(self, pid, address, max_len)
+        crate::debugger_core::strings::read_wide_string(|a, n| self.read_memory(pid, a, n), address, max_len)
     }
 
     fn get_thread_context(&self, pid: u32, tid: u32) -> Result<crate::protocol::ThreadContext, PlatformError> {
@@ -682,73 +570,15 @@ impl PlatformAPI for WindowsPlatform {
     }
 
     fn get_function_arguments(&self, pid: u32, tid: u32, count: usize) -> Result<Vec<u64>, PlatformError> {
+        use crate::debugger_core::function_args::{function_arguments, CallingConvention};
         let process = self.get_process(pid)?;
-        let arch = process.architecture();
+        let cc = match process.architecture() {
+            Architecture::X64 => CallingConvention::Win64,
+            Architecture::X86 => CallingConvention::Cdecl32,
+            Architecture::Arm64 => CallingConvention::Aapcs64,
+        };
         let context = self.get_thread_context(pid, tid)?;
-
-        let mut arguments = Vec::with_capacity(count);
-
-        match (arch, context) {
-            #[cfg(all(windows, target_arch = "x86_64"))]
-            (Architecture::X64, crate::protocol::ThreadContext::Win32RawContext(ctx)) => {
-                // First 4 arguments are in registers: RCX, RDX, R8, R9
-                if count > 0 { arguments.push(ctx.Rcx); }
-                if count > 1 { arguments.push(ctx.Rdx); }
-                if count > 2 { arguments.push(ctx.R8); }
-                if count > 3 { arguments.push(ctx.R9); }
-
-                // Subsequent arguments are on the stack
-                if count > 4 {
-                    let stack_ptr = ctx.Rsp;
-                    // The first stack argument is at RSP+0x28 (after return address and space for register args)
-                    let stack_args_ptr = stack_ptr + 0x28;
-                    let num_stack_args = count - 4;
-                    let stack_data = self.read_memory(pid, stack_args_ptr, num_stack_args * 8)?;
-                    
-                    for chunk in stack_data.chunks_exact(8) {
-                        arguments.push(u64::from_le_bytes(chunk.try_into().unwrap()));
-                    }
-                }
-            }
-            // 32-bit cdecl/stdcall: every argument is on the stack, 4 bytes each,
-            // starting just above the return address.
-            (Architecture::X86, crate::protocol::ThreadContext::Wow64RawContext(ctx)) => {
-                if count > 0 {
-                    let stack_data = self.read_memory(pid, ctx.Esp as u64 + 4, count * 4)?;
-                    for chunk in stack_data.chunks_exact(4) {
-                        arguments.push(u32::from_le_bytes(chunk.try_into().unwrap()) as u64);
-                    }
-                }
-            }
-            #[cfg(all(windows, target_arch = "aarch64"))]
-            (Architecture::Arm64, crate::protocol::ThreadContext::Win32RawContext(ctx)) => {
-                // First 8 arguments are in registers X0-X7
-                for i in 0..std::cmp::min(count, 8) {
-                    arguments.push(unsafe { ctx.Anonymous.X[i] });
-                }
-
-                // Subsequent arguments are on the stack
-                if count > 8 {
-                    let stack_ptr = ctx.Sp;
-                    let num_stack_args = count - 8;
-                    let stack_data = self.read_memory(pid, stack_ptr, num_stack_args * 8)?;
-
-                    for chunk in stack_data.chunks_exact(8) {
-                        arguments.push(u64::from_le_bytes(chunk.try_into().unwrap()));
-                    }
-                }
-            }
-            _ => return Err(PlatformError::NotImplemented),
-        }
-
-        Ok(arguments)
-    }
-
-    fn list_modules(&self, pid: u32) -> Result<Vec<ModuleInfo>, PlatformError> {
-        match self.get_process(pid) {
-            Ok(process) => Ok(process.module_manager().list_modules()),
-            Err(_) => utils::get_modules(pid).map_err(PlatformError::Other),
-        }
+        function_arguments(cc, &context, count, |a, n| self.read_memory(pid, a, n))
     }
 
     fn list_threads(&self, pid: u32) -> Result<Vec<ThreadInfo>, PlatformError> {
@@ -935,47 +765,11 @@ impl PlatformAPI for WindowsPlatform {
     /// (aligning at least the rows nearest `target`), and finally to the plain
     /// self-resync window when no boundary is known (leaf/JIT code, no symbols).
     fn disassemble_backward(&self, pid: u32, target: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
-        if count == 0 || target == 0 {
-            return Ok(Vec::new());
-        }
-        let back = crate::interfaces::backward_resync_window(arch, count);
-        let fallback_start = target.saturating_sub(back);
-        // Never anchor an anchored decode more than this far before `target`, so a
-        // huge function can't turn each scroll-up tick into a massive re-decode.
-        const MAX_ANCHOR_SPAN: u64 = 8192;
-        let min_anchor = target.saturating_sub(MAX_ANCHOR_SPAN.max(back));
-
-        // Largest guaranteed instruction boundary <= `probe`, within
-        // [min_anchor, target): `.pdata` function start first, then nearest symbol.
         let modules = self.modules_for(pid);
-        let boundary_before = |probe: u64| -> Option<u64> {
-            let mut best: Option<u64> = None;
-            if let Ok(Some((func_start, _, _))) = self.find_function_bounds(pid, probe) {
-                if func_start >= min_anchor && func_start < target {
-                    best = Some(func_start);
-                }
-            }
-            if let Some(ref symbol_manager) = self.symbol_manager {
-                if let Ok(Some((_, _, offset))) = symbol_manager.try_resolve_address_to_symbol(&modules, probe) {
-                    let sym_start = probe.saturating_sub(offset);
-                    if sym_start >= min_anchor && sym_start < target {
-                        best = Some(best.map_or(sym_start, |b| b.max(sym_start)));
-                    }
-                }
-            }
-            best
-        };
-
-        // No known boundary (leaf/JIT code, no symbols) — plain self-resync
-        // fallback, provided by the trait. An anchor needs no region clamp: it
-        // is already inside a mapped module and `boundary_before` guarantees
-        // min_anchor <= start < target.
-        let Some(start) = boundary_before(fallback_start).or_else(|| boundary_before(target - 1)) else {
-            return self.disassemble_backward_resync(pid, target, count, arch);
-        };
-        let window = (target - start) as usize;
-        let instructions = self.disassemble_memory_bytes(pid, start, window, arch)?;
-        Ok(crate::interfaces::align_backward_instructions(instructions, target, count))
+        let bounds = |probe: u64| self.find_function_bounds(pid, probe).ok().flatten();
+        crate::debugger_core::disasm::disassemble_backward_anchored(
+            self, pid, target, count, arch, self.symbol_manager.as_ref(), &modules, &bounds,
+        )
     }
 
     fn get_call_stack(&self, pid: u32, tid: u32) -> Result<Vec<crate::interfaces::CallFrame>, PlatformError> {
@@ -1048,7 +842,7 @@ impl PlatformAPI for WindowsPlatform {
     ) -> Result<Vec<crate::protocol::DereferenceEntry>, PlatformError> {
         let arch = self.arch_for(pid);
         let symbol_resolver = self.nonblocking_symbol_resolver(pid);
-        dereference::dereference(pid, address, count, reference_base, probe_start, arch, Some(symbol_resolver))
+        crate::debugger_core::dereference::dereference(&(self, pid), address, count, reference_base, probe_start, arch, Some(symbol_resolver))
     }
 
     fn dereference_batch(
@@ -1067,7 +861,7 @@ impl PlatformAPI for WindowsPlatform {
         // re-walk the whole address space for each register, the dominant
         // per-step cost on large targets.
         let symbol_resolver = self.nonblocking_symbol_resolver(pid);
-        dereference::dereference_batch(pid, addresses, count, reference_base, probe_start, arch, Some(symbol_resolver))
+        crate::debugger_core::dereference::dereference_batch(&(self, pid), addresses, count, reference_base, probe_start, arch, Some(symbol_resolver))
     }
 
     fn get_teb_address(&self, pid: u32, tid: u32) -> Result<u64, PlatformError> {
@@ -1236,11 +1030,29 @@ impl PlatformAPI for WindowsPlatform {
     }
 }
 
+#[cfg(windows)]
 impl Stepper for WindowsPlatform {
     fn step(&mut self, pid: u32, tid: u32, kind: StepKind) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
-        stepper::step(self, pid, tid, kind)
+        // Step-out needs the caller frame; the stack walk borrows the whole
+        // platform, so it runs before the process book is taken mutably.
+        let call_stack = if kind == StepKind::Out {
+            Some(callstack::get_call_stack(self, pid, tid)
+                .map_err(|e| PlatformError::Other(format!("Failed to get call stack for step-out: {}", e)))?)
+        } else {
+            None
+        };
+        let disasm = self
+            .disassembler
+            .as_ref()
+            .ok_or_else(|| PlatformError::Other("Disassembler not initialized".to_string()))?;
+        let process = self
+            .processes
+            .get_mut(&pid)
+            .ok_or_else(|| PlatformError::Other(format!("Process {} not found", pid)))?;
+        crate::debugger_core::stepping::step(&mut process.book, &process.os, disasm, pid, tid, kind, call_stack)
     }
 }
+#[cfg(windows)]
 impl WindowsPlatform {
     /// Find function boundaries for an address using the exception directory (RuntimeFunction).
     /// Returns (function_start_va, function_end_va, function_name) if found.
@@ -1308,42 +1120,14 @@ impl WindowsPlatform {
         max_instructions: usize,
         arch: Architecture,
     ) -> Result<(Vec<Instruction>, Option<u64>, Option<u64>, Option<String>), crate::interfaces::DisassemblerError> {
-        // Try to find function bounds
-        let bounds = self.find_function_bounds(pid, address)
-            .ok()
-            .flatten();
-        let (func_start, func_end, func_name) = match &bounds {
-            Some((start, end, name)) => (Some(*start), Some(*end), name.clone()),
-            None => (None, None, None),
-        };
-        // Whole-function decode when it fits, else a bounded window at the
-        // address — see `decode_function_listing` for why.
-        let instructions = crate::interfaces::decode_function_listing(
-            bounds.map(|(s, e, _)| (s, e)),
-            address,
-            max_instructions,
-            |start, count| self.disassemble_memory(pid, start, count, arch),
-        )?;
-        Ok((instructions, func_start, func_end, func_name))
+        let bounds = self.find_function_bounds(pid, address).ok().flatten();
+        crate::debugger_core::disasm::disassemble_function(self, pid, address, max_instructions, arch, bounds)
     }
 
     /// Non-blocking symbol resolver over a snapshot of the process's module
-    /// list: returns `None` immediately for a module whose symbols are still
-    /// loading rather than waiting (up to seconds) for the PDB parse — callers
-    /// stay instant even for large PDBs, and re-resolve once symbols land.
+    /// list (see `debugger_core::disasm::nonblocking_symbol_resolver`).
     fn nonblocking_symbol_resolver(&self, pid: u32) -> impl Fn(u64) -> Option<crate::interfaces::SymbolInfo> + '_ {
-        let mut modules = self.modules_for(pid);
-        // Sort by base address for binary search in symbol resolution
-        modules.sort_by_key(|m| m.base);
-        let symbol_manager = self.symbol_manager.as_ref();
-        move |addr: u64| -> Option<crate::interfaces::SymbolInfo> {
-            let sm = symbol_manager?;
-            if let Ok(Some((module_path, symbol, offset))) = sm.try_resolve_address_to_symbol(&modules, addr) {
-                let module_name = crate::formatting::module_stem(&module_path);
-                return Some(crate::interfaces::SymbolInfo { module_name, symbol_name: symbol.name, offset });
-            }
-            None
-        }
+        crate::debugger_core::disasm::nonblocking_symbol_resolver(self.symbol_manager.as_ref(), self.modules_for(pid))
     }
 
     /// Disassemble a SINGLE instruction from target memory WITHOUT symbolization.
@@ -1370,140 +1154,23 @@ impl WindowsPlatform {
     /// Shared body of `disassemble_memory` / `disassemble_memory_bytes`:
     /// reads `read_len` bytes and decodes up to `count` instructions.
     fn disassemble_memory_impl(&self, pid: u32, address: u64, read_len: usize, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
-        use std::time::Instant;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use std::cell::Cell;
-
-        // Thread-local timing accumulators
-        thread_local! {
-            static MEMORY_READ_US: Cell<u64> = const { Cell::new(0) };
-            static MODULE_LIST_US: Cell<u64> = const { Cell::new(0) };
-            static DISASM_US: Cell<u64> = const { Cell::new(0) };
-            static SYMBOL_US: Cell<u64> = const { Cell::new(0) };
-            static CALL_COUNT: Cell<u64> = const { Cell::new(0) };
-            static SYMBOL_CALLS: Cell<u64> = const { Cell::new(0) };
-        }
-
-        if self.disassembler.is_none() {
+        let Some(disasm) = self.disassembler.as_ref() else {
             return Err(DisassemblerError::CapstoneError("Disassembler not initialized".to_string()));
-        }
-
-        // Time memory read
-        let t0 = Instant::now();
-        let mut data = memory::read_memory_unlocked(pid, address, read_len)
-            .map_err(|e| DisassemblerError::InvalidData(format!("Failed to read memory: {}", e)))?;
-
-        // Patch breakpoint bytes with originals so disassembly shows real instructions
-        if let Ok(process) = self.get_process(pid) {
-            process.patch_breakpoint_bytes(address, &mut data);
-        }
-        let memory_time = t0.elapsed();
-
-        // Time module list fetch
-        let t1 = Instant::now();
-        let mut modules = self.modules_for(pid);
-        // Sort modules by base address for binary search
-        modules.sort_by_key(|m| m.base);
-        let module_time = t1.elapsed();
-        // The symbol resolver closure consumes `modules`; keep a copy for line annotation.
-        let modules_for_lines = modules.clone();
-
-        let symbol_manager = self.symbol_manager.as_ref();
-
-        // Track symbol resolution time
-        let symbol_time_us = std::sync::Arc::new(AtomicU64::new(0));
-        let symbol_call_count = std::sync::Arc::new(AtomicU64::new(0));
-        let symbol_time_clone = symbol_time_us.clone();
-        let symbol_count_clone = symbol_call_count.clone();
-
-        let symbol_resolver = move |addr: u64| -> Option<crate::interfaces::SymbolInfo> {
-            let t = Instant::now();
-            let result = if let Some(symbol_manager) = symbol_manager {
-                // Non-blocking: skip symbolization while PDBs are still loading rather
-                // than stalling the disassembly response behind symbol downloads.
-                // The UI re-requests disassembly once symbols finish loading.
-                if let Ok(Some((module_path, symbol, offset))) = symbol_manager.try_resolve_address_to_symbol(&modules, addr) {
-                    let module_name = crate::formatting::module_stem(&module_path);
-                    Some(crate::interfaces::SymbolInfo { module_name, symbol_name: symbol.name, offset })
-                } else { None }
-            } else { None };
-            symbol_time_clone.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-            symbol_count_clone.fetch_add(1, Ordering::Relaxed);
-            result
         };
-
-        // Time disassembly
-        let t2 = Instant::now();
-        let result = self.disassembler.as_ref().unwrap().disassemble_with_symbols(arch, &data, address, count, symbol_resolver);
-        let disasm_time = t2.elapsed();
-
-        // Accumulate timing stats
-        MEMORY_READ_US.with(|c| c.set(c.get() + memory_time.as_micros() as u64));
-        MODULE_LIST_US.with(|c| c.set(c.get() + module_time.as_micros() as u64));
-        DISASM_US.with(|c| c.set(c.get() + disasm_time.as_micros() as u64));
-        SYMBOL_US.with(|c| c.set(c.get() + symbol_time_us.load(Ordering::Relaxed)));
-        SYMBOL_CALLS.with(|c| c.set(c.get() + symbol_call_count.load(Ordering::Relaxed)));
-        let call_count = CALL_COUNT.with(|c| { c.set(c.get() + 1); c.get() });
-
-        // Print stats every 1000 calls
-        if call_count % 1000 == 0 {
-            let mem_ms = MEMORY_READ_US.with(|c| c.get()) as f64 / 1000.0;
-            let mod_ms = MODULE_LIST_US.with(|c| c.get()) as f64 / 1000.0;
-            let dis_ms = DISASM_US.with(|c| c.get()) as f64 / 1000.0;
-            let sym_ms = SYMBOL_US.with(|c| c.get()) as f64 / 1000.0;
-            let sym_calls = SYMBOL_CALLS.with(|c| c.get());
-            println!("\n=== TIMING STATS after {} calls ===", call_count);
-            println!("  Memory read:    {:8.2} ms", mem_ms);
-            println!("  Module list:    {:8.2} ms", mod_ms);
-            println!("  Disassembly:    {:8.2} ms (includes symbol resolution)", dis_ms);
-            println!("  Symbol resolve: {:8.2} ms ({} calls, {:.3} ms/call avg)",
-                sym_ms, sym_calls, if sym_calls > 0 { sym_ms / sym_calls as f64 } else { 0.0 });
-            println!("=====================================\n");
-        }
-
-        // Resolve indirect jump/call targets (e.g., `call qword ptr [IAT_slot]`)
-        // by reading the pointer value so clicking navigates to the actual
-        // function. This is best-effort and speculative: for misdecoded data the
-        // target is garbage/unmapped, so use the fast pointer read (no partial-
-        // read fallback, no error log) — otherwise each such instruction spends a
-        // wasted VirtualQueryEx and spams an ERROR line. One VM_READ handle is
-        // shared by every read in the batch (IAT-heavy code has hundreds).
-        let mut instructions = result?;
-        let is_indirect = |i: &Instruction| (i.is_call || i.is_jump) && i.jump_target.is_some() && i.op_str.contains('[');
-        let ptr_handle = instructions.iter().any(is_indirect)
-            .then(|| memory::open_vm_read_handle(pid))
-            .flatten();
-        if let Some(ref handle) = ptr_handle {
-            for instr in &mut instructions {
-                if is_indirect(instr) {
-                    let ptr_addr = instr.jump_target.unwrap();
-                    if let Some(actual_target) = memory::try_read_pointer(handle.0, ptr_addr) {
-                        instr.jump_target = Some(actual_target);
-                    }
-                }
-            }
-        }
-
-        // Annotate with source lines from already-cached line tables only.
-        // The first source-view request triggers the parse; until then this is a no-op,
-        // so bulk disassembly never stalls behind a PDB line-table parse.
-        if let Some(symbol_manager) = self.symbol_manager.as_ref() {
-            for instr in &mut instructions {
-                instr.line_info = symbol_manager.try_resolve_address_to_line_cached(&modules_for_lines, instr.address);
-                // At a symbol start, collect every name sharing this address (aliases
-                // like NtClose/ZwClose) so the UI can show all labels, not just the
-                // one `symbol_info` picked. Gated on offset == 0 to avoid a lookup for
-                // the vast majority of instructions that sit mid-symbol.
-                if instr.symbol_info.as_ref().is_some_and(|s| s.offset == 0) {
-                    let all = symbol_manager.resolve_all_at_exact_address(&modules_for_lines, instr.address);
-                    // Keep the trait-default seed (the single resolved symbol) if
-                    // the alias lookup unexpectedly comes back empty.
-                    if !all.is_empty() {
-                        instr.symbols_at_address = all;
-                    }
-                }
-            }
-        }
-        Ok(instructions)
+        let process = self.get_process(pid).ok();
+        let listing = crate::debugger_core::disasm::Listing {
+            reader: &(self, pid),
+            bps: process.map(|p| &p.book.bps),
+            disasm,
+            symbol_manager: self.symbol_manager.as_ref(),
+            modules: self.modules_for(pid),
+        };
+        // One VM_READ handle shared by every speculative pointer read in the
+        // batch; `try_read_pointer` has no partial-read fallback and no error log.
+        crate::debugger_core::disasm::decode_listing(listing, address, read_len, count, arch, || {
+            memory::open_vm_read_handle(pid).map(|handle| {
+                Box::new(move |addr: u64| memory::try_read_pointer(handle.0, addr)) as Box<dyn Fn(u64) -> Option<u64>>
+            })
+        })
     }
 }

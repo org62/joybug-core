@@ -1,4 +1,5 @@
-use crate::interfaces::{LineEntry, ModuleSymbol, ResolvedSymbol, SourceFileEntry, SourceLineRef, SymbolConfig, SymbolError, SymbolProvider};
+#![cfg_attr(not(windows), allow(dead_code))]
+use crate::interfaces::{LineEntry, ModuleSymbol, ResolvedSymbol, SourceFileEntry, SourceLineRef, SymbolConfig, SymbolError};
 use crate::protocol::{ModuleInfo, ModuleSymbolStatus, PdbLoadOutcome, SymbolLoadState};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -6,13 +7,11 @@ use std::sync::{Arc, Mutex, Condvar, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{trace, warn, error};
-use crate::windows_platform::symbol_provider::{WindowsSymbolProvider, ModuleLineTable, parse_pdb_to_symbols, parse_pdb_matching_pe, parse_pdb_to_lines};
-use crate::windows_platform::type_provider::{ModuleTypeInfo, parse_pdb_to_types};
+use crate::symbols::symbol_provider::ModuleLineTable;
+use crate::symbols::type_provider::ModuleTypeInfo;
 use crate::protocol::{TypeLayout, TypeSummary};
-use pelite::pe64::exception_arm64::Arm64ExceptionExt;
-use pelite::pe64::{Pe, PeFile};
-use pelite::image::{RUNTIME_FUNCTION, UNWIND_INFO, UNW_FLAG_CHAININFO};
-use windows_sys::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_ARM64;
+use pelite::image::RUNTIME_FUNCTION;
+use super::backend::{FunctionTable, PdbBackend, SymbolBackend};
 
 /// Where a module's cached symbols came from. `Exports` marks the PE-export
 /// fallback used when no PDB is available; it carries the PDB failure reason
@@ -47,24 +46,17 @@ enum PdbArtifactState<T> {
     Failed(String),
 }
 
-/// Cached PE exception data for chain resolution
-struct PdataCache {
-    /// Parsed .pdata entries (sorted by BeginAddress)
-    pdata: Vec<RUNTIME_FUNCTION>,
-    /// Precomputed map: fragment BeginAddress → primary function BeginAddress
-    /// Only entries with UNW_FLAG_CHAININFO are included, so this is always
-    /// empty on ARM64 — that unwind format has no chained-info flag.
-    chain_map: HashMap<u32, u32>,
-}
-
 /// Manages symbol loading for modules in the Windows platform
 /// Uses RVA-based storage for efficient sharing across processes
 pub struct SymbolManager {
     /// Store loaded symbols for fast access (module_path -> ModuleSymbols)
     symbol_cache: Arc<Mutex<HashMap<String, ModuleSymbols>>>,
 
-    /// Cached .pdata + PE bytes per module for chain resolution
-    pdata_cache: Mutex<HashMap<String, Option<PdataCache>>>,
+    /// The file-format side: providers, fallbacks, debug-file parsers.
+    backend: Arc<dyn SymbolBackend>,
+
+    /// Cached function table per module for chain resolution
+    pdata_cache: Mutex<HashMap<String, Option<FunctionTable>>>,
 
     /// Lazily parsed PDB line tables per module (module_path -> state).
     /// Populated on the first source-level request, never during the
@@ -105,45 +97,13 @@ struct SymbolLoadRequest {
     deny_error: Option<String>,
 }
 
-/// Parse a module's PE export table into symbol entries (the no-PDB fallback).
-/// Handles both 32- and 64-bit images. Forwarders have no RVA and are skipped;
-/// unused ordinal slots (RVA 0) are skipped; nameless exports get a synthetic
-/// `Ordinal{n}` name. Returned unsorted; the caller sorts by RVA.
-fn parse_export_symbols(module_path: &str) -> Result<Vec<ModuleSymbol>, String> {
-    // Map instead of read: only the header + export-directory pages get faulted in.
-    let map = pelite::FileMap::open(module_path)
-        .map_err(|e| format!("failed to read module: {}", e))?;
-    // pelite::PeFile is the 32/64 Wrap; every method used here forwards to both arms.
-    let pe = pelite::PeFile::from_bytes(map.as_ref())
-        .map_err(|e| format!("PE parse failed: {}", e))?;
-    let exports = pe.exports().map_err(|e| format!("no export directory: {}", e))?;
-    let by = exports.by().map_err(|e| format!("export table unreadable: {}", e))?;
-    let mut index_to_name: HashMap<usize, String> = HashMap::new();
-    for (name_res, func_index) in by.iter_name_indices() {
-        if let Some(name) = name_res.ok().and_then(|c| c.to_str().ok()) {
-            index_to_name.insert(func_index, name.to_string());
-        }
-    }
-    let ordinal_base = by.ordinal_base() as u32;
-    let mut symbols: Vec<ModuleSymbol> = Vec::new();
-    for (index, result) in by.iter().enumerate() {
-        let Ok(pelite::Export::Symbol(&rva)) = result else { continue };
-        if rva == 0 {
-            continue; // unused ordinal slot
-        }
-        let name = index_to_name
-            .remove(&index)
-            .unwrap_or_else(|| format!("Ordinal{}", ordinal_base + index as u32));
-        symbols.push(ModuleSymbol { name, rva, is_function: true });
-    }
-    if symbols.is_empty() {
-        return Err("module exports no symbols".to_string());
-    }
-    Ok(symbols)
-}
-
 impl SymbolManager {
+    /// A manager for PE/PDB modules.
     pub fn new_with_config(cfg: SymbolConfig) -> Result<Self, SymbolError> {
+        Self::new_with_backend(cfg, Arc::new(PdbBackend))
+    }
+
+    pub fn new_with_backend(cfg: SymbolConfig, backend: Arc<dyn SymbolBackend>) -> Result<Self, SymbolError> {
         let symbol_cache = Arc::new(Mutex::new(HashMap::<String, ModuleSymbols>::new()));
         let pending_loads = Arc::new(Mutex::new(HashSet::new()));
         let failed_loads = Arc::new(Mutex::new(HashMap::new()));
@@ -163,15 +123,16 @@ impl SymbolManager {
             let failed_clone = failed_loads.clone();
             let cv_clone = pending_cv.clone();
             let cfg_clone = cfg.clone();
+            let backend = backend.clone();
 
             thread::spawn(move || {
                 trace!(worker_id = i, "Symbol worker thread started");
 
                 // Create the provider (and its Runtime) ONCE per thread
-                let mut provider = match WindowsSymbolProvider::with_config(&cfg_clone) {
+                let mut provider = match backend.new_provider(&cfg_clone) {
                     Ok(p) => p,
                     Err(e) => {
-                        error!(worker_id = i, error = %e, "Failed to create WindowsSymbolProvider in worker thread");
+                        error!(worker_id = i, error = %e, "Failed to create the symbol provider in worker thread");
                         return;
                     }
                 };
@@ -216,7 +177,7 @@ impl SymbolManager {
                                 trace!(worker_id = i, module_path = %module_path, "Symbol loading completed successfully");
                                 // Store in cache
                                 if let Ok(symbols) = provider.list_symbols(&module_path) {
-                                    let pdb_path = provider.pdb_path_for(&module_path);
+                                    let pdb_path = provider.debug_file_path(&module_path);
                                     insert_symbols(symbols, pdb_path, SymbolSource::Pdb);
                                 }
                                 None
@@ -233,7 +194,7 @@ impl SymbolManager {
                     // completely nameless. The failure stays recorded (the client
                     // persists it), only the cache gains the export stubs.
                     if let Some(error) = pdb_error {
-                        match parse_export_symbols(&module_path) {
+                        match backend.fallback_symbols(&module_path) {
                             Ok(symbols) => {
                                 trace!(worker_id = i, module_path = %module_path, count = symbols.len(), "Loaded PE export names as symbol fallback");
                                 insert_symbols(symbols, None, SymbolSource::Exports { error });
@@ -258,6 +219,7 @@ impl SymbolManager {
 
         Ok(Self {
             symbol_cache,
+            backend,
             pdata_cache: Mutex::new(HashMap::new()),
             line_cache: Mutex::new(HashMap::new()),
             type_cache: Mutex::new(HashMap::new()),
@@ -435,13 +397,9 @@ impl SymbolManager {
     /// a mismatch is returned as `PdbLoadOutcome::Mismatch`, not an error.
     /// A user-loaded PDB replaces any previously cached symbols for the module.
     pub fn load_pdb_from_path(&self, module: &ModuleInfo, pdb_path: &Path, force: bool) -> Result<PdbLoadOutcome, SymbolError> {
-        let mut symbols = if force {
-            parse_pdb_to_symbols(pdb_path)?
-        } else {
-            match parse_pdb_matching_pe(Path::new(&module.name), pdb_path)? {
-                Ok(symbols) => symbols,
-                Err(mismatch) => return Ok(PdbLoadOutcome::Mismatch(mismatch)),
-            }
+        let mut symbols = match self.backend.load_debug_file(module, pdb_path, force)? {
+            Ok(symbols) => symbols,
+            Err(mismatch) => return Ok(PdbLoadOutcome::Mismatch(mismatch)),
         };
         symbols.sort_by_key(|s| s.rva);
         let symbol_count = symbols.len();
@@ -523,7 +481,7 @@ impl SymbolManager {
     /// Get (lazily parsing) the PDB line table for a module. See `get_pdb_artifact`
     /// for the caching/non-blocking contract.
     pub fn get_line_table(&self, module_path: &str) -> Result<Option<Arc<ModuleLineTable>>, SymbolError> {
-        self.get_pdb_artifact(&self.line_cache, module_path, "line table", parse_pdb_to_lines)
+        self.get_pdb_artifact(&self.line_cache, module_path, "line table", |p| self.backend.parse_lines(p))
     }
 
     /// Drop a module's cached line table (e.g. after a user loads a different PDB).
@@ -615,7 +573,7 @@ impl SymbolManager {
     /// Get (lazily parsing) the PDB type information for a module. See
     /// `get_pdb_artifact` for the caching/non-blocking contract.
     fn get_type_info(&self, module_path: &str) -> Result<Option<Arc<ModuleTypeInfo>>, SymbolError> {
-        self.get_pdb_artifact(&self.type_cache, module_path, "type info", parse_pdb_to_types)
+        self.get_pdb_artifact(&self.type_cache, module_path, "type info", |p| self.backend.parse_types(p))
     }
 
     /// List UDT/enum type summaries across the given modules, optionally filtered by
@@ -736,10 +694,8 @@ impl SymbolManager {
             // Search only in the specified module
             for (module_path, module_symbols) in cache.iter() {
                 // Extract module name from path
-                let module_name = std::path::Path::new(module_path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(module_path);
+                let module_name_owned = crate::formatting::module_stem(module_path);
+                let module_name = module_name_owned.as_str();
 
                 // Check if this is the target module (case-insensitive)
                 if module_name.to_lowercase() == target_module_name.to_lowercase() {
@@ -799,11 +755,7 @@ impl SymbolManager {
             let tokens = query_tokens(symbol_name);
             for (_module_path, module_symbols) in cache.iter() {
                 // Extract module name from path
-                let module_name = std::path::Path::new(_module_path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(_module_path)
-                    .to_string();
+                let module_name = crate::formatting::module_stem(_module_path);
                     
                 // Find all matching symbols in this module (token-based search)
                 for symbol in &module_symbols.symbols {
@@ -866,11 +818,7 @@ impl SymbolManager {
             let symbol = &symbols[idx - 1];
 
             // Extract module name from path
-            let module_name = std::path::Path::new(module_path)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(module_path)
-                .to_string();
+            let module_name = crate::formatting::module_stem(module_path);
 
             // Calculate VA for the returned symbol
             let symbol_with_va = ResolvedSymbol {
@@ -951,12 +899,12 @@ impl SymbolManager {
         let mut pdata_cache = self.pdata_cache.lock().unwrap();
         let cached = pdata_cache
             .entry(module_path.to_string())
-            .or_insert_with(|| Self::load_pdata_for_module(module_path));
+            .or_insert_with(|| self.backend.function_table(module_path));
         let Some(cached) = cached.as_ref() else {
             return Vec::new();
         };
         cached
-            .pdata
+            .entries
             .iter()
             .filter(|rf| !cached.chain_map.contains_key(&rf.BeginAddress))
             .map(|rf| (rf.BeginAddress, rf.EndAddress))
@@ -968,13 +916,13 @@ impl SymbolManager {
     fn lookup_chain_target(&self, module_path: &str, rva: u32) -> Option<u32> {
         let mut pdata_cache = self.pdata_cache.lock().unwrap();
         let cached = pdata_cache.entry(module_path.to_string()).or_insert_with(|| {
-            Self::load_pdata_for_module(module_path)
+            self.backend.function_table(module_path)
         });
         let cached = cached.as_ref()?;
         if cached.chain_map.is_empty() {
             return None;
         }
-        let rf = Self::find_runtime_function(&cached.pdata, rva)?;
+        let rf = Self::find_runtime_function(&cached.entries, rva)?;
         cached.chain_map.get(&rf.BeginAddress).copied()
     }
 
@@ -1184,11 +1132,7 @@ impl SymbolManager {
                     // Calculate offset from the symbol's RVA
                     let offset_from_symbol = address - (module.base + symbol.rva as u64);
                     // Extract only module name, not the full path
-                    let module_name = std::path::Path::new(&module.name)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(&module.name)
-                        .to_string();
+                    let module_name = crate::formatting::module_stem(&module.name);
                     Ok(Some((module_name, symbol, offset_from_symbol)))
                 }
                 None => Ok(None),
@@ -1277,82 +1221,6 @@ impl SymbolManager {
         Ok(None)
     }
 
-    /// Load .pdata and precompute the chain map for a module.
-    /// The chain map resolves all UNW_FLAG_CHAININFO entries to their primary function.
-    ///
-    /// The exception directory is machine-specific: x64 entries are 12-byte
-    /// `RUNTIME_FUNCTION`s, ARM64 entries are 8-byte
-    /// `IMAGE_ARM64_RUNTIME_FUNCTION_ENTRY`s. Parsing an ARM64 directory with the
-    /// x64 reader doesn't just misread it, it fails outright (the directory size
-    /// is a multiple of 8, rarely of 12), which is why the machine type has to be
-    /// consulted before picking a reader.
-    fn load_pdata_for_module(module_path: &str) -> Option<PdataCache> {
-        let pe_bytes = std::fs::read(module_path).ok()?;
-        let pe = PeFile::from_bytes(&pe_bytes).ok()?;
-
-        if pe.file_header().Machine == IMAGE_FILE_MACHINE_ARM64 {
-            return Self::load_arm64_pdata(&pe);
-        }
-
-        let exception = pe.exception().ok()?;
-        let pdata = exception.image().to_vec();
-        if pdata.is_empty() {
-            return None;
-        }
-
-        // Build chain map: for each entry with UNW_FLAG_CHAININFO, follow the chain
-        // to find the primary (non-chained) function entry.
-        let mut chain_map = HashMap::new();
-        for rf in &pdata {
-            if let Ok(primary) = Self::follow_unwind_chain_raw(&pe, rf) {
-                if primary != rf.BeginAddress {
-                    chain_map.insert(rf.BeginAddress, primary);
-                }
-            }
-        }
-
-        Some(PdataCache { pdata, chain_map })
-    }
-
-    /// ARM64 exception directory, normalized into the x64 `RUNTIME_FUNCTION`
-    /// shape the rest of the manager works with.
-    ///
-    /// `EndAddress` is synthesized: ARM64 entries store only a begin RVA and
-    /// unwind data, from which the function length comes either packed in the
-    /// entry itself or from the first word of its `.xdata` record. When neither
-    /// yields a length, the next entry's begin is used as an upper bound (the
-    /// last entry falls back to a zero-length range) so ranges stay ascending and
-    /// non-inverted.
-    ///
-    /// The chain map is always empty here: ARM64 unwind info has no
-    /// `UNW_FLAG_CHAININFO` equivalent. Separated function segments are marked by
-    /// the packed-fragment flag, which identifies a fragment but does not name
-    /// its primary, so there is nothing to map them to.
-    fn load_arm64_pdata(pe: &PeFile<'_>) -> Option<PdataCache> {
-        let exception = pe.exception_arm64().ok()?;
-        let functions: Vec<(u32, u32, Option<u32>)> = exception
-            .functions()
-            .map(|f| (f.begin_address(), f.raw_unwind_data(), f.end_address().ok().flatten()))
-            .collect();
-        if functions.is_empty() {
-            return None;
-        }
-
-        let pdata: Vec<RUNTIME_FUNCTION> = functions
-            .iter()
-            .enumerate()
-            .map(|(i, &(begin, unwind, end))| {
-                let end = end
-                    .or_else(|| functions.get(i + 1).map(|&(next_begin, _, _)| next_begin))
-                    .filter(|&end| end >= begin)
-                    .unwrap_or(begin);
-                RUNTIME_FUNCTION { BeginAddress: begin, EndAddress: end, UnwindData: unwind }
-            })
-            .collect();
-
-        Some(PdataCache { pdata, chain_map: HashMap::new() })
-    }
-
     /// Find the RUNTIME_FUNCTION entry containing a given RVA.
     fn find_runtime_function(pdata: &[RUNTIME_FUNCTION], rva: u32) -> Option<&RUNTIME_FUNCTION> {
         let pos = pdata.partition_point(|rf| rf.BeginAddress <= rva);
@@ -1367,41 +1235,6 @@ impl SymbolManager {
         }
     }
 
-    /// Follow RUNTIME_FUNCTION unwind chain from a single entry.
-    /// Used during cache building to precompute all chains.
-    fn follow_unwind_chain_raw<'a>(
-        pe: &PeFile<'a>,
-        rf: &RUNTIME_FUNCTION,
-    ) -> Result<u32, SymbolError> {
-        let unwind_info: &UNWIND_INFO = pe.derva(rf.UnwindData)
-            .map_err(|e| SymbolError::PeParsingFailed(format!("{:?}", e)))?;
-        let flags = unwind_info.VersionFlags >> 3;
-        if (flags & UNW_FLAG_CHAININFO) == 0 {
-            return Ok(rf.BeginAddress); // Not chained
-        }
-
-        // Follow chain
-        let mut current_unwind_data = rf.UnwindData;
-        let mut current_unwind = unwind_info;
-        for _ in 0..32 {
-            let count = current_unwind.CountOfCodes as u32;
-            let aligned = (count + 1) & !1;
-            let chain_rva = current_unwind_data + 4 + aligned * 2;
-            let chained_rf: &RUNTIME_FUNCTION = pe.derva(chain_rva)
-                .map_err(|e| SymbolError::PeParsingFailed(format!("{:?}", e)))?;
-
-            // Read the chained entry's unwind info
-            let next_unwind: &UNWIND_INFO = pe.derva(chained_rf.UnwindData)
-                .map_err(|e| SymbolError::PeParsingFailed(format!("{:?}", e)))?;
-            let next_flags = next_unwind.VersionFlags >> 3;
-            if (next_flags & UNW_FLAG_CHAININFO) == 0 {
-                return Ok(chained_rf.BeginAddress); // Found the primary
-            }
-            current_unwind_data = chained_rf.UnwindData;
-            current_unwind = next_unwind;
-        }
-        Ok(rf.BeginAddress) // Chain too deep, give up
-    }
 }
 
 /// Extract module name (without path or extension) from a full path.

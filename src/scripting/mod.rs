@@ -7,11 +7,12 @@ pub mod colors;
 pub mod debug_client;
 pub mod bindings;
 pub mod repl;
-/// Host ETW tracing bindings (`etw` global). Behind the `etw` feature so the
-/// default build never pulls the winsandbox/`windows` deps.
+/// Host ETW tracing bindings (`etw` global). Windows only: it drives the
+/// `winsandbox` collector.
+#[cfg(windows)]
 pub mod etw;
-/// In-process Windows Sandbox bindings (`sbx` global). Behind the `sandbox`
-/// feature so the default build never pulls the winsandbox/`windows` deps.
+/// In-process Windows Sandbox bindings (`sbx` global). Windows only.
+#[cfg(windows)]
 pub mod sbx;
 /// Offline PE analysis bindings (`pe` global).
 pub mod pe;
@@ -50,9 +51,11 @@ pub fn create_lua() -> mlua::Result<Lua> {
     bindings::register_mem_functions(&lua)?;
 
     // Register the host ETW table (etw.start, etw.spawn, etw.events, etc.).
+    #[cfg(windows)]
     etw::register_etw_functions(&lua)?;
 
     // Register the in-process Windows Sandbox table (sbx.provision, etc.).
+    #[cfg(windows)]
     sbx::register_sbx_functions(&lua)?;
 
     // Register the offline PE table (pe.open -> image object).

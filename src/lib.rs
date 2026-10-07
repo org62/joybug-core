@@ -1,10 +1,17 @@
 pub mod protocol;
+/// OS-neutral debugger bookkeeping shared by the platform backends.
+pub mod debugger_core;
+/// Symbol resolution (shared by every backend and the offline PE analysis).
+pub mod symbols;
 pub mod formatting;
 pub mod protocol_io;
 pub mod interfaces;
 pub mod pe_types;
 pub mod pe_image;
+pub mod elf;
 /// Offline PE analysis: disassembly, xrefs and process-less emulation of a file on disk.
+pub mod static_elf;
+pub mod static_image;
 pub mod static_pe;
 pub mod windows_platform;
 pub mod server;
@@ -16,29 +23,50 @@ pub mod local_server;
 pub mod assembler;
 pub mod memory_scanner;
 pub mod pointer_scanner;
+/// POSIX signals as exception codes (OS-neutral).
+pub mod posix_signals;
 pub mod pointer_results;
 pub mod string_scanner;
 pub mod string_results;
 pub mod scan_results;
 pub mod freeze_manager;
 pub mod scripting;
+#[cfg(windows)]
 pub mod inline_hook;
 pub mod peb_normalize;
+#[cfg(windows)]
 pub mod env_block;
 /// Host ETW tracing: drives the collector in [`winsandbox::tracer`], run as a
 /// mode of the hosting executable rather than a separate binary.
+#[cfg(windows)]
 pub mod etw;
 /// Windows Sandbox run mode (host-side VM orchestration).
+#[cfg(windows)]
 pub mod sandbox;
 /// The embedded "this exe can be a sandbox guest" record and its reader.
 pub mod guest_marker;
 /// The guest side of the sandbox desktop probes (`--ui` role).
+#[cfg(windows)]
 pub mod guest_desktop;
 /// Raw-argv guest role dispatch shared by every guest-capable binary.
 pub mod guest_roles;
+/// Placeholder platform for OSes without a live-debugging backend yet.
+#[cfg(not(any(windows, target_os = "linux")))]
+pub mod stub_platform;
+/// The Linux debugger backend (ptrace).
+#[cfg(target_os = "linux")]
+pub mod linux_platform;
 
+/// The platform behind [`local_server::LocalServer::start`] and `jlua --listen`.
+/// Windows and Linux have a real debugger; every other OS gets `stub_platform::StubPlatform`
+/// (every live-process request fails with `NotImplemented`) so the server, the
+/// protocol, the offline `static_pe` analysis and the UI all build and run there.
 #[cfg(windows)]
 pub type PlatformImpl = windows_platform::WindowsPlatform;
+#[cfg(target_os = "linux")]
+pub type PlatformImpl = linux_platform::LinuxPlatform;
+#[cfg(not(any(windows, target_os = "linux")))]
+pub type PlatformImpl = stub_platform::StubPlatform;
 
 pub use interfaces::SymbolConfig;
 

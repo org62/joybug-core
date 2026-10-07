@@ -1,7 +1,9 @@
-//! The `pe` global: offline PE analysis from Lua, with no server and no
-//! process. `pe.open(path)` returns an image object whose methods mirror the
-//! `dbg:*` disassembly/memory API but read the file's mapped image, plus
-//! xrefs, function recovery, byte-pattern search and process-less emulation.
+//! The `pe` and `elf` globals: offline image analysis from Lua, with no
+//! server and no process. `pe.open(path)` / `elf.open(path)` return an image
+//! object whose methods mirror the `dbg:*` disassembly/memory API but read
+//! the file's mapped image, plus xrefs, function recovery, byte-pattern
+//! search and process-less emulation. Both formats share the object; the
+//! PE-only parts (resources, PDB discovery) are empty / no-ops for an ELF.
 
 use std::path::Path;
 
@@ -10,7 +12,9 @@ use mlua::prelude::*;
 use crate::emulator::{EmulationResult, ImportPolicy};
 use crate::interfaces::{Architecture, ResolvedSymbol};
 use crate::protocol::{EmulationMode, StringEncodingFilter};
-use crate::static_pe::{EmulateSpec, PeImage};
+use crate::static_elf::ElfImage;
+use crate::static_image::{EmulateSpec, StaticFile, StaticImage};
+use crate::static_pe::PeImage;
 
 use super::debug_client::{
     arch_name, emulation_result_to_lua_table, instruction_to_lua_table, memory_reads_from_lua,
@@ -18,8 +22,9 @@ use super::debug_client::{
 };
 use super::opt;
 
-/// `pe.open()` result. Mutating calls (`load_pdb`) go through `add_method_mut`.
-pub struct LuaPeImage(PeImage);
+/// `pe.open()` / `elf.open()` result. Mutating calls (`load_pdb`) go through
+/// `add_method_mut`.
+pub struct LuaPeImage(StaticFile);
 
 fn ext<E: std::fmt::Display>(e: E) -> LuaError {
     LuaError::external(anyhow::anyhow!("{}", e))
@@ -33,7 +38,7 @@ fn instructions_table(lua: &Lua, instrs: &[crate::interfaces::Instruction]) -> L
     Ok(t)
 }
 
-fn symbol_table(lua: &Lua, img: &PeImage, s: &crate::interfaces::ModuleSymbol) -> LuaResult<LuaTable> {
+fn symbol_table(lua: &Lua, img: &StaticImage, s: &crate::interfaces::ModuleSymbol) -> LuaResult<LuaTable> {
     resolved_symbol_to_lua_table(lua, &ResolvedSymbol {
         name: s.name.clone(),
         module_name: img.module_name().to_string(),
@@ -108,6 +113,7 @@ impl LuaUserData for LuaPeImage {
     fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
         // ---- Identity ----
         methods.add_method("path", |_, this, ()| Ok(this.0.path().to_string()));
+        methods.add_method("format", |_, this, ()| Ok(this.0.format()));
         methods.add_method("arch", |_, this, ()| Ok(arch_name(this.0.arch())));
         methods.add_method("base", |_, this, ()| Ok(this.0.base()));
         methods.add_method("size", |_, this, ()| Ok(this.0.image_size()));
@@ -334,7 +340,7 @@ impl LuaUserData for LuaPeImage {
     }
 }
 
-/// Register the `pe` table.
+/// Register the `pe` and `elf` tables.
 pub fn register_pe_functions(lua: &Lua) -> LuaResult<()> {
     let pe = lua.create_table()?;
     // pe.open(path[, { base = 0x400000, pdb = "..." }])
@@ -343,8 +349,19 @@ pub fn register_pe_functions(lua: &Lua) -> LuaResult<()> {
         let base: Option<u64> = opt(opts, "base")?;
         let pdb: Option<String> = opt(opts, "pdb")?;
         let img = PeImage::open(&path, base, pdb.as_deref().map(Path::new)).map_err(ext)?;
-        lua.create_userdata(LuaPeImage(img))
+        lua.create_userdata(LuaPeImage(StaticFile::Pe(img)))
     })?)?;
     lua.globals().set("pe", pe)?;
+
+    let elf = lua.create_table()?;
+    // elf.open(path[, { base = 0x555555554000, debug = "/path/prog.debug" }])
+    elf.set("open", lua.create_function(|lua, (path, opts): (String, Option<LuaTable>)| {
+        let opts = opts.as_ref();
+        let base: Option<u64> = opt(opts, "base")?;
+        let debug: Option<String> = opt(opts, "debug")?;
+        let img = ElfImage::open(&path, base, debug.as_deref().map(Path::new)).map_err(ext)?;
+        lua.create_userdata(LuaPeImage(StaticFile::Elf(img)))
+    })?)?;
+    lua.globals().set("elf", elf)?;
     Ok(())
 }
