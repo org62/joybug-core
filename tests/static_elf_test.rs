@@ -1,6 +1,8 @@
+#![cfg(target_os = "linux")]
 //! The offline image over an ELF file: headers, symbols, disassembly,
-//! strings, byte search, xrefs, function recovery and process-less emulation,
-//! on every OS (the file is just bytes). Uses the `hello` test program.
+//! strings, byte search, xrefs, function recovery and process-less emulation.
+//! `ElfImage` itself is OS-neutral (the file is just bytes), but the `hello`
+//! ELF it opens is only built by build.rs on Linux.
 mod common;
 use common::get_test_program_path;
 use joybug_core::protocol::StringEncodingFilter;

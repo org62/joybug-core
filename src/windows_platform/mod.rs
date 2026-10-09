@@ -22,7 +22,7 @@ mod thread_context;
 // Live in `crate::symbols`; aliased so the `symbol_manager::` paths below and the
 // re-exports `static_pe` and the UI import keep resolving.
 #[cfg_attr(not(windows), allow(unused_imports))]
-pub(crate) use crate::symbols::{symbol_manager, symbol_provider, type_provider};
+pub(crate) use crate::symbols::{symbol_manager, symbol_provider};
 /// Compiled in `debugger_core`; the path is kept for `static_pe` and the UI.
 pub use crate::debugger_core::disassembler;
 #[cfg(windows)]
@@ -145,7 +145,7 @@ impl WindowsPlatform {
     /// Module list for symbolization/PE parsing: the debug-event-populated cache
     /// when the process is attached, otherwise a Toolhelp snapshot so it works
     /// non-invasively (no `DebugActiveProcess`).
-    fn modules_for(&self, pid: u32) -> Vec<ModuleInfo> {
+    pub(crate) fn modules_for(&self, pid: u32) -> Vec<ModuleInfo> {
         match self.get_process(pid) {
             Ok(p) => p.module_manager().list_modules(),
             Err(_) => utils::get_modules(pid).unwrap_or_default(),
@@ -579,6 +579,13 @@ impl PlatformAPI for WindowsPlatform {
         };
         let context = self.get_thread_context(pid, tid)?;
         function_arguments(cc, &context, count, |a, n| self.read_memory(pid, a, n))
+    }
+
+    fn list_modules(&self, pid: u32) -> Result<Vec<ModuleInfo>, PlatformError> {
+        match self.get_process(pid) {
+            Ok(process) => Ok(process.module_manager().list_modules()),
+            Err(_) => utils::get_modules(pid).map_err(PlatformError::Other),
+        }
     }
 
     fn list_threads(&self, pid: u32) -> Result<Vec<ThreadInfo>, PlatformError> {

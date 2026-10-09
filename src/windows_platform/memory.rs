@@ -1,6 +1,6 @@
 use super::{utils, WindowsPlatform};
-use crate::interfaces::{PlatformAPI, PlatformError};
-use tracing::{error, trace, warn, debug};
+use crate::interfaces::PlatformError;
+use tracing::{error, trace, debug};
 use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE, HANDLE};
 use windows_sys::Win32::System::Diagnostics::Debug::{FlushInstructionCache, ReadProcessMemory, WriteProcessMemory};
 use windows_sys::Win32::System::Memory::{

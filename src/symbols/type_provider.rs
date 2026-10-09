@@ -307,11 +307,18 @@ impl ModuleTypeInfo {
                     },
                 }
             }
+            // A member usually names a UDT/enum through its forward reference,
+            // whose record carries no size (and no underlying type): read both
+            // from the definition the index is redirected to.
             Some(OwnedType::Udt { name, size, .. }) => {
                 let def = self.by_name.get(name).copied().unwrap_or(index);
+                let size = match self.types.get(&def) {
+                    Some(OwnedType::Udt { size, .. }) => *size,
+                    _ => *size,
+                };
                 TypeRef {
                     name: name.clone(),
-                    size: *size,
+                    size,
                     class: TypeClass::Udt { index: def },
                 }
             }
@@ -319,9 +326,13 @@ impl ModuleTypeInfo {
                 name, underlying, ..
             }) => {
                 let def = self.by_name.get(name).copied().unwrap_or(index);
+                let underlying = match self.types.get(&def) {
+                    Some(OwnedType::Enum { underlying, .. }) => *underlying,
+                    _ => *underlying,
+                };
                 TypeRef {
                     name: name.clone(),
-                    size: self.type_ref(*underlying, depth + 1).size,
+                    size: self.type_ref(underlying, depth + 1).size,
                     class: TypeClass::Enum { index: def },
                 }
             }

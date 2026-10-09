@@ -743,9 +743,8 @@ pub fn handle_debug_event(
             // fUnicode indicates whether the string is UTF-16. nDebugStringLength is in characters.
             let output = if info.fUnicode != 0 {
                 // Read UTF-16 string with known length
-                match super::memory::read_wide_string(
-                    platform,
-                    pid,
+                match crate::debugger_core::strings::read_wide_string(
+                    |a, n| super::memory::read_memory(platform, pid, a, n),
                     info.lpDebugStringData as u64,
                     Some(info.nDebugStringLength as usize),
                 ) {
