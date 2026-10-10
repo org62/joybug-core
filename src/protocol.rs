@@ -51,6 +51,32 @@ mod fingerprint {
 pub mod request_response {
     use super::*;
 
+    /// How the listing requests (`DisassembleMemory`, `DisassembleFunction`,
+    /// `DisassembleBackward`) decode. The default is the full listing; the
+    /// other settings exist to tell where a slow listing spends its time.
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+    pub struct DisasmOptions {
+        /// Name rows and operands and attach source lines. Off: plain
+        /// instructions, function bounds still from the unwind tables.
+        pub symbolize: bool,
+        /// A linear decode from the requested address and nothing else: no
+        /// function bounds, no symbols, no indirect-target reads.
+        pub naive: bool,
+    }
+
+    impl Default for DisasmOptions {
+        fn default() -> Self {
+            Self { symbolize: true, naive: false }
+        }
+    }
+
+    impl DisasmOptions {
+        /// Whether a listing consults the symbols at all.
+        pub fn symbolizes(&self) -> bool {
+            self.symbolize && !self.naive
+        }
+    }
+
     #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
     pub enum StepKind {
         Into,
@@ -628,10 +654,16 @@ pub mod request_response {
             len: u64,
             max_results: usize,
         },
-        /// Resolve an address to a source file/line via the module's PDB line table.
+        /// Resolve an address to a source file/line via the module's line table.
+        /// The table is parsed on first use, which takes seconds for a large
+        /// debug file. With `wait` the answer comes once it is parsed; without,
+        /// the parse is started in the background and the answer comes at once,
+        /// flagged `pending` (ask again when `ModuleSymbolStatus::line_info`
+        /// turns `Ready`).
         ResolveAddressToLine {
             pid: u32,
             address: u64,
+            wait: bool,
         },
         /// All line→address entries for one source file of a module. When
         /// `start_line`/`end_line` are set, only entries whose `line_start` falls
@@ -812,6 +844,10 @@ pub mod request_response {
         /// no-op on a platform without signals.
         SetReportedSignals {
             signals: Vec<u32>,
+        },
+        /// How this server decodes listings from now on (see [`DisasmOptions`]).
+        SetDisasmOptions {
+            options: DisasmOptions,
         },
         /// Write a dump of `pid` to `path` on the server machine: a minidump
         /// on Windows, an ELF core file on Linux.
@@ -1001,6 +1037,16 @@ pub mod request_response {
             size: usize,
             executable: bool,
         },
+        /// `VirtualProtectEx` the pages covering `[address, address + size)` to
+        /// `protect` (a `PAGE_*` value); answers `MemoryProtected`. On Linux it
+        /// is an `mprotect` run on a stopped thread, so the target must be
+        /// paused, and only the read/write/execute combinations exist.
+        ProtectMemory {
+            pid: u32,
+            address: u64,
+            size: usize,
+            protect: u32,
+        },
     }
 
     /// Where a coverage target came from, so a UI can tell a PDB-named function
@@ -1148,7 +1194,9 @@ pub mod request_response {
             results: Vec<Option<(String, crate::interfaces::ModuleSymbol, u64)>>,
         },
         // Source line responses
-        AddressLine { info: Option<AddressLineInfo> },
+        /// `pending`: no answer yet — the module's line table (or its symbols)
+        /// is still loading. Only a request without `wait` gets it.
+        AddressLine { info: Option<AddressLineInfo>, pending: bool },
         SourceFileLineMap {
             file: Option<crate::interfaces::SourceFileEntry>,
             entries: Vec<crate::interfaces::LineEntry>,
@@ -1265,6 +1313,9 @@ pub mod request_response {
         },
         /// Reply to [`DebuggerRequest::AllocateMemory`]: the region's base.
         MemoryAllocated { address: u64 },
+        /// Reply to [`DebuggerRequest::ProtectMemory`]: the protection the
+        /// first page of the range had.
+        MemoryProtected { old_protect: u32 },
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1419,6 +1470,14 @@ pub mod request_response {
         pub size: Option<u64>,
     }
 
+    impl ModuleInfo {
+        /// Whether `address` lies inside this module's mapped range (a module
+        /// of unknown size contains nothing).
+        pub fn contains(&self, address: u64) -> bool {
+            address >= self.base && address < self.base.saturating_add(self.size.unwrap_or(0))
+        }
+    }
+
     /// Symbol load state for a single module.
     #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
     pub enum SymbolLoadState {
@@ -1431,6 +1490,17 @@ pub mod request_response {
         NotRequested,
     }
 
+    /// Where a module's source line table stands. It is parsed on the first
+    /// source-level request for the module, not with its symbols.
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+    pub enum LineInfoState {
+        /// Not parsed: nobody asked yet, or there is nothing to parse.
+        NotLoaded,
+        /// Being parsed in the background.
+        Loading,
+        Ready,
+    }
+
     /// Per-module symbol load status, as reported by `GetSymbolStatus`.
     #[derive(Debug, Serialize, Deserialize, Clone)]
     pub struct ModuleSymbolStatus {
@@ -1439,6 +1509,7 @@ pub mod request_response {
         pub state: SymbolLoadState,
         /// Path of the PDB the symbols were loaded from, when loaded.
         pub pdb_path: Option<String>,
+        pub line_info: LineInfoState,
     }
 
     /// A resolved address → source line mapping, as returned by `ResolveAddressToLine`.

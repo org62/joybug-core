@@ -12,6 +12,8 @@ use crate::symbols::type_provider::ModuleTypeInfo;
 use crate::protocol::{TypeLayout, TypeSummary};
 use pelite::image::RUNTIME_FUNCTION;
 use super::backend::{FunctionTable, PdbBackend, SymbolBackend};
+use super::line_tables::LineTables;
+use super::line_tables::LineTableLookup;
 
 /// Where a module's cached symbols came from. `Exports` marks the PE-export
 /// fallback used when no PDB is available; it carries the PDB failure reason
@@ -58,10 +60,9 @@ pub struct SymbolManager {
     /// Cached function table per module for chain resolution
     pdata_cache: Mutex<HashMap<String, Option<FunctionTable>>>,
 
-    /// Lazily parsed PDB line tables per module (module_path -> state).
-    /// Populated on the first source-level request, never during the
-    /// background symbol load.
-    line_cache: Mutex<HashMap<String, PdbArtifactState<ModuleLineTable>>>,
+    /// Line tables per module (module_path -> state), each parsed once on the
+    /// background warm-up thread from the moment its debug file loads.
+    lines: Arc<LineTables>,
 
     /// Lazily parsed PDB type information per module (module_path -> state).
     /// Populated on the first type-level request, never during the background
@@ -108,6 +109,7 @@ impl SymbolManager {
         let pending_loads = Arc::new(Mutex::new(HashSet::new()));
         let failed_loads = Arc::new(Mutex::new(HashMap::new()));
         let pending_cv = Arc::new(Condvar::new());
+        let lines = LineTables::new(backend.clone(), symbol_cache.clone(), pending_loads.clone());
 
         let (worker_tx, worker_rx) = mpsc::channel::<SymbolLoadRequest>();
         // Wrap receiver in Arc<Mutex> to share among multiple worker threads
@@ -124,6 +126,7 @@ impl SymbolManager {
             let cv_clone = pending_cv.clone();
             let cfg_clone = cfg.clone();
             let backend = backend.clone();
+            let lines = lines.clone();
 
             thread::spawn(move || {
                 trace!(worker_id = i, "Symbol worker thread started");
@@ -158,7 +161,16 @@ impl SymbolManager {
 
                     // Insert a finished symbol list, but never clobber a real PDB a
                     // user loaded manually meanwhile; export stubs are replaceable.
+                    let mut span = crate::perf::span("symbols.load_module");
+                    if span.is_live() {
+                        span.attr("module_key", crate::perf::path_key(&module_path));
+                        span.attr("module_size", module_size.unwrap_or(0) as u64);
+                    }
+                    // What ended up in the cache: (symbol count, 1 = debug file / 2 = export names).
+                    let loaded = std::cell::Cell::new((0u64, 0u64));
+
                     let insert_symbols = |mut symbols: Vec<ModuleSymbol>, pdb_path: Option<String>, source: SymbolSource| {
+                        loaded.set((symbols.len() as u64, if matches!(source, SymbolSource::Pdb) { 1 } else { 2 }));
                         // Sort symbols by RVA for binary search
                         symbols.sort_by_key(|s| s.rva);
                         let mut cache = cache_clone.lock().unwrap();
@@ -205,12 +217,23 @@ impl SymbolManager {
                         }
                     }
 
+                    span.attr("symbols", loaded.get().0);
+                    span.attr("source", loaded.get().1);
+                    drop(span);
+                    let loaded_from_debug_file = loaded.get().1 == 1;
+
                     // Remove from pending and notify waiters
                     {
                         let mut pending = pending_clone.lock().unwrap();
                         pending.remove(&module_path);
                     }
                     cv_clone.notify_all();
+
+                    // A debug file just landed: parse its line table now, in
+                    // the background, instead of on the first source lookup.
+                    if loaded_from_debug_file {
+                        lines.warm(&module_path);
+                    }
                 }
                 
                 trace!(worker_id = i, "Symbol worker thread exiting");
@@ -221,7 +244,7 @@ impl SymbolManager {
             symbol_cache,
             backend,
             pdata_cache: Mutex::new(HashMap::new()),
-            line_cache: Mutex::new(HashMap::new()),
+            lines,
             type_cache: Mutex::new(HashMap::new()),
             pending_loads,
             failed_loads,
@@ -310,9 +333,15 @@ impl SymbolManager {
         let start = Instant::now();
         let mut pending = self.pending_loads.lock().unwrap();
         
+        // A record only when there is something to wait for.
+        let mut span = if pending.contains(module_path) { crate::perf::span("symbols.wait_for_loading") } else { crate::perf::Span::off() };
+        if span.is_live() {
+            span.attr("module_key", crate::perf::path_key(module_path));
+        }
         while pending.contains(module_path) {
             let elapsed = start.elapsed();
             if elapsed >= self.wait_timeout {
+                span.attr("timed_out", 1);
                 trace!(module_path, timeout_ms = self.wait_timeout.as_millis() as u64, "Timeout waiting for symbol loading");
                 return Ok(()); // Return Ok even on timeout to allow partial results
             }
@@ -321,6 +350,7 @@ impl SymbolManager {
             let (guard, timeout_result) = self.pending_cv.wait_timeout(pending, remaining).unwrap();
             pending = guard;
             if timeout_result.timed_out() {
+                span.attr("timed_out", 1);
                 trace!(module_path, timeout_ms = self.wait_timeout.as_millis() as u64, "Timeout waiting for symbol loading (cv)");
                 return Ok(());
             }
@@ -383,11 +413,13 @@ impl SymbolManager {
     pub fn get_symbol_status(&self, modules: Vec<ModuleInfo>) -> Vec<ModuleSymbolStatus> {
         modules.into_iter().map(|module| {
             let (state, pdb_path) = self.load_state(&module.name);
+            let line_info = self.lines.state(&module.name);
             ModuleSymbolStatus {
                 module_path: module.name,
                 module_base: module.base,
                 state,
                 pdb_path,
+                line_info,
             }
         }).collect()
     }
@@ -415,8 +447,10 @@ impl SymbolManager {
         }
         self.failed_loads.lock().unwrap().remove(&module.name);
         self.denied_loads.lock().unwrap().remove(&Self::short_name_lower(&module.name));
-        // The line/type tables came from the previous PDB; re-parse on demand.
+        // The line/type tables came from the previous PDB. Types are re-parsed
+        // on demand; the line table right away, in the background.
         self.invalidate_line_table(&module.name);
+        self.lines.warm(&module.name);
         self.type_cache.lock().unwrap().remove(&module.name);
 
         trace!(module_path = %module.name, pdb_path = %pdb_path.display(), symbol_count, force, "Loaded user-supplied PDB");
@@ -463,6 +497,10 @@ impl SymbolManager {
         };
 
         // Parse outside all locks; a rare duplicate parse under concurrency is fine.
+        let mut span = crate::perf::span("symbols.parse_artifact");
+        if span.is_live() {
+            span.attr("module_key", crate::perf::path_key(module_path));
+        }
         let state = match parse(Path::new(&pdb_path)) {
             Ok(v) => PdbArtifactState::Ready(Arc::new(v)),
             Err(e) => {
@@ -478,15 +516,23 @@ impl SymbolManager {
         }
     }
 
-    /// Get (lazily parsing) the PDB line table for a module. See `get_pdb_artifact`
-    /// for the caching/non-blocking contract.
+    /// The line table of a module, waiting for it if it is still being parsed
+    /// (seconds, for a large debug file) — for a background thread or an
+    /// explicit request. `Ok(None)` when there is no debug file. See
+    /// `line_tables` for how and when tables are parsed.
     pub fn get_line_table(&self, module_path: &str) -> Result<Option<Arc<ModuleLineTable>>, SymbolError> {
-        self.get_pdb_artifact(&self.line_cache, module_path, "line table", |p| self.backend.parse_lines(p))
+        self.lines.get(module_path)
+    }
+
+    /// The line table of a module if it is there now; `Pending` while it (or
+    /// the module's symbols) is still loading. Never waits.
+    fn try_get_line_table(&self, module_path: &str) -> Result<LineTableLookup, SymbolError> {
+        self.lines.try_get(module_path)
     }
 
     /// Drop a module's cached line table (e.g. after a user loads a different PDB).
     pub fn invalidate_line_table(&self, module_path: &str) {
-        self.line_cache.lock().unwrap().remove(module_path);
+        self.lines.invalidate(module_path);
     }
 
     /// Resolve an RVA against an already-parsed line table.
@@ -505,12 +551,23 @@ impl SymbolManager {
         Some((file, entry.clone()))
     }
 
-    /// Resolve an RVA to a source line, lazily parsing the module's line table.
+    /// Resolve an RVA to a source line, parsing the module's line table if
+    /// needed (see [`Self::get_line_table`] for what that can cost).
     pub fn resolve_rva_to_line(&self, module_path: &str, rva: u32) -> Result<Option<(SourceFileEntry, LineEntry)>, SymbolError> {
         match self.get_line_table(module_path)? {
             Some(table) => Ok(Self::resolve_rva_in_table(&table, rva)),
             None => Ok(None),
         }
+    }
+
+    /// Resolve an RVA to a source line without waiting for a line-table parse.
+    /// The flag is `true` when the answer is "not yet": the table is loading.
+    pub fn try_resolve_rva_to_line(&self, module_path: &str, rva: u32) -> Result<(Option<(SourceFileEntry, LineEntry)>, bool), SymbolError> {
+        Ok(match self.try_get_line_table(module_path)? {
+            LineTableLookup::Ready(table) => (Self::resolve_rva_in_table(&table, rva), false),
+            LineTableLookup::Pending => (None, true),
+            LineTableLookup::Unavailable => (None, false),
+        })
     }
 
     /// Resolve an absolute address to a source line from ALREADY-CACHED line
@@ -519,13 +576,7 @@ impl SymbolManager {
     pub fn try_resolve_address_to_line_cached(&self, modules: &[ModuleInfo], address: u64) -> Option<SourceLineRef> {
         let module = Self::find_module_binary_search(modules, address)?;
         let rva = (address - module.base) as u32;
-        let table = {
-            let cache = self.line_cache.lock().unwrap();
-            match cache.get(&module.name) {
-                Some(PdbArtifactState::Ready(table)) => table.clone(),
-                _ => return None,
-            }
-        };
+        let table = self.lines.cached(&module.name)?;
         let (file, entry) = Self::resolve_rva_in_table(&table, rva)?;
         Some(SourceLineRef { file_path: file.path, line: entry.line_start })
     }
@@ -916,6 +967,10 @@ impl SymbolManager {
     fn lookup_chain_target(&self, module_path: &str, rva: u32) -> Option<u32> {
         let mut pdata_cache = self.pdata_cache.lock().unwrap();
         let cached = pdata_cache.entry(module_path.to_string()).or_insert_with(|| {
+            let mut span = crate::perf::span("symbols.function_table_load");
+            if span.is_live() {
+                span.attr("module_key", crate::perf::path_key(module_path));
+            }
             self.backend.function_table(module_path)
         });
         let cached = cached.as_ref()?;
@@ -1090,6 +1145,11 @@ impl SymbolManager {
 
         let cache = self.symbol_cache.lock().unwrap();
         if let Some(module_symbols) = cache.get(module_path) {
+            let mut span = crate::perf::span("symbols.raw_scan");
+            if span.is_live() {
+                span.attr("module_key", crate::perf::path_key(module_path));
+                span.attr("symbols", module_symbols.symbols.len() as u64);
+            }
             // Find the symbol with the highest RVA that is still <= the target RVA
             let mut best_match: Option<&ModuleSymbol> = None;
             for symbol in &module_symbols.symbols {

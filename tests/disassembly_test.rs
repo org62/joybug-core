@@ -642,7 +642,6 @@ fn test_disassembly_speed_kernelbase() {
         println!("Total instructions: {}", total_instructions);
         println!("Errors: {}", errors);
         println!("Time taken: {:.2}ms", elapsed.as_secs_f64() * 1000.0);
-        joybug_core::framed_json_stream::print_serialization_stats();
 
         if functions_disassembled > 0 {
             let funcs_per_sec = functions_disassembled as f64 / elapsed.as_secs_f64();

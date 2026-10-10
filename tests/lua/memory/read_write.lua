@@ -51,6 +51,16 @@ dbg:on_initial_breakpoint(function(pid, tid, addr)
     local code = dbg:allocate_memory(pid, 0x1000, true)
     assert(code and code > 0 and code ~= buf, "an executable allocation is a distinct region")
 
+    -- Changing a page's protection reports what it was and shows in the region.
+    local PAGE_READONLY, PAGE_READWRITE = 0x02, 0x04
+    assert(dbg:query_memory(pid, buf).protect == PAGE_READWRITE, "a fresh allocation is read-write")
+    local old = dbg:protect_memory(pid, buf, 0x1000, PAGE_READONLY)
+    assert(old == PAGE_READWRITE, string.format("protect_memory should return the old protection, got 0x%X", old))
+    assert(dbg:query_memory(pid, buf).protect == PAGE_READONLY, "the region should now be read-only")
+    assert(dbg:protect_memory(pid, buf, 0x1000, PAGE_READWRITE) == PAGE_READONLY, "and changing back reports read-only")
+    assert(not pcall(function() dbg:protect_memory(pid, 0x10000000000000, 0x1000, PAGE_READONLY) end),
+        "protecting an unmapped address should fail")
+
     dbg:terminate(pid)
 end)
 

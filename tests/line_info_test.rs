@@ -133,6 +133,68 @@ fn test_source_line_info() {
     assert!(final_state.line_info_tested, "Line info tests should have run");
 }
 
+/// A line lookup that does not wait. The table is parsed in the background as
+/// soon as the module's debug file loads, so the lookup either finds the line
+/// or answers `Pending` — never blocks — and the module's `line_info` status
+/// says when asking again will work.
+#[test]
+fn test_source_line_lookup_without_waiting() {
+    use joybug_core::protocol::LineInfoState;
+    use joybug_core::protocol_io::LineLookup;
+
+    let server = TestServer::spawn();
+    let server_addr = server.address().to_string();
+    let test_exe_path = get_test_program_path("xtea_test");
+
+    let final_state = DebugSession::new(false, Some(server_addr.as_str()))
+        .expect("Failed to connect to debug server")
+        .on_initial_breakpoint(|session, pid, _tid, _addr| {
+            // Waits for the symbols, so the debug file is known.
+            let main_sym = find_symbol(session, "xtea_test!main", "xtea_test")?;
+            let module = find_module(session, pid, "xtea_test")?;
+            let line_info = |session: &mut DebugSession<bool>| -> anyhow::Result<LineInfoState> {
+                Ok(session
+                    .get_symbol_status(pid)?
+                    .into_iter()
+                    .find(|s| s.module_base == module.base)
+                    .expect("the module has a symbol status")
+                    .line_info)
+            };
+
+            // Nobody asked for line info yet, but the debug file is loaded: its
+            // table is already queued, being parsed, or done.
+            assert_ne!(line_info(session)?, LineInfoState::NotLoaded, "the parse starts with the debug file, not with the first lookup");
+            match session.try_resolve_address_to_line(pid, main_sym.va)? {
+                LineLookup::Pending => {}
+                LineLookup::Found(info) => assert!(info.file.path.to_lowercase().ends_with("xtea_test.c")),
+                LineLookup::NoLineInfo => panic!("main has a source line; \"no line info\" is the wrong answer while the table loads"),
+            }
+
+            // The parse runs on its own; the status reports it.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while line_info(session)? != LineInfoState::Ready {
+                assert!(std::time::Instant::now() < deadline, "line table never became ready");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+
+            match session.try_resolve_address_to_line(pid, main_sym.va)? {
+                LineLookup::Found(info) => assert!(info.file.path.to_lowercase().ends_with("xtea_test.c")),
+                other => panic!("expected the line once the table is ready, got {:?}", other),
+            }
+            // An address outside every module has no line, and is not "pending".
+            assert!(matches!(session.try_resolve_address_to_line(pid, 0x10)?, LineLookup::NoLineInfo));
+            // The waiting lookup agrees.
+            assert!(session.resolve_address_to_line(pid, main_sym.va)?.is_some());
+
+            session.state = true;
+            Ok(())
+        })
+        .launch(test_exe_path)
+        .expect("Debug session failed");
+
+    assert!(final_state, "the lookup test should have run");
+}
+
 /// Reproduce joybug-tauri's runner-driven source-line stepping: the on_event
 /// handler, on each StepComplete, keeps issuing steps (returning Ok(true) so the
 /// loop's auto-continue resumes) until the source line changes. This mirrors

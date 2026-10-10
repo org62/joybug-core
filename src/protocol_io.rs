@@ -107,8 +107,13 @@ pub fn send_request(stream: &mut FramedJsonStream, req: &DebuggerRequest) -> any
 
 pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<DebuggerResponse> {
     let resp: DebuggerResponse = stream.receive()?;
+    log_response(&resp);
+    Ok(resp)
+}
+
+fn log_response(resp: &DebuggerResponse) {
     // Print only the response type, and for Instructions include the count
-    let summary = match &resp {
+    let summary = match resp {
         DebuggerResponse::Instructions { instructions } => {
             format!("Instructions ({} instructions)", instructions.len())
         }
@@ -169,9 +174,20 @@ pub fn receive_response(stream: &mut FramedJsonStream) -> anyhow::Result<Debugge
         DebuggerResponse::PebAddress { .. } => "PebAddress".to_string(),
         DebuggerResponse::Hello { server, version, .. } => format!("Hello({server} {version})"),
         DebuggerResponse::MemoryAllocated { address } => format!("MemoryAllocated(0x{address:x})"),
+        DebuggerResponse::MemoryProtected { old_protect } => format!("MemoryProtected(was 0x{old_protect:x})"),
     };
     debug!("Received response: {}", summary);
-    Ok(resp)
+}
+
+/// An address looked up in the source line tables without waiting.
+#[derive(Debug, Clone)]
+pub enum LineLookup {
+    Found(Box<crate::protocol::AddressLineInfo>),
+    /// The module has no line for this address (or no line info at all).
+    NoLineInfo,
+    /// The module's line table is still loading; ask again when its
+    /// `line_info` status is `Ready`.
+    Pending,
 }
 
 /// What the server said in reply to our `Hello`.
@@ -981,6 +997,11 @@ impl<S> DebugSession<S> {
         }
     }
 
+    /// How the server decodes listings from now on (see `DisasmOptions`).
+    pub fn set_disasm_options(&mut self, options: crate::protocol::DisasmOptions) -> anyhow::Result<()> {
+        self.ack_request(DebuggerRequest::SetDisasmOptions { options }, "SetDisasmOptions")
+    }
+
     /// Which POSIX signals the server reports as exceptions (Linux targets).
     pub fn set_reported_signals(&mut self, signals: &[u32]) -> anyhow::Result<()> {
         self.ack_request(DebuggerRequest::SetReportedSignals { signals: signals.to_vec() }, "SetReportedSignals")
@@ -1024,8 +1045,26 @@ impl<S> DebugSession<S> {
         req: &crate::protocol::DebuggerRequest,
     ) -> anyhow::Result<crate::protocol::DebuggerResponse> {
         let mut stream = self.stream.lock().unwrap();
-        send_request(&mut stream, req)?;
-        receive_response(&mut stream)
+        if !crate::perf::enabled() {
+            send_request(&mut stream, req)?;
+            return receive_response(&mut stream);
+        }
+        // The round trip as the client sees it. `wait_us` is the time blocked
+        // on the answer: the server's handling, or for a request that waits
+        // for a debug event, the target's run time.
+        let _request = crate::perf::request_scope(crate::perf::variant_name(req));
+        let mut span = crate::perf::span("client.request");
+        debug!("Sending request: {:?}", req);
+        let sent = stream.send_timed(req)?;
+        let (resp, received): (DebuggerResponse, _) = stream.receive_timed()?;
+        span.attr("req_bytes", sent.bytes);
+        span.attr("encode_us", sent.codec_us);
+        span.attr("send_us", sent.io_us);
+        span.attr("wait_us", received.io_us);
+        span.attr("resp_bytes", received.bytes);
+        span.attr("decode_us", received.codec_us);
+        log_response(&resp);
+        Ok(resp)
     }
 
     pub fn send(&mut self, req: &crate::protocol::DebuggerRequest) -> anyhow::Result<()> {
@@ -1396,10 +1435,7 @@ impl<S> DebugSession<S> {
         }
 
         let address = symbols[0].va;
-        println!(
-            "Setting single-shot breakpoint at {} (0x{:x})",
-            symbol_name, address
-        );
+        debug!("Setting single-shot breakpoint at {} (0x{:x})", symbol_name, address);
 
         match self.send_and_receive(&DebuggerRequest::SetSingleShotBreakpoint { pid, addr: address })?
         {
@@ -1575,23 +1611,33 @@ impl<S> DebugSession<S> {
         }
     }
 
-    /// Resolve an address to a source file/line via the module's PDB line table.
+    /// Resolve an address to its source line, waiting for the module's line
+    /// table if it has to be parsed first (seconds, for a large debug file).
     pub fn resolve_address_to_line(
         &mut self,
         pid: u32,
         address: u64,
     ) -> anyhow::Result<Option<crate::protocol::AddressLineInfo>> {
-        let req = DebuggerRequest::ResolveAddressToLine { pid, address };
-        match self.send_and_receive(&req)? {
-            DebuggerResponse::AddressLine { info } => Ok(info),
-            DebuggerResponse::Error { message } => Err(anyhow::anyhow!(
-                "Failed to resolve address to line: {}",
-                message
-            )),
-            other => Err(anyhow::anyhow!(
-                "Unexpected response to ResolveAddressToLine: {:?}",
-                other
-            )),
+        match self.request_address_line(pid, address, true)? {
+            LineLookup::Found(info) => Ok(Some(*info)),
+            LineLookup::NoLineInfo | LineLookup::Pending => Ok(None),
+        }
+    }
+
+    /// Resolve an address to its source line without waiting: when the line
+    /// table is not parsed yet the server starts parsing it in the background
+    /// and answers [`LineLookup::Pending`].
+    pub fn try_resolve_address_to_line(&mut self, pid: u32, address: u64) -> anyhow::Result<LineLookup> {
+        self.request_address_line(pid, address, false)
+    }
+
+    fn request_address_line(&mut self, pid: u32, address: u64, wait: bool) -> anyhow::Result<LineLookup> {
+        match self.send_and_receive(&DebuggerRequest::ResolveAddressToLine { pid, address, wait })? {
+            DebuggerResponse::AddressLine { info: Some(info), .. } => Ok(LineLookup::Found(Box::new(info))),
+            DebuggerResponse::AddressLine { info: None, pending: true } => Ok(LineLookup::Pending),
+            DebuggerResponse::AddressLine { info: None, pending: false } => Ok(LineLookup::NoLineInfo),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to resolve address to line: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to ResolveAddressToLine: {:?}", other)),
         }
     }
 
@@ -1783,6 +1829,17 @@ impl<S> DebugSession<S> {
             DebuggerResponse::MemoryAllocated { address } => Ok(address),
             DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to allocate memory: {}", message)),
             other => Err(anyhow::anyhow!("Unexpected response to AllocateMemory: {:?}", other)),
+        }
+    }
+
+    /// Change the protection of the pages covering `[address, address + size)`
+    /// to `protect` (a `PAGE_*` value); returns the previous protection.
+    pub fn protect_memory(&mut self, pid: u32, address: u64, size: usize, protect: u32) -> anyhow::Result<u32> {
+        let req = DebuggerRequest::ProtectMemory { pid, address, size, protect };
+        match self.send_and_receive(&req)? {
+            DebuggerResponse::MemoryProtected { old_protect } => Ok(old_protect),
+            DebuggerResponse::Error { message } => Err(anyhow::anyhow!("Failed to change memory protection: {}", message)),
+            other => Err(anyhow::anyhow!("Unexpected response to ProtectMemory: {:?}", other)),
         }
     }
 

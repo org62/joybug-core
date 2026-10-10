@@ -149,6 +149,8 @@ local bytes = dbg:write_dump(pid, "/tmp/target.core", "full")  -- every readable
 Writes a minidump on Windows and an ELF core file on Linux (opens in gdb/lldb), on the
 server's machine, from a stopped target. On Linux "mini" keeps what the process could have
 written (stacks, heap, data) plus each file mapping's first page; code comes from the binaries.
+A dump written while stopped on an exception records it — the exception stream on Windows
+(`.ecxr`, `!analyze`), `NT_SIGINFO` on Linux (`$_siginfo`) — a breakpoint or step stop does not.
 
 ### Breakpoints
 
@@ -289,6 +291,12 @@ dbg:write_memory(pid, addr, "\x90\x90\x90")  -- Write NOPs
 -- with `executable = true`. Never freed by the debugger.
 local buf = dbg:allocate_memory(pid, 0x1000)
 local code = dbg:allocate_memory(pid, 0x1000, true)
+
+-- Change the protection of the pages covering [addr, addr + size) to a PAGE_*
+-- value (VirtualProtectEx); returns the previous protection. On Linux it is an
+-- mprotect on a stopped thread: the target must be paused, and only the
+-- read/write/execute combinations exist (no PAGE_GUARD, no WRITECOPY).
+local old = dbg:protect_memory(pid, buf, 0x1000, 0x20)  -- PAGE_EXECUTE_READ
 
 -- Search for a byte pattern in process memory
 local addrs, capped = dbg:search_memory(pid, "PATTERN", 100)
@@ -468,6 +476,12 @@ disasm(func.instructions)
 -- boundary. Useful for scrolling up past functions with no `.pdata` bounds.
 local prev = dbg:disassemble_backward(pid, target, 5)
 disasm(prev)  -- prev[#prev] ends exactly at `target` for well-formed code
+
+-- How the server decodes listings from now on (a diagnostic: which part of a
+-- slow listing costs the time). Missing keys take the default.
+dbg:set_disasm_options({ symbolize = false })  -- no names, no source lines; bounds stay
+dbg:set_disasm_options({ naive = true })       -- linear decode from the address, nothing else
+dbg:set_disasm_options({})                     -- back to the full listing
 ```
 
 ### Call Stack

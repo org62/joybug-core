@@ -149,6 +149,7 @@ fn hardware_breakpoint_all_types() {
 
 /// State for the ARM64 max-concurrent test: two execute breakpoints and one
 /// watchpoint, all armed at the same time.
+#[cfg(target_arch = "aarch64")]
 struct HwBpConcurrentState {
     exec_write_dword_hit: bool,
     exec_execute_target_hit: bool,

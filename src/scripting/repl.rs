@@ -94,6 +94,7 @@ const FN_SIGS: &[FnSig] = &[
     // dbg methods - disassembly
     FnSig { name: "dbg:disassemble", sig: "pid, addr, [count=10]", desc: "Disassemble N instructions. Returns table of {address, mnemonic, operands, symbol, size, bytes, is_call, is_jump, is_ret}." },
     FnSig { name: "dbg:disassemble_function", sig: "pid, addr, [max=1000]", desc: "Disassemble entire function. Returns {instructions, start, end, name}." },
+    FnSig { name: "dbg:set_disasm_options", sig: "{symbolize=true, naive=false}", desc: "How the server decodes listings from now on: without symbols, or as a plain linear decode." },
     // dbg methods - call stack
     FnSig { name: "dbg:get_call_stack", sig: "[pid], [tid]", desc: "Get call stack frames. Returns table of {address, sp, fp, symbol, module}." },
     // dbg methods - listing

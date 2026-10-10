@@ -112,7 +112,7 @@ NTSTATUS; any other signal is delivered unseen unless the client listed it with
 (`0x4C53_0000 | signo`, parameters `[signo, si_code, sender pid]`) that the continue delivers
 (`pass_exception`) or drops. Passing a signal nobody handles (`SigCgt`/`SigIgn` in
 `/proc/pid/status`) first stops once more as a second-chance exception. `inject_syscall` runs one
-system call on a stopped thread (`mmap` for `allocate_memory`, `close` for `close_remote_handle`).
+system call on a stopped thread (`mmap` for `allocate_memory`, `mprotect` for `protect_memory`, `close` for `close_remote_handle`).
 
 **Key patterns:**
 - Async Tokio server with blocking debug loop in separate thread
@@ -139,6 +139,8 @@ Integration tests in `tests/` use compiled C programs from `tests/test_programs/
 - `symbols/backend.rs` - `SymbolBackend` (PDB / ELF) behind the shared `SymbolManager`
 - `emulator/mod.rs` - Unicorn CPU emulator for forward execution (over an `EmuTarget`: `emulator/target.rs`)
 - `static_pe/mod.rs` - `PeImage`: offline PE analysis (mapped image, xrefs, functions, process-less emulation)
+- `symbols/symbol_manager.rs` - shared as `Arc<SymbolManager>` (`PlatformAPI::symbols_handle`). Line tables (`symbols/line_tables.rs`) are parsed once each, in the background, queued as soon as a module's debug file loads: `resolve_rva_to_line` waits, `try_resolve_rva_to_line` answers `Pending`; `ModuleSymbolStatus.line_info` reports the state. `server.rs` does the slow symbol requests (`LoadPdbFromPath`, `ResolveAddressToLine`, line maps) through `symbols_and_module`, i.e. without holding the platform lock — a request that can take seconds must not hold it, or every write request (step, breakpoint) waits behind it
+- `perf.rs` - In-process performance recorder (`perf::span`, `request_scope`); a no-op unless a host installs a sink. Spans carry numbers only; a module is named solely through the `module_key` attribute (`perf::path_key`). Timing goes here, never to `println!`
 - `callstack_proposal.md` - Design doc for call stack feature
 - `docs/stepping/` - Stepping algorithm analysis
 - [docs/jlua-guide.md](docs/jlua-guide.md) - Lua scripting API reference (jlua REPL + `dbg` API)

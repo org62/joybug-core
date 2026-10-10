@@ -560,11 +560,12 @@ pub trait PlatformAPI: Send + Sync {
     fn get_symbol_status(&self, _pid: u32) -> Result<Vec<crate::protocol::ModuleSymbolStatus>, SymbolError> {
         Err(SymbolError::SymbolsNotFound("Symbol status not supported by this platform".to_string()))
     }
-    /// Load symbols for a module from a user-supplied PDB file.
-    /// Unless `force`, the PDB's GUID/age must match the module's PE debug directory;
-    /// a mismatch is a negotiable outcome (`PdbLoadOutcome::Mismatch`), not an error.
-    fn load_pdb_from_path(&self, _pid: u32, _module_base: u64, _pdb_path: &str, _force: bool) -> Result<crate::protocol::PdbLoadOutcome, SymbolError> {
-        Err(SymbolError::SymbolsNotFound("Loading PDB from path not supported by this platform".to_string()))
+    /// The platform's symbol manager, shared. Lets the server run the slow
+    /// symbol work (a debug-file load, a line-table parse) without holding the
+    /// platform lock, which would stall every request that needs to write to
+    /// the platform — a step, a breakpoint — for as long as the parse takes.
+    fn symbols_handle(&self) -> Option<std::sync::Arc<crate::symbols::symbol_manager::SymbolManager>> {
+        None
     }
     /// Retry a failed symbol download for a module.
     fn retry_symbol_load(&self, _pid: u32, _module_base: u64) -> Result<(), SymbolError> {
@@ -579,22 +580,6 @@ pub trait PlatformAPI: Send + Sync {
     /// download is suppressed.
     fn set_symbol_deny_list(&self, _modules: Vec<String>) -> Result<(), SymbolError> {
         Err(SymbolError::SymbolsNotFound("Symbol deny list not supported by this platform".to_string()))
-    }
-
-    // Source line methods (PDB line tables)
-    /// Resolve an address to a source file/line. Lazily parses the module's line table.
-    fn resolve_address_to_line(&self, _pid: u32, _address: u64) -> Result<Option<crate::protocol::AddressLineInfo>, SymbolError> {
-        Err(SymbolError::SymbolsNotFound("Source line resolution not supported by this platform".to_string()))
-    }
-    /// All line→address entries for one source file of a module, plus the matched
-    /// file record. `start_line`/`end_line` (inclusive, 1-based) bound the returned
-    /// entries by `line_start`; `None` = whole file.
-    fn get_source_file_line_map(&self, _pid: u32, _module_base: u64, _file_path: &str, _start_line: Option<u32>, _end_line: Option<u32>) -> Result<(Option<SourceFileEntry>, Vec<LineEntry>), SymbolError> {
-        Err(SymbolError::SymbolsNotFound("Source line maps not supported by this platform".to_string()))
-    }
-    /// All source files referenced by a module's PDB line table.
-    fn list_source_files(&self, _pid: u32, _module_base: u64) -> Result<Vec<SourceFileEntry>, SymbolError> {
-        Err(SymbolError::SymbolsNotFound("Source file listing not supported by this platform".to_string()))
     }
 
     // Type system methods (PDB TPI stream)
@@ -734,6 +719,11 @@ pub trait PlatformAPI: Send + Sync {
         Ok(())
     }
 
+    /// How listings decode from now on (see `protocol::DisasmOptions`).
+    fn set_disasm_options(&self, _options: crate::protocol::DisasmOptions) -> Result<(), PlatformError> {
+        Ok(())
+    }
+
     /// Write a dump of the process to `path` (a path on the machine running
     /// the platform): a minidump on Windows, an ELF core file on Linux.
     /// Returns the file size in bytes.
@@ -744,6 +734,14 @@ pub trait PlatformAPI: Send + Sync {
     /// Kernel handles, windows, TCP connections and token privileges of the
     /// process (the Handles window).
     fn list_process_objects(&self, _pid: u32) -> Result<ProcessObjects, PlatformError> {
+        Err(PlatformError::NotImplemented)
+    }
+
+    /// Change the protection of the pages covering `[address, address + size)`
+    /// to `protect` (a Win32 `PAGE_*` value, the protocol's vocabulary on every
+    /// OS); returns the protection the first page had. The range must lie in
+    /// one region: Windows refuses a range that crosses allocations.
+    fn protect_memory(&self, _pid: u32, _address: u64, _size: usize, _protect: u32) -> Result<u32, PlatformError> {
         Err(PlatformError::NotImplemented)
     }
 

@@ -26,8 +26,11 @@ pub struct Handled {
 impl LinuxProcess {
     /// A signal stop the client gets to see: remembered so the continue can
     /// deliver it (`pass_exception`) or drop it.
-    fn report_signal(&mut self, pid: u32, tid: u32, signo: i32, code: u32, address: u64, parameters: Vec<u64>) -> DebugEvent {
-        self.last_fault.insert(tid, PendingSignal { signo, code, address, parameters: parameters.clone(), second_chance_reported: false });
+    /// `siginfo` is the kernel's `(si_code, payload)` for the signal, kept for a
+    /// core file's `NT_SIGINFO`.
+    fn report_signal(&mut self, pid: u32, tid: u32, signo: i32, code: u32, address: u64, parameters: Vec<u64>, siginfo: (i32, u64)) -> DebugEvent {
+        let (si_code, si_payload) = siginfo;
+        self.last_fault.insert(tid, PendingSignal { signo, code, address, parameters: parameters.clone(), second_chance_reported: false, si_code, si_payload });
         DebugEvent::Exception { pid, tid, code, address, first_chance: true, parameters }
     }
 
@@ -64,7 +67,7 @@ impl LinuxProcess {
                 SignalClass::Fault(status) => {
                     let parameters = if signo == libc::SIGSEGV || signo == libc::SIGBUS { vec![0, addr] } else { vec![] };
                     trace!(pid, tid, signo, address = %format!("{rip:#x}"), "fault");
-                    Ok(Handled { event: Some(self.report_signal(pid, tid, signo, status, rip, parameters)), reinject: None })
+                    Ok(Handled { event: Some(self.report_signal(pid, tid, signo, status, rip, parameters, (code, addr))), reinject: None })
                 }
                 // The client asked to see this one: it stops like an exception
                 // and is delivered only when the continue passes it on. A
@@ -77,7 +80,7 @@ impl LinuxProcess {
                     trace!(pid, tid, signo, "signal reported");
                     let parameters = vec![signo as u64, code as i64 as u64, sender];
                     Ok(Handled {
-                        event: Some(self.report_signal(pid, tid, signo, signal_exception_code(signo as u32), rip, parameters)),
+                        event: Some(self.report_signal(pid, tid, signo, signal_exception_code(signo as u32), rip, parameters, (code, addr))),
                         reinject: None,
                     })
                 }

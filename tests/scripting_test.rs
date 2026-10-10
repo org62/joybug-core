@@ -799,6 +799,12 @@ fn test_lua_file_disassembly_backward() {
     run_lua_test_file("disassembly/backward.lua", Some(&test_exe));
 }
 
+#[test]
+fn test_lua_file_disassembly_options() {
+    let test_exe = common::get_test_program_path("disassembly_test");
+    run_lua_test_file("disassembly/options.lua", Some(&test_exe));
+}
+
 // --- breakpoints ---
 
 #[test]

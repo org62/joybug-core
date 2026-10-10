@@ -6,7 +6,7 @@ use super::dereference::MemoryReader;
 use super::disassembler::CapstoneDisassembler;
 use super::ops::ProcessOps;
 use crate::interfaces::{Architecture, DisassemblerError, DisassemblerProvider, Instruction, PlatformAPI, SymbolInfo};
-use crate::protocol::ModuleInfo;
+use crate::protocol::{DisasmOptions, ModuleInfo};
 use crate::symbols::symbol_manager::SymbolManager;
 
 /// Decode the single instruction at `address`. Raw (non-symbolizing): callers
@@ -49,6 +49,42 @@ pub fn nonblocking_symbol_resolver(
     }
 }
 
+/// A platform's current [`DisasmOptions`], settable through `&self`.
+#[derive(Debug, Default)]
+pub struct DisasmOptionsCell(std::sync::Mutex<DisasmOptions>);
+
+impl DisasmOptionsCell {
+    pub fn set(&self, options: DisasmOptions) {
+        *self.0.lock().unwrap() = options;
+    }
+
+    pub fn get(&self) -> DisasmOptions {
+        *self.0.lock().unwrap()
+    }
+}
+
+/// The function containing `start`, named `module!symbol` — when `with_name`.
+/// Off, the lookup is skipped altogether: it waits for a module whose symbols
+/// are still loading, which a listing that must not stall cannot afford. The
+/// time spent is the span's `name_us`.
+pub fn function_name(
+    symbol_manager: Option<&SymbolManager>,
+    modules: &[ModuleInfo],
+    start: u64,
+    with_name: bool,
+    span: &mut crate::perf::Span,
+) -> Option<String> {
+    if !with_name {
+        return None;
+    }
+    let t = std::time::Instant::now();
+    let name = symbol_manager
+        .and_then(|sm| sm.resolve_address_to_symbol_raw(modules, start).ok().flatten())
+        .map(|(module_path, symbol, _offset)| format!("{}!{}", crate::formatting::module_stem(&module_path), symbol.name));
+    span.attr_elapsed("name_us", t);
+    name
+}
+
 /// What a symbolized listing decode needs from the process.
 pub struct Listing<'a> {
     pub reader: &'a dyn MemoryReader,
@@ -58,6 +94,7 @@ pub struct Listing<'a> {
     pub symbol_manager: Option<&'a SymbolManager>,
     /// The process's modules (any order).
     pub modules: Vec<ModuleInfo>,
+    pub options: DisasmOptions,
 }
 
 /// Shared body of `disassemble_memory` / `disassemble_memory_bytes`: reads
@@ -73,23 +110,15 @@ pub fn decode_listing<'a>(
     arch: Architecture,
     pointer_reader: impl FnOnce() -> Option<Box<dyn Fn(u64) -> Option<u64> + 'a>>,
 ) -> Result<Vec<Instruction>, DisassemblerError> {
-    use std::time::Instant;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::cell::Cell;
+    use std::time::Instant;
 
-    // Thread-local timing accumulators
-    thread_local! {
-        static MEMORY_READ_US: Cell<u64> = const { Cell::new(0) };
-        static DISASM_US: Cell<u64> = const { Cell::new(0) };
-        static SYMBOL_US: Cell<u64> = const { Cell::new(0) };
-        static CALL_COUNT: Cell<u64> = const { Cell::new(0) };
-        static SYMBOL_CALLS: Cell<u64> = const { Cell::new(0) };
-    }
+    let Listing { reader, bps, disasm, symbol_manager, mut modules, options } = listing;
+    let symbol_manager = symbol_manager.filter(|_| options.symbolizes());
+    let mut span = crate::perf::span("disasm.decode_listing");
+    let timed = span.is_live();
 
-    let Listing { reader, bps, disasm, symbol_manager, mut modules } = listing;
-
-    // Time memory read
-    let t0 = Instant::now();
+    let t = Instant::now();
     let mut data = reader
         .read(address, read_len)
         .map_err(|e| DisassemblerError::InvalidData(format!("Failed to read memory: {}", e)))?;
@@ -98,60 +127,59 @@ pub fn decode_listing<'a>(
     if let Some(bps) = bps {
         bps.patch_breakpoint_bytes(address, &mut data);
     }
-    let memory_time = t0.elapsed();
+    span.attr_elapsed("read_us", t);
+    span.attr("read_bytes", data.len() as u64);
+
+    if options.naive {
+        let t = Instant::now();
+        let instructions = disasm.disassemble(arch, &data, address, count)?;
+        span.attr_elapsed("decode_us", t);
+        span.attr("instructions", instructions.len() as u64);
+        span.attr("naive", 1);
+        return Ok(instructions);
+    }
 
     // Sort modules by base address for binary search
+    let t = Instant::now();
     modules.sort_by_key(|m| m.base);
     // The symbol resolver closure consumes `modules`; keep a copy for line annotation.
     let modules_for_lines = modules.clone();
+    span.attr_elapsed("modules_us", t);
+    span.attr("modules", modules.len() as u64);
+    if timed {
+        if let Some(module) = SymbolManager::find_module_binary_search(&modules, address) {
+            span.attr("module_key", crate::perf::path_key(&module.name));
+        }
+    }
 
-    // Track symbol resolution time
-    let symbol_time_us = std::sync::Arc::new(AtomicU64::new(0));
-    let symbol_call_count = std::sync::Arc::new(AtomicU64::new(0));
-    let symbol_time_clone = symbol_time_us.clone();
-    let symbol_count_clone = symbol_call_count.clone();
-
-    let symbol_resolver = move |addr: u64| -> Option<SymbolInfo> {
-        let t = Instant::now();
-        let result = if let Some(symbol_manager) = symbol_manager {
-            // Non-blocking: skip symbolization while symbols are still loading rather
-            // than stalling the disassembly response behind symbol downloads.
-            // The UI re-requests disassembly once symbols finish loading.
-            if let Ok(Some((module_path, symbol, offset))) = symbol_manager.try_resolve_address_to_symbol(&modules, addr) {
+    let symbol_us = Cell::new(0u64);
+    let symbol_calls = Cell::new(0u64);
+    let symbol_resolver = |addr: u64| -> Option<SymbolInfo> {
+        let symbol_manager = symbol_manager?;
+        let t = timed.then(Instant::now);
+        // Non-blocking: skip symbolization while symbols are still loading rather
+        // than stalling the disassembly response behind symbol downloads.
+        // The UI re-requests disassembly once symbols finish loading.
+        let result = match symbol_manager.try_resolve_address_to_symbol(&modules, addr) {
+            Ok(Some((module_path, symbol, offset))) => {
                 let module_name = crate::formatting::module_stem(&module_path);
                 Some(SymbolInfo { module_name, symbol_name: symbol.name, offset })
-            } else { None }
-        } else { None };
-        symbol_time_clone.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-        symbol_count_clone.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => None,
+        };
+        if let Some(t) = t {
+            symbol_us.set(symbol_us.get() + t.elapsed().as_micros() as u64);
+            symbol_calls.set(symbol_calls.get() + 1);
+        }
         result
     };
 
-    // Time disassembly
-    let t2 = Instant::now();
+    let t = Instant::now();
     let result = disasm.disassemble_with_symbols(arch, &data, address, count, symbol_resolver);
-    let disasm_time = t2.elapsed();
-
-    // Accumulate timing stats
-    MEMORY_READ_US.with(|c| c.set(c.get() + memory_time.as_micros() as u64));
-    DISASM_US.with(|c| c.set(c.get() + disasm_time.as_micros() as u64));
-    SYMBOL_US.with(|c| c.set(c.get() + symbol_time_us.load(Ordering::Relaxed)));
-    SYMBOL_CALLS.with(|c| c.set(c.get() + symbol_call_count.load(Ordering::Relaxed)));
-    let call_count = CALL_COUNT.with(|c| { c.set(c.get() + 1); c.get() });
-
-    // Print stats every 1000 calls
-    if call_count % 1000 == 0 {
-        let mem_ms = MEMORY_READ_US.with(|c| c.get()) as f64 / 1000.0;
-        let dis_ms = DISASM_US.with(|c| c.get()) as f64 / 1000.0;
-        let sym_ms = SYMBOL_US.with(|c| c.get()) as f64 / 1000.0;
-        let sym_calls = SYMBOL_CALLS.with(|c| c.get());
-        println!("\n=== TIMING STATS after {} calls ===", call_count);
-        println!("  Memory read:    {:8.2} ms", mem_ms);
-        println!("  Disassembly:    {:8.2} ms (includes symbol resolution)", dis_ms);
-        println!("  Symbol resolve: {:8.2} ms ({} calls, {:.3} ms/call avg)",
-            sym_ms, sym_calls, if sym_calls > 0 { sym_ms / sym_calls as f64 } else { 0.0 });
-        println!("=====================================\n");
-    }
+    // Includes the resolver time, reported separately below.
+    span.attr_elapsed("decode_us", t);
+    span.attr("symbolize_us", symbol_us.get());
+    span.attr("resolver_calls", symbol_calls.get());
 
     // Resolve indirect jump/call targets (e.g., `call qword ptr [IAT_slot]`)
     // by reading the pointer value so clicking navigates to the actual
@@ -160,23 +188,30 @@ pub fn decode_listing<'a>(
     // (no partial-read fallback, no error log). One reader is shared by every
     // read in the batch (IAT-heavy code has hundreds).
     let mut instructions = result?;
+    span.attr("instructions", instructions.len() as u64);
+    let t = Instant::now();
+    let mut indirect_reads = 0u64;
     let is_indirect = |i: &Instruction| (i.is_call || i.is_jump) && i.jump_target.is_some() && i.op_str.contains('[');
     let ptr_reader = instructions.iter().any(is_indirect).then(pointer_reader).flatten();
     if let Some(read_ptr) = ptr_reader {
         for instr in &mut instructions {
             if is_indirect(instr) {
                 let ptr_addr = instr.jump_target.unwrap();
+                indirect_reads += 1;
                 if let Some(actual_target) = read_ptr(ptr_addr) {
                     instr.jump_target = Some(actual_target);
                 }
             }
         }
     }
+    span.attr_elapsed("indirect_us", t);
+    span.attr("indirect_reads", indirect_reads);
 
-    // Annotate with source lines from already-cached line tables only.
-    // The first source-view request triggers the parse; until then this is a no-op,
-    // so bulk disassembly never stalls behind a line-table parse.
+    // Annotate with source lines from already-parsed line tables only: a table
+    // still parsing in the background is skipped, so bulk disassembly never
+    // stalls behind one.
     if let Some(symbol_manager) = symbol_manager {
+        let t = Instant::now();
         for instr in &mut instructions {
             instr.line_info = symbol_manager.try_resolve_address_to_line_cached(&modules_for_lines, instr.address);
             // At a symbol start, collect every name sharing this address (aliases
@@ -192,6 +227,7 @@ pub fn decode_listing<'a>(
                 }
             }
         }
+        span.attr_elapsed("lines_us", t);
     }
     Ok(instructions)
 }
@@ -217,10 +253,17 @@ pub fn disassemble_backward_anchored<P: PlatformAPI + ?Sized>(
     symbol_manager: Option<&SymbolManager>,
     modules: &[ModuleInfo],
     bounds: &dyn Fn(u64) -> FunctionBounds,
+    options: DisasmOptions,
 ) -> Result<Vec<Instruction>, DisassemblerError> {
     if count == 0 || target == 0 {
         return Ok(Vec::new());
     }
+    let mut span = crate::perf::span("disasm.backward");
+    if options.naive {
+        span.attr("naive", 1);
+        return platform.disassemble_backward_resync(pid, target, count, arch);
+    }
+    let symbol_manager = symbol_manager.filter(|_| options.symbolizes());
     let back = crate::interfaces::backward_resync_window(arch, count);
     let fallback_start = target.saturating_sub(back);
     // Never anchor an anchored decode more than this far before `target`, so a
@@ -252,10 +295,16 @@ pub fn disassemble_backward_anchored<P: PlatformAPI + ?Sized>(
     // fallback, provided by the trait. An anchor needs no region clamp: it
     // is already inside a mapped module and `boundary_before` guarantees
     // min_anchor <= start < target.
-    let Some(start) = boundary_before(fallback_start).or_else(|| boundary_before(target - 1)) else {
+    let t = std::time::Instant::now();
+    let anchor = boundary_before(fallback_start).or_else(|| boundary_before(target - 1));
+    span.attr_elapsed("anchor_us", t);
+    let Some(start) = anchor else {
+        span.attr("anchored", 0);
         return platform.disassemble_backward_resync(pid, target, count, arch);
     };
     let window = (target - start) as usize;
+    span.attr("anchored", 1);
+    span.attr("window_bytes", window as u64);
     let instructions = platform.disassemble_memory_bytes(pid, start, window, arch)?;
     Ok(crate::interfaces::align_backward_instructions(instructions, target, count))
 }
@@ -270,6 +319,9 @@ pub fn disassemble_function<P: PlatformAPI + ?Sized>(
     arch: Architecture,
     bounds: FunctionBounds,
 ) -> Result<(Vec<Instruction>, Option<u64>, Option<u64>, Option<String>), DisassemblerError> {
+    let mut span = crate::perf::span("disasm.function");
+    span.attr("has_bounds", bounds.is_some() as u64);
+    let mut decodes = 0u64;
     let (func_start, func_end, func_name) = match &bounds {
         Some((start, end, name)) => (Some(*start), Some(*end), name.clone()),
         None => (None, None, None),
@@ -280,7 +332,13 @@ pub fn disassemble_function<P: PlatformAPI + ?Sized>(
         bounds.map(|(s, e, _)| (s, e)),
         address,
         max_instructions,
-        |start, count| platform.disassemble_memory(pid, start, count, arch),
+        |start, count| {
+            decodes += 1;
+            platform.disassemble_memory(pid, start, count, arch)
+        },
     )?;
+    // 2 = the whole-function decode had no row at `address` and ran again.
+    span.attr("decodes", decodes);
+    span.attr("instructions", instructions.len() as u64);
     Ok((instructions, func_start, func_end, func_name))
 }

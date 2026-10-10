@@ -28,8 +28,6 @@ pub use crate::debugger_core::disassembler;
 #[cfg(windows)]
 mod callstack;
 #[cfg(windows)]
-mod stepper;
-#[cfg(windows)]
 mod debugged_process;
 #[cfg(windows)]
 mod win_ops;
@@ -46,13 +44,14 @@ mod hardware_breakpoints;
 mod process_objects;
 
 #[cfg(windows)]
-use crate::interfaces::{PlatformAPI, PlatformError, ModuleSymbol, ResolvedSymbol, SymbolError, Architecture, DisassemblerError, Instruction, DisassemblerProvider, Stepper};
+use crate::interfaces::{PlatformAPI, PlatformError, ModuleSymbol, ResolvedSymbol, SymbolError, Architecture, DisassemblerError, Instruction, Stepper};
 // no-op
 #[cfg(windows)]
 use crate::protocol::{MinidumpKind, ModuleInfo, ProcessInfo, ProcessObjects, ThreadInfo, StepKind};
 #[cfg(windows)]
 use crate::emulator::{Emulator, EmulationResult};
 #[cfg(windows)]
+use std::sync::Arc;
 use symbol_manager::SymbolManager;
 pub use crate::interfaces::SymbolConfig;
 #[cfg(windows)]
@@ -109,9 +108,11 @@ pub struct WindowsPlatform {
     /// Map of PID to DebuggedProcess for managing multiple processes
     processes: HashMap<u32, DebuggedProcess>,
     /// Shared symbol manager for all processes
-    symbol_manager: Option<SymbolManager>,
+    symbol_manager: Option<Arc<SymbolManager>>,
     /// Shared disassembler for all processes
     disassembler: Option<CapstoneDisassembler>,
+    /// How listings decode (`SetDisasmOptions`).
+    disasm_options: crate::debugger_core::disasm::DisasmOptionsCell,
 }
 
 
@@ -122,12 +123,13 @@ impl WindowsPlatform {
     }
 
     pub fn new_with_config(symbol_config: SymbolConfig) -> Self {
-        let symbol_manager = SymbolManager::new_with_config(symbol_config).ok(); // Log error but don't fail initialization
+        let symbol_manager = SymbolManager::new_with_config(symbol_config).ok().map(Arc::new); // Log error but don't fail initialization
         let disassembler = CapstoneDisassembler::new().ok(); // Log error but don't fail initialization
         Self {
             processes: HashMap::new(),
             symbol_manager,
             disassembler,
+            disasm_options: Default::default(),
         }
     }
     
@@ -154,7 +156,7 @@ impl WindowsPlatform {
 
     /// The symbol manager, or the uniform error when it failed to initialize.
     fn symbols(&self) -> Result<&SymbolManager, SymbolError> {
-        self.symbol_manager.as_ref()
+        self.symbol_manager.as_deref()
             .ok_or_else(|| SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()))
     }
 
@@ -464,6 +466,9 @@ impl PlatformAPI for WindowsPlatform {
     }
 
     fn continue_exec(&mut self, pid: u32, tid: u32) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
+        if let Ok(process) = self.get_process_mut(pid) {
+            process.last_exception = None;
+        }
         // Blocking variant retained for direct callers; server uses non-locking helpers
         debug_events::continue_only(pid, tid)?;
         let debug_event = debug_events::wait_for_debug_event_blocking()?;
@@ -484,7 +489,7 @@ impl PlatformAPI for WindowsPlatform {
 
     fn enumerate_coverage_targets(&self, pid: u32, module_path: &str, sources: &[crate::protocol::CoverageTargetSource]) -> Result<Vec<crate::protocol::CoverageTarget>, PlatformError> {
         let arch = self.get_process(pid)?.architecture();
-        let symbol_manager = self.symbol_manager.as_ref().ok_or_else(|| PlatformError::Other("Symbol manager unavailable".to_string()))?;
+        let symbol_manager = self.symbol_manager.as_deref().ok_or_else(|| PlatformError::Other("Symbol manager unavailable".to_string()))?;
         let disassembler = self.disassembler.as_ref().ok_or_else(|| PlatformError::Other("Disassembler unavailable".to_string()))?;
         crate::debugger_core::coverage_targets::enumerate_coverage_targets(self, symbol_manager, disassembler, arch, pid, module_path, sources)
     }
@@ -554,6 +559,10 @@ impl PlatformAPI for WindowsPlatform {
 
     fn allocate_memory(&self, pid: u32, size: usize, executable: bool) -> Result<u64, PlatformError> {
         memory::allocate_memory(self, pid, size, executable)
+    }
+
+    fn protect_memory(&self, pid: u32, address: u64, size: usize, protect: u32) -> Result<u32, PlatformError> {
+        memory::protect_memory(self, pid, address, size, protect)
     }
 
     fn read_wide_string(&self, pid: u32, address: u64, max_len: Option<usize>) -> Result<String, PlatformError> {
@@ -678,9 +687,8 @@ impl PlatformAPI for WindowsPlatform {
         Ok(self.symbols()?.get_symbol_status(self.modules_for(pid)))
     }
 
-    fn load_pdb_from_path(&self, pid: u32, module_base: u64, pdb_path: &str, force: bool) -> Result<crate::protocol::PdbLoadOutcome, SymbolError> {
-        let module = self.module_at(pid, module_base)?;
-        self.symbols()?.load_pdb_from_path(&module, std::path::Path::new(pdb_path), force)
+    fn symbols_handle(&self) -> Option<Arc<SymbolManager>> {
+        self.symbol_manager.clone()
     }
 
     fn retry_symbol_load(&self, pid: u32, module_base: u64) -> Result<(), SymbolError> {
@@ -700,33 +708,9 @@ impl PlatformAPI for WindowsPlatform {
         Ok(())
     }
 
-    fn resolve_address_to_line(&self, pid: u32, address: u64) -> Result<Option<crate::protocol::AddressLineInfo>, SymbolError> {
-        let symbol_manager = self.symbols()?;
-        let mut modules = self.modules_for(pid);
-        modules.sort_by_key(|m| m.base);
-        let Some(module) = SymbolManager::find_module_binary_search(&modules, address) else {
-            return Ok(None);
-        };
-        let rva = (address - module.base) as u32;
-        Ok(symbol_manager.resolve_rva_to_line(&module.name, rva)?.map(|(file, line_entry)| {
-            crate::protocol::AddressLineInfo {
-                module_path: module.name.clone(),
-                module_base: module.base,
-                rva,
-                file,
-                line_entry,
-            }
-        }))
-    }
-
-    fn get_source_file_line_map(&self, pid: u32, module_base: u64, file_path: &str, start_line: Option<u32>, end_line: Option<u32>) -> Result<(Option<crate::interfaces::SourceFileEntry>, Vec<crate::interfaces::LineEntry>), SymbolError> {
-        let module = self.module_at(pid, module_base)?;
-        self.symbols()?.file_line_map(&module.name, file_path, start_line, end_line)
-    }
-
-    fn list_source_files(&self, pid: u32, module_base: u64) -> Result<Vec<crate::interfaces::SourceFileEntry>, SymbolError> {
-        let module = self.module_at(pid, module_base)?;
-        self.symbols()?.list_source_files(&module.name)
+    fn set_disasm_options(&self, options: crate::protocol::DisasmOptions) -> Result<(), PlatformError> {
+        self.disasm_options.set(options);
+        Ok(())
     }
 
     // Type system methods (PDB TPI stream)
@@ -773,9 +757,10 @@ impl PlatformAPI for WindowsPlatform {
     /// self-resync window when no boundary is known (leaf/JIT code, no symbols).
     fn disassemble_backward(&self, pid: u32, target: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
         let modules = self.modules_for(pid);
-        let bounds = |probe: u64| self.find_function_bounds(pid, probe).ok().flatten();
+        let options = self.disasm_options.get();
+        let bounds = |probe: u64| self.find_function_bounds(pid, probe, options.symbolizes()).ok().flatten();
         crate::debugger_core::disasm::disassemble_backward_anchored(
-            self, pid, target, count, arch, self.symbol_manager.as_ref(), &modules, &bounds,
+            self, pid, target, count, arch, self.symbol_manager.as_deref(), &modules, &bounds, options,
         )
     }
 
@@ -803,7 +788,25 @@ impl PlatformAPI for WindowsPlatform {
 
     fn write_minidump(&self, pid: u32, path: &str, kind: MinidumpKind) -> Result<u64, PlatformError> {
         info!(pid, path, ?kind, "Writing minidump");
-        dbghelp::write_minidump(self.process_handle(pid)?, pid, path, kind)
+        // The exception the process is stopped on, with the context of the
+        // thread that raised it — at an exception stop that is the faulting
+        // context. A thread that is already gone costs the stream, not the dump.
+        let exception = self.get_process(pid).ok().and_then(|process| {
+            let last = process.last_exception?;
+            let context = process
+                .thread_manager()
+                .get_thread_handle(last.tid)
+                .ok_or_else(|| PlatformError::OsError(format!("No handle for thread {}", last.tid)))
+                .and_then(thread_context::get_native_context);
+            match context {
+                Ok(context) => Some(dbghelp::DumpException { tid: last.tid, record: last.record, context }),
+                Err(e) => {
+                    tracing::warn!(pid, tid = last.tid, error = %e, "Exception thread context unavailable; writing the dump without its exception stream");
+                    None
+                }
+            }
+        });
+        dbghelp::write_minidump(self.process_handle(pid)?, pid, path, kind, exception)
     }
 
     fn terminate_process(&self, pid: u32) -> Result<(), PlatformError> {
@@ -904,6 +907,11 @@ impl PlatformAPI for WindowsPlatform {
         tid: u32,
         pass_exception: bool,
     ) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
+        // The stop the client is leaving is over: its exception no longer
+        // describes the process (a dump of the running target has none).
+        if let Ok(process) = platform.write().unwrap().get_process_mut(pid) {
+            process.last_exception = None;
+        }
         let mut cont_pid = pid;
         let mut cont_tid = tid;
         let mut cont_pass = pass_exception;
@@ -1061,21 +1069,17 @@ impl Stepper for WindowsPlatform {
 }
 #[cfg(windows)]
 impl WindowsPlatform {
-    /// Find function boundaries for an address using the exception directory (RuntimeFunction).
-    /// Returns (function_start_va, function_end_va, function_name) if found.
-    pub fn find_function_bounds(&self, pid: u32, address: u64) -> Result<Option<(u64, u64, Option<String>)>, PlatformError> {
+    /// Find function boundaries for an address using the exception directory
+    /// (RuntimeFunction): (function_start_va, function_end_va, function_name)
+    /// if found. The function is named only when `with_name`: the name lookup
+    /// waits for a module whose symbols are still loading.
+    fn find_function_bounds(&self, pid: u32, address: u64, with_name: bool) -> Result<Option<(u64, u64, Option<String>)>, PlatformError> {
+        let mut span = crate::perf::span("disasm.function_bounds");
+        let t = std::time::Instant::now();
         let process = self.get_process(pid)?;
         let modules = process.module_manager().list_modules();
-
-        // Find which module contains this address
-        let containing_module = modules.iter().find(|m| {
-            let end = m.base + m.size.unwrap_or(0);
-            address >= m.base && address < end
-        });
-
-        let module = match containing_module {
-            Some(m) => m,
-            None => return Ok(None),
+        let Some(module) = modules.iter().find(|m| m.contains(address)) else {
+            return Ok(None);
         };
 
         // Convert address to RVA
@@ -1085,36 +1089,30 @@ impl WindowsPlatform {
         // disassembly boundary probe, and `get_extra_info`'s deep clone of the
         // whole ModuleExtraInfo just to binary-search `.pdata` is wasteful.
         // Fall back to a file parse only when nothing is cached yet.
+        if span.is_live() {
+            span.attr("module_key", crate::perf::path_key(&module.name));
+        }
         let bounds = match process
             .module_manager()
             .with_extra_info(module.base, |info| info.runtime_function_bounds(rva))
         {
             Some(b) => b,
-            None => match self.parse_module_extra_info(pid, module.base) {
-                Ok(info) => info.runtime_function_bounds(rva),
-                Err(_) => return Ok(None),
-            },
+            None => {
+                // Nothing cached: the module file is read and parsed right here.
+                span.attr("file_parse", 1);
+                match self.parse_module_extra_info(pid, module.base) {
+                    Ok(info) => info.runtime_function_bounds(rva),
+                    Err(_) => return Ok(None),
+                }
+            }
         };
+        span.attr_elapsed("table_us", t);
         let Some((begin_rva, end_rva)) = bounds else {
             return Ok(None);
         };
         let func_start = module.base + begin_rva as u64;
         let func_end = module.base + end_rva as u64;
-
-        // Try to get function name from symbol
-        let func_name = if let Some(ref symbol_manager) = self.symbol_manager {
-            symbol_manager
-                .resolve_address_to_symbol_raw(&modules, func_start)
-                .ok()
-                .flatten()
-                .map(|(module_path, symbol, _offset)| {
-                    let module_name = crate::formatting::module_stem(&module_path);
-                    format!("{}!{}", module_name, symbol.name)
-                })
-        } else {
-            None
-        };
-
+        let func_name = crate::debugger_core::disasm::function_name(self.symbol_manager.as_deref(), &modules, func_start, with_name, &mut span);
         Ok(Some((func_start, func_end, func_name)))
     }
 
@@ -1127,35 +1125,15 @@ impl WindowsPlatform {
         max_instructions: usize,
         arch: Architecture,
     ) -> Result<(Vec<Instruction>, Option<u64>, Option<u64>, Option<String>), crate::interfaces::DisassemblerError> {
-        let bounds = self.find_function_bounds(pid, address).ok().flatten();
+        let options = self.disasm_options.get();
+        let bounds = if options.naive { None } else { self.find_function_bounds(pid, address, options.symbolizes()).ok().flatten() };
         crate::debugger_core::disasm::disassemble_function(self, pid, address, max_instructions, arch, bounds)
     }
 
     /// Non-blocking symbol resolver over a snapshot of the process's module
     /// list (see `debugger_core::disasm::nonblocking_symbol_resolver`).
     fn nonblocking_symbol_resolver(&self, pid: u32) -> impl Fn(u64) -> Option<crate::interfaces::SymbolInfo> + '_ {
-        crate::debugger_core::disasm::nonblocking_symbol_resolver(self.symbol_manager.as_ref(), self.modules_for(pid))
-    }
-
-    /// Disassemble a SINGLE instruction from target memory WITHOUT symbolization.
-    /// Used by the stepper, which needs only the instruction's size and mnemonic
-    /// (call/branch classification). The symbolizing decode path does per-
-    /// instruction symbol/pdata/line lookups and a module-list snapshot — all
-    /// wasted work here, and all contending with the symbol loader's locks while
-    /// a large PDB (millions of symbols) is being parsed, which showed up as
-    /// step hitches during symbol loading. This raw path never touches symbols.
-    /// Breakpoint bytes are still restored so the real opcode is decoded.
-    pub(crate) fn disassemble_instruction_raw(&self, pid: u32, address: u64, arch: Architecture) -> Result<Option<Instruction>, DisassemblerError> {
-        let Some(disasm) = self.disassembler.as_ref() else {
-            return Err(DisassemblerError::CapstoneError("Disassembler not initialized".to_string()));
-        };
-        // 16 bytes covers the longest x86 instruction (15) with slack.
-        let mut data = memory::read_memory_unlocked(pid, address, 16)
-            .map_err(|e| DisassemblerError::InvalidData(format!("Failed to read memory: {}", e)))?;
-        if let Ok(process) = self.get_process(pid) {
-            process.patch_breakpoint_bytes(address, &mut data);
-        }
-        Ok(disasm.disassemble(arch, &data, address, 1)?.into_iter().next())
+        crate::debugger_core::disasm::nonblocking_symbol_resolver(self.symbol_manager.as_deref(), self.modules_for(pid))
     }
 
     /// Shared body of `disassemble_memory` / `disassemble_memory_bytes`:
@@ -1169,8 +1147,9 @@ impl WindowsPlatform {
             reader: &(self, pid),
             bps: process.map(|p| &p.book.bps),
             disasm,
-            symbol_manager: self.symbol_manager.as_ref(),
+            symbol_manager: self.symbol_manager.as_deref(),
             modules: self.modules_for(pid),
+            options: self.disasm_options.get(),
         };
         // One VM_READ handle shared by every speculative pointer read in the
         // batch; `try_read_pointer` has no partial-read fallback and no error log.

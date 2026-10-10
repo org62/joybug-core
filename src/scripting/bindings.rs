@@ -562,6 +562,21 @@ impl LuaUserData for LuaDebugClient {
             allocate_memory(&mut this.inner.borrow_mut(), pid, size, executable.unwrap_or(false))
         });
 
+        // dbg:protect_memory(pid, addr, size, protect) -> old_protect
+        // Change the protection of the pages covering [addr, addr + size) to
+        // `protect`, a PAGE_* value (VirtualProtectEx; an mprotect on Linux,
+        // where the target must be stopped and only R/W/X combinations exist).
+        methods.add_method("protect_memory", |_lua, this, (pid, addr, size, protect): (u32, u64, usize, u32)| {
+            let req = DebuggerRequest::ProtectMemory { pid, address: addr, size, protect };
+            match this.inner.borrow_mut().send_and_receive(&req).map_err(mlua::Error::external)? {
+                DebuggerResponse::MemoryProtected { old_protect } => Ok(old_protect),
+                DebuggerResponse::Error { message } => {
+                    Err(mlua::Error::external(anyhow::anyhow!("ProtectMemory failed: {message}")))
+                }
+                _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
+            }
+        });
+
         // ---- Value freeze (server-side continuous write) ----
 
         // dbg:freeze_value(pid, addr, data[, interval_ms][, offsets]) -> freeze_id
@@ -1028,11 +1043,12 @@ impl LuaUserData for LuaDebugClient {
 
         methods.add_method("resolve_line", |lua, this, (pid, addr): (u32, u64)| {
             let mut client = this.inner.borrow_mut();
+            // A script wants the answer, not "loading": wait for the line table.
             let resp = client.send_and_receive(&DebuggerRequest::ResolveAddressToLine {
-                pid, address: addr,
+                pid, address: addr, wait: true,
             }).map_err(|e| mlua::Error::external(e))?;
             match resp {
-                DebuggerResponse::AddressLine { info } => {
+                DebuggerResponse::AddressLine { info, .. } => {
                     match info {
                         Some(info) => {
                             let table = lua.create_table()?;
@@ -1250,6 +1266,20 @@ impl LuaUserData for LuaDebugClient {
                 other => Err(mlua::Error::external(
                     anyhow::anyhow!("Unexpected response to ListProcessObjects: {:?}", other))),
             }
+        });
+
+        // How the server decodes listings from now on: `{ symbolize = false }`
+        // drops names and source lines, `{ naive = true }` is a plain linear
+        // decode. Missing keys take the default (the full listing).
+        methods.add_method("set_disasm_options", |_lua, this, options: LuaTable| {
+            let defaults = crate::protocol::DisasmOptions::default();
+            let options = crate::protocol::DisasmOptions {
+                symbolize: options.get::<Option<bool>>("symbolize")?.unwrap_or(defaults.symbolize),
+                naive: options.get::<Option<bool>>("naive")?.unwrap_or(defaults.naive),
+            };
+            let mut client = this.inner.borrow_mut();
+            ack_method("SetDisasmOptions", client.send_and_receive(&DebuggerRequest::SetDisasmOptions { options }))?;
+            Ok(true)
         });
 
         // POSIX signals to report as exceptions (Linux targets): numbers or

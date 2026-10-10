@@ -70,7 +70,6 @@ pub(super) fn determine_process_architecture(process_handle: windows_sys::Win32:
 }
 
 pub(super) fn launch(platform: &mut WindowsPlatform, command: &str, debug_children: bool, working_directory: Option<&str>, environment: Option<&[(String, String)]>) -> Result<Option<crate::protocol::DebugEvent>, PlatformError> {
-    println!("[windows_platform] launch thread id: {:?}", std::thread::current().id());
     trace!(command, working_directory, ?environment, "WindowsPlatform::launch called");
     let cmd_line_wide = to_wide(command);
     // Wide buffer must outlive the CreateProcessW call; null pointer => inherit debugger CWD.

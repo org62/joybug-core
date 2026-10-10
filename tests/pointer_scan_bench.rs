@@ -6,8 +6,8 @@
 //!   cargo test --release --test pointer_scan_bench -- --ignored --nocapture
 //! Tune via env: JOYBUG_BENCH_GB (default 6), JOYBUG_BENCH_DENSITY (default 15).
 //!
-//! Per-phase server timings are printed by the scanner itself (the test sets
-//! JOYBUG_PTRSCAN_TIMING=1).
+//! The scanner reports its phases to the perf recorder (`ptrscan.scan`); the
+//! test installs a sink and prints them.
 
 mod common;
 
@@ -24,8 +24,15 @@ struct BenchState {
 #[ignore = "heavy: allocates a multi-GB target process"]
 fn pointer_scan_benchmark() {
     joybug_core::init_tracing();
-    // SAFETY: set before any threads read the env in this test process.
-    unsafe { std::env::set_var("JOYBUG_PTRSCAN_TIMING", "1") };
+    let (tx, rx) = std::sync::mpsc::sync_channel(4096);
+    joybug_core::perf::set_sink(Some(tx));
+    std::thread::spawn(move || {
+        for record in rx {
+            if record.name == "ptrscan.scan" {
+                println!("[ptrscan] {:.1} ms {:?}", record.dur_us as f64 / 1000.0, record.attrs);
+            }
+        }
+    });
 
     let gb = std::env::var("JOYBUG_BENCH_GB").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(6.0);
     let density = std::env::var("JOYBUG_BENCH_DENSITY").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(15);

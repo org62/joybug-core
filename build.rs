@@ -160,10 +160,7 @@ fn compile_test_program_x86(manifest_dir: &str, out_dir: &str, name: &str) -> bo
         "/link", "/DEBUG",
     ]);
     match cmd.output() {
-        Ok(output) if output.status.success() => {
-            println!("cargo:warning=Compiled 32-bit test program: {}", out_exe.display());
-            true
-        }
+        Ok(output) if output.status.success() => true,
         Ok(output) => {
             println!("cargo:warning=Failed to compile 32-bit {}: {}{}", stem,
                 String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));

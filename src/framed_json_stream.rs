@@ -2,48 +2,21 @@
 use serde::{de::DeserializeOwned, Serialize};
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tracing::debug;
 
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 
-// Global timing stats
-static SERIALIZE_US: AtomicU64 = AtomicU64::new(0);
-static DESERIALIZE_US: AtomicU64 = AtomicU64::new(0);
-static SEND_BYTES: AtomicU64 = AtomicU64::new(0);
-static RECV_BYTES: AtomicU64 = AtomicU64::new(0);
-static SEND_COUNT: AtomicUsize = AtomicUsize::new(0);
-static RECV_COUNT: AtomicUsize = AtomicUsize::new(0);
-static NET_SEND_US: AtomicU64 = AtomicU64::new(0);
-static NET_RECV_US: AtomicU64 = AtomicU64::new(0);
-
-pub fn print_serialization_stats() {
-    let ser = SERIALIZE_US.load(Ordering::Relaxed) as f64 / 1000.0;
-    let deser = DESERIALIZE_US.load(Ordering::Relaxed) as f64 / 1000.0;
-    let send_bytes = SEND_BYTES.load(Ordering::Relaxed);
-    let recv_bytes = RECV_BYTES.load(Ordering::Relaxed);
-    let send_count = SEND_COUNT.load(Ordering::Relaxed);
-    let recv_count = RECV_COUNT.load(Ordering::Relaxed);
-    let net_send = NET_SEND_US.load(Ordering::Relaxed) as f64 / 1000.0;
-    let net_recv = NET_RECV_US.load(Ordering::Relaxed) as f64 / 1000.0;
-    eprintln!("=== SERIALIZATION STATS (bincode) ===");
-    eprintln!("  Serialize:   {:>8.2} ms ({} calls, {} bytes)", ser, send_count, send_bytes);
-    eprintln!("  Deserialize: {:>8.2} ms ({} calls, {} bytes)", deser, recv_count, recv_bytes);
-    eprintln!("  Net send:    {:>8.2} ms", net_send);
-    eprintln!("  Net recv:    {:>8.2} ms", net_recv);
-    eprintln!("=====================================");
-}
-
-pub fn reset_serialization_stats() {
-    SERIALIZE_US.store(0, Ordering::Relaxed);
-    DESERIALIZE_US.store(0, Ordering::Relaxed);
-    SEND_BYTES.store(0, Ordering::Relaxed);
-    RECV_BYTES.store(0, Ordering::Relaxed);
-    SEND_COUNT.store(0, Ordering::Relaxed);
-    RECV_COUNT.store(0, Ordering::Relaxed);
-    NET_SEND_US.store(0, Ordering::Relaxed);
-    NET_RECV_US.store(0, Ordering::Relaxed);
+/// What one `send` or `receive` cost, for the caller's perf span.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FrameStats {
+    /// Payload size on the wire.
+    pub bytes: u64,
+    /// Encode (send) or decode (receive) time.
+    pub codec_us: u64,
+    /// Socket write time, or the time blocked in the read — which for a
+    /// client is the server's whole handling time.
+    pub io_us: u64,
 }
 
 pub struct FramedJsonStream {
@@ -67,25 +40,31 @@ impl FramedJsonStream {
     }
 
     pub fn send<T: Serialize>(&mut self, message: &T) -> anyhow::Result<()> {
+        self.send_timed(message).map(|_| ())
+    }
+
+    pub fn send_timed<T: Serialize>(&mut self, message: &T) -> anyhow::Result<FrameStats> {
         // Serialize with bincode
         let start = Instant::now();
         let data = bincode::serde::encode_to_vec(message, BINCODE_CONFIG)?;
-        SERIALIZE_US.fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
-        SEND_BYTES.fetch_add(data.len() as u64, Ordering::Relaxed);
-        SEND_COUNT.fetch_add(1, Ordering::Relaxed);
+        let codec_us = start.elapsed().as_micros() as u64;
 
         // Send: 8 bytes length + data
         let net_start = Instant::now();
         let len_bytes = (data.len() as u64).to_le_bytes();
         self.stream.write_all(&len_bytes)?;
         self.stream.write_all(&data)?;
-        NET_SEND_US.fetch_add(net_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let io_us = net_start.elapsed().as_micros() as u64;
 
         debug!("Sent message: {:?}", std::any::type_name::<T>());
-        Ok(())
+        Ok(FrameStats { bytes: data.len() as u64, codec_us, io_us })
     }
 
     pub fn receive<T: DeserializeOwned>(&mut self) -> anyhow::Result<T> {
+        self.receive_timed().map(|(message, _)| message)
+    }
+
+    pub fn receive_timed<T: DeserializeOwned>(&mut self) -> anyhow::Result<(T, FrameStats)> {
         // Receive header: 8 bytes length
         let net_start = Instant::now();
         let mut len_bytes = [0u8; 8];
@@ -94,20 +73,18 @@ impl FramedJsonStream {
 
         self.read_buffer.resize(len, 0);
         self.stream.read_exact(&mut self.read_buffer)?;
-        NET_RECV_US.fetch_add(net_start.elapsed().as_micros() as u64, Ordering::Relaxed);
-        RECV_BYTES.fetch_add(len as u64, Ordering::Relaxed);
-        RECV_COUNT.fetch_add(1, Ordering::Relaxed);
+        let io_us = net_start.elapsed().as_micros() as u64;
 
         // Deserialize with bincode
         let start = Instant::now();
         let (message, _): (T, _) = bincode::serde::decode_from_slice(&self.read_buffer, BINCODE_CONFIG)
             .map_err(|e| {
-                eprintln!("bincode decode error for {}: {}", std::any::type_name::<T>(), e);
+                tracing::error!("bincode decode error for {}: {}", std::any::type_name::<T>(), e);
                 e
             })?;
-        DESERIALIZE_US.fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let codec_us = start.elapsed().as_micros() as u64;
 
         debug!("Received message: {:?}", std::any::type_name::<T>());
-        Ok(message)
+        Ok((message, FrameStats { bytes: len as u64, codec_us, io_us }))
     }
 }

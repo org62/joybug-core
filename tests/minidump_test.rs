@@ -24,6 +24,60 @@ fn assert_mdmp(path: &std::path::Path, reported: u64) {
     assert_eq!(&magic, b"MDMP", "missing MDMP signature");
 }
 
+/// The dump's exception stream as `(thread id, code, address)`, or `None`
+/// when the dump has none. Walks the stream directory by hand: the header
+/// holds the stream count at 8 and the directory offset at 12, each entry is
+/// `(type, size, offset)`, and stream type 6 is `MINIDUMP_EXCEPTION_STREAM`.
+fn exception_stream(path: &std::path::Path) -> Option<(u32, u32, u64)> {
+    let dump = std::fs::read(path).expect("dump file should exist");
+    let u32_at = |at: usize| u32::from_le_bytes(dump[at..at + 4].try_into().unwrap());
+    let u64_at = |at: usize| u64::from_le_bytes(dump[at..at + 8].try_into().unwrap());
+    let (count, directory) = (u32_at(8) as usize, u32_at(12) as usize);
+    (0..count)
+        .map(|i| directory + i * 12)
+        .find(|&entry| u32_at(entry) == 6)
+        .map(|entry| u32_at(entry + 8) as usize)
+        // ThreadId, alignment, then the record: code, flags, nested record, address.
+        .map(|stream| (u32_at(stream), u32_at(stream + 8), u64_at(stream + 24)))
+}
+
+/// A dump written while stopped on an exception says which thread raised
+/// what, where — the stream `.ecxr` and `!analyze` read.
+#[test]
+fn minidump_at_an_exception_records_it() {
+    use joybug_core::protocol::DebugEvent;
+    joybug_core::init_tracing();
+
+    let server = TestServer::spawn();
+    let server_addr = server.address().to_string();
+    let dir = std::env::temp_dir().join(format!("joybug-minidump-exc-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dump = dir.join("exception.dmp");
+
+    let seen = DebugSession::new(None::<(u32, u32, u64)>, Some(server_addr.as_str()))
+        .expect("Failed to create debug session")
+        .on_event({
+            let dump = dump.clone();
+            move |session, event| {
+                if let DebugEvent::Exception { pid, tid, code, address, .. } = event {
+                    if session.state.is_none() {
+                        session.write_minidump(*pid, &dump.to_string_lossy(), MinidumpKind::Mini)?;
+                        session.state = Some((*tid, *code, *address));
+                    }
+                }
+                Ok(true)
+            }
+        })
+        .launch(get_test_program_path("exception_test"))
+        .expect("Debug session failed");
+
+    let (tid, code, address) = seen.expect("the target should raise its exception");
+    assert_eq!(code, 0xE000_0001, "exception_test raises 0xE0000001");
+    assert_eq!(exception_stream(&dump), Some((tid, code, address)));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn minidump_write() {
     joybug_core::init_tracing();
@@ -63,6 +117,8 @@ fn minidump_write() {
 
     assert_mdmp(&mini, final_state.mini_size);
     assert_mdmp(&full, final_state.full_size);
+    // The initial breakpoint is the debugger's stop, not a crash.
+    assert_eq!(exception_stream(&mini), None, "a breakpoint stop has no exception stream");
     assert!(final_state.full_size > final_state.mini_size, "full dump should be larger than mini dump");
     assert!(final_state.bad_path_errored, "unwritable path should error");
     assert!(!bad.exists());

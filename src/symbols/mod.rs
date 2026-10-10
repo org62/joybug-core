@@ -3,6 +3,7 @@
 //! Compiled on every OS; the PDB/PE provider is pure Rust (`pdb`, `pelite`).
 
 pub mod backend;
+mod line_tables;
 pub mod module_extra;
 pub mod symbol_manager;
 pub mod symbol_provider;

@@ -125,11 +125,9 @@ impl PointerMap {
         }
     }
 
-    fn location(&self) -> &'static str {
-        match self {
-            PointerMap::Ram(_) => "RAM",
-            PointerMap::Disk { .. } => "disk",
-        }
+    /// Whether the map spilled to disk instead of fitting the RAM budget.
+    fn on_disk(&self) -> bool {
+        matches!(self, PointerMap::Disk { .. })
     }
 }
 
@@ -235,13 +233,12 @@ impl PointerScanner {
         // restricted to the caller's selected base modules.
         let module_ranges = build_module_ranges(&modules, allowed_modules.as_deref());
 
-        // Optional per-phase timing for benchmarking (set JOYBUG_PTRSCAN_TIMING=1).
-        let timing = std::env::var("JOYBUG_PTRSCAN_TIMING").is_ok();
+        // Per-phase timing, for whoever is recording (see `crate::perf`).
         let total_bytes: u64 = regions.iter().map(|(_, s)| *s as u64).sum();
-        if timing {
-            eprintln!("[ptrscan] regions={} committed={:.2}GB setup={:?}",
-                regions.len(), total_bytes as f64 / 1e9, start.elapsed());
-        }
+        let mut span = crate::perf::span("ptrscan.scan");
+        span.attr("regions", regions.len() as u64);
+        span.attr("committed_bytes", total_bytes);
+        span.attr_elapsed("setup_us", start);
 
         // Phase 1: build the reverse pointer map in RAM. Split regions into
         // fixed-size chunks so a single huge region doesn't pin one core, then
@@ -285,13 +282,12 @@ impl PointerScanner {
             by_value, budget_pairs, thread_count, &read_ns, &scan_ns,
         )?;
         let pairs = map.as_slice();
-        if timing {
-            let secs = t_build.elapsed().as_secs_f64().max(1e-9);
-            eprintln!("[ptrscan] build map: {} candidates ({:.2}GB, {}) in {:?} ({:.2}GB/s read | core-time read={:.1}s scan={:.1}s)",
-                pairs.len(), pairs.len() as f64 * PAIR_BYTES as f64 / 1e9, map.location(), t_build.elapsed(),
-                total_bytes as f64 / 1e9 / secs,
-                read_ns.load(Ordering::Relaxed) as f64 / 1e9, scan_ns.load(Ordering::Relaxed) as f64 / 1e9);
-        }
+        span.attr_elapsed("build_map_us", t_build);
+        span.attr("candidates", pairs.len() as u64);
+        span.attr("map_on_disk", map.on_disk() as u64);
+        // Summed over the worker threads.
+        span.attr("read_core_us", read_ns.load(Ordering::Relaxed) / 1000);
+        span.attr("scan_core_us", scan_ns.load(Ordering::Relaxed) / 1000);
 
         // Stream found paths to a disk results file — no in-RAM cap, so a broad
         // scan can keep millions of paths (Cheat-Engine style). The walk's
@@ -304,10 +300,10 @@ impl PointerScanner {
         let t_walk = Instant::now();
         let count = reverse_walk(pairs, &module_ranges, target_address, max_offset, max_depth, max_results, thread_count, t_walk, |p| { let _ = writer.push(p); });
         let match_count = writer.finish().map_err(|e| format!("Failed to finalize results: {}", e))?;
-        if timing {
-            eprintln!("[ptrscan] walk: {} paths in {:?}", count, t_walk.elapsed());
-            eprintln!("[ptrscan] TOTAL: {:?} ({} paths -> {})", start.elapsed(), match_count, results_path.display());
-        }
+        span.attr_elapsed("walk_us", t_walk);
+        span.attr("walked_paths", count as u64);
+        span.attr("paths", match_count as u64);
+        drop(span);
 
         let scan_time_us = start.elapsed().as_micros() as u64;
         Ok((results_path.to_string_lossy().into_owned(), match_count, scan_time_us))

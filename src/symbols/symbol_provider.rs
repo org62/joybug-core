@@ -218,8 +218,17 @@ pub(crate) fn parse_pdb_to_lines(pdb_path: &Path) -> Result<ModuleLineTable, Sym
         SymbolError::PdbParsingFailed(format!("PDB {} from {}: {}", what, pdb_path.display(), e))
     };
 
+    let string_table = match pdb_parser.string_table() {
+        Ok(table) => table,
+        // A public (stripped) PDB — every system module's — has no names
+        // stream, so no file names and no line info to offer. That is an
+        // empty table, not a failure: line tables are parsed for every module
+        // as its debug file loads, and most debug files are of this kind, so
+        // this is checked before anything else is parsed.
+        Err(pdb::Error::StreamNameNotFound) => return Ok(ModuleLineTable::default()),
+        Err(e) => return Err(map_err("string_table", e)),
+    };
     let address_map = pdb_parser.address_map().map_err(|e| map_err("address_map", e))?;
-    let string_table = pdb_parser.string_table().map_err(|e| map_err("string_table", e))?;
     let dbi = pdb_parser.debug_information().map_err(|e| map_err("debug_information", e))?;
     let mut modules = dbi.modules().map_err(|e| map_err("modules", e))?;
 

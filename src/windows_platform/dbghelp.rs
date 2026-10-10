@@ -13,7 +13,8 @@ use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
 use windows_sys::Win32::System::Diagnostics::Debug::{
     MiniDumpWithFullMemory, MiniDumpWithFullMemoryInfo, MiniDumpWithHandleData,
     MiniDumpWithIndirectlyReferencedMemory, MiniDumpWithThreadInfo, MiniDumpWithUnloadedModules,
-    MiniDumpWriteDump, MINIDUMP_TYPE,
+    MiniDumpWriteDump, CONTEXT, EXCEPTION_POINTERS, EXCEPTION_RECORD, MINIDUMP_EXCEPTION_INFORMATION,
+    MINIDUMP_TYPE,
 };
 
 /// `MINIDUMP_TYPE` bit set for a dump flavour. `Full` is what WinDbg's
@@ -36,17 +37,51 @@ fn dump_type(kind: MinidumpKind) -> MINIDUMP_TYPE {
     }
 }
 
+/// The exception a dump records: the thread that raised it, the record from
+/// the debug event and that thread's context.
+pub(super) struct DumpException {
+    pub(super) tid: u32,
+    pub(super) record: EXCEPTION_RECORD,
+    pub(super) context: CONTEXT,
+}
+
 /// Write a minidump of `pid` (opened as `process`) to `path`, overwriting any
 /// existing file. Returns the size of the written file in bytes. On failure
 /// the partially-written file is removed.
+///
+/// With `exception`, the dump gets an exception stream — what `.ecxr` and
+/// `!analyze` read — naming the faulting thread, code, address and context.
 pub(super) fn write_minidump(
     process: HANDLE,
     pid: u32,
     path: &str,
     kind: MinidumpKind,
+    exception: Option<DumpException>,
 ) -> Result<u64, PlatformError> {
     let file = std::fs::File::create(path)
         .map_err(|e| PlatformError::OsError(format!("Failed to create '{}': {}", path, e)))?;
+
+    // The dump is written from this process, so the record and context are
+    // handed over as our own memory (`ClientPointers = FALSE`). The record's
+    // link to a nested exception is an address in the *target*: dbghelp would
+    // follow it here, so it is cut.
+    let mut exception = exception.map(|e| {
+        let mut record = e.record;
+        record.ExceptionRecord = std::ptr::null_mut();
+        (e.tid, record, super::AlignedContext { context: e.context })
+    });
+    let mut pointers = exception.as_mut().map(|(_, record, aligned)| EXCEPTION_POINTERS {
+        ExceptionRecord: record,
+        ContextRecord: &mut aligned.context,
+    });
+    let exception_info = match (&exception, pointers.as_mut()) {
+        (Some((tid, _, _)), Some(pointers)) => Some(MINIDUMP_EXCEPTION_INFORMATION {
+            ThreadId: *tid,
+            ExceptionPointers: pointers,
+            ClientPointers: 0,
+        }),
+        _ => None,
+    };
 
     let write_err = {
         let _lock = DBGHELP_LOCK.lock().unwrap();
@@ -56,7 +91,7 @@ pub(super) fn write_minidump(
                 pid,
                 file.as_raw_handle() as HANDLE,
                 dump_type(kind),
-                std::ptr::null(),
+                exception_info.as_ref().map_or(std::ptr::null(), |info| info as *const _),
                 std::ptr::null(),
                 std::ptr::null(),
             )

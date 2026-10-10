@@ -134,9 +134,9 @@ pub(super) fn set_thread_context_os(
     }
 }
 
-/// Read-modify-write a thread's context in one round trip: every caller that
-/// used to destructure `Win32RawContext`, poke a field and write it back goes
-/// through here, so the WOW64 arm is handled once.
+/// Read-modify-write a thread's context in one round trip, so the WOW64 arm is
+/// handled once (the ARM64 hardware-breakpoint step-over is what needs it).
+#[cfg(target_arch = "aarch64")]
 pub(super) fn modify_thread_context(
     process: &DebuggedProcess,
     pid: u32,

@@ -1,36 +1,40 @@
-use crate::interfaces::{PlatformAPI, Stepper};
-use crate::protocol::{DebuggerRequest, DebuggerResponse};
+use crate::interfaces::{PlatformAPI, Stepper, SymbolError};
+use crate::protocol::{DebuggerRequest, DebuggerResponse, ModuleInfo};
+use crate::symbols::symbol_manager::SymbolManager;
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 
 use std::future::{pending, Future};
 use std::net::TcpListener as StdTcpListener;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-// Server-side timing stats
-static SERVER_RECV_US: AtomicU64 = AtomicU64::new(0);
-static SERVER_HANDLE_US: AtomicU64 = AtomicU64::new(0);
-static SERVER_SEND_US: AtomicU64 = AtomicU64::new(0);
-static SERVER_REQ_COUNT: AtomicUsize = AtomicUsize::new(0);
+use crate::framed_json_stream::FramedJsonStream;
 
-fn print_server_stats() {
-    let count = SERVER_REQ_COUNT.load(Ordering::Relaxed);
-    if count > 0 && count % 1000 == 0 {
-        let recv = SERVER_RECV_US.load(Ordering::Relaxed) as f64 / 1000.0;
-        let handle = SERVER_HANDLE_US.load(Ordering::Relaxed) as f64 / 1000.0;
-        let send = SERVER_SEND_US.load(Ordering::Relaxed) as f64 / 1000.0;
-        eprintln!("=== SERVER STATS after {} requests ===", count);
-        eprintln!("  Receive:  {:>8.2} ms", recv);
-        eprintln!("  Handle:   {:>8.2} ms", handle);
-        eprintln!("  Send:     {:>8.2} ms", send);
-        eprintln!("  Total:    {:>8.2} ms", recv + handle + send);
-        eprintln!("======================================");
-    }
+/// The platform's shared symbol manager and the module of `pid` that `select`
+/// picks, taken under one brief read lock. The requests that can spend seconds
+/// in the symbol manager (loading a debug file, parsing a line table) go
+/// through this and then work with the lock released — holding it that long
+/// would stall every request that needs the platform exclusively.
+///
+/// A module the platform does not know comes back as `(_, None)`.
+fn symbols_and_module<P: PlatformAPI>(
+    platform: &RwLock<P>,
+    pid: u32,
+    select: impl Fn(&ModuleInfo) -> bool,
+) -> Result<(Arc<SymbolManager>, Option<ModuleInfo>), SymbolError> {
+    let p = platform.read().unwrap();
+    let symbols = p.symbols_handle().ok_or_else(|| SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()))?;
+    let module = p.list_modules(pid).ok().and_then(|modules| modules.into_iter().find(|m| select(m)));
+    Ok((symbols, module))
 }
 
-use crate::framed_json_stream::FramedJsonStream;
+/// [`symbols_and_module`] for the module at `module_base`, which must exist.
+fn symbols_and_module_at<P: PlatformAPI>(platform: &RwLock<P>, pid: u32, module_base: u64) -> Result<(Arc<SymbolManager>, ModuleInfo), SymbolError> {
+    let (symbols, module) = symbols_and_module(platform, pid, |m| m.base == module_base)?;
+    let module = module.ok_or_else(|| SymbolError::ModuleNotLoaded(format!("No module at base 0x{:X}", module_base)))?;
+    Ok((symbols, module))
+}
 
 fn handle_connection<P>(stream: std::net::TcpStream, platform: Arc<RwLock<P>>)
 where
@@ -43,7 +47,6 @@ where
     // Per-connection value freezes; dropped (which stops all threads) on disconnect.
     let mut freeze_manager = crate::freeze_manager::FreezeManager::new();
     loop {
-        let recv_start = Instant::now();
         let req: DebuggerRequest = match framed_stream.receive() {
             Ok(req) => req,
             Err(e) => {
@@ -57,8 +60,16 @@ where
                 break;
             }
         };
-        SERVER_RECV_US.fetch_add(recv_start.elapsed().as_micros() as u64, Ordering::Relaxed);
         debug!(?req, "Received request");
+        let _request = crate::perf::request_scope(if crate::perf::enabled() { crate::perf::variant_name(&req) } else { "" });
+        let mut span = crate::perf::span("server.request");
+        if span.is_live() {
+            // What the request waits for before it can touch the platform: a
+            // reader blocks only while a writer (event handling, a step) holds it.
+            let t = Instant::now();
+            drop(platform.read().unwrap());
+            span.attr_elapsed("lock_wait_us", t);
+        }
         let handle_start = Instant::now();
 
         let resp = match req {
@@ -243,6 +254,13 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::ProtectMemory { pid, address, size, protect } => {
+                let p = platform.read().unwrap();
+                match p.protect_memory(pid, address, size, protect) {
+                    Ok(old_protect) => DebuggerResponse::MemoryProtected { old_protect },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::ReadWideString { pid, address, max_len } => {
                 let p = platform.read().unwrap();
                 match p.read_wide_string(pid, address, max_len) {
@@ -363,8 +381,9 @@ where
                 }
             }
             DebuggerRequest::LoadPdbFromPath { pid, module_base, pdb_path, force } => {
-                let p = platform.read().unwrap();
-                match p.load_pdb_from_path(pid, module_base, &pdb_path, force) {
+                let outcome = symbols_and_module_at(&platform, pid, module_base)
+                    .and_then(|(symbols, module)| symbols.load_pdb_from_path(&module, std::path::Path::new(&pdb_path), force));
+                match outcome {
                     Ok(crate::protocol::PdbLoadOutcome::Loaded { symbol_count }) => DebuggerResponse::PdbLoaded { symbol_count },
                     Ok(crate::protocol::PdbLoadOutcome::Mismatch(info)) => DebuggerResponse::PdbMismatch(info),
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
@@ -442,23 +461,40 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
-            DebuggerRequest::ResolveAddressToLine { pid, address } => {
-                let p = platform.read().unwrap();
-                match p.resolve_address_to_line(pid, address) {
-                    Ok(info) => DebuggerResponse::AddressLine { info },
+            DebuggerRequest::ResolveAddressToLine { pid, address, wait } => {
+                let resolved = symbols_and_module(&platform, pid, |m| m.contains(address)).and_then(|(symbols, module)| {
+                    let Some(module) = module else { return Ok((None, false)) };
+                    let rva = (address - module.base) as u32;
+                    let (line, pending) = if wait {
+                        (symbols.resolve_rva_to_line(&module.name, rva)?, false)
+                    } else {
+                        symbols.try_resolve_rva_to_line(&module.name, rva)?
+                    };
+                    let info = line.map(|(file, line_entry)| crate::protocol::AddressLineInfo {
+                        module_path: module.name,
+                        module_base: module.base,
+                        rva,
+                        file,
+                        line_entry,
+                    });
+                    Ok((info, pending))
+                });
+                match resolved {
+                    Ok((info, pending)) => DebuggerResponse::AddressLine { info, pending },
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
             DebuggerRequest::GetSourceFileLineMap { pid, module_base, file_path, start_line, end_line } => {
-                let p = platform.read().unwrap();
-                match p.get_source_file_line_map(pid, module_base, &file_path, start_line, end_line) {
+                let map = symbols_and_module_at(&platform, pid, module_base)
+                    .and_then(|(symbols, module)| symbols.file_line_map(&module.name, &file_path, start_line, end_line));
+                match map {
                     Ok((file, entries)) => DebuggerResponse::SourceFileLineMap { file, entries },
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
             DebuggerRequest::ListSourceFiles { pid, module_base } => {
-                let p = platform.read().unwrap();
-                match p.list_source_files(pid, module_base) {
+                let files = symbols_and_module_at(&platform, pid, module_base).and_then(|(symbols, module)| symbols.list_source_files(&module.name));
+                match files {
                     Ok(files) => DebuggerResponse::SourceFileList { files },
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
@@ -557,6 +593,13 @@ where
             DebuggerRequest::SetReportedSignals { signals } => {
                 let mut p = platform.write().unwrap();
                 match p.set_reported_signals(&signals) {
+                    Ok(()) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::SetDisasmOptions { options } => {
+                let p = platform.read().unwrap();
+                match p.set_disasm_options(options) {
                     Ok(()) => DebuggerResponse::Ack,
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
@@ -759,7 +802,7 @@ where
                 }
             }
         };
-        SERVER_HANDLE_US.fetch_add(handle_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+        span.attr_elapsed("handle_us", handle_start);
         debug!(resp = %match &resp {
             DebuggerResponse::Event { event } => event.to_string(),
             DebuggerResponse::ThreadContext { context } => {
@@ -796,14 +839,17 @@ where
             ),
             _ => format!("{:?}", resp),
         }, "Sending response");
-        let send_start = Instant::now();
-        if let Err(e) = framed_stream.send(&resp) {
-            error!(?e, "Failed to write response to socket");
-            break;
+        match framed_stream.send_timed(&resp) {
+            Ok(sent) => {
+                span.attr("resp_bytes", sent.bytes);
+                span.attr("encode_us", sent.codec_us);
+                span.attr("send_us", sent.io_us);
+            }
+            Err(e) => {
+                error!(?e, "Failed to write response to socket");
+                break;
+            }
         }
-        SERVER_SEND_US.fetch_add(send_start.elapsed().as_micros() as u64, Ordering::Relaxed);
-        SERVER_REQ_COUNT.fetch_add(1, Ordering::Relaxed);
-        print_server_stats();
     }
 }
 

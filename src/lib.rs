@@ -16,6 +16,8 @@ pub mod static_pe;
 pub mod windows_platform;
 pub mod server;
 pub mod framed_json_stream;
+/// In-process performance recorder (off unless a host installs a sink).
+pub mod perf;
 pub mod emulator;
 pub mod memory_operand;
 pub mod tenet_format;

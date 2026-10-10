@@ -103,6 +103,11 @@ pub struct PendingSignal {
     pub parameters: Vec<u64>,
     /// The "nobody will handle this" stop was already given.
     pub second_chance_reported: bool,
+    /// The kernel's `si_code` for the signal.
+    pub si_code: i32,
+    /// The 8 bytes of `siginfo_t` after its header: the fault address
+    /// (`si_addr`) for a fault, the sender's pid and uid for a sent signal.
+    pub si_payload: u64,
 }
 
 /// What a tracer stop turned into.
@@ -194,9 +199,11 @@ fn arm_loader_hook(bps: &mut breakpoints::BreakpointTable, os: &LinuxOps, pid: u
 pub struct LinuxPlatform {
     tracer: Tracer,
     processes: HashMap<u32, LinuxProcess>,
-    symbol_manager: Option<SymbolManager>,
+    symbol_manager: Option<Arc<SymbolManager>>,
     disassembler: Option<CapstoneDisassembler>,
     unwinder: Mutex<unwind::Unwinder>,
+    /// How listings decode (`SetDisasmOptions`).
+    disasm_options: disasm::DisasmOptionsCell,
     /// Signals reported as exceptions instead of delivered unseen.
     reported_signals: Arc<HashSet<i32>>,
     /// Debugged vfork children that have not exec'd yet (child -> parent).
@@ -223,7 +230,7 @@ impl LinuxPlatform {
     }
 
     pub fn new_with_config(symbol_config: SymbolConfig) -> Self {
-        let symbol_manager = SymbolManager::new_with_backend(symbol_config, Arc::new(elf_symbols::ElfBackend)).ok();
+        let symbol_manager = SymbolManager::new_with_backend(symbol_config, Arc::new(elf_symbols::ElfBackend)).ok().map(Arc::new);
         let disassembler = CapstoneDisassembler::new().ok();
         Self {
             tracer: Tracer::spawn(),
@@ -231,6 +238,7 @@ impl LinuxPlatform {
             symbol_manager,
             disassembler,
             unwinder: Mutex::new(unwind::Unwinder::default()),
+            disasm_options: Default::default(),
             reported_signals: Arc::new(HashSet::new()),
             vfork_children: HashMap::new(),
         }
@@ -246,7 +254,7 @@ impl LinuxPlatform {
 
     fn symbols(&self) -> Result<&SymbolManager, SymbolError> {
         self.symbol_manager
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()))
     }
 
@@ -271,7 +279,7 @@ impl LinuxPlatform {
     }
 
     fn nonblocking_symbol_resolver(&self, pid: u32) -> impl Fn(u64) -> Option<crate::interfaces::SymbolInfo> + '_ {
-        disasm::nonblocking_symbol_resolver(self.symbol_manager.as_ref(), self.modules_for(pid))
+        disasm::nonblocking_symbol_resolver(self.symbol_manager.as_deref(), self.modules_for(pid))
     }
 
     // ---- process bring-up --------------------------------------------------
@@ -1024,6 +1032,11 @@ impl PlatformAPI for LinuxPlatform {
         Ok(())
     }
 
+    fn set_disasm_options(&self, options: crate::protocol::DisasmOptions) -> Result<(), PlatformError> {
+        self.disasm_options.set(options);
+        Ok(())
+    }
+
     fn write_minidump(&self, pid: u32, path: &str, kind: crate::protocol::MinidumpKind) -> Result<u64, PlatformError> {
         coredump::write_core(self, pid, Path::new(path), kind)
     }
@@ -1069,7 +1082,7 @@ impl PlatformAPI for LinuxPlatform {
 
     fn enumerate_coverage_targets(&self, pid: u32, module_path: &str, sources: &[crate::protocol::CoverageTargetSource]) -> Result<Vec<crate::protocol::CoverageTarget>, PlatformError> {
         let arch = self.process(pid)?.book.arch;
-        let symbol_manager = self.symbol_manager.as_ref().ok_or_else(|| PlatformError::Other("Symbol manager unavailable".to_string()))?;
+        let symbol_manager = self.symbol_manager.as_deref().ok_or_else(|| PlatformError::Other("Symbol manager unavailable".to_string()))?;
         let disassembler = self.disassembler.as_ref().ok_or_else(|| PlatformError::Other("Disassembler unavailable".to_string()))?;
         crate::debugger_core::coverage_targets::enumerate_coverage_targets(self, symbol_manager, disassembler, arch, pid, module_path, sources)
     }
@@ -1128,6 +1141,25 @@ impl PlatformAPI for LinuxPlatform {
             return Err(PlatformError::OsError(format!("mmap in the target failed: errno {}", -(address as i64))));
         }
         Ok(address)
+    }
+
+    /// `VirtualProtectEx` by an injected `mprotect` (see `inject_syscall`).
+    fn protect_memory(&self, pid: u32, address: u64, size: usize, protect: u32) -> Result<u32, PlatformError> {
+        let prot = maps::prot_from_protect(protect).map_err(PlatformError::Other)?;
+        // mprotect wants a page-aligned start; VirtualProtectEx rounds for the
+        // caller, so do the same here.
+        let page = 4096u64;
+        let start = address & !(page - 1);
+        let len = (address - start) + size.max(1) as u64;
+        let old_protect = self.query_memory_region(pid, address)?.protect;
+        let result = self.inject_syscall(pid, libc::SYS_mprotect as u64, [start, len, prot as u64, 0, 0, 0])?;
+        if (result as i64) < 0 {
+            return Err(PlatformError::OsError(format!(
+                "mprotect(0x{start:x}, {len} bytes) in the target failed: {}",
+                std::io::Error::from_raw_os_error(-(result as i64) as i32)
+            )));
+        }
+        Ok(old_protect)
     }
 
     fn read_wide_string(&self, pid: u32, address: u64, max_len: Option<usize>) -> Result<String, PlatformError> {
@@ -1195,9 +1227,8 @@ impl PlatformAPI for LinuxPlatform {
         Ok(self.symbols()?.get_symbol_status(self.modules_for(pid)))
     }
 
-    fn load_pdb_from_path(&self, pid: u32, module_base: u64, pdb_path: &str, force: bool) -> Result<crate::protocol::PdbLoadOutcome, SymbolError> {
-        let module = self.module_at(pid, module_base)?;
-        self.symbols()?.load_pdb_from_path(&module, Path::new(pdb_path), force)
+    fn symbols_handle(&self) -> Option<Arc<SymbolManager>> {
+        self.symbol_manager.clone()
     }
 
     fn retry_symbol_load(&self, pid: u32, module_base: u64) -> Result<(), SymbolError> {
@@ -1215,33 +1246,6 @@ impl PlatformAPI for LinuxPlatform {
     fn set_symbol_deny_list(&self, modules: Vec<String>) -> Result<(), SymbolError> {
         self.symbols()?.set_deny_list(modules);
         Ok(())
-    }
-
-    fn resolve_address_to_line(&self, pid: u32, address: u64) -> Result<Option<crate::protocol::AddressLineInfo>, SymbolError> {
-        let symbol_manager = self.symbols()?;
-        let mut modules = self.modules_for(pid);
-        modules.sort_by_key(|m| m.base);
-        let Some(module) = SymbolManager::find_module_binary_search(&modules, address) else {
-            return Ok(None);
-        };
-        let rva = (address - module.base) as u32;
-        Ok(symbol_manager.resolve_rva_to_line(&module.name, rva)?.map(|(file, line_entry)| crate::protocol::AddressLineInfo {
-            module_path: module.name.clone(),
-            module_base: module.base,
-            rva,
-            file,
-            line_entry,
-        }))
-    }
-
-    fn get_source_file_line_map(&self, pid: u32, module_base: u64, file_path: &str, start_line: Option<u32>, end_line: Option<u32>) -> Result<(Option<crate::interfaces::SourceFileEntry>, Vec<crate::interfaces::LineEntry>), SymbolError> {
-        let module = self.module_at(pid, module_base)?;
-        self.symbols()?.file_line_map(&module.name, file_path, start_line, end_line)
-    }
-
-    fn list_source_files(&self, pid: u32, module_base: u64) -> Result<Vec<crate::interfaces::SourceFileEntry>, SymbolError> {
-        let module = self.module_at(pid, module_base)?;
-        self.symbols()?.list_source_files(&module.name)
     }
 
     fn list_types(&self, pid: u32, module_base: Option<u64>, filter: Option<&str>, max_results: usize) -> Result<Vec<crate::protocol::TypeSummary>, SymbolError> {
@@ -1271,12 +1275,14 @@ impl PlatformAPI for LinuxPlatform {
 
     fn disassemble_backward(&self, pid: u32, target: u64, count: usize, arch: Architecture) -> Result<Vec<Instruction>, DisassemblerError> {
         let modules = self.modules_for(pid);
-        let bounds = |probe: u64| self.find_function_bounds(pid, probe);
-        disasm::disassemble_backward_anchored(self, pid, target, count, arch, self.symbol_manager.as_ref(), &modules, &bounds)
+        let options = self.disasm_options.get();
+        let bounds = |probe: u64| self.find_function_bounds(pid, probe, options.symbolizes());
+        disasm::disassemble_backward_anchored(self, pid, target, count, arch, self.symbol_manager.as_deref(), &modules, &bounds, options)
     }
 
     fn disassemble_function(&self, pid: u32, address: u64, max_instructions: usize, arch: Architecture) -> Result<(Vec<Instruction>, Option<u64>, Option<u64>, Option<String>), DisassemblerError> {
-        let bounds = self.find_function_bounds(pid, address);
+        let options = self.disasm_options.get();
+        let bounds = if options.naive { None } else { self.find_function_bounds(pid, address, options.symbolizes()) };
         disasm::disassemble_function(self, pid, address, max_instructions, arch, bounds)
     }
 
@@ -1439,16 +1445,20 @@ impl LinuxPlatform {
     }
 
     /// Function bounds for an address: from the unwinder's FDE table when the
-    /// module has one, else the symbol's extent is unknown.
-    fn find_function_bounds(&self, pid: u32, address: u64) -> disasm::FunctionBounds {
+    /// module has one, else the symbol's extent is unknown. The function is
+    /// named only when `with_name`: the name lookup waits for a module whose
+    /// symbols are still loading.
+    fn find_function_bounds(&self, pid: u32, address: u64, with_name: bool) -> disasm::FunctionBounds {
+        let mut span = crate::perf::span("disasm.function_bounds");
+        let t = std::time::Instant::now();
         let modules = self.modules_for(pid);
-        let module = modules.iter().find(|m| address >= m.base && address < m.base + m.size.unwrap_or(0))?;
+        let module = modules.iter().find(|m| m.contains(address))?;
+        if span.is_live() {
+            span.attr("module_key", crate::perf::path_key(&module.name));
+        }
         let (start, end) = self.unwinder.lock().unwrap().function_range(module, address)?;
-        let name = self
-            .symbol_manager
-            .as_ref()
-            .and_then(|sm| sm.resolve_address_to_symbol_raw(&modules, start).ok().flatten())
-            .map(|(module_path, symbol, _)| format!("{}!{}", crate::formatting::module_stem(&module_path), symbol.name));
+        span.attr_elapsed("table_us", t);
+        let name = disasm::function_name(self.symbol_manager.as_deref(), &modules, start, with_name, &mut span);
         Some((start, end, name))
     }
 
@@ -1461,8 +1471,9 @@ impl LinuxPlatform {
             reader: &(self, pid),
             bps: process.map(|p| &p.book.bps),
             disasm: disasm_engine,
-            symbol_manager: self.symbol_manager.as_ref(),
+            symbol_manager: self.symbol_manager.as_deref(),
             modules: self.modules_for(pid),
+            options: self.disasm_options.get(),
         };
         disasm::decode_listing(listing, address, read_len, count, arch, || {
             // Speculative pointer reads for indirect branch targets: one

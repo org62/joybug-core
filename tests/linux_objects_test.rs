@@ -7,7 +7,7 @@ mod common;
 
 use common::{get_test_program_path, TestServer};
 use joybug_core::protocol::{DebugEvent, MinidumpKind};
-use joybug_core::protocol_io::{BreakpointDecision, DebugSession};
+use joybug_core::protocol_io::{BreakpointDecision, DebugSession, ExceptionAction};
 use object::read::elf::{FileHeader, ProgramHeader};
 use object::{elf, Endianness};
 
@@ -85,6 +85,62 @@ fn load_segment_for(core: &[u8], address: u64) -> Option<(u64, u64)> {
     })
 }
 
+/// The descriptor of the first note of type `wanted` in `core`'s PT_NOTE.
+fn core_note(core: &[u8], wanted: u32) -> Option<Vec<u8>> {
+    let header = elf::FileHeader64::<Endianness>::parse(core).ok()?;
+    let endian = header.endian().ok()?;
+    let notes = header.program_headers(endian, core).ok()?.iter().find(|ph| ph.p_type(endian) == elf::PT_NOTE)?;
+    let notes = &core[notes.p_offset(endian) as usize..(notes.p_offset(endian) + notes.p_filesz(endian)) as usize];
+    let u32_at = |at: usize| u32::from_le_bytes(notes[at..at + 4].try_into().unwrap()) as usize;
+    let mut at = 0;
+    while at + 12 <= notes.len() {
+        let (name_size, desc_size, kind) = (u32_at(at), u32_at(at + 4), u32_at(at + 8) as u32);
+        let desc = at + 12 + name_size.next_multiple_of(4);
+        if kind == wanted {
+            return Some(notes[desc..desc + desc_size].to_vec());
+        }
+        at = desc + desc_size.next_multiple_of(4);
+    }
+    None
+}
+
+const NT_SIGINFO: u32 = 0x5349_4749;
+
+/// A core written while stopped on a fault carries its `siginfo_t`: the
+/// signal, its `si_code` and the address that faulted (gdb's `$_siginfo`).
+#[test]
+fn a_core_file_at_a_fault_records_its_siginfo() {
+    joybug_core::init_tracing();
+    let server = TestServer::spawn();
+    let dir = std::env::temp_dir().join(format!("joybug-core-siginfo-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("segv.core");
+    let core_path = path.clone();
+
+    let state = session(&server)
+        .on_exception(move |session, pid, _tid, code, _address, first_chance, _params| {
+            if first_chance {
+                assert_eq!(code, 0xC000_0005);
+                session.write_minidump(pid, core_path.to_str().unwrap(), MinidumpKind::Mini)?;
+                session.state.checked = true;
+            }
+            // Delivered: nobody handles it, so the target dies of it.
+            Ok(ExceptionAction::PassToApplication)
+        })
+        .launch(get_test_program_path("segv"))
+        .expect("launch");
+    assert!(state.checked, "the fault was reported");
+
+    let core = std::fs::read(&path).unwrap();
+    let info = core_note(&core, NT_SIGINFO).expect("NT_SIGINFO");
+    assert_eq!(info.len(), 128, "a whole siginfo_t");
+    let i32_at = |at: usize| i32::from_le_bytes(info[at..at + 4].try_into().unwrap());
+    assert_eq!(i32_at(0), 11, "si_signo: SIGSEGV");
+    assert_eq!(i32_at(8), 1, "si_code: SEGV_MAPERR, nothing mapped at NULL");
+    assert_eq!(u64::from_le_bytes(info[16..24].try_into().unwrap()), 0, "si_addr: the NULL write");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_core_file_holds_the_stack_and_opens_in_gdb() {
     joybug_core::init_tracing();
@@ -125,6 +181,8 @@ fn a_core_file_holds_the_stack_and_opens_in_gdb() {
                         .map(|ph| &core[ph.p_offset(endian) as usize..(ph.p_offset(endian) + ph.p_filesz(endian)) as usize])
                         .expect("PT_NOTE");
                     assert!(notes.windows(8).any(|w| w == address.to_le_bytes()), "the breakpoint address is the saved PC");
+                    // A breakpoint is the debugger's stop, not a signal the target got.
+                    assert!(core_note(&core, NT_SIGINFO).is_none(), "no siginfo at a breakpoint stop");
                 }
                 // Code: saved in the full dump with the breakpoint byte taken
                 // out, left to the binary on disk in the mini one.

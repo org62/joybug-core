@@ -156,8 +156,9 @@ impl std::fmt::Debug for DebuggerResponse {
                 .field("addresses", &results.len())
                 .field("resolved", &results.iter().filter(|r| r.is_some()).count())
                 .finish(),
-            DebuggerResponse::AddressLine { info } => f.debug_struct("AddressLine")
+            DebuggerResponse::AddressLine { info, pending } => f.debug_struct("AddressLine")
                 .field("info", &info.as_ref().map(|i| format!("{}:{} (rva 0x{:X})", i.file.path, i.line_entry.line_start, i.rva)))
+                .field("pending", pending)
                 .finish(),
             DebuggerResponse::SourceFileLineMap { file, entries } => f.debug_struct("SourceFileLineMap")
                 .field("file", &file.as_ref().map(|f| f.path.as_str()))
@@ -303,6 +304,10 @@ impl std::fmt::Debug for DebuggerResponse {
             DebuggerResponse::MemoryAllocated { address } => f
                 .debug_struct("MemoryAllocated")
                 .field("address", &format_args!("0x{address:x}"))
+                .finish(),
+            DebuggerResponse::MemoryProtected { old_protect } => f
+                .debug_struct("MemoryProtected")
+                .field("old_protect", &format_args!("0x{old_protect:x}"))
                 .finish(),
         }
     }

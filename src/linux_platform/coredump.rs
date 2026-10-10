@@ -7,7 +7,9 @@
 //! program headers: PT_NOTE, then one PT_LOAD per mapping
 //! notes:  per thread NT_PRSTATUS + NT_FPREGSET (the thread that faulted
 //!         first: debuggers show the first one as the crashing thread),
-//!         NT_PRPSINFO, NT_AUXV, NT_FILE (which file backs which range)
+//!         NT_PRPSINFO, NT_SIGINFO (the signal the target is stopped on, when
+//!         it is: fault address and si_code), NT_AUXV, NT_FILE (which file
+//!         backs which range)
 //! memory: page-aligned, in mapping order
 //! ```
 //!
@@ -27,7 +29,7 @@ use tracing::{debug, info};
 
 use super::maps::{self, Mapping};
 use super::regs::RegisterImage;
-use super::{procfs, LinuxPlatform, LinuxProcess};
+use super::{procfs, LinuxPlatform, LinuxProcess, PendingSignal};
 use crate::debugger_core::ops::ProcessOps;
 use crate::interfaces::PlatformError;
 use crate::protocol::MinidumpKind;
@@ -49,6 +51,8 @@ const NT_FPREGSET: u32 = 2;
 const NT_PRPSINFO: u32 = 3;
 const NT_AUXV: u32 = 6;
 const NT_FILE: u32 = 0x4649_4C45;
+const NT_SIGINFO: u32 = 0x5349_4749;
+const SIGINFO_SIZE: usize = 128;
 
 const PRSTATUS_SIZE: usize = 336;
 const PRSTATUS_PID: usize = 32;
@@ -88,7 +92,7 @@ pub fn write_core(platform: &LinuxPlatform, pid: u32, path: &Path, kind: Minidum
 }
 
 /// Registers of every thread, the thread with a pending fault first.
-fn thread_images(process: &LinuxProcess, pid: u32) -> Result<Vec<(u32, RegisterImage, i32)>, PlatformError> {
+fn thread_images(process: &LinuxProcess, pid: u32) -> Result<Vec<(u32, RegisterImage, Option<PendingSignal>)>, PlatformError> {
     let mut tids = process.os.live_threads(pid);
     tids.sort_unstable();
     // Faulting thread first, then the main thread, then the rest.
@@ -96,7 +100,7 @@ fn thread_images(process: &LinuxProcess, pid: u32) -> Result<Vec<(u32, RegisterI
     let mut out = Vec::with_capacity(tids.len());
     for tid in tids {
         match process.os.image(tid) {
-            Ok(image) => out.push((tid, image, process.last_fault.get(&tid).map(|p| p.signo).unwrap_or(0))),
+            Ok(image) => out.push((tid, image, process.last_fault.get(&tid).cloned())),
             // Exiting under us is fine; a running thread is not a snapshot.
             Err(e) => debug!(pid, tid, error = %e, "thread left out of the core file"),
         }
@@ -267,13 +271,24 @@ fn status_ids(pid: u32, key: &str) -> u32 {
         .unwrap_or(0)
 }
 
-fn build_notes(process: &LinuxProcess, pid: u32, threads: &[(u32, RegisterImage, i32)], mappings: &[Mapping]) -> Vec<u8> {
+/// `siginfo_t` of a reported signal, as the kernel lays it out: `si_signo`,
+/// `si_errno`, `si_code`, then (after padding to 8) the payload union.
+fn siginfo(fault: &PendingSignal) -> [u8; SIGINFO_SIZE] {
+    let mut info = [0u8; SIGINFO_SIZE];
+    info[0..4].copy_from_slice(&fault.signo.to_le_bytes());
+    info[8..12].copy_from_slice(&fault.si_code.to_le_bytes());
+    info[16..24].copy_from_slice(&fault.si_payload.to_le_bytes());
+    info
+}
+
+fn build_notes(process: &LinuxProcess, pid: u32, threads: &[(u32, RegisterImage, Option<PendingSignal>)], mappings: &[Mapping]) -> Vec<u8> {
     let (state, ppid, pgrp, sid) = stat_fields(pid);
     let mut notes = Vec::new();
-    for (index, (tid, image, signo)) in threads.iter().enumerate() {
+    for (index, (tid, image, fault)) in threads.iter().enumerate() {
+        let signo = fault.as_ref().map_or(0, |f| f.signo);
         let mut prstatus = [0u8; PRSTATUS_SIZE];
         prstatus[0..4].copy_from_slice(&signo.to_le_bytes()); // pr_info.si_signo
-        prstatus[12..14].copy_from_slice(&(*signo as i16).to_le_bytes()); // pr_cursig
+        prstatus[12..14].copy_from_slice(&(signo as i16).to_le_bytes()); // pr_cursig
         for (i, value) in [*tid, ppid, pgrp, sid].into_iter().enumerate() {
             prstatus[PRSTATUS_PID + i * 4..PRSTATUS_PID + i * 4 + 4].copy_from_slice(&value.to_le_bytes());
         }
@@ -282,6 +297,11 @@ fn build_notes(process: &LinuxProcess, pid: u32, threads: &[(u32, RegisterImage,
         push_note(&mut notes, NT_PRSTATUS, &prstatus);
         if index == 0 {
             push_note(&mut notes, NT_PRPSINFO, &prpsinfo(process, pid, state, ppid, pgrp, sid));
+            // The first thread is the one that faulted, when one did: its
+            // siginfo is what gdb shows as `$_siginfo` (fault address, si_code).
+            if let Some(fault) = fault {
+                push_note(&mut notes, NT_SIGINFO, &siginfo(fault));
+            }
             if let Ok(auxv) = fs::read(format!("/proc/{pid}/auxv")) {
                 push_note(&mut notes, NT_AUXV, &auxv);
             }

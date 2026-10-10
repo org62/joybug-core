@@ -346,7 +346,7 @@ fn arm64_begin_step_over_hw_bp(
         Ok(())
     })?;
     // dr_index is unused on ARM64 (we re-arm all active bps); pass 0 as a marker.
-    platform.get_process_mut(pid)?.schedule_hw_bp_rearm(tid, 0);
+    platform.get_process_mut(pid)?.book.steps.schedule_hw_bp_rearm(tid, 0);
     Ok(())
 }
 
@@ -417,17 +417,15 @@ pub(super) fn handle_exception_event(
             let hw_hit: Option<InternalHardwareBreakpoint> = {
                 let wp = if ex_record.NumberParameters >= 2 {
                     let data_addr = ex_record.ExceptionInformation[1] as u64;
-                    process.active_hw_bp_for_access(data_addr, true)
+                    process.book.hw.active_for_access(data_addr, true)
                 } else {
                     None
                 };
                 wp.or_else(|| {
-                    if process.has_single_shot_breakpoint(address)
-                        || process.is_persistent_breakpoint(address)
-                    {
+                    if process.book.bps.has_single_shot(address) || process.book.bps.is_persistent(address) {
                         None
                     } else {
-                        process.active_hw_bp_for_access(address, false)
+                        process.book.hw.active_for_access(address, false)
                     }
                 })
             };
@@ -444,7 +442,7 @@ pub(super) fn handle_exception_event(
                 // Silent access-trace path: ARM64 reports the exact faulting PC
                 // (`address`), so no client-side back-step is needed. If the watched
                 // address is being traced, record and auto-continue silently.
-                if platform.get_process_mut(pid)?.record_watchpoint_access(bp.address, address, tid) {
+                if platform.get_process_mut(pid)?.book.watch.record_access(bp.address, address, tid) {
                     return Ok(None);
                 }
                 return Ok(Some(crate::protocol::DebugEvent::HardwareBreakpoint {
@@ -520,6 +518,8 @@ pub(super) fn handle_exception_event(
     let num_params = ex_record.NumberParameters as usize;
     for i in 0..num_params { params.push(ex_record.ExceptionInformation[i] as u64); }
     trace!(pid = pid, tid = tid, code = %format!("0x{:X}", ex_record.ExceptionCode as u32), address = %format!("0x{:X}", ex_record.ExceptionAddress as u64), first_chance = ex_info.dwFirstChance == 1, parameters = ?params, "Exception event");
+    // Remembered for a dump written during this stop (see `write_minidump`).
+    platform.get_process_mut(pid)?.last_exception = Some(super::debugged_process::LastException { tid, record: ex_record });
     Ok(Some(crate::protocol::DebugEvent::Exception { pid, tid, code: ex_record.ExceptionCode as u32, address: ex_record.ExceptionAddress as u64, first_chance: ex_info.dwFirstChance == 1, parameters: params }))
 }
 

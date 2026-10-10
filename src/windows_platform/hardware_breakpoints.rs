@@ -1,7 +1,7 @@
 use crate::interfaces::{Architecture, PlatformError};
 use crate::protocol::{HardwareBreakpointType, HardwareBreakpointSize};
 use crate::debugger_core::hw_breakpoints::{
-    x86_check_dr6, x86_clear_hw_bp, x86_disable_enable_bit, x86_enable_enable_bit, x86_set_hw_bp,
+    x86_clear_hw_bp, x86_set_hw_bp,
     InternalHardwareBreakpoint, X86DebugRegs,
 };
 use tracing::trace;
@@ -93,12 +93,6 @@ impl X86DebugCtx {
         x86_set_hw_bp(self.regs(), dr_index, address, bp_type, size);
     }
     pub(super) fn clear_bp(&mut self, dr_index: u8) { x86_clear_hw_bp(self.regs(), dr_index); }
-    pub(super) fn check_dr6(&mut self) -> Option<u8> { x86_check_dr6(self.regs()) }
-    pub(super) fn enable_bit(&mut self, dr_index: u8) { x86_enable_enable_bit(self.regs(), dr_index); }
-    pub(super) fn disable_bit(&mut self, dr_index: u8) { x86_disable_enable_bit(self.regs(), dr_index); }
-    pub(super) fn set_dr6(&mut self, value: u64) { self.regs().set_dr6(value); }
-    pub(super) fn pc(&mut self) -> u64 { self.regs().pc() }
-    pub(super) fn set_trap_flag(&mut self, on: bool) { self.regs().set_trap_flag(on); }
 }
 
 // ---- Thread-level operations dispatched on the debuggee's architecture ----

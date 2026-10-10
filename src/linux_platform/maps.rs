@@ -46,6 +46,24 @@ impl Mapping {
     }
 }
 
+/// The `PROT_*` bits for a `PAGE_*` value: the reverse of [`Mapping::protect`].
+/// Linux has no guard, no-cache, write-combine or copy-on-write protections, so
+/// those are refused rather than silently dropped.
+pub fn prot_from_protect(protect: u32) -> Result<i32, String> {
+    const READ: i32 = 1; // PROT_READ
+    const WRITE: i32 = 2; // PROT_WRITE
+    const EXEC: i32 = 4; // PROT_EXEC
+    match protect {
+        PAGE_NOACCESS => Ok(0),
+        PAGE_READONLY => Ok(READ),
+        PAGE_READWRITE => Ok(READ | WRITE),
+        PAGE_EXECUTE => Ok(EXEC),
+        PAGE_EXECUTE_READ => Ok(READ | EXEC),
+        PAGE_EXECUTE_READWRITE => Ok(READ | WRITE | EXEC),
+        other => Err(format!("protection 0x{other:X} has no Linux equivalent (only the read/write/execute combinations exist)")),
+    }
+}
+
 pub fn parse_maps(text: &str) -> Vec<Mapping> {
     text.lines().filter_map(parse_line).collect()
 }
@@ -159,6 +177,17 @@ mod tests {
         assert_eq!(maps[2].path, "");
         assert_eq!(maps[3].path, "[vdso]");
         assert_eq!(maps[4].path, "[stack]");
+    }
+
+    #[test]
+    fn protections_map_back_to_prot_bits() {
+        for (read, write, exec) in [(false, false, false), (true, false, false), (true, true, false), (false, false, true), (true, false, true), (true, true, true)] {
+            let m = Mapping { start: 0, end: 0x1000, read, write, exec, shared: false, offset: 0, path: String::new() };
+            let prot = prot_from_protect(m.protect()).unwrap();
+            assert_eq!((prot & 1 != 0, prot & 2 != 0, prot & 4 != 0), (read, write, exec));
+        }
+        assert!(prot_from_protect(PAGE_READWRITE | 0x100).is_err(), "PAGE_GUARD does not exist on Linux");
+        assert!(prot_from_protect(PAGE_EXECUTE_WRITECOPY).is_err());
     }
 
     #[test]

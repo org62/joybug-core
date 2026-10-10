@@ -442,8 +442,8 @@ impl DebugClient {
 
     /// Resolve an address to its (file, line) via the module's PDB line table.
     fn resolve_line(&mut self, pid: u32, address: u64) -> Option<(String, u32)> {
-        match self.send_and_receive(&DebuggerRequest::ResolveAddressToLine { pid, address }).ok()? {
-            DebuggerResponse::AddressLine { info: Some(info) } => {
+        match self.send_and_receive(&DebuggerRequest::ResolveAddressToLine { pid, address, wait: true }).ok()? {
+            DebuggerResponse::AddressLine { info: Some(info), .. } => {
                 Some((info.file.path, info.line_entry.line_start))
             }
             _ => None,

@@ -466,6 +466,51 @@ fn allocate_memory_internal(handle: HANDLE, size: usize, executable: bool) -> Re
     Ok(base as u64)
 }
 
+pub(super) fn protect_memory(
+    platform: &WindowsPlatform,
+    pid: u32,
+    address: u64,
+    size: usize,
+    protect: u32,
+) -> Result<u32, PlatformError> {
+    trace!(pid, address = %format!("0x{:X}", address), size, protect, "WindowsPlatform::protect_memory called");
+    match platform.get_process(pid) {
+        Ok(process) => protect_memory_internal(process.handle(), address, size, protect),
+        Err(_) => unsafe {
+            let handle = OpenProcess(PROCESS_VM_OPERATION, 0, pid);
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                let error = GetLastError();
+                return Err(PlatformError::OsError(format!(
+                    "OpenProcess(PROCESS_VM_OPERATION) failed: {} ({})",
+                    error,
+                    utils::error_message(error)
+                )));
+            }
+            let res = protect_memory_internal(handle, address, size, protect);
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+            res
+        },
+    }
+}
+
+fn protect_memory_internal(handle: HANDLE, address: u64, size: usize, protect: u32) -> Result<u32, PlatformError> {
+    let mut old_protect = 0u32;
+    unsafe {
+        if VirtualProtectEx(handle, address as *const _, size, protect, &mut old_protect) == 0 {
+            let error = GetLastError();
+            return Err(PlatformError::OsError(format!(
+                "VirtualProtectEx(0x{address:X}, {size} bytes, 0x{protect:X}) failed: {} ({})",
+                error,
+                utils::error_message(error)
+            )));
+        }
+        // Best-effort, as after a write: pages that gain or lose execute may be
+        // run next, and ARM64 caches are not coherent with the change.
+        FlushInstructionCache(handle, address as *const std::ffi::c_void, size);
+    }
+    Ok(old_protect)
+}
+
 pub(super) fn query_memory_region_unlocked(
     pid: u32,
     address: u64,
