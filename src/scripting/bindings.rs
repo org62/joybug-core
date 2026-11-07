@@ -7,6 +7,7 @@ use std::cell::RefCell;
 
 use mlua::prelude::*;
 
+use crate::decompiler::{DecompileRequest, SymbolSet};
 use crate::interfaces::{Architecture, ModuleSymbol};
 use crate::pe_types::{ImportDescriptorInfo, ImportItem, ImportKind, ModuleExtraInfo};
 use crate::protocol::*;
@@ -1168,6 +1169,35 @@ impl LuaUserData for LuaDebugClient {
                 )),
                 _ => Err(mlua::Error::external(anyhow::anyhow!("Unexpected response"))),
             }
+        });
+
+        // dbg:decompile(pid, addr) -> { name, start, size, code, lines = { { line, addresses } } }
+        // Pseudocode of the function containing `addr`. Decompiled here, in the
+        // client, from the module's file — so the file has to be readable from
+        // this machine, and bytes patched in the target's memory are not in it.
+        methods.add_method("decompile", |lua, this, (pid, addr): (u32, u64)| {
+            let mut client = this.inner.borrow_mut();
+            let module = list_modules_of(&mut client, pid)?
+                .into_iter()
+                .find(|m| m.contains(addr))
+                .ok_or_else(|| mlua::Error::external(anyhow::anyhow!("no module at 0x{addr:x}")))?;
+            let rva = addr - module.base;
+            let info = module_extra_info(&mut client, pid, module.base)?;
+            // Names are a refinement: a module whose symbols are not loaded decompiles without.
+            let symbols = match client.send_and_receive(&DebuggerRequest::ListSymbols { module_path: module.name.clone() }) {
+                Ok(DebuggerResponse::SymbolList { symbols }) => Some(SymbolSet::from_module_symbols(&symbols)),
+                _ => None,
+            };
+            let function = crate::decompiler::global()
+                .decompile(DecompileRequest {
+                    image_path: module.name,
+                    rva,
+                    function: info.runtime_function_bounds(rva as u32).map(|(begin, end)| (begin as u64, end as u64)),
+                    symbols,
+                    client: None,
+                })
+                .map_err(mlua::Error::external)?;
+            decompiled_to_lua_table(lua, &function, module.base)
         });
 
         methods.add_method("disassemble_backward", |lua, this, (pid, target, count): (u32, u64, Option<usize>)| {

@@ -73,7 +73,7 @@ The engine links Capstone, Keystone, Unicorn and Lua natively, so the build need
 - Visual Studio with **both** the MSVC and **LLVM/Clang** components, and `LIBCLANG_PATH` pointing at the libclang matching your host architecture — `build.rs` panics without it.
 - An MSVC developer shell (`vcvars64.bat`, or `Launch-VsDevShell.ps1 -Arch arm64`), since `build.rs` also compiles C test programs with `cl.exe`.
 - On ARM64, Keystone's bundled CMakeLists needs CMake < 4: `pip install cmake==3.31.6`, put it first on `PATH`, and set `CMAKE_GENERATOR=Ninja`.
-- Two dependencies are pulled from GitHub forks rather than crates.io, so the build needs network access.
+- Some dependencies are pulled from GitHub rather than crates.io (two forks, and the Kuna decompiler, pinned by revision), so the build needs network access.
 
 Integration tests under `tests/` need Windows with debugging privileges. The live Windows Sandbox tests need more: set `JOYBUG_SANDBOX_LIVE=1`; the freshly built `jlua.exe` is staged as the guest (override with `JOYBUG_SANDBOX_TEST_GUEST_EXE`). They self-skip when Windows Sandbox isn't available, and are serialized against each other because Windows allows only one sandbox per user.
 

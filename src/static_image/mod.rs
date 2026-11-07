@@ -7,7 +7,9 @@
 //! their format has (PDB discovery and resources; ELF debug files).
 
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+
+use crate::decompiler::{DecompileClient, DecompileError, DecompileRequest, Decompiled, SymbolSet};
 
 use crate::interfaces::{
     align_backward_instructions, backward_resync_window, decode_function_listing, Architecture,
@@ -80,6 +82,7 @@ pub struct StaticImage {
     mapped: OnceLock<MappedImage>,
     xrefs: OnceLock<XrefIndex>,
     functions: OnceLock<Vec<FunctionEntry>>,
+    decompiler_symbols: OnceLock<Arc<SymbolSet>>,
 }
 
 impl StaticImage {
@@ -100,6 +103,7 @@ impl StaticImage {
             mapped: OnceLock::new(),
             xrefs: OnceLock::new(),
             functions: OnceLock::new(),
+            decompiler_symbols: OnceLock::new(),
         };
         if let Some(parsed) = symbols {
             img.set_symbols(parsed);
@@ -233,6 +237,7 @@ impl StaticImage {
                 self.symbols = Some(syms);
                 // Symbol functions and names feed the recovered function list.
                 self.functions.take();
+                self.decompiler_symbols.take();
                 status
             }
             Err(e) => SymbolLoad { loaded: false, count: 0, error: Some(e) },
@@ -409,6 +414,34 @@ impl StaticImage {
         self.functions.get_or_init(|| {
             collect_functions(self.mapped(), &self.info, self.symbols.as_deref(), self.xrefs(), self.arch)
         })
+    }
+
+    // ---- Decompilation ----
+
+    /// What to ask the decompiler for the function containing `va`, on behalf
+    /// of `client` (see [`DecompileRequest::client`]). Split from the asking so
+    /// a caller holding a lock on the image can release it first: the engine
+    /// may take seconds.
+    pub fn decompile_request(&self, va: u64, client: Option<DecompileClient>) -> Option<DecompileRequest> {
+        let rva = va.checked_sub(self.base).filter(|rva| *rva < self.image_size())?;
+        let symbols = self.symbols.as_ref().map(|symbols| {
+            Arc::clone(self.decompiler_symbols.get_or_init(|| SymbolSet::from_module_symbols(symbols)))
+        });
+        Some(DecompileRequest {
+            image_path: self.path.clone(),
+            rva,
+            function: self.info.runtime_function_bounds(rva as u32).map(|(begin, end)| (begin as u64, end as u64)),
+            symbols,
+            client,
+        })
+    }
+
+    /// Pseudocode for the function containing `va` (addresses in the result
+    /// are RVAs). The decompiler reads the file on disk, so bytes edited here
+    /// and not saved yet are not in its output.
+    pub fn decompile(&self, va: u64) -> Result<Decompiled, DecompileError> {
+        let request = self.decompile_request(va, None).ok_or(DecompileError::NoFunction)?;
+        crate::decompiler::global().decompile(request)
     }
 
     // ---- Emulation ----

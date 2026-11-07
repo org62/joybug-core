@@ -471,6 +471,13 @@ local func = dbg:disassemble_function(pid, addr)
 print("Function: " .. (func.name or "unknown"))
 disasm(func.instructions)
 
+-- Decompile the function containing an address to C-like pseudocode. It is produced from the
+-- module's file as jlua sees it (not from the target's memory, so patched bytes are not in it;
+-- with a remote server the file must exist on this machine). `lines` maps a line of `code` to
+-- the live addresses of the instructions it came from.
+local fn = dbg:decompile(pid, addr)      -- { name, start, size, code, lines = { { line, addresses } } }
+print(fn.code)
+
 -- Backward disassembly: up to N instructions ending immediately before `target`
 -- (x64dbg-style self-resynchronizing decode). `target` should be a real instruction
 -- boundary. Useful for scrolling up past functions with no `.pdata` bounds.
@@ -1130,6 +1137,21 @@ img:disassemble(va[, n])                 -- n instructions from va
 img:disassemble_backward(va[, n])        -- n instructions ending exactly at va
 local fn = img:disassemble_function(va)  -- { instructions, start, end, name }
 -- Bounds come from .pdata (x64/ARM64) or from the recovered function list (x86).
+```
+
+**Decompilation** — C-like pseudocode of the function containing an address, by the
+[Kuna](https://github.com/Noelo-Lab/kuna) engine built into jlua (x86, x64, ARM64). Function
+names come from the image's loaded symbols:
+
+```lua
+local fn = img:decompile(va)             -- { name, start, size, code, lines }
+print(fn.code)
+for _, row in ipairs(fn.lines) do        -- which instructions a line of `code` came from
+    print(row.line, hex(row.addresses[1]))
+end
+-- The engine reads the file on disk: bytes changed with img:write and not saved are not in it.
+-- The first call on an image loads it into the engine (about a second; longer for a very
+-- large file); further functions of the same image take milliseconds.
 ```
 
 **Symbols** — a PDB next to the file (or in the local symbol cache) loads on `pe.open`;

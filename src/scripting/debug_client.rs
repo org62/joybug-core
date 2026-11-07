@@ -594,6 +594,25 @@ pub fn lua_table_to_context(table: &LuaTable, original: &ThreadContext) -> mlua:
     }
 }
 
+/// Convert a decompiled function to a Lua table, its addresses rebased from
+/// RVAs onto `base`: `{name, start, size, code, lines = {{line, addresses}}}`.
+pub fn decompiled_to_lua_table(lua: &Lua, function: &crate::decompiler::Decompiled, base: u64) -> mlua::Result<LuaTable> {
+    let table = lua.create_table()?;
+    table.set("name", function.name.as_str())?;
+    table.set("start", base + function.start_rva)?;
+    table.set("size", function.size)?;
+    table.set("code", function.code.as_str())?;
+    let lines = lua.create_table()?;
+    for mapping in &function.lines {
+        let row = lua.create_table()?;
+        row.set("line", mapping.line)?;
+        row.set("addresses", mapping.rvas.iter().map(|rva| base + rva).collect::<Vec<u64>>())?;
+        lines.push(row)?;
+    }
+    table.set("lines", lines)?;
+    Ok(table)
+}
+
 /// Convert an Instruction to a Lua table.
 pub fn instruction_to_lua_table(lua: &Lua, inst: &Instruction) -> mlua::Result<LuaTable> {
     let table = lua.create_table()?;

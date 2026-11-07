@@ -782,6 +782,12 @@ fn test_lua_file_disassembly_function() {
 }
 
 #[test]
+fn test_lua_file_disassembly_decompile() {
+    let test_exe = common::get_test_program_path("disassembly_test");
+    run_lua_test_file("disassembly/decompile.lua", Some(&test_exe));
+}
+
+#[test]
 fn test_lua_file_disassembly_mid_instruction() {
     let test_exe = common::get_test_program_path("disassembly_test");
     run_lua_test_file("disassembly/mid_instruction.lua", Some(&test_exe));
@@ -1086,6 +1092,12 @@ fn test_lua_file_pe_open_and_read() {
 fn test_lua_file_pe_disassembly() {
     let test_exe = common::get_test_program_path("xtea_test");
     run_lua_test_file_no_server("pe/disassembly.lua", Some(&test_exe));
+}
+
+#[test]
+fn test_lua_file_pe_decompile() {
+    let test_exe = common::get_test_program_path("xtea_test");
+    run_lua_test_file_no_server("pe/decompile.lua", Some(&test_exe));
 }
 
 #[test]

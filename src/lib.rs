@@ -13,6 +13,8 @@ pub mod elf;
 pub mod static_elf;
 pub mod static_image;
 pub mod static_pe;
+/// Pseudocode for a function of an image on disk (the Kuna engine).
+pub mod decompiler;
 pub mod windows_platform;
 pub mod server;
 pub mod framed_json_stream;

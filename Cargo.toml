@@ -84,6 +84,14 @@ gimli = { version = "0.31", default-features = false, features = ["read", "std"]
 crc32fast = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 rustc-demangle = "0.1"
+# The decompiler (`src/decompiler`): Kuna's engine, linked in. Pure Rust, not on
+# crates.io, so pinned by revision. Moving the pin means regenerating the
+# embedded processor specs: `cargo run --example update_kuna_specs`.
+kuna-console = { git = "https://github.com/Noelo-Lab/kuna", rev = "9f14fb06fd7faf145138e02c23a20b959a020512" }
+kuna-decomp = { git = "https://github.com/Noelo-Lab/kuna", rev = "9f14fb06fd7faf145138e02c23a20b959a020512" }
+kuna-base = { git = "https://github.com/Noelo-Lab/kuna", rev = "9f14fb06fd7faf145138e02c23a20b959a020512" }
+# The embedded spec bundle's compression (already in the lock via `object`).
+flate2 = "1"
 
 # Windows Sandbox control (wsb.exe wrapper + ETW tracer driver). No feature flag
 # on Windows - always compiled in; `sbx.status()` reports at runtime whether the
@@ -101,3 +109,19 @@ shlex = "1"
 
 [build-dependencies]
 cc = "1.0"
+
+# The decompiler engine is unusable unoptimized: a large function that takes
+# a fraction of a second in a release build runs past its time budget in a
+# plain dev build. So it is optimized in dev builds too.
+[profile.dev.package.kuna-base]
+opt-level = 3
+[profile.dev.package.kuna-num]
+opt-level = 3
+[profile.dev.package.kuna-sleigh]
+opt-level = 3
+[profile.dev.package.kuna-decomp]
+opt-level = 3
+[profile.dev.package.kuna-analysis]
+opt-level = 3
+[profile.dev.package.kuna-console]
+opt-level = 3

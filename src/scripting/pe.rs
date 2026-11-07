@@ -17,7 +17,7 @@ use crate::static_image::{EmulateSpec, StaticFile, StaticImage};
 use crate::static_pe::PeImage;
 
 use super::debug_client::{
-    arch_name, emulation_result_to_lua_table, instruction_to_lua_table, memory_reads_from_lua,
+    arch_name, decompiled_to_lua_table, emulation_result_to_lua_table, instruction_to_lua_table, memory_reads_from_lua,
     register_snapshot_to_lua_table, resolved_symbol_to_lua_table,
 };
 use super::opt;
@@ -237,6 +237,12 @@ impl LuaUserData for LuaPeImage {
             if let Some(e) = end { t.set("end", e)?; }
             if let Some(n) = name { t.set("name", n)?; }
             Ok(t)
+        });
+        // img:decompile(va) -> { name, start, size, code, lines = { { line, addresses } } }
+        // Pseudocode of the function containing `va`, from the file on disk.
+        methods.add_method("decompile", |lua, this, va: u64| {
+            let function = this.0.decompile(va).map_err(ext)?;
+            decompiled_to_lua_table(lua, &function, this.0.base())
         });
 
         // ---- Search ----
