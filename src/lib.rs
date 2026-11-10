@@ -52,6 +52,11 @@ pub mod guest_marker;
 /// The guest side of the sandbox desktop probes (`--ui` role).
 #[cfg(windows)]
 pub mod guest_desktop;
+/// Native interactive-console broker and its shared wire schema.
+#[cfg(windows)]
+pub mod console_protocol;
+#[cfg(windows)]
+pub mod guest_console;
 /// Raw-argv guest role dispatch shared by every guest-capable binary.
 pub mod guest_roles;
 /// Placeholder platform for OSes without a live-debugging backend yet.

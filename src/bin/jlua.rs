@@ -119,7 +119,9 @@ fn main() {
 
     if args.sandbox {
         #[cfg(windows)]
-        sandbox_mode(&args, script.as_deref());
+        if !sandbox_mode(&args, script.as_deref()) {
+            exit(1);
+        }
         #[cfg(not(windows))]
         {
             let _ = &script;
@@ -217,7 +219,7 @@ fn session_lua(args: &Args, server_addr: &str) -> mlua::Lua {
 /// against the live guest as long as you like — the boot cost is paid a single
 /// time (RETRO F3). On exit the VM is stopped unless `--keep-sandbox`.
 #[cfg(windows)]
-fn sandbox_mode(args: &Args, script: Option<&std::path::Path>) {
+fn sandbox_mode(args: &Args, script: Option<&std::path::Path>) -> bool {
     use joybug_core::sandbox;
 
     // Ctrl+C / console close stops any VM we provisioned, so a hard kill does
@@ -317,12 +319,14 @@ fn sandbox_mode(args: &Args, script: Option<&std::path::Path>) {
         joybug_core::scripting::sbx::wrap_handle(&lua, handle).expect("wrap sandbox handle");
     lua.globals().set("h", handle_ud).unwrap();
     lua.globals().set("sbx_info", info_tbl).unwrap();
+    let mut failed = false;
 
     // --command launches the guest target under the debugger.
     if !guest_cmd.is_empty() {
         let code = format!("dbg:launch({:?})", guest_cmd);
         if let Err(e) = lua.load(&code).exec() {
             eprintln!("failed to launch the guest target: {e}");
+            failed = true;
         }
     }
 
@@ -331,9 +335,13 @@ fn sandbox_mode(args: &Args, script: Option<&std::path::Path>) {
             Ok(code) => {
                 if let Err(e) = lua.load(&code).set_name(script_path.to_string_lossy()).exec() {
                     eprintln!("Script error: {}", e);
+                    failed = true;
                 }
             }
-            Err(e) => eprintln!("Failed to read script '{}': {}", script_path.display(), e),
+            Err(e) => {
+                eprintln!("Failed to read script '{}': {}", script_path.display(), e);
+                failed = true;
+            }
         }
     } else {
         eprintln!("Sandbox REPL. `dbg` talks to the guest; `h` is the sandbox, `sbx_info` its details.");
@@ -353,4 +361,5 @@ fn sandbox_mode(args: &Args, script: Option<&std::path::Path>) {
             eprintln!("warning: {e}");
         }
     }
+    !failed
 }

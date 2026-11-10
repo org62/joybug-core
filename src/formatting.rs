@@ -1,6 +1,72 @@
 use crate::protocol::*;
 use crate::interfaces::*;
 
+/// Known Windows loader failure statuses, without guessing the failing dependency.
+/// Other nonzero application exit codes are not startup failures.
+pub fn loader_failure(code: u32) -> Option<&'static str> {
+    match code {
+        0xC0000135 => Some("STATUS_DLL_NOT_FOUND: a required DLL could not be found"),
+        0xC000007B => Some("STATUS_INVALID_IMAGE_FORMAT: an executable or DLL has an invalid image format (for example, an architecture mismatch)"),
+        0xC0000139 => Some("STATUS_ENTRYPOINT_NOT_FOUND: a required entry point could not be found"),
+        0xC0000142 => Some("STATUS_DLL_INIT_FAILED: DLL initialization failed"),
+        0xC0150002 => Some("STATUS_SXS_CANT_GEN_ACTCTX: the side-by-side activation context could not be generated"),
+        _ => None,
+    }
+}
+
+/// Preserve the raw exit status as eight hexadecimal digits on every platform.
+pub fn process_exit_status(code: u32) -> String {
+    use std::fmt::Write;
+
+    let failure = loader_failure(code);
+    let mut status = String::with_capacity(10 + failure.map_or(0, |text| text.len() + 3));
+    write!(status, "0x{code:08X}").expect("writing to a String cannot fail");
+    if let Some(failure) = failure {
+        status.push_str(" (");
+        status.push_str(failure);
+        status.push(')');
+    }
+    status
+}
+
+#[cfg(test)]
+mod process_exit_status_tests {
+    use super::{loader_failure, process_exit_status};
+
+    #[test]
+    fn preserves_signed_windows_status_bits_and_identifies_loader_failures() {
+        let signed_status = -1_073_741_515i32;
+        assert_eq!(
+            process_exit_status(signed_status as u32),
+            "0xC0000135 (STATUS_DLL_NOT_FOUND: a required DLL could not be found)",
+        );
+        for (code, name) in [
+            (0xC0000135, "STATUS_DLL_NOT_FOUND"),
+            (0xC000007B, "STATUS_INVALID_IMAGE_FORMAT"),
+            (0xC0000139, "STATUS_ENTRYPOINT_NOT_FOUND"),
+            (0xC0000142, "STATUS_DLL_INIT_FAILED"),
+            (0xC0150002, "STATUS_SXS_CANT_GEN_ACTCTX"),
+        ] {
+            assert!(loader_failure(code).unwrap().starts_with(name));
+            assert!(process_exit_status(code).contains(name));
+        }
+    }
+
+    #[test]
+    fn ordinary_and_unknown_exit_codes_remain_numeric() {
+        for (code, expected) in [
+            (0, "0x00000000"),
+            (1, "0x00000001"),
+            (259, "0x00000103"),
+            (0xDEADBEEF, "0xDEADBEEF"),
+            (u32::MAX, "0xFFFFFFFF"),
+        ] {
+            assert_eq!(loader_failure(code), None);
+            assert_eq!(process_exit_status(code), expected);
+        }
+    }
+}
+
 /// Lowercased file-name portion of a module path ("C:\\x\\Foo.DLL" -> "foo.dll").
 /// The cross-run identity key for module matching (symbol deny lists,
 /// pointer-scan result rebinding) — keyed by name because bases change with

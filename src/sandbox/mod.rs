@@ -28,6 +28,7 @@
 //! without scraping `wsb.exe list --raw` by hand.
 
 mod config;
+pub mod console;
 pub mod guest_ui;
 pub mod preflight;
 pub mod rewrite;
@@ -239,6 +240,7 @@ pub fn stage_guest_bin(guest_bin_dir: &Path, io_dir: &Path) -> Result<PathBuf, S
 
 /// Copy the VC runtime DLLs the guest exe needs into `dir` (the bare sandbox
 /// image has no VC++ redistributable; the core binaries link it dynamically).
+/// Native dependencies in debug builds can also import the debug UCRT.
 /// Host arch == guest arch, so the host's own System32 copies are correct.
 /// Best-effort: a missing DLL is logged, not fatal (the failure would otherwise
 /// surface as a guest 0xC0000135).
@@ -246,7 +248,7 @@ fn stage_vc_runtime(dir: &Path) {
     let sys32 = std::env::var("SystemRoot")
         .map(|r| PathBuf::from(r).join("System32"))
         .unwrap_or_else(|_| PathBuf::from(r"C:\Windows\System32"));
-    for dll in ["vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll"] {
+    for dll in ["vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "ucrtbased.dll"] {
         let dst = dir.join(dll);
         if dst.exists() {
             continue;

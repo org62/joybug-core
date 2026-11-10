@@ -9,6 +9,7 @@
 //! |---|---|
 //! | `--out <file>` | ETW collector ([`crate::etw::run_collector`]) |
 //! | `--ui <mode>` | desktop probe ([`crate::guest_desktop::run_cli`]) |
+//! | `--console <mode>` | interactive console broker ([`crate::guest_console::run_cli`]) |
 //! | `--listen <addr>` | debug server ([`run_server`]) |
 //! | none of these | not a guest role: the caller continues normally |
 //!
@@ -26,6 +27,8 @@ use clap::{Args as _, FromArgMatches as _};
 /// `guest_desktop`, because the sniff must work on every OS while the probe
 /// itself is Windows-only.
 pub const DESKTOP_UI_ROLE_FLAG: &str = "--ui";
+/// Native console-broker role; selected only when it is the first argument.
+pub const CONSOLE_ROLE_FLAG: &str = "--console";
 
 /// Which guest role an invocation is.
 pub enum GuestRole {
@@ -33,6 +36,8 @@ pub enum GuestRole {
     Tracer,
     /// Desktop probe; it parses the whole argument list itself.
     DesktopUi,
+    /// Persistent native console broker; it parses its own argument list.
+    Console,
     /// Debug server.
     Server(ServerArgs),
 }
@@ -78,6 +83,9 @@ pub fn from_argv(argv: &[String]) -> Option<GuestRole> {
     if argv.first().map(String::as_str) == Some(DESKTOP_UI_ROLE_FLAG) {
         return Some(GuestRole::DesktopUi);
     }
+    if argv.first().map(String::as_str) == Some(CONSOLE_ROLE_FLAG) {
+        return Some(GuestRole::Console);
+    }
     if argv.iter().any(|a| a == "--out") {
         return Some(GuestRole::Tracer);
     }
@@ -101,8 +109,10 @@ pub fn run(role: GuestRole, argv: Vec<String>) -> ! {
         GuestRole::Tracer => crate::etw::run_collector(argv.into_iter()),
         #[cfg(windows)]
         GuestRole::DesktopUi => crate::guest_desktop::run_cli(argv.into_iter()),
+        #[cfg(windows)]
+        GuestRole::Console => crate::guest_console::run_cli(argv.into_iter()),
         #[cfg(not(windows))]
-        GuestRole::Tracer | GuestRole::DesktopUi => {
+        GuestRole::Tracer | GuestRole::DesktopUi | GuestRole::Console => {
             // The ETW collector and the desktop probe only exist inside a
             // Windows Sandbox guest; there is nothing to run here.
             let _ = argv;
@@ -153,6 +163,7 @@ mod tests {
     #[test]
     fn roles_are_picked_from_their_flags() {
         assert!(matches!(from_argv(&argv("--ui windows --ui-out x")), Some(GuestRole::DesktopUi)));
+        assert!(matches!(from_argv(&argv("--console start --config C:/io/config.json")), Some(GuestRole::Console)));
         assert!(matches!(from_argv(&argv("--out C:/io/e.jsonl -- target.exe")), Some(GuestRole::Tracer)));
         match from_argv(&argv("--listen 0.0.0.0:9000 --symbol-path srv*C:/s --offline")) {
             Some(GuestRole::Server(a)) => {
@@ -163,6 +174,7 @@ mod tests {
             _ => panic!("expected the server role"),
         }
         assert!(from_argv(&argv("script.lua --command x.exe")).is_none());
+        assert!(from_argv(&argv("script.lua --console start")).is_none());
         assert!(from_argv(&[]).is_none());
     }
 

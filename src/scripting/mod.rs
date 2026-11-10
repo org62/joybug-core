@@ -14,6 +14,8 @@ pub mod etw;
 /// In-process Windows Sandbox bindings (`sbx` global). Windows only.
 #[cfg(windows)]
 pub mod sbx;
+#[cfg(windows)]
+mod sbx_console;
 /// Offline PE analysis bindings (`pe` global).
 pub mod pe;
 

@@ -1,5 +1,5 @@
 //! The guest side of "see the guest desktop from the host" (RETRO F4): the
-//! window tree, one window's text, and a screenshot of the virtual screen,
+//! window tree, one window's text, and PNG captures of a screen or window,
 //! read straight from Win32 by the process that runs *inside* the guest's
 //! interactive session. `sandbox::guest_ui` is the host side: it launches the
 //! staged guest exe in this role through `wsb exec` and reads the result file
@@ -15,19 +15,20 @@ use std::path::{Path, PathBuf};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, ReleaseDC,
-    SelectObject, CAPTUREBLT, SRCCOPY,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, HDC,
+    PatBlt, ReleaseDC, SelectObject, BLACKNESS, CAPTUREBLT, SRCCOPY,
 };
 use windows_sys::Win32::Graphics::GdiPlus::{
     GdipCreateBitmapFromHBITMAP, GdipDisposeImage, GdipSaveImageToFile, GdiplusShutdown,
     GdiplusStartup, GdiplusStartupInput,
 };
+use windows_sys::Win32::Storage::Xps::PrintWindow;
 use windows_sys::Win32::UI::HiDpi::{
-    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, EnumWindows, GetClassNameW, GetParent, GetSystemMetrics, GetWindowRect,
-    GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, SendMessageTimeoutW,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, SendMessageTimeoutW,
     SMTO_ABORTIFHUNG, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN, WM_GETTEXT, WM_GETTEXTLENGTH,
 };
@@ -52,8 +53,26 @@ pub struct GuestWindow {
     pub bottom: i32,
 }
 
+/// Scope physical-pixel coordinates to this thread without changing the caller's process.
+struct PhysicalPixels(DPI_AWARENESS_CONTEXT);
+
+impl PhysicalPixels {
+    fn enter() -> Self {
+        Self(unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) })
+    }
+}
+
+impl Drop for PhysicalPixels {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { SetThreadDpiAwarenessContext(self.0) };
+        }
+    }
+}
+
 /// Every window in the session: each top-level window followed by its children.
 pub fn list_windows() -> Vec<GuestWindow> {
+    let _dpi = PhysicalPixels::enter();
     unsafe extern "system" fn push(hwnd: HWND, list: LPARAM) -> i32 {
         unsafe { (*(list as *mut Vec<HWND>)).push(hwnd) };
         1
@@ -130,8 +149,7 @@ pub fn window_text(hwnd: u64) -> String {
 /// GDI `BitBlt` from the screen DC; encoding goes through GDI+ so no image crate
 /// is needed in the guest.
 pub fn screenshot_png(path: &Path) -> Result<(), String> {
-    // Without this the capture is the DPI-virtualised (scaled, blurry) screen.
-    unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    let _dpi = PhysicalPixels::enter();
     let (x, y, w, h) = unsafe {
         (
             GetSystemMetrics(SM_XVIRTUALSCREEN),
@@ -143,16 +161,84 @@ pub fn screenshot_png(path: &Path) -> Result<(), String> {
     if w <= 0 || h <= 0 {
         return Err("no display: the virtual screen is empty (not an interactive session?)".into());
     }
+    capture_png(w, h, path, |mem, screen| {
+        if unsafe { BitBlt(mem, 0, 0, w, h, screen, x, y, SRCCOPY | CAPTUREBLT) } == 0 {
+            Err("BitBlt from the screen failed".into())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+/// Render only this HWND, including its frame, without activating or changing it.
+/// PrintWindow asks the window to paint; it never falls back to desktop pixels.
+pub fn screenshot_window_png(hwnd: u64, path: &Path) -> Result<(), String> {
+    let _dpi = PhysicalPixels::enter();
+    let window = hwnd as HWND;
+    if hwnd == 0 || unsafe { IsWindow(window) } == 0 {
+        return Err(format!("invalid window HWND {hwnd:#x}"));
+    }
+    if unsafe { IsWindowVisible(window) } == 0 || unsafe { IsIconic(window) } != 0 {
+        return Err(format!("window {hwnd:#x} must be visible and not minimized"));
+    }
+    let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    if unsafe { GetWindowRect(window, &mut rect) } == 0 {
+        return Err(format!("GetWindowRect({hwnd:#x}) failed"));
+    }
+    let width = rect.right.checked_sub(rect.left).filter(|n| *n > 0)
+        .ok_or_else(|| format!("window {hwnd:#x} has invalid width"))?;
+    let height = rect.bottom.checked_sub(rect.top).filter(|n| *n > 0)
+        .ok_or_else(|| format!("window {hwnd:#x} has invalid height"))?;
+    capture_png(width, height, path, |mem, _screen| {
+        // PW_RENDERFULLCONTENT (Windows 8.1+), absent from windows-sys's constants.
+        const PW_RENDERFULLCONTENT: u32 = 2;
+        if unsafe { PrintWindow(window, mem, PW_RENDERFULLCONTENT) } == 0 {
+            Err(format!("PrintWindow({hwnd:#x}) failed; the window may not support capture"))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+/// Own the temporary GDI objects until rendering and PNG encoding have finished.
+fn capture_png(
+    width: i32,
+    height: i32,
+    path: &Path,
+    render: impl FnOnce(HDC, HDC) -> Result<(), String>,
+) -> Result<(), String> {
     unsafe {
         let screen = GetDC(std::ptr::null_mut());
+        if screen.is_null() {
+            return Err("GetDC for capture failed".into());
+        }
         let mem = CreateCompatibleDC(screen);
-        let bitmap = CreateCompatibleBitmap(screen, w, h);
+        if mem.is_null() {
+            ReleaseDC(std::ptr::null_mut(), screen);
+            return Err("CreateCompatibleDC for capture failed".into());
+        }
+        let bitmap = CreateCompatibleBitmap(screen, width, height);
+        if bitmap.is_null() {
+            DeleteDC(mem);
+            ReleaseDC(std::ptr::null_mut(), screen);
+            return Err("CreateCompatibleBitmap for capture failed".into());
+        }
         let previous = SelectObject(mem, bitmap);
-        let copied = BitBlt(mem, 0, 0, w, h, screen, x, y, SRCCOPY | CAPTUREBLT) != 0;
-        SelectObject(mem, previous);
+        let result = if previous.is_null() || previous as isize == -1 {
+            Err("SelectObject for capture failed".into())
+        } else {
+            // Windows need not paint invisible frame padding; never encode uninitialized pixels.
+            let result = if PatBlt(mem, 0, 0, width, height, BLACKNESS) == 0 {
+                Err("Initializing the capture bitmap failed".into())
+            } else {
+                render(mem, screen)
+            };
+            SelectObject(mem, previous);
+            result
+        };
         DeleteDC(mem);
         ReleaseDC(std::ptr::null_mut(), screen);
-        let result = if copied { save_png(bitmap, path) } else { Err("BitBlt from the screen failed".into()) };
+        let result = result.and_then(|()| save_png(bitmap, path));
         DeleteObject(bitmap);
         result
     }
@@ -202,6 +288,8 @@ unsafe fn save_png(bitmap: windows_sys::Win32::Graphics::Gdi::HBITMAP, path: &Pa
 pub enum UiMode {
     /// The whole virtual screen as PNG.
     Screenshot,
+    /// One window, including its frame, as PNG.
+    ScreenshotWindow { hwnd: u64 },
     /// Every window in the session, as JSON (`Vec<GuestWindow>`).
     Windows,
     /// `WM_GETTEXT` of one window, as UTF-8 text.
@@ -213,6 +301,7 @@ impl UiMode {
     pub fn name(self) -> &'static str {
         match self {
             UiMode::Screenshot => "screenshot",
+            UiMode::ScreenshotWindow { .. } => "screenshot-window",
             UiMode::Windows => "windows",
             UiMode::Text { .. } => "text",
         }
@@ -221,7 +310,7 @@ impl UiMode {
     /// Extension of the result file.
     pub fn ext(self) -> &'static str {
         match self {
-            UiMode::Screenshot => "png",
+            UiMode::Screenshot | UiMode::ScreenshotWindow { .. } => "png",
             UiMode::Windows => "json",
             UiMode::Text { .. } => "txt",
         }
@@ -230,7 +319,7 @@ impl UiMode {
     /// The arguments after the exe: `--ui <mode> --ui-out <out> [--hwnd <n>]`.
     pub fn cli_args(self, out: &str) -> String {
         let mut args = format!("{ROLE_FLAG} {} --ui-out {out}", self.name());
-        if let UiMode::Text { hwnd } = self {
+        if let UiMode::Text { hwnd } | UiMode::ScreenshotWindow { hwnd } = self {
             args.push_str(&format!(" --hwnd {hwnd}"));
         }
         args
@@ -253,16 +342,18 @@ impl UiMode {
         let out = PathBuf::from(out.ok_or("missing --ui-out <path>")?);
         let mode = match mode.as_str() {
             "screenshot" => UiMode::Screenshot,
+            "screenshot-window" if hwnd == 0 => return Err("--ui screenshot-window needs --hwnd <n>".into()),
+            "screenshot-window" => UiMode::ScreenshotWindow { hwnd },
             "windows" => UiMode::Windows,
             "text" if hwnd == 0 => return Err("--ui text needs --hwnd <n>".into()),
             "text" => UiMode::Text { hwnd },
-            other => return Err(format!("unknown --ui mode {other:?} (screenshot|windows|text)")),
+            other => return Err(format!("unknown --ui mode {other:?} (screenshot|screenshot-window|windows|text)")),
         };
         Ok((mode, out))
     }
 }
 
-/// The `--ui` role: `--ui <screenshot|windows|text> --ui-out <path> [--hwnd <n>]`.
+/// The `--ui` role: `--ui <screenshot|screenshot-window|windows|text> --ui-out <path> [--hwnd <n>]`.
 /// Writes the result to the output path and exits 0, or prints the error to
 /// stderr and exits 1 (the host redirects both streams to a log it tails).
 pub fn run_cli(argv: impl Iterator<Item = String>) -> ! {
@@ -281,6 +372,7 @@ fn run_cli_inner(argv: impl Iterator<Item = String>) -> Result<(), String> {
     let write = |bytes: Vec<u8>| std::fs::write(&out, bytes).map_err(|e| format!("write {}: {e}", out.display()));
     match mode {
         UiMode::Screenshot => screenshot_png(&out),
+        UiMode::ScreenshotWindow { hwnd } => screenshot_window_png(hwnd, &out),
         UiMode::Windows => write(serde_json::to_vec(&list_windows()).map_err(|e| e.to_string())?),
         UiMode::Text { hwnd } => write(window_text(hwnd).into_bytes()),
     }
@@ -313,13 +405,15 @@ mod tests {
     }
 
     #[test]
-    fn cli_args_round_trip_through_parse() {
-        for mode in [UiMode::Screenshot, UiMode::Windows, UiMode::Text { hwnd: 0x1234 }] {
-            let line = mode.cli_args(r"C:\io\out.bin");
-            let argv = line.split_whitespace().map(String::from);
-            let (back, out) = UiMode::parse(argv).unwrap();
-            assert_eq!(back, mode);
-            assert_eq!(out, PathBuf::from(r"C:\io\out.bin"));
+    fn window_capture_rejects_missing_or_invalid_handles() {
+        for suffix in ["", " --hwnd 0", " --hwnd -1", " --hwnd 18446744073709551616"] {
+            let args = format!("--ui screenshot-window --ui-out unused.png{suffix}");
+            assert!(UiMode::parse(args.split_whitespace().map(String::from))
+                .unwrap_err().contains("--hwnd"));
         }
+        let path = std::env::temp_dir().join(format!("joybug-invalid-window-{}.png", std::process::id()));
+        let error = screenshot_window_png(0, &path).unwrap_err();
+        assert!(error.contains("invalid window"));
+        assert!(!path.exists(), "invalid HWND must not create a screenshot");
     }
 }

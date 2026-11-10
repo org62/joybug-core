@@ -1041,6 +1041,7 @@ dependencies = [
  "tracing-subscriber",
  "unicorn-engine",
  "uuid",
+ "windows 0.61.3",
  "windows-sys 0.59.0",
  "winsandbox",
 ]

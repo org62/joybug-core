@@ -16,7 +16,7 @@
 //! Recovery and introspection: `sbx.list()`, `sbx.stop(id)`, `sbx.stop_all()`,
 //! `sbx.attach(id)` (adopt a VM a crashed script left behind) and `sbx.ops()`
 //! (the ETW op vocabulary). Guest desktop access lives on the handle:
-//! `h:exec`, `h:screenshot`, `h:list_windows`, `h:window_text`.
+//! `h:exec`, `h:screenshot`, `h:screenshot_window`, `h:list_windows`, `h:window_text`.
 //!
 //! Windows-only.
 
@@ -55,7 +55,7 @@ impl SbxHandle {
     }
 
     /// Run `f` against the live handle, or error once stopped.
-    fn with<R>(&self, f: impl FnOnce(&SandboxHandle) -> mlua::Result<R>) -> mlua::Result<R> {
+    pub(super) fn with<R>(&self, f: impl FnOnce(&SandboxHandle) -> mlua::Result<R>) -> mlua::Result<R> {
         let guard = self.0.borrow();
         let h = guard.as_ref().ok_or_else(|| mlua::Error::external("sbx handle already stopped"))?;
         f(h)
@@ -76,6 +76,8 @@ fn run_as_from(opts: Option<&LuaTable>) -> mlua::Result<sandbox::RunAs> {
 
 impl LuaUserData for SbxHandle {
     fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
+        super::sbx_console::add_handle_methods(methods);
+
         // Stop the VM now (`wsb stop`). Idempotent — a second call, or the GC
         // drop, is a no-op once the handle has been taken. Works for attached
         // handles too (explicit stop is the one way they end a VM).
@@ -127,6 +129,16 @@ impl LuaUserData for SbxHandle {
             let dest = path.filter(|s| !s.is_empty()).map(PathBuf::from);
             this.with(|h| {
                 sandbox::guest_ui::screenshot(h, dest.as_deref())
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .map_err(mlua::Error::external)
+            })
+        });
+
+        // h:screenshot_window(hwnd[, host_path]) -> host_path of the PNG
+        methods.add_method("screenshot_window", |_lua, this, (hwnd, path): (u64, Option<String>)| {
+            let dest = path.filter(|s| !s.is_empty()).map(PathBuf::from);
+            this.with(|h| {
+                sandbox::guest_ui::screenshot_window(h, hwnd, dest.as_deref())
                     .map(|p| p.to_string_lossy().into_owned())
                     .map_err(mlua::Error::external)
             })

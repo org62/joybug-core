@@ -1260,6 +1260,17 @@ so a wrong or stale binary fails immediately with a clear message instead of
 producing an empty capture or a hung request. The folder is snapshotted into the
 session's `io_dir` and *that* is shared into the VM, so your build output is
 never locked while a sandbox is up.
+The snapshot also includes the host's VC runtime DLLs, including `ucrtbased.dll`
+needed by native dependencies in debug builds; the bare guest does not provide
+the development-machine runtime.
+These DLLs are local to the staged Joybug executable, not a system-wide
+redistributable installation for targets in other folders.
+
+`jlua --sandbox -s script.lua` returns exit status `1` for a script read error,
+an uncaught Lua error, or an initial guest-launch request error, after the normal
+teardown path. Errors deliberately handled by the script do not force a failing
+CLI status; inspect the target's own exit code when that is the result you need.
+
 
 ```lua
 -- Availability (no VM booted): { supported, build, wsb_present, reason }
@@ -1313,8 +1324,8 @@ stops the VM — `false` for an `attach`ed one).
 `h:info()` (the same table, or `nil` once stopped), `h:run_traced()` (run-only
 handles only — see below; **errors, with the tracer's own message, if the guest
 collector never started** instead of returning zero events), and the guest-desktop
-methods `h:exec`, `h:screenshot`, `h:list_windows`, `h:window_text` (see *Seeing
-the guest desktop* below).
+methods `h:exec`, `h:screenshot`, `h:screenshot_window`, `h:list_windows`, `h:window_text` (see *Seeing
+the guest desktop* below), plus `h:console` and `h:attach_console` for interactive consoles.
 
 **Recovery and introspection** (module functions, no VM needed to call):
 - `sbx.list()` → ids of every sandbox running for this user.
@@ -1335,8 +1346,8 @@ the guest desktop* below).
 
 A payload that ends in "a form shows a string" gives it up without pixels: the
 handle launches the staged guest exe in its `--ui` role *inside* the guest's
-interactive session (plain Win32: `EnumWindows`, `WM_GETTEXT`, a `BitBlt` of the
-virtual screen encoded by GDI+) and returns the result through the `C:\io` share.
+interactive session (plain Win32: `EnumWindows`, `WM_GETTEXT`, screen `BitBlt` or
+HWND-targeted `PrintWindow`, encoded by GDI+) and returns the result through the `C:\io` share.
 
 ```lua
 local code, out = h:exec([[start "" notepad.exe]], { run_as = "user" })  -- run_as: "user"|"system"
@@ -1345,11 +1356,136 @@ for _, w in ipairs(h:list_windows()) do        -- every top-level + child window
 end
 local text = h:window_text(some_hwnd)           -- WM_GETTEXT: reads edit-box contents too
 local png  = h:screenshot()                     -- or h:screenshot([[C:\host\shot.png]])
+-- Capture one particular window instead of the desktop:
+local shot = h:screenshot_window(some_hwnd, [[C:\host\window.png]])
 ```
 
 `h:exec(cmd[, {run_as=}])` returns `(exit_code, output)` (captured through the
 share). The window list, text and screenshot all run as the interactive user, so
 the screenshot is the visible desktop, not a black session-0 frame.
+
+`h:screenshot_window(hwnd[, host_path])` returns the host path of a PNG of that guest
+window, including its frame and title bar. Omitting the path leaves the result in the
+I/O share, just like `h:screenshot()`. Choose the HWND from `h:list_windows()`; a PID can
+own multiple windows, and a console shared by `cmd.exe` and Python may belong to the
+console host rather than either process.
+
+Window capture uses `PrintWindow` with `PW_RENDERFULLCONTENT`, not a desktop crop.
+It does not activate, raise, resize, restore, or retitle the window. The HWND must
+still exist, be visible, and not be minimized; invalid targets and Win32 failures
+return errors. Windows that do not implement printing, protected surfaces, and some
+GPU-rendered content may produce incomplete or blank images even when Win32 reports
+success. There is no silent fallback to desktop capture. `PrintWindow` is synchronous
+and can wait on an unresponsive target.
+
+Captures and `list_windows()` rectangles use physical pixels, including on scaled
+displays. The guest role is also directly available as
+`jlua --ui screenshot-window --ui-out C:\io\window.png --hwnd <decimal HWND>`.
+
+### Interactive guest consoles
+
+`h:console(command[, {cwd=..., environment={KEY="VALUE"}, ansi=true/false}])`
+launches a guest command in a new, visible console. `h:attach_console(pid[, {ansi=true/false}])`
+attaches to an existing guest process's console. Both return console userdata; the
+handle must know its `io_dir` and `guest_exe` (supply both to `sbx.attach`).
+Commands, working directories and environment values are **guest paths/values**;
+these methods do not rewrite host mount paths. Launch is native `CreateProcessW`,
+not a shell: explicitly use `cmd.exe` when shell built-ins or syntax are needed.
+The target runs independently of `dbg`; attach to its `pid` separately to debug it.
+
+No helper PowerShell/C# script or redirected stdin is needed. The API does not
+retitle, resize, restyle, or forcibly focus the console; normal OS launch behavior
+still applies. Omitting `ansi` leaves console output modes untouched;
+`ansi=true` explicitly enables virtual-terminal processing and processed output,
+and `ansi=false` disables virtual-terminal processing while preserving other flags.
+A shell such as `cmd.exe` can reset modes during initialization, so call
+`c:set_ansi(true)` **after** its prompt appears when needed.
+
+| Method | Result / behavior |
+|---|---|
+| `c:read()` | Current snapshot table (fields below). |
+| `c:write(text)` | Inject Unicode key events verbatim, without Enter. |
+| `c:send_line(text)` | Inject text verbatim followed by Enter (CR); existing newlines are not rewritten. |
+| `c:set_ansi(enabled)` | Explicitly set ANSI output handling. |
+| `c:wait_text(literal[, timeout_ms=5000])` | Snapshot whose visible text contains the literal substring, not a Lua pattern. |
+| `c:wait_exit([timeout_ms=5000])` | Snapshot after the root process exits, with its real exit code. |
+| `c:screenshot([host_path])` | PNG host path, using the current console HWND and `h:screenshot_window` semantics. |
+| `c:close()` | Idempotently release the broker/console attachment, not terminate the target. |
+
+Snapshots contain `pid`, `hwnd`, `text`, `running`, `exit_code` (`nil` while running),
+`input_mode`, `output_mode`, `columns`, `rows`, `cursor_x`, and `cursor_y`. The HWND is
+the actual console window, which need not belong to the target PID. Cursor coordinates
+are absolute screen-buffer coordinates. **Text is the visible viewport, not output
+history**: trailing spaces/empty rows are trimmed; output scrolled away is not retained.
+Console text comes from the UI Automation text provider, preserving complete Unicode
+graphemes instead of the legacy cell API's
+[U+FFFD projection](https://github.com/microsoft/terminal/issues/16892).
+Reads are not frame-atomic with simultaneous output or viewport changes.
+Waits can therefore miss transient/scrolled text, and echoed input can itself match.
+`wait_text` errors on timeout (including last visible text) or exit without a match;
+`wait_exit` errors on timeout. Input uses the target's existing console modes, including
+its normal echo and line-input behavior; writing does not mean the application has
+already consumed the input.
+
+If the target exits before console attachment or text-reader initialization
+completes, initialization reports its actual hexadecimal exit status. A known
+Windows loader failure already visible in
+the initial snapshot also fails initialization rather than reporting startup success.
+Premature-exit errors from `wait_text` include that status and the last visible text;
+known statuses include a symbolic name and explanation, for example
+`0xC0000135 (STATUS_DLL_NOT_FOUND: a required DLL could not be found)`.
+This does not identify the missing DLL or install dependencies. `wait_exit` still
+returns the raw numeric `exit_code`, including ordinary nonzero application returns.
+
+For example, with `h` from `sbx.provision` or the `jlua --sandbox` REPL:
+
+```lua
+local c = h:console([[C:\Windows\System32\cmd.exe /d /k]])
+c:wait_text(">", 5000)             -- wait until cmd has initialized its modes
+c:set_ansi(true)                   -- explicit; no default mode/title decoration
+c:send_line([[set /p answer=Name:]])
+c:wait_text("Name:", 5000)
+c:write("Ada")                    -- no Enter yet
+c:send_line("")                   -- submit the answer
+c:send_line([[echo Hello %answer%]])
+print(c:wait_text("Hello Ada", 5000).text)
+print(c:screenshot())             -- real console window; PNG in the host I/O share
+c:send_line("exit /b 7")
+assert(c:wait_exit(5000).exit_code == 7)
+c:close()
+h:stop()
+```
+
+Startup is bounded to 30 seconds; ordinary operations and close wait up to 5 seconds,
+and explicit waits allow their requested timeout plus 5 seconds for transport.
+Each session pre-creates append-only `requests.jsonl` and `responses.jsonl` streams
+in its unique I/O directory, avoiding Windows Sandbox's missing-file cache.
+Messages have sequence numbers: a late response is never reused as a later result.
+A timeout does not cancel a published command; later commands (including close)
+remain queued behind it. Streams and initial metadata remain for diagnostics.
+Screenshots inherit `PrintWindow`'s synchronous/unresponsive-window limitations above.
+
+The console keeps its parent Lua sandbox handle alive even if the script drops `h`.
+Closing releases that reference; GC sends a best-effort close without waiting.
+Other operations on a closed console error, and explicit `h:stop()` invalidates
+subsequent console operations immediately (`c:close()` remains safe). Closing/GC
+never kills an attached or launched target; it can outlive the console session while
+the VM lives. Releasing the last owning sandbox handle still stops the whole VM.
+The broker retains its attachment and process handle after root exit, so the final
+buffer and exit code remain readable until close.
+The text provider is retained too, rather than rediscovered from a window tree that
+can change after root exit.
+
+Very fast programs may exit before the initial console attachment succeeds; this
+is an error, not fabricated retained output. To inspect short commands, launch a
+persistent shell and send them through it, as above. Attachment requires a live
+console process in the guest interactive session, not a GUI-only process or a PID
+whose console has already disappeared. Exit status tracks the root process, not
+every child sharing its console.
+Classic Win32 console windows are supported; a ConPTY/Windows Terminal message-only
+HWND is not a visible text/capture target. The console host must remain responsive:
+when debugging the application, do not also freeze its console host under child
+debugging while waiting for console input or accessibility reads.
 
 ### Provisioning once, iterating (`jlua --sandbox`)
 
@@ -1369,6 +1505,22 @@ itself a valid guest), `--guest-exe`, `--io-dir`, `--mount <path>[:rw|:ro]`
 REPL, relaunch the target with `dbg:launch(sbx_info.guest_launch_command)` and run
 `dofile("script.lua")` against the live guest as many times as you like. Ctrl+C
 stops the VM so a hard kill never leaves it occupied.
+
+**Python targets.** Mount a complete Python runtime and the script folder
+read-only, then debug the interpreter with the script as its argument:
+
+```text
+jlua --sandbox --mount C:\Python314:ro --mount C:\samples:ro --command "C:\Python314\python.exe -I C:\mounts\samples\example.py"
+```
+
+The executable and working directory are translated to guest paths; argument
+paths are preserved, so the script argument must already name its guest path.
+Use the full runtime, not a venv that references an unmapped host installation.
+This is native CPython debugging, not Python source-level stepping. A breakpoint
+on `python314!Py_CompileStringObject` can inspect dynamically compiled UTF-8
+source through its first argument without installing a Python tracing hook.
+For console redirection, launch guest `cmd.exe /c ...` with `debug_children=true`
+(`dbg:launch(command, true)`) so the interpreter child remains debugged.
 
 **Sandbox + ETW, no UAC.** Collecting ETW *inside* the sandbox needs no UAC prompt
 — kernel ETW runs as the sandbox's built-in admin. Provision **run-only**

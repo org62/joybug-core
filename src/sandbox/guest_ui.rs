@@ -1,5 +1,5 @@
-//! See the guest desktop from the host (RETRO F4): a screenshot, the window
-//! tree, and any window's text — including the contents of an edit control,
+//! See the guest desktop from the host (RETRO F4): screen/window screenshots,
+//! the window tree, and any window's text — including the contents of an edit control,
 //! which is how a payload that "displays a string on a form" gives it up
 //! without pixels.
 //!
@@ -34,9 +34,10 @@ fn run_mode(handle: &SandboxHandle, mode: UiMode) -> Result<PathBuf, String> {
     // The interactive session: a screenshot of session 0 would be black, and
     // the target's windows live on the visible desktop.
     let (code, log) = exec_capture(handle, &cmd, RunAs::ExistingLogin)?;
-    if host_out.exists() {
+    if code == 0 && host_out.is_file() {
         return Ok(host_out);
     }
+    let _ = std::fs::remove_file(&host_out);
     let tail = tail_lines(&log, 12);
     Err(format!(
         "guest UI role ({}) produced no output (exit code {code}){}",
@@ -56,6 +57,20 @@ fn take_result(path: &Path) -> Result<Vec<u8>, String> {
 /// moved there; otherwise it stays in the io share and that path is returned.
 pub fn screenshot(handle: &SandboxHandle, host_out: Option<&Path>) -> Result<PathBuf, String> {
     let produced = run_mode(handle, UiMode::Screenshot)?;
+    move_screenshot(produced, host_out)
+}
+
+/// Render a guest HWND, including its frame, without capturing other windows.
+pub fn screenshot_window(
+    handle: &SandboxHandle,
+    hwnd: u64,
+    host_out: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let produced = run_mode(handle, UiMode::ScreenshotWindow { hwnd })?;
+    move_screenshot(produced, host_out)
+}
+
+fn move_screenshot(produced: PathBuf, host_out: Option<&Path>) -> Result<PathBuf, String> {
     match host_out {
         Some(dest) => {
             if let Some(parent) = dest.parent() {

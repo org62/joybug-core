@@ -41,6 +41,7 @@ windows-sys = { version = "0.59.0", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_ProcessStatus",
     "Win32_Storage_FileSystem",
+    "Win32_Storage_Xps",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_SystemInformation",
@@ -102,6 +103,15 @@ flate2 = "1"
 # that use it are gated the same way in lib.rs.
 [target.'cfg(windows)'.dependencies]
 winsandbox = { path = "winsandbox" }
+# UI Automation preserves complete console graphemes; legacy cell reads replace
+# non-BMP characters with U+FFFD on current Windows.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_UI_Accessibility",
+] }
 
 # The Linux (ptrace) backend: raw ptrace/procfs through libc, shell-style
 # command-line splitting for `launch`.
