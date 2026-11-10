@@ -283,6 +283,10 @@ where
                 }
             }
             DebuggerRequest::ResumeThread { pid, tid } => {
+                // Exclude listings' suspend-count check and context sample.
+                #[cfg(windows)]
+                let p = platform.write().unwrap();
+                #[cfg(not(windows))]
                 let p = platform.read().unwrap();
                 match p.resume_thread(pid, tid) {
                     Ok(_) => DebuggerResponse::Ack,

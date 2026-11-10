@@ -1184,7 +1184,11 @@ impl PlatformAPI for LinuxPlatform {
     }
 
     fn list_threads(&self, pid: u32) -> Result<Vec<ThreadInfo>, PlatformError> {
-        Ok(self.process(pid)?.os.threads.lock().unwrap().list_threads())
+        let mut rows = self.process(pid)?.os.threads.lock().unwrap().list_threads();
+        for row in &mut rows {
+            row.suspend_count = Some(row.suspend_count.unwrap_or(0));
+        }
+        Ok(rows)
     }
 
     fn list_processes(&self) -> Result<Vec<ProcessInfo>, PlatformError> {
@@ -1313,8 +1317,8 @@ impl PlatformAPI for LinuxPlatform {
         let previous = {
             let mut threads = process.os.threads.lock().unwrap();
             let info = threads.info_mut(tid).ok_or_else(|| PlatformError::Other(format!("thread {tid} not found")))?;
-            let previous = info.suspend_count;
-            info.suspend_count += 1;
+            let previous = info.suspend_count.unwrap_or(0);
+            info.suspend_count = Some(previous + 1);
             previous
         };
         process.os.tracer.hold(tid)?;
@@ -1326,11 +1330,11 @@ impl PlatformAPI for LinuxPlatform {
         let previous = {
             let mut threads = process.os.threads.lock().unwrap();
             let info = threads.info_mut(tid).ok_or_else(|| PlatformError::Other(format!("thread {tid} not found")))?;
-            let previous = info.suspend_count;
+            let previous = info.suspend_count.unwrap_or(0);
             if previous == 0 {
                 return Ok(0);
             }
-            info.suspend_count -= 1;
+            info.suspend_count = Some(previous - 1);
             previous
         };
         process.os.tracer.release(tid)?;

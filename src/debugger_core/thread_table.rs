@@ -30,6 +30,27 @@ impl<H> ThreadTable<H> {
         self.threads.insert(tid, (info, payload));
     }
 
+    pub fn live_info(&self, tid: u32) -> Option<&ThreadInfo> {
+        self.threads.get(&tid).filter(|_| self.is_live(tid)).map(|(info, _)| info)
+    }
+
+    /// Notifications cannot resurrect a thread after its exit event.
+    pub fn set_name(&mut self, tid: u32, name: Option<String>) -> bool {
+        if !self.is_live(tid) {
+            return false;
+        }
+        if let Some((info, _)) = self.threads.get_mut(&tid) {
+            info.name = name;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn iter_live_info(&self) -> impl Iterator<Item = (&ThreadInfo, &H)> + '_ {
+        self.live().map(|(_, (info, payload))| (info, payload))
+    }
+
     /// Mark a thread as exited; see [`exited`](Self::exited).
     pub fn remove_thread(&mut self, tid: u32) {
         if self.threads.contains_key(&tid) && !self.exited.contains(&tid) {
@@ -93,5 +114,30 @@ impl<H> ThreadTable<H> {
         // Both halves, or a recycled tid in the next process incarnation would
         // stay filtered out of `live()` forever.
         self.exited.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ThreadTable;
+
+    #[test]
+    fn names_follow_live_thread_incarnations() {
+        let mut threads = ThreadTable::new();
+        assert!(!threads.set_name(7, Some("absent".into())));
+        threads.insert(7, 10, 42);
+        assert!(threads.set_name(7, Some("first".into())));
+        threads.remove_thread(7);
+        assert!(!threads.set_name(7, Some("exited".into())));
+        assert!(threads.live_info(7).is_none());
+        assert_eq!(threads.get(7), Some(&42));
+        threads.purge_exited();
+        threads.insert(7, 20, 43);
+        assert_eq!(threads.live_info(7).unwrap().name, None);
+        assert!(threads.set_name(7, Some("second".into())));
+        threads.insert(7, 30, 44);
+        assert_eq!(threads.live_info(7).unwrap().name, None);
+        threads.clear();
+        assert!(threads.live_info(7).is_none());
     }
 }

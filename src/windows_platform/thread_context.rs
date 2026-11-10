@@ -25,6 +25,26 @@ use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_ALL_AMD64 as CONTEXT
 #[cfg(target_arch = "aarch64")]
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_ALL_ARM64 as CONTEXT_ALL_NATIVE;
 
+/// A quiet CONTROL-only sample. Caller must establish a positive native suspend
+/// count first; this helper never suspends or changes the regular register path.
+pub(super) fn sample_instruction_pointer(handle: HANDLE, arch: Architecture) -> Option<u64> {
+    if arch == Architecture::X86 {
+        let mut context: WOW64_CONTEXT = unsafe { std::mem::zeroed() };
+        context.ContextFlags = windows_sys::Win32::System::Diagnostics::Debug::WOW64_CONTEXT_CONTROL;
+        return (unsafe { Wow64GetThreadContext(handle, &mut context) } != 0).then_some(context.Eip as u64);
+    }
+    let mut aligned = AlignedContext { context: unsafe { std::mem::zeroed() } };
+    #[cfg(target_arch = "x86_64")]
+    { aligned.context.ContextFlags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_AMD64; }
+    #[cfg(target_arch = "aarch64")]
+    { aligned.context.ContextFlags = windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_CONTROL_ARM64; }
+    if unsafe { GetThreadContext(handle, &mut aligned.context) } == 0 { return None; }
+    #[cfg(target_arch = "x86_64")]
+    { Some(aligned.context.Rip) }
+    #[cfg(target_arch = "aarch64")]
+    { Some(aligned.context.Pc) }
+}
+
 fn last_os_error(what: &str) -> PlatformError {
     let error = unsafe { GetLastError() };
     let error_str = utils::error_message(error);
@@ -91,9 +111,9 @@ pub(super) fn get_thread_context_os(
     match os.architecture() {
         Architecture::X86 => match get_wow64_context(handle) {
             Ok(ctx) => Ok(ThreadContext::Wow64RawContext(ctx)),
-            // A thread with no 32-bit half — the 64-bit break-in thread that
-            // `DebugBreakProcess`/attach inject into a WOW64 process — has no
-            // WOW64 context. Report its native one so the event can still be
+            // A thread with no 32-bit half — the native break-in thread that
+            // pause/attach inject into a WOW64 process — has no WOW64 context.
+            // Report its native one so the event can still be
             // shown rather than failing the whole stop.
             Err(e) => {
                 debug!(pid, tid, error = %e, "No WOW64 context for thread; falling back to the native context");

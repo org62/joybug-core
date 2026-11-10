@@ -189,3 +189,94 @@ fn test_sample_sees_debugger_launched_values_without_normalize() {
     assert_ne!(code & DETECT_BEING_DEBUGGED, 0,
         "BeingDebugged bit (0x1) must be set under the debugger, got 0x{:x}", code);
 }
+
+/// Exercise the normal flag first, then clear it and request two more breaks.
+/// The separate control connection is the same out-of-band path the UI uses.
+/// A finite target makes a missing breakpoint fail at process exit, not hang.
+fn check_break_into_with_normalized_peb(wow64: bool) {
+    use joybug_core::interfaces::Architecture;
+    use joybug_core::protocol::{DebugEvent, DebuggerRequest};
+    use joybug_core::protocol_io::expect_ack;
+    use std::path::PathBuf;
+
+    struct BreakState {
+        control: DebugSession<()>,
+        peb: u64,
+        native_ntdll: std::ops::Range<u64>,
+        main_tid: u32,
+        hits: u32,
+    }
+
+    let server = TestServer::spawn();
+    let address = server.address().to_string();
+    let control = DebugSession::new((), Some(&address)).expect("connect control client");
+    let state = BreakState {
+        control,
+        peb: 0,
+        native_ntdll: 0..0,
+        main_tid: 0,
+        hits: 0,
+    };
+    let session = DebugSession::new(state, Some(&address))
+        .expect("connect debug client")
+        .on_initial_breakpoint(move |session, pid, tid, _| {
+            let expected_arch = if wow64 { Architecture::X86 } else { Architecture::from_native() };
+            assert_eq!(session.get_process_architecture(pid)?, expected_arch);
+            session.state.main_tid = tid;
+            let probe = session.normalize_peb(pid, PebNormalizeOptions::default())?;
+            session.state.peb = probe.peb_address;
+            assert_eq!(session.read_memory(pid, probe.peb_address + PEB_BEING_DEBUGGED, 1)?, [1]);
+
+            let modules = session.list_modules(pid)?;
+            let ntdll = modules.iter()
+                .find(|module| module.name.to_ascii_lowercase().ends_with("\\system32\\ntdll.dll"))
+                .expect("native ntdll is loaded");
+            session.state.native_ntdll = ntdll.base..ntdll.base + ntdll.size.unwrap();
+            let response = session.state.control.send_and_receive(&DebuggerRequest::BreakInto { pid })?;
+            expect_ack("BreakInto", response)
+        })
+        .on_event(|session, event| {
+            if let DebugEvent::Breakpoint { pid, tid, address } = event {
+                assert_ne!(*tid, session.state.main_tid, "break-in runs on its own thread");
+                assert!(session.state.native_ntdll.contains(address), "breakpoint must be in native ntdll");
+                let expected_flag = if session.state.hits == 0 { 1 } else { 0 };
+                assert_eq!(
+                    session.read_memory(*pid, session.state.peb + PEB_BEING_DEBUGGED, 1)?,
+                    [expected_flag],
+                    "break-in must preserve BeingDebugged"
+                );
+                session.state.hits += 1;
+                if session.state.hits == 3 {
+                    session.terminate_process(*pid)?;
+                } else {
+                    if session.state.hits == 1 {
+                        let report = session.normalize_peb(*pid, PebNormalizeOptions {
+                            being_debugged: true,
+                            heap_flags: false,
+                        })?;
+                        assert!(report.failures.is_empty(), "{:?}", report.failures);
+                        assert_eq!(session.read_memory(*pid, session.state.peb + PEB_BEING_DEBUGGED, 1)?, [0]);
+                    }
+                    let response = session.state.control.send_and_receive(&DebuggerRequest::BreakInto { pid: *pid })?;
+                    expect_ack("BreakInto", response)?;
+                }
+            }
+            Ok(true)
+        });
+    let target = PathBuf::from(std::env::var_os("WINDIR").expect("Windows directory"))
+        .join(if wow64 { "SysWOW64" } else { "System32" })
+        .join("ping.exe");
+    let state = session.launch(format!("\"{}\" -n 10 127.0.0.1", target.display()))
+        .expect("debug finite-running ping target");
+    assert_eq!(state.hits, 3, "one normal and two normalized break-ins must stop the target");
+}
+
+#[test]
+fn break_into_preserves_normalized_peb() {
+    check_break_into_with_normalized_peb(false);
+}
+
+#[test]
+fn wow64_break_into_preserves_normalized_peb() {
+    check_break_into_with_normalized_peb(true);
+}

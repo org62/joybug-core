@@ -1272,6 +1272,19 @@ impl LuaUserData for LuaDebugClient {
                         tt.set("tid", t.tid)?;
                         tt.set("start_address", t.start_address)?;
                         tt.set("suspend_count", t.suspend_count)?;
+                        tt.set("name", t.name.as_deref())?;
+                        tt.set("teb_address", t.teb_address)?;
+                        tt.set("teb_architecture", t.teb_architecture.map(arch_name))?;
+                        tt.set("instruction_pointer", t.instruction_pointer)?;
+                        tt.set("instruction_pointer_architecture", t.instruction_pointer_architecture.map(arch_name))?;
+                        tt.set("priority", t.priority)?;
+                        tt.set("thread_state", t.thread_state)?;
+                        tt.set("wait_reason", t.wait_reason)?;
+                        tt.set("last_error", t.last_error)?;
+                        tt.set("user_time_100ns", t.user_time_100ns.map(|v| v.to_string()))?;
+                        tt.set("kernel_time_100ns", t.kernel_time_100ns.map(|v| v.to_string()))?;
+                        tt.set("creation_time_filetime_100ns", t.creation_time_filetime_100ns.map(|v| v.to_string()))?;
+                        tt.set("cpu_cycles", t.cpu_cycles.map(|v| v.to_string()))?;
                         table.set(i + 1, tt)?;
                     }
                     Ok(table)

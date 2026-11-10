@@ -19,6 +19,8 @@ pub mod debug_events;
 mod memory;
 #[cfg(windows)]
 mod thread_context;
+#[cfg(windows)]
+mod thread_info;
 // Live in `crate::symbols`; aliased so the `symbol_manager::` paths below and the
 // re-exports `static_pe` and the UI import keep resolving.
 #[cfg_attr(not(windows), allow(unused_imports))]
@@ -598,14 +600,7 @@ impl PlatformAPI for WindowsPlatform {
     }
 
     fn list_threads(&self, pid: u32) -> Result<Vec<ThreadInfo>, PlatformError> {
-        let (mut threads, count_of): (Vec<ThreadInfo>, fn(u32) -> Option<u32>) = match self.get_process(pid) {
-            Ok(process) => (process.thread_manager().list_threads(), thread_control::debugged_suspend_count),
-            Err(_) => (utils::list_threads_toolhelp(pid)?, thread_control::queried_suspend_count),
-        };
-        for t in &mut threads {
-            t.suspend_count = count_of(t.tid).unwrap_or(0);
-        }
-        Ok(threads)
+        thread_info::list_threads(self, pid)
     }
 
     fn suspend_thread(&self, _pid: u32, tid: u32) -> Result<u32, PlatformError> {
@@ -897,9 +892,9 @@ impl PlatformAPI for WindowsPlatform {
 
     // ---------------------- Server-side fast paths ----------------------
     //
-    // These bypass the platform lock for OS calls that don't need shared
-    // state, so concurrent read-only requests aren't starved while a
-    // Continue is parked in WaitForDebugEvent.
+    // Release the platform lock before WaitForDebugEvent, so read-only requests
+    // remain available while the target runs. The actual continue stays exclusive
+    // with thread listings: their stopped-context samples must not race a resume.
 
     fn server_continue(
         platform: &std::sync::Arc<std::sync::RwLock<Self>>,
@@ -917,12 +912,15 @@ impl PlatformAPI for WindowsPlatform {
         let mut cont_pass = pass_exception;
         let mut cont_reply_later = false;
         loop {
-            if cont_reply_later {
-                crate::windows_platform::debug_events::continue_reply_later(cont_pid, cont_tid)?;
-            } else {
-                crate::windows_platform::debug_events::continue_debug_event(
-                    cont_pid, cont_tid, cont_pass,
-                )?;
+            {
+                let _guard = platform.write().unwrap();
+                if cont_reply_later {
+                    crate::windows_platform::debug_events::continue_reply_later(cont_pid, cont_tid)?;
+                } else {
+                    crate::windows_platform::debug_events::continue_debug_event(
+                        cont_pid, cont_tid, cont_pass,
+                    )?;
+                }
             }
 
             let debug_event =
@@ -994,11 +992,12 @@ impl PlatformAPI for WindowsPlatform {
         pid: u32,
         tid: u32,
     ) -> Result<(), PlatformError> {
+        let mut p = platform.write().unwrap();
         let cont = crate::windows_platform::debug_events::continue_debug_event(pid, tid, false);
 
         // Drop our handles either way: on a failed continue the process is still
         // gone, and holding them would only keep the zombie around longer.
-        platform.write().unwrap().remove_process(pid);
+        p.remove_process(pid);
         cont
     }
 

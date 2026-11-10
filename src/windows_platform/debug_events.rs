@@ -378,6 +378,15 @@ pub(super) fn handle_exception_event(
     let process = platform.get_process_mut(pid)?;
     let arch = process.architecture();
     let raw_code = ex_record.ExceptionCode;
+    if raw_code as u32 == super::thread_info::LEGACY_NAME_EXCEPTION
+        && ex_info.dwFirstChance == 1
+        && (ex_record.NumberParameters as usize) <= ex_record.ExceptionInformation.len()
+        && super::thread_info::legacy_notification(
+            process, tid, &ex_record.ExceptionInformation[..ex_record.NumberParameters as usize],
+        )
+    {
+        return Ok(None);
+    }
     let code = normalize_exception_code(raw_code, arch);
     let trap = crate::debugger_core::events::TrapInfo {
         code: ex_record.ExceptionCode as u32,

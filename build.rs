@@ -270,5 +270,7 @@ fn main() {
         let _ = compile_test_program_with(&manifest_dir, &out_dir, "open_remote", None, &["/MT"]);
         // 32-bit (WOW64) debuggee for the wow64 tests: wow64_test32.exe.
         let _ = compile_test_program_x86(&manifest_dir, &out_dir, "wow64_test");
+        let _ = compile_test_program(&manifest_dir, &out_dir, "thread_info_test", None);
+        let _ = compile_test_program_x86(&manifest_dir, &out_dir, "thread_info_test");
     }
 }

@@ -1,22 +1,22 @@
 //! User-initiated thread control: suspend / resume / terminate, plus the live
 //! suspend count shown in thread lists.
 //!
-//! Every call opens its own [`HandleSafe`] thread handle rather than reusing
-//! the debugger's cached ones: the non-invasive (`open_non_invasive`) handles
-//! are opened with only `THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION`, and a
-//! fresh handle needs no platform lock, so the same code serves debugged and
-//! merely-opened processes alike.
+//! Each explicit control opens its own [`HandleSafe`] thread handle rather than
+//! reusing the debugger's cached ones: the non-invasive (`open_non_invasive`)
+//! handles are opened with only `THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION`,
+//! so the same code serves debugged and merely-opened processes alike.
 //!
 //! Suspend counts nest with the step-over freezer in `debugged_process.rs`
 //! (both are plain `SuspendThread` calls on the same thread), so a user suspend
-//! survives a step-over and vice versa. The one unguarded hazard is a user
-//! *resume* landing inside an in-flight step-over window; that window is a
-//! single instruction long.
+//! survives a step-over and vice versa. Server-side resume holds the platform
+//! write lock, excluding stopped-context samples in listings. A user resume
+//! during the in-flight single-instruction step-over window can still release
+//! the step-over freezer's suspension.
 
 use tracing::{error, trace};
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::System::Threading::{
-    OpenThread, ResumeThread, SuspendThread, TerminateThread, THREAD_QUERY_INFORMATION,
+    OpenThread, ResumeThread, SuspendThread, TerminateThread,
     THREAD_SUSPEND_RESUME, THREAD_TERMINATE,
 };
 
@@ -42,20 +42,6 @@ fn open(tid: u32, access: u32, what: &str) -> Result<HandleSafe, PlatformError> 
         )));
     }
     Ok(HandleSafe(h))
-}
-
-/// Open a thread handle for a suspend-count probe. Unlike [`open`] this stays
-/// silent on failure: `list_threads` probes every tid it knows about on every
-/// poll, and a tid that has exited (the debugged `ThreadManager` never evicts
-/// them) fails every time — formatting an OS message and logging an error for
-/// that, once per thread per poll, is pure noise and allocation.
-fn open_quiet(tid: u32, access: u32) -> Option<HandleSafe> {
-    let h = unsafe { OpenThread(access, 0, tid) };
-    if h.is_null() {
-        trace!(tid, code = unsafe { GetLastError() }, "OpenThread failed for suspend-count probe");
-        return None;
-    }
-    Some(HandleSafe(h))
 }
 
 fn os_err(what: &str, tid: u32) -> PlatformError {
@@ -97,36 +83,15 @@ pub fn terminate_thread_unlocked(tid: u32, exit_code: u32) -> Result<(), Platfor
     Ok(())
 }
 
-/// Suspend count of a thread in a process we are debugging, read through a
-/// `SuspendThread`/`ResumeThread` round-trip: `SuspendThread` returns the
-/// previous *user* suspend count, which is what the UI wants. The
-/// `ThreadSuspendCount` query in [`queried_suspend_count`] cannot be used here
-/// because it also counts the kernel's debug freeze — every thread of a process
-/// halted at a debug event reads one too high. While halted the round-trip is
-/// invisible (the threads are frozen anyway); on a running target it is a
-/// microsecond hiccup per poll. `None` when the thread cannot be opened or has
-/// exited.
-pub fn debugged_suspend_count(tid: u32) -> Option<u32> {
-    let h = open_quiet(tid, THREAD_SUSPEND_RESUME)?;
-    let prev = unsafe { SuspendThread(h.0) };
-    if prev == u32::MAX {
-        return None;
-    }
-    unsafe { ResumeThread(h.0) };
-    Some(prev)
-}
-
-/// Non-intrusive suspend count for a process we are *not* debugging. Includes
-/// any debug freeze another debugger may hold, which is why the debugged path
-/// uses [`debugged_suspend_count`] instead. `None` when the thread cannot be
-/// opened or queried (e.g. it has exited).
-pub fn queried_suspend_count(tid: u32) -> Option<u32> {
-    let h = open_quiet(tid, THREAD_QUERY_INFORMATION)?;
+/// Passive kernel suspend count, including a debug-event freeze. `None` when the
+/// query fails (e.g. the thread has exited). Listings reuse their query-capable
+/// handle and use this same count to decide whether context sampling is safe.
+pub(super) fn queried_suspend_count_handle(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<u32> {
     let mut count: u32 = 0;
     let mut ret: u32 = 0;
     let status = unsafe {
         NtQueryInformationThread(
-            h.0,
+            handle,
             THREAD_SUSPEND_COUNT,
             &mut count as *mut u32 as *mut std::ffi::c_void,
             core::mem::size_of::<u32>() as u32,
@@ -134,7 +99,6 @@ pub fn queried_suspend_count(tid: u32) -> Option<u32> {
         )
     };
     if status < 0 {
-        trace!(tid, status, "NtQueryInformationThread(ThreadSuspendCount) failed");
         return None;
     }
     Some(count)

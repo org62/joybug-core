@@ -2102,10 +2102,22 @@ pub mod request_response {
     pub struct ThreadInfo {
         pub tid: u32,
         pub start_address: u64,
-        /// Live user-mode suspend count (`SuspendThread` nesting); 0 = runnable.
-        /// A debugger-event pause does not count. Queried at list time.
-        #[serde(default)]
-        pub suspend_count: u32,
+        /// Windows kernel suspend count, including debug-event freezes; Linux
+        /// logical suspend count. Unavailable queries remain unknown.
+        pub suspend_count: Option<u32>,
+        pub name: Option<String>,
+        pub teb_address: Option<u64>,
+        pub teb_architecture: Option<crate::interfaces::Architecture>,
+        pub instruction_pointer: Option<u64>,
+        pub instruction_pointer_architecture: Option<crate::interfaces::Architecture>,
+        pub priority: Option<i32>,
+        pub thread_state: Option<u32>,
+        pub wait_reason: Option<u32>,
+        pub last_error: Option<u32>,
+        pub user_time_100ns: Option<u64>,
+        pub kernel_time_100ns: Option<u64>,
+        pub creation_time_filetime_100ns: Option<u64>,
+        pub cpu_cycles: Option<u64>,
     }
 }
 

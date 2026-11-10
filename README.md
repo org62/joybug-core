@@ -27,6 +27,11 @@ Each has a `.sha256` sidecar next to it. It's a single portable `.exe` — no in
 
 Windows, x64 and ARM64. Breakpoints and single-stepping are written natively, so for a **native 64-bit** target **the host architecture must match** — an ARM64 build won't correctly debug an emulated x64 process, or vice versa. **32-bit x86 (WOW64)** targets are supported on either host, driven through the 32-bit (`WOW64_CONTEXT`) register file.
 
+Pause / `BreakInto` works with PEB normalization enabled, including when
+`BeingDebugged` is cleared. Windows starts a native break-in thread directly at
+the target's `ntdll!DbgBreakPoint`, without changing PEB flags or patching target
+code. The same path supports WOW64 targets and does not need downloaded symbols.
+
 ## Usage
 
 As a command-line tool — `jlua` is the only binary this crate builds:
@@ -76,6 +81,8 @@ The engine links Capstone, Keystone, Unicorn and Lua natively, so the build need
 - Some dependencies are pulled from GitHub rather than crates.io (two forks, and the Kuna decompiler, pinned by revision), so the build needs network access.
 
 Integration tests under `tests/` need Windows with debugging privileges. The live Windows Sandbox tests need more: set `JOYBUG_SANDBOX_LIVE=1`; the freshly built `jlua.exe` is staged as the guest (override with `JOYBUG_SANDBOX_TEST_GUEST_EXE`). They self-skip when Windows Sandbox isn't available, and are serialized against each other because Windows allows only one sandbox per user.
+
+CI uses self-hosted Windows ARM64/X64 and Linux X64 runners. The Linux job requires Ubuntu/Debian with passwordless `sudo apt-get`; offline runners leave jobs queued, with no GitHub-hosted fallback.
 
 ### Releases
 

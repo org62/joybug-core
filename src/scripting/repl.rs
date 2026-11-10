@@ -100,7 +100,7 @@ const FN_SIGS: &[FnSig] = &[
     FnSig { name: "dbg:get_call_stack", sig: "[pid], [tid]", desc: "Get call stack frames. Returns table of {address, sp, fp, symbol, module}." },
     // dbg methods - listing
     FnSig { name: "dbg:list_modules", sig: "pid", desc: "List loaded modules. Returns table of {name, base, size}." },
-    FnSig { name: "dbg:list_threads", sig: "pid", desc: "List threads. Returns table of {tid, start_address}." },
+    FnSig { name: "dbg:list_threads", sig: "pid", desc: "List threads: numeric tid/start_address (0 = unknown Entry), optional numeric suspend_count, teb_address, instruction_pointer, priority, thread_state, wait_reason, last_error; optional name and teb_architecture/instruction_pointer_architecture (x86/x64/arm64). Windows suspend_count is query-only, includes debug-event freezes (0 = none; nil = unavailable); Linux keeps its logical count. user_time_100ns, kernel_time_100ns, creation_time_filetime_100ns and cpu_cycles are exact decimal strings. Unavailable optional fields are nil." },
     FnSig { name: "dbg:list_processes", sig: "", desc: "List all running processes. Returns table of {pid, name}." },
     // dbg methods - memory regions
     FnSig { name: "dbg:get_module_info", sig: "pid, module_base", desc: "Get PE info: entry_point, image_base, size_of_image, sections." },

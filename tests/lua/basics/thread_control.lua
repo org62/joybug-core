@@ -1,4 +1,4 @@
--- Test: suspend/resume nest and show up in list_threads' suspend_count;
+-- Test: Windows suspend/resume nest on top of the debug-event freeze;
 -- terminate_thread ends the thread with our exit code.
 
 local killed_tid, killed_code
@@ -11,13 +11,15 @@ local function count_of(pid, tid)
 end
 
 dbg:on_initial_breakpoint(function(pid, tid, addr)
-    assert(count_of(pid, tid) == 0, "fresh thread not suspended")
+    assert(count_of(pid, tid) == 1, "initial breakpoint contributes a debug freeze")
     dbg:suspend_thread(pid, tid)
+    assert(count_of(pid, tid) == 2, "explicit suspension adds to the debug freeze")
     dbg:suspend_thread(pid, tid)
-    assert(count_of(pid, tid) == 2, "suspend nests")
+    assert(count_of(pid, tid) == 3, "suspend nests")
     dbg:resume_thread(pid, tid)
+    assert(count_of(pid, tid) == 2, "one user suspension remains")
     dbg:resume_thread(pid, tid)
-    assert(count_of(pid, tid) == 0, "fully resumed")
+    assert(count_of(pid, tid) == 1, "user suspensions cleared; debug freeze remains")
     dbg:terminate_thread(pid, tid, 7)
     killed_tid = tid
 end)

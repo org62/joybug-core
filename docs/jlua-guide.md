@@ -504,7 +504,22 @@ end
 
 ```lua
 local mods = dbg:list_modules(pid)
-local threads = dbg:list_threads(pid)   -- { {tid=, start_address=, suspend_count=}, ... }
+local threads = dbg:list_threads(pid)
+-- Each row keeps numeric tid and start_address (0 = unknown).
+-- Windows suspend_count is queried without suspending/resuming the thread and
+-- includes debug-event freezes: 0 means none, nil means the query was unavailable.
+-- Windows also supplies name, teb_address, teb_architecture,
+-- instruction_pointer, instruction_pointer_architecture, priority, thread_state,
+-- wait_reason (only while Waiting), and last_error. Unavailable fields are nil;
+-- architectures are "x86", "x64", or "arm64". IP requires a queried count > 0.
+-- IP is a point-in-time sample: server listings serialize with debugger-controlled
+-- resumes/continues, but do not keep the thread stopped after returning.
+-- user_time_100ns, kernel_time_100ns, creation_time_filetime_100ns and cpu_cycles
+-- are exact decimal strings, not Lua numbers. Times use 100ns units; creation
+-- is FILETIME since 1601-01-01 UTC; cycles are a raw counter, not elapsed time.
+-- Nonempty modern descriptions override legacy names; clearing one reveals
+-- the latest legacy name. Linux keeps its logical suspend count; Windows-only
+-- metadata remains nil there.
 local procs = dbg:list_processes()
 -- Instruction-set architecture of the debuggee: "x64", "arm64", or "x86" for a
 -- 32-bit (WOW64) process. Registers of an "x86" target come back as

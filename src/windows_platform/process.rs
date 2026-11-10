@@ -1,4 +1,4 @@
-use super::WindowsPlatform;
+use super::{HandleSafe, WindowsPlatform};
 use super::utils;
 use super::debug_events;
 use crate::env_block::EnvironmentBlock;
@@ -17,19 +17,20 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
     DebugActiveProcess, DebugActiveProcessStop,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, Process32FirstW, Process32NextW,
+    MODULEENTRY32W, PROCESSENTRY32W, TH32CS_SNAPMODULE, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, IsWow64Process2, OpenThread,
+    CreateProcessW, CreateRemoteThread, IsWow64Process2, OpenThread,
     CREATE_NEW_CONSOLE,
     DEBUG_PROCESS, DEBUG_ONLY_THIS_PROCESS, INFINITE, PROCESS_INFORMATION, STARTUPINFOW, OpenProcess, TerminateProcess,
-    PROCESS_TERMINATE, PROCESS_ALL_ACCESS, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, PROCESS_VM_WRITE, PROCESS_VM_OPERATION, PROCESS_DUP_HANDLE,
+    PROCESS_TERMINATE, PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, PROCESS_VM_WRITE, PROCESS_VM_OPERATION, PROCESS_DUP_HANDLE,
     THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION,
 };
 use windows_sys::Win32::System::SystemInformation::{
     IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_UNKNOWN
 };
-use windows_sys::Win32::System::Diagnostics::Debug::DebugBreakProcess;
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
 fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(Some(0)).collect()
@@ -359,24 +360,85 @@ pub fn terminate_process_unlocked(pid: u32) -> Result<(), PlatformError> {
     }
 }
 
+/// Find the target's native DbgBreakPoint without symbols or the platform lock.
+/// A native-only snapshot is intentional: WOW64 also loads a 32-bit ntdll, but
+/// the remote thread starts in the host's native architecture.
+fn remote_breakpoint_address(pid: u32) -> Result<usize, PlatformError> {
+    unsafe {
+        let local_ntdll = GetModuleHandleW(windows_sys::w!("ntdll.dll"));
+        if local_ntdll.is_null() {
+            return Err(PlatformError::OsError(format!(
+                "GetModuleHandleW(ntdll) failed: {}", std::io::Error::last_os_error()
+            )));
+        }
+        let breakpoint = GetProcAddress(local_ntdll, windows_sys::s!("DbgBreakPoint"))
+            .ok_or_else(|| PlatformError::OsError(format!(
+                "GetProcAddress(DbgBreakPoint) failed: {}", std::io::Error::last_os_error()
+            )))?;
+        // Native ntdll is the same system image in both processes, but its load
+        // base need not match. Translate the export's RVA, not its local VA.
+        let rva = (breakpoint as usize) - (local_ntdll as usize);
+        let snapshot = HandleSafe(CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid));
+        if snapshot.0 == INVALID_HANDLE_VALUE {
+            return Err(PlatformError::OsError(format!(
+                "CreateToolhelp32Snapshot(modules) failed: {}", std::io::Error::last_os_error()
+            )));
+        }
+        let mut entry: MODULEENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
+        if Module32FirstW(snapshot.0, &mut entry) == 0 {
+            return Err(PlatformError::OsError(format!(
+                "Module32FirstW failed: {}", std::io::Error::last_os_error()
+            )));
+        }
+        loop {
+            let is_ntdll = entry.szModule[..10].iter().zip(b"ntdll.dll\0").all(|(&wide, &ascii)| {
+                wide == u16::from(ascii) || wide == u16::from(ascii.to_ascii_uppercase())
+            });
+            if is_ntdll {
+                return (rva < entry.modBaseSize as usize)
+                    .then(|| (entry.modBaseAddr as usize).checked_add(rva))
+                    .flatten()
+                    .ok_or_else(|| PlatformError::Other("Native DbgBreakPoint is outside the target ntdll".into()));
+            }
+            if Module32NextW(snapshot.0, &mut entry) == 0 {
+                return Err(PlatformError::OsError(format!(
+                    "Cannot find native ntdll in process {}: {}", pid, std::io::Error::last_os_error()
+                )));
+            }
+        }
+    }
+}
+
 pub fn debug_break_process_unlocked(pid: u32) -> Result<(), PlatformError> {
     unsafe {
-        let h = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);
-        if h.is_null() {
-            let e = GetLastError();
-            let err = utils::error_message(e);
-            error!(pid, code = e, err, "OpenProcess(PROCESS_ALL_ACCESS) failed");
-            return Err(PlatformError::OsError(format!("OpenProcess(PROCESS_ALL_ACCESS) failed: {} ({})", e, err)));
+        let process = HandleSafe(OpenProcess(
+            PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION
+                | PROCESS_VM_WRITE | PROCESS_VM_READ,
+            0,
+            pid,
+        ));
+        if process.0.is_null() {
+            return Err(PlatformError::OsError(format!(
+                "OpenProcess for break-in failed: {}", std::io::Error::last_os_error()
+            )));
         }
-        let rc = DebugBreakProcess(h);
-        CloseHandle(h);
-        if rc == 0 {
-            let e = GetLastError();
-            let err = utils::error_message(e);
-            error!(pid, code = e, err, "DebugBreakProcess failed");
-            return Err(PlatformError::OsError(format!("DebugBreakProcess failed: {} ({})", e, err)));
+        let address = remote_breakpoint_address(pid)?;
+        // DebugBreakProcess enters DbgUiRemoteBreakin, which skips the trap
+        // when PEB normalization clears BeingDebugged. Enter DbgBreakPoint
+        // directly instead; its return goes through the OS thread-start thunk.
+        let start = std::mem::transmute::<usize, unsafe extern "system" fn(*mut core::ffi::c_void) -> u32>(address);
+        let thread = HandleSafe(CreateRemoteThread(
+            process.0, ptr::null(), 0, Some(start), ptr::null(), 0, ptr::null_mut(),
+        ));
+        if thread.0.is_null() {
+            return Err(PlatformError::OsError(format!(
+                "CreateRemoteThread(DbgBreakPoint) failed: {}", std::io::Error::last_os_error()
+            )));
         }
-        trace!(pid, "DebugBreakProcess succeeded (unlocked)");
+        // Never wait: the debug loop must be free to receive this thread's
+        // create/breakpoint events. Closing the handle does not stop the thread.
+        trace!(pid, "Break-in thread started (unlocked)");
         Ok(())
     }
 }
