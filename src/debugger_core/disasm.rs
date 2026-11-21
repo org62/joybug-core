@@ -191,17 +191,16 @@ pub fn decode_listing<'a>(
     span.attr("instructions", instructions.len() as u64);
     let t = Instant::now();
     let mut indirect_reads = 0u64;
-    let is_indirect = |i: &Instruction| (i.is_call || i.is_jump) && i.jump_target.is_some() && i.op_str.contains('[');
-    let ptr_reader = instructions.iter().any(is_indirect).then(pointer_reader).flatten();
-    if let Some(read_ptr) = ptr_reader {
+    if arch == Architecture::X64 {
+        let reader = std::cell::LazyCell::new(pointer_reader);
         for instr in &mut instructions {
-            if is_indirect(instr) {
-                let ptr_addr = instr.jump_target.unwrap();
-                indirect_reads += 1;
-                if let Some(actual_target) = read_ptr(ptr_addr) {
-                    instr.jump_target = Some(actual_target);
-                }
+            let Some(slot) = instr.mem_ref else { continue };
+            if !matches!(instr.mnemonic.as_str(), "call" | "jmp") {
+                continue;
             }
+            let Some(read_ptr) = reader.as_ref() else { break };
+            indirect_reads += 1;
+            instr.jump_target = read_ptr(slot).filter(|&target| target != 0);
         }
     }
     span.attr_elapsed("indirect_us", t);
@@ -341,4 +340,94 @@ pub fn disassemble_function<P: PlatformAPI + ?Sized>(
     span.attr("decodes", decodes);
     span.attr("instructions", instructions.len() as u64);
     Ok((instructions, func_start, func_end, func_name))
+}
+
+#[cfg(test)]
+mod indirect_follow {
+    use super::*;
+    use crate::interfaces::PlatformError;
+    use crate::protocol::MemoryRegionInfo;
+
+    const VA: u64 = 0x7FFE82494A24;
+    const SLOT: u64 = 0x7FFE83C5A3C8;
+    const CALL: &[u8] = &[0xFF, 0x15, 0x9E, 0x59, 0x7C, 0x01];
+
+    struct Code<'a>(&'a [u8]);
+
+    impl MemoryReader for Code<'_> {
+        fn read(&self, address: u64, len: usize) -> Result<Vec<u8>, PlatformError> {
+            let start = (address - VA) as usize;
+            Ok(self.0[start..start + len].to_vec())
+        }
+
+        fn regions(&self) -> Result<Vec<MemoryRegionInfo>, PlatformError> {
+            panic!("listing decode must not scan the process map")
+        }
+    }
+
+    fn decode(
+        code: &[u8],
+        arch: Architecture,
+        options: DisasmOptions,
+        reader: impl FnOnce() -> Option<Box<dyn Fn(u64) -> Option<u64>>>,
+    ) -> Vec<Instruction> {
+        let listing = Listing {
+            reader: &Code(code),
+            disasm: &CapstoneDisassembler::new().unwrap(),
+            bps: None,
+            symbol_manager: None,
+            modules: Vec::new(),
+            options,
+        };
+        decode_listing(listing, VA, code.len(), code.len(), arch, || reader()).unwrap()
+    }
+
+    #[test]
+    fn call_follows_live_pointer_only() {
+        for symbolize in [true, false] {
+            for value in [Some(0x12345678), None, Some(0)] {
+                let rows = decode(CALL, Architecture::X64, DisasmOptions { symbolize, naive: false }, || {
+                    Some(Box::new(move |addr| {
+                        assert_eq!(addr, SLOT);
+                        value
+                    }))
+                });
+                assert_eq!(rows[0].mem_ref, Some(SLOT));
+                assert_eq!(rows[0].jump_target, value.filter(|&v| v != 0));
+            }
+        }
+    }
+
+    #[test]
+    fn no_reader_and_naive_listings_offer_only_the_slot() {
+        for naive in [false, true] {
+            let rows = decode(CALL, Architecture::X64, DisasmOptions { naive, ..Default::default() }, || {
+                assert!(!naive, "naive mode opened a pointer reader");
+                None
+            });
+            assert_eq!((rows[0].mem_ref, rows[0].jump_target), (Some(SLOT), None));
+        }
+    }
+
+    #[test]
+    fn only_the_indirect_jump_reads_a_pointer() {
+        let code = [
+            0xFF, 0x25, 0xFA, 0xFE, 0xFF, 0xFF, // jmp [rip - 0x106]
+            0xE8, 0x10, 0, 0, 0,               // call rel32
+            0x48, 0x8B, 0x05, 0x20, 0, 0, 0,   // mov rax, [rip + 0x20]
+        ];
+        let rows = decode(&code, Architecture::X64, DisasmOptions::default(), || Some(Box::new(|slot| {
+            assert_eq!(slot, VA - 0x100);
+            Some(0x12345678)
+        })));
+        assert_eq!((rows[0].mem_ref, rows[0].jump_target), (Some(VA - 0x100), Some(0x12345678)));
+        assert_eq!((rows[1].mem_ref, rows[1].jump_target), (None, Some(VA + 11 + 0x10)));
+        assert_eq!((rows[2].mem_ref, rows[2].jump_target), (Some(VA + 18 + 0x20), None));
+    }
+
+    #[test]
+    fn wow64_slot_is_not_a_qword() {
+        let rows = decode(CALL, Architecture::X86, DisasmOptions::default(), || panic!("opened x64 reader"));
+        assert_eq!((rows[0].mem_ref, rows[0].jump_target), (Some(0x017C599E), None));
+    }
 }

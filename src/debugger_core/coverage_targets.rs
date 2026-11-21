@@ -398,7 +398,7 @@ fn is_thunk(first: &Instruction) -> bool {
 /// short blocks would each fail to corroborate the next, rejecting whole chains
 /// of genuine code.
 fn jumps_to_known_code(ins: &Instruction, code_labels: &[u64]) -> bool {
-    if ins.mnemonic != "jmp" || ins.op_str.contains('[') {
+    if ins.mnemonic != "jmp" {
         return false;
     }
     ins.jump_target
@@ -444,23 +444,18 @@ fn is_terminator(ins: &Instruction, arch: Architecture) -> bool {
 /// code, which on x86 — where nearly every byte sequence decodes to *something*
 /// — is the single strongest signal available.
 ///
-/// Memory-indirect forms (`jmp qword ptr [rip+N]`, the import-thunk shape) carry
-/// the address of the pointer *slot*, not the destination, so those only have to
-/// land in readable memory.
+/// Indirect branches have no raw destination; `mem_ref_sane` checks the slot.
 fn branch_target_sane(ins: &Instruction, regions: &[MemoryRegionInfo]) -> bool {
     if !(ins.is_jump || ins.is_call) {
         return true;
     }
     let Some(target) = ins.jump_target else {
-        return true; // register-indirect, or below the operand extractor's floor
+        return true; // indirect, or below the operand extractor's floor
     };
     let Some(region) = find_region(regions, target) else {
         return false;
     };
-    if !is_accessible(region) {
-        return false;
-    }
-    ins.op_str.contains('[') || (region.protect & PAGE_EXECUTABLE_MASK) != 0
+    is_accessible(region) && (region.protect & PAGE_EXECUTABLE_MASK) != 0
 }
 
 /// Whether `addr` plausibly begins an instruction stream: `None` accepts,

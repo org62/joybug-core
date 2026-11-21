@@ -321,12 +321,12 @@ pub(super) fn open_vm_read_handle(pid: u32) -> Option<super::HandleSafe> {
 /// and log an ERROR per instruction, spamming the log and adding tens of ms.
 /// Takes an open handle (see `open_vm_read_handle`) so a decode batch with
 /// hundreds of indirect targets pays one OpenProcess, not one per instruction.
-pub(super) fn try_read_pointer(handle: HANDLE, address: u64) -> Option<u64> {
+pub(super) fn try_read_pointer(handle: &super::HandleSafe, address: u64) -> Option<u64> {
     unsafe {
         let mut buf = [0u8; 8];
         let mut bytes_read: usize = 0;
         let ok = ReadProcessMemory(
-            handle,
+            handle.0,
             address as *const std::ffi::c_void,
             buf.as_mut_ptr() as *mut std::ffi::c_void,
             8,

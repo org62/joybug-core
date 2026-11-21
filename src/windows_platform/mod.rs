@@ -1154,7 +1154,7 @@ impl WindowsPlatform {
         // batch; `try_read_pointer` has no partial-read fallback and no error log.
         crate::debugger_core::disasm::decode_listing(listing, address, read_len, count, arch, || {
             memory::open_vm_read_handle(pid).map(|handle| {
-                Box::new(move |addr: u64| memory::try_read_pointer(handle.0, addr)) as Box<dyn Fn(u64) -> Option<u64>>
+                Box::new(move |addr: u64| memory::try_read_pointer(&handle, addr)) as Box<dyn Fn(u64) -> Option<u64>>
             })
         })
     }

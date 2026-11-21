@@ -306,21 +306,11 @@ fn extract_jump_target_from_operands(
             let detail = engine.insn_detail(insn).ok()?;
             if let ArchDetail::X86Detail(x86) = detail.arch_detail() {
                 for op in x86.operands() {
-                    match op.op_type {
-                        X86OperandType::Imm(value) => {
-                            // Direct jump/call target
-                            let addr = value as u64;
-                            if addr > 0x10000 {
-                                return Some(addr);
-                            }
+                    if let X86OperandType::Imm(value) = op.op_type {
+                        let addr = value as u64;
+                        if addr > 0x10000 {
+                            return Some(addr);
                         }
-                        X86OperandType::Mem(ref mem) => {
-                            // RIP-relative call/jump (e.g., call qword ptr [rip+0x1234])
-                            if mem.base() == RegId(X86_REG_RIP) {
-                                return Some(rip_relative_target(insn, mem));
-                            }
-                        }
-                        _ => {}
                     }
                 }
             }

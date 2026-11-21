@@ -228,12 +228,11 @@ pub struct Instruction {
     pub is_jump: bool,           // jmp, jcc instructions (conditional/unconditional jumps)
     pub is_call: bool,           // call instruction
     pub is_ret: bool,            // ret instruction
-    pub jump_target: Option<u64>, // Target address if resolvable (for jumps/calls)
-    /// Absolute address of a memory operand when statically resolvable
-    /// (RIP-relative or absolute displacement) — the data address the
-    /// instruction reads/writes, e.g. `mov rdx, [rip + 0xNN]`. Unlike
-    /// `addresses_to_symbolize` this never contains plain immediates, so a UI
-    /// can offer "go to memory" only for real memory references.
+    /// Known control-flow destination. For a memory-indirect branch this is
+    /// the live pointer value, never the address of the pointer slot.
+    pub jump_target: Option<u64>,
+    /// Statically known address accessed by a memory operand (RIP-relative
+    /// or absolute displacement), not its contents or an immediate operand.
     #[serde(default)]
     pub mem_ref: Option<u64>,
     pub addresses_to_symbolize: Vec<u64>, // Addresses extracted from operands for symbolization
