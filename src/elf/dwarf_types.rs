@@ -91,7 +91,7 @@ pub fn parse_types(path: &Path) -> Result<ModuleTypeInfo, SymbolError> {
                         _ => TypeClass::Void,
                     };
                     let static_name: &'static str = intern(name.as_deref().unwrap_or("?"));
-                    types.insert(index, OwnedType::Primitive { name: static_name, size: byte_size, class, pointer: false });
+                    types.insert(index, OwnedType::Primitive { name: static_name, size: byte_size, class, pointer_size: None });
                 }
                 gimli::DW_TAG_structure_type | gimli::DW_TAG_class_type | gimli::DW_TAG_union_type => {
                     let kind = match tag {
@@ -129,7 +129,7 @@ pub fn parse_types(path: &Path) -> Result<ModuleTypeInfo, SymbolError> {
                     // the underlying type, so synthesize one when DWARF has none.
                     let underlying = type_ref.unwrap_or_else(|| {
                         let u = synth.alloc();
-                        types.insert(u, OwnedType::Primitive { name: "int", size: byte_size.max(4), class: TypeClass::Int, pointer: false });
+                        types.insert(u, OwnedType::Primitive { name: "int", size: byte_size.max(4), class: TypeClass::Int, pointer_size: None });
                         u
                     });
                     let name = name.unwrap_or_else(|| "<anonymous enum>".to_string());
@@ -142,14 +142,14 @@ pub fn parse_types(path: &Path) -> Result<ModuleTypeInfo, SymbolError> {
                     match type_ref {
                         Some(underlying) => types.insert(index, OwnedType::Modifier { underlying }),
                         // `typedef void x` / `const void`: no referent means void.
-                        None => types.insert(index, OwnedType::Primitive { name: "void", size: 0, class: TypeClass::Void, pointer: false }),
+                        None => types.insert(index, OwnedType::Primitive { name: "void", size: 0, class: TypeClass::Void, pointer_size: None }),
                     };
                 }
                 gimli::DW_TAG_pointer_type | gimli::DW_TAG_reference_type | gimli::DW_TAG_rvalue_reference_type | gimli::DW_TAG_ptr_to_member_type => {
                     let size = if byte_size == 0 { 8 } else { byte_size };
                     let underlying = type_ref.unwrap_or_else(|| {
                         let v = synth.alloc();
-                        types.insert(v, OwnedType::Primitive { name: "void", size: 0, class: TypeClass::Void, pointer: false });
+                        types.insert(v, OwnedType::Primitive { name: "void", size: 0, class: TypeClass::Void, pointer_size: None });
                         v
                     });
                     types.insert(index, OwnedType::Pointer { underlying, size });
@@ -201,7 +201,7 @@ fn size_of(types: &HashMap<u32, OwnedType>, index: u32, depth: u32) -> u32 {
         return 0;
     }
     match types.get(&index) {
-        Some(OwnedType::Primitive { size, pointer, .. }) => if *pointer { 8 } else { *size },
+        Some(OwnedType::Primitive { size, pointer_size, .. }) => pointer_size.map_or(*size, u32::from),
         Some(OwnedType::Udt { size, .. }) => *size,
         Some(OwnedType::Enum { underlying, .. }) => size_of(types, *underlying, depth + 1),
         Some(OwnedType::Pointer { size, .. }) => *size,

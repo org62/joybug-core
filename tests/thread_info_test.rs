@@ -2,9 +2,10 @@
 
 mod common;
 use common::{try_get_test_program_path, TestServer};
-use joybug_core::interfaces::Architecture;
-use joybug_core::protocol::{DebugEvent, DebuggerRequest, DebuggerResponse, ThreadInfo};
+use joybug_core::interfaces::{Architecture, PlatformAPI, SymbolConfig};
+use joybug_core::protocol::{DebugEvent, DebuggerRequest, DebuggerResponse, NtBlockKind, ThreadInfo};
 use joybug_core::protocol_io::{DebugSession, ExceptionAction};
+use joybug_core::windows_platform::WindowsPlatform;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -231,6 +232,26 @@ fn run(name: &str) {
                     let teb = row.teb_address.expect("native break-in TEB");
                     let self_bytes = session.read_memory(*pid, teb + 0x30, 8)?;
                     assert_eq!(u64::from_le_bytes(self_bytes.try_into().unwrap()), teb);
+                    let (missing, layout) = session.get_nt_block_overlay(*pid, Some(0), NtBlockKind::Teb)?;
+                    assert!(missing.is_none() && layout.is_none(), "an unknown event TID must not pick another thread");
+                    if session.state.arch == Some(Architecture::X86) {
+                        // Inspect the typed anchors without depending on the host's ntdll PDBs.
+                        // Noninvasive open discovers the same helper via the class-9 entry query.
+                        let mut observer = WindowsPlatform::new_with_config(SymbolConfig { offline: true, ..Default::default() });
+                        observer.open_process(*pid)?;
+                        assert_eq!(
+                            observer.nt_block_anchor(*pid, Some(*tid), NtBlockKind::Teb)?,
+                            Some((teb, Architecture::from_native())),
+                        );
+                        let guest_peb = observer.get_wow64_peb_address(*pid)?;
+                        assert_ne!(guest_peb, 0);
+                        assert_ne!(guest_peb, observer.get_native_peb_address(*pid)?);
+                        assert_eq!(
+                            observer.nt_block_anchor(*pid, Some(*tid), NtBlockKind::Peb)?,
+                            Some((guest_peb, Architecture::X86)),
+                        );
+                        observer.close_process(*pid)?;
+                    }
                     assert!(row.instruction_pointer.expect("native break-in CONTROL sample") > u32::MAX as u64);
                     assert_eq!(row.instruction_pointer_architecture, row.teb_architecture);
                     assert_eq!(row.suspend_count, Some(1), "native break-in thread includes the debug freeze");

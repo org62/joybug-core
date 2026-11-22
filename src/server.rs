@@ -11,6 +11,8 @@ use std::time::Instant;
 
 use crate::framed_json_stream::FramedJsonStream;
 
+mod nt_block;
+
 /// The platform's shared symbol manager and the module of `pid` that `select`
 /// picks, taken under one brief read lock. The requests that can spend seconds
 /// in the symbol manager (loading a debug file, parsing a line table) go
@@ -523,6 +525,10 @@ where
                     Ok(layout) => DebuggerResponse::TypeResult { layout },
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
+            }
+            DebuggerRequest::GetNtBlockOverlay { pid, tid, kind } => {
+                nt_block::overlay(&platform, pid, tid, kind)
+                    .unwrap_or_else(|e| DebuggerResponse::Error { message: e.to_string() })
             }
             DebuggerRequest::GetTebAddress { pid, tid } => {
                 let p = platform.read().unwrap();

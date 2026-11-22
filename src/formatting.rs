@@ -266,6 +266,11 @@ impl std::fmt::Debug for DebuggerResponse {
                 .field("name", &layout.as_ref().map(|l| &l.name))
                 .field("members", &layout.as_ref().map(|l| l.members.len()))
                 .finish(),
+            DebuggerResponse::NtBlockOverlay { address, layout } => f.debug_struct("NtBlockOverlay")
+                .field("address", address)
+                .field("name", &layout.as_ref().map(|l| &l.name))
+                .field("members", &layout.as_ref().map(|l| l.members.len()))
+                .finish(),
             DebuggerResponse::TebAddress { address } => f.debug_struct("TebAddress")
                 .field("address", &format_args!("0x{:X}", address))
                 .finish(),

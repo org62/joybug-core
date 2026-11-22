@@ -49,7 +49,7 @@ mod process_objects;
 use crate::interfaces::{PlatformAPI, PlatformError, ModuleSymbol, ResolvedSymbol, SymbolError, Architecture, DisassemblerError, Instruction, Stepper};
 // no-op
 #[cfg(windows)]
-use crate::protocol::{MinidumpKind, ModuleInfo, ProcessInfo, ProcessObjects, ThreadInfo, StepKind};
+use crate::protocol::{MinidumpKind, ModuleInfo, NtBlockKind, ProcessInfo, ProcessObjects, ThreadInfo, StepKind};
 #[cfg(windows)]
 use crate::emulator::{Emulator, EmulationResult};
 #[cfg(windows)]
@@ -337,13 +337,17 @@ impl WindowsPlatform {
     /// The PEB the target's own code uses: the 32-bit PEB of a WOW64 process,
     /// otherwise the native one. See [`Self::get_native_peb_address`].
     pub fn get_peb_address(&self, pid: u32) -> Result<u64, PlatformError> {
+        self.peb_anchor(pid).map(|(address, _)| address)
+    }
+
+    fn peb_anchor(&self, pid: u32) -> Result<(u64, Architecture), PlatformError> {
         if self.get_process(pid)?.architecture() == Architecture::X86 {
             let peb32 = self.get_wow64_peb_address(pid)?;
             if peb32 != 0 {
-                return Ok(peb32);
+                return Ok((peb32, Architecture::X86));
             }
         }
-        self.get_native_peb_address(pid)
+        self.get_native_peb_address(pid).map(|address| (address, Architecture::from_native()))
     }
 
     /// The native (64-bit) PEB of a process — a WOW64 process has this one too,
@@ -876,6 +880,13 @@ impl PlatformAPI for WindowsPlatform {
 
     fn get_peb_address(&self, pid: u32) -> Result<u64, PlatformError> {
         WindowsPlatform::get_peb_address(self, pid)
+    }
+
+    fn nt_block_anchor(&self, pid: u32, tid: Option<u32>, kind: NtBlockKind) -> Result<Option<(u64, Architecture)>, PlatformError> {
+        match kind {
+            NtBlockKind::Teb => thread_info::teb_anchor(self.get_process(pid)?, tid),
+            NtBlockKind::Peb => self.peb_anchor(pid).map(|anchor| (anchor.0 != 0).then_some(anchor)),
+        }
     }
 
     fn is_wow64(&self, pid: u32) -> Result<bool, PlatformError> {

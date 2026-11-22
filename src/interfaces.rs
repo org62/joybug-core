@@ -1,7 +1,7 @@
 use thiserror::Error;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use crate::protocol::{MinidumpKind, ModuleInfo, ProcessInfo, ProcessObjects, ThreadInfo};
+use crate::protocol::{MinidumpKind, ModuleInfo, NtBlockKind, ProcessInfo, ProcessObjects, ThreadInfo};
 
 pub type Address = u64;
 
@@ -768,6 +768,12 @@ pub trait PlatformAPI: Send + Sync {
     /// architecture: the 32-bit PEB for a WOW64 process, else the native one.
     fn get_peb_address(&self, _pid: u32) -> Result<u64, PlatformError> {
         Err(PlatformError::NotImplemented)
+    }
+
+    /// A Windows environment block's address and layout architecture, not
+    /// necessarily the process architecture (a WOW64 helper can use a native TEB).
+    fn nt_block_anchor(&self, _pid: u32, _tid: Option<u32>, _kind: NtBlockKind) -> Result<Option<(u64, Architecture)>, PlatformError> {
+        Ok(None)
     }
 
     /// The native (64-bit) PEB, which a WOW64 process has alongside its 32-bit

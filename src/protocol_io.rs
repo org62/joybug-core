@@ -2,7 +2,7 @@ use crate::interfaces::{Architecture, Instruction, ModuleSymbol};
 use crate::pe_types::ModuleExtraInfo;
 pub use crate::protocol::{
     AddressLineInfo, DebuggerRequest, DebuggerResponse, DebugEvent, EmulationMode,
-    HardwareBreakpointSize, HardwareBreakpointType, MinidumpKind, ModuleInfo, ModuleSymbolStatus,
+    HardwareBreakpointSize, HardwareBreakpointType, MinidumpKind, ModuleInfo, ModuleSymbolStatus, NtBlockKind,
     PdbLoadOutcome, PdbMismatchInfo, ProcessInfo, ScanCompareType, ScanRegionFilter, ScanValue,
     ScanValueType, StepAction, StepKind, StringEncodingFilter, StringHit, StringSortKey,
     SymbolLoadState, ThreadContext, ThreadInfo, ProcessObjects,
@@ -170,6 +170,7 @@ fn log_response(resp: &DebuggerResponse) {
         DebuggerResponse::SourceFileList { files } => format!("SourceFileList ({} files)", files.len()),
         DebuggerResponse::TypeList { types } => format!("TypeList ({} types)", types.len()),
         DebuggerResponse::TypeResult { layout } => format!("TypeResult ({})", layout.as_ref().map(|l| l.name.as_str()).unwrap_or("none")),
+        DebuggerResponse::NtBlockOverlay { .. } => format!("{resp:?}"),
         DebuggerResponse::TebAddress { .. } => "TebAddress".to_string(),
         DebuggerResponse::PebAddress { .. } => "PebAddress".to_string(),
         DebuggerResponse::Hello { server, version, .. } => format!("Hello({server} {version})"),
@@ -1385,6 +1386,23 @@ impl<S> DebugSession<S> {
         }
     }
 
+    /// The address and matching symbol layout of a Windows environment block.
+    /// The address may be known even when the layout is not.
+    pub fn get_nt_block_overlay(
+        &mut self,
+        pid: u32,
+        tid: Option<u32>,
+        kind: NtBlockKind,
+    ) -> anyhow::Result<(Option<u64>, Option<TypeLayout>)> {
+        match self.send_and_receive(&DebuggerRequest::GetNtBlockOverlay { pid, tid, kind })? {
+            DebuggerResponse::NtBlockOverlay { address, layout } => Ok((address, layout)),
+            DebuggerResponse::Error { message } => {
+                Err(anyhow::anyhow!("Failed to get {kind:?} overlay: {message}"))
+            }
+            other => Err(anyhow::anyhow!("Unexpected response to GetNtBlockOverlay: {:?}", other)),
+        }
+    }
+
     /// TEB base address of thread `tid`.
     pub fn get_teb_address(&mut self, pid: u32, tid: u32) -> anyhow::Result<u64> {
         match self.send_and_receive(&DebuggerRequest::GetTebAddress { pid, tid })? {
@@ -1406,18 +1424,6 @@ impl<S> DebugSession<S> {
             other => Err(anyhow::anyhow!("Unexpected response to GetPebAddress: {:?}", other)),
         }
     }
-
-    /// Convenience: TEB (for `tid`) and PEB base addresses, with `None` for an
-    /// address that fails to resolve (e.g. a platform without TEB support).
-    pub fn get_teb_peb_addresses(
-        &mut self,
-        pid: u32,
-        tid: u32,
-    ) -> anyhow::Result<(Option<u64>, Option<u64>)> {
-        Ok((self.get_teb_address(pid, tid).ok(), self.get_peb_address(pid).ok()))
-    }
-
-    // removed older helper to avoid duplicate names; use set_breakpoint_by_symbol with handler below
 
     /// Set up a single-shot breakpoint at a symbol
     pub fn setup_single_shot_breakpoint(

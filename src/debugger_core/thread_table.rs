@@ -31,7 +31,11 @@ impl<H> ThreadTable<H> {
     }
 
     pub fn live_info(&self, tid: u32) -> Option<&ThreadInfo> {
-        self.threads.get(&tid).filter(|_| self.is_live(tid)).map(|(info, _)| info)
+        self.live_entry(tid).map(|(info, _)| info)
+    }
+
+    pub(crate) fn live_entry(&self, tid: u32) -> Option<(&ThreadInfo, &H)> {
+        self.threads.get(&tid).filter(|_| self.is_live(tid)).map(|(info, payload)| (info, payload))
     }
 
     /// Notifications cannot resurrect a thread after its exit event.

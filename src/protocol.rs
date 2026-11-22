@@ -706,12 +706,18 @@ pub mod request_response {
             module_base: u64,
             index: u32,
         },
-        /// TEB base address of thread `tid` — anchor for overlaying `_TEB`.
+        /// Resolve a Windows TEB or PEB and its matching live overlay layout.
+        GetNtBlockOverlay {
+            pid: u32,
+            tid: Option<u32>,
+            kind: NtBlockKind,
+        },
+        /// Raw TEB base address of thread `tid`.
         GetTebAddress {
             pid: u32,
             tid: u32,
         },
-        /// PEB base address of a process — anchor for overlaying `_PEB`.
+        /// Raw PEB base address of a process.
         GetPebAddress {
             pid: u32,
         },
@@ -1205,6 +1211,8 @@ pub mod request_response {
         // Type system responses
         TypeList { types: Vec<TypeSummary> },
         TypeResult { layout: Option<TypeLayout> },
+        /// A known address can outlive or lack a matching symbol layout.
+        NtBlockOverlay { address: Option<u64>, layout: Option<TypeLayout> },
         TebAddress { address: u64 },
         PebAddress { address: u64 },
         // Disassembly responses
@@ -1542,6 +1550,14 @@ pub mod request_response {
     // ---------------------------------------------------------------------
     // Type system (parsed from the PDB TPI stream)
     // ---------------------------------------------------------------------
+
+    /// Windows thread or process environment block.
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum NtBlockKind {
+        Teb,
+        Peb,
+    }
 
     /// Struct/class/union/enum discriminator.
     #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]

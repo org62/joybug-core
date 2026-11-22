@@ -23,13 +23,12 @@ use crate::symbols::symbol_provider::open_pdb;
 pub(crate) enum OwnedType {
     Primitive {
         name: &'static str,
-        /// Size of the value itself (not the pointer, if `pointer` is set).
+        /// Size of the value itself, even when referenced by a pointer.
         size: u32,
         /// Value category (always a scalar `TypeClass` variant).
         class: TypeClass,
-        /// The record is a pointer to the primitive (PDB encodes e.g. `void*`
-        /// as a primitive with an indirection).
-        pointer: bool,
+        /// Width encoded by a CodeView primitive indirection, if present.
+        pointer_size: Option<u8>,
     },
     Udt {
         name: String,
@@ -254,9 +253,9 @@ impl ModuleTypeInfo {
                 name,
                 size,
                 class,
-                pointer,
+                pointer_size,
             }) => {
-                if *pointer {
+                if let Some(pointer_size) = pointer_size {
                     let pointee = TypeRef {
                         name: name.to_string(),
                         size: *size,
@@ -264,7 +263,7 @@ impl ModuleTypeInfo {
                     };
                     TypeRef {
                         name: format!("{} *", name),
-                        size: 8,
+                        size: u32::from(*pointer_size),
                         class: TypeClass::Pointer {
                             pointee: Box::new(pointee),
                         },
@@ -575,7 +574,16 @@ fn owned_primitive(p: &pdb::PrimitiveType) -> OwnedType {
         name,
         size,
         class,
-        pointer: p.indirection.is_some(),
+        pointer_size: p.indirection.map(|mode| {
+            use pdb::Indirection::*;
+            match mode {
+                Near16 => 2,
+                Far16 | Huge16 | Near32 => 4,
+                Far32 => 6,
+                Near64 => 8,
+                Near128 => 16,
+            }
+        }),
     }
 }
 

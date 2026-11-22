@@ -65,11 +65,14 @@ pub(super) fn legacy_notification(process: &mut DebuggedProcess, event_tid: u32,
     true
 }
 
-fn query<T: Copy>(handle: HANDLE, class: u32) -> Option<T> {
+fn query<T: Copy>(handle: HANDLE, class: u32) -> Result<Option<T>, i32> {
     let mut value: T = unsafe { std::mem::zeroed() };
     let mut returned = 0;
     let status = unsafe { NtQueryInformationThread(handle, class, (&mut value as *mut T).cast(), std::mem::size_of::<T>() as u32, &mut returned) };
-    (status >= 0 && returned as usize == std::mem::size_of::<T>()).then_some(value)
+    if status < 0 {
+        return Err(status);
+    }
+    Ok((returned as usize == std::mem::size_of::<T>()).then_some(value))
 }
 
 #[repr(C)]
@@ -93,18 +96,43 @@ fn scalar<const N: usize>(process: HANDLE, address: u64) -> Option<[u8; N]> {
     read_exact(process, address, &mut bytes).then_some(bytes)
 }
 
-fn teb_layout(process: HANDLE, thread: HANDLE, arch: Architecture, entry: u64) -> Option<(u64, Architecture)> {
-    let native = query::<ThreadBasicInformation>(thread, 0)?.teb as u64;
-    if native == 0 { return None; }
-    if arch != Architecture::X86 || entry > u32::MAX as u64 {
-        return Some((native, NATIVE_ARCH));
+fn entry_address(thread: HANDLE, recorded: u64) -> u64 {
+    if recorded != 0 {
+        return recorded;
     }
-    let offset = i32::from_le_bytes(scalar(process, native.checked_add(0x180C)?)?);
-    if offset == 0 { return None; }
-    let guest = native.checked_add_signed(offset as i64)?;
-    if guest == 0 || guest > u32::MAX as u64 { return None; }
-    let self_address = u32::from_le_bytes(scalar(process, guest.checked_add(0x18)?)?) as u64;
-    (self_address == guest).then_some((guest, Architecture::X86))
+    query::<usize>(thread, 9).ok().flatten().unwrap_or(0) as u64
+}
+
+fn teb_layout(process: HANDLE, thread: HANDLE, arch: Architecture, entry: u64) -> Result<Option<(u64, Architecture)>, PlatformError> {
+    let info = query::<ThreadBasicInformation>(thread, 0).map_err(|status| {
+        PlatformError::Other(format!("NtQueryInformationThread(ThreadBasicInformation) failed: 0x{status:08X}"))
+    })?;
+    Ok(info.and_then(|info| {
+        let native = info.teb as u64;
+        if native == 0 { return None; }
+        if arch != Architecture::X86 || entry > u32::MAX as u64 {
+            return Some((native, NATIVE_ARCH));
+        }
+        let offset = i32::from_le_bytes(scalar(process, native.checked_add(0x180C)?)?);
+        if offset == 0 { return None; }
+        let guest = native.checked_add_signed(offset as i64)?;
+        if guest == 0 || guest > u32::MAX as u64 { return None; }
+        let self_address = u32::from_le_bytes(scalar(process, guest.checked_add(0x18)?)?) as u64;
+        (self_address == guest).then_some((guest, Architecture::X86))
+    }))
+}
+
+pub(super) fn teb_anchor(process: &DebuggedProcess, tid: Option<u32>) -> Result<Option<(u64, Architecture)>, PlatformError> {
+    let threads = process.thread_manager();
+    let entry = match tid {
+        Some(tid) => threads.live_entry(tid),
+        None => threads.iter_live_info().next(),
+    };
+    let Some((info, handle)) = entry else {
+        return Ok(None);
+    };
+    let start = entry_address(handle.0, info.start_address);
+    teb_layout(process.handle(), handle.0, process.architecture(), start)
 }
 
 fn modern_name(thread: HANDLE) -> Option<String> {
@@ -197,11 +225,10 @@ fn open_thread(pid: u32, tid: u32) -> Option<HandleSafe> {
 fn enrich(info: &ThreadInfo, thread: HANDLE, process: HANDLE, arch: Option<Architecture>, schedule: Option<&(u32, Option<u32>)>) -> ThreadInfo {
     use windows_sys::Win32::System::Threading::{GetThreadPriority, GetThreadTimes};
     use windows_sys::Win32::System::WindowsProgramming::{QueryThreadCycleTime, THREAD_PRIORITY_ERROR_RETURN};
-    let mut row = ThreadInfo { tid: info.tid, start_address: info.start_address, ..Default::default() };
-    if row.start_address == 0 { row.start_address = query::<usize>(thread, 9).unwrap_or(0) as u64; }
+    let mut row = ThreadInfo { tid: info.tid, start_address: entry_address(thread, info.start_address), ..Default::default() };
     row.name = modern_name(thread).or_else(|| info.name.clone());
     row.suspend_count = super::thread_control::queried_suspend_count_handle(thread);
-    let layout = arch.and_then(|arch| teb_layout(process, thread, arch, row.start_address));
+    let layout = arch.and_then(|arch| teb_layout(process, thread, arch, row.start_address).ok().flatten());
     if let Some((teb, architecture)) = layout {
         row.teb_address = Some(teb);
         row.teb_architecture = Some(architecture);

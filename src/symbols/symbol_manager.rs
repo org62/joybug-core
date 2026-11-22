@@ -623,7 +623,7 @@ impl SymbolManager {
 
     /// Get (lazily parsing) the PDB type information for a module. See
     /// `get_pdb_artifact` for the caching/non-blocking contract.
-    fn get_type_info(&self, module_path: &str) -> Result<Option<Arc<ModuleTypeInfo>>, SymbolError> {
+    pub(crate) fn get_type_info(&self, module_path: &str) -> Result<Option<Arc<ModuleTypeInfo>>, SymbolError> {
         self.get_pdb_artifact(&self.type_cache, module_path, "type info", |p| self.backend.parse_types(p))
     }
 
