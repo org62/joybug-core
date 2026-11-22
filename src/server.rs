@@ -38,6 +38,50 @@ fn symbols_and_module_at<P: PlatformAPI>(platform: &RwLock<P>, pid: u32, module_
     Ok((symbols, module))
 }
 
+/// Capture a live module with its mapping ID, then validate that ID under a
+/// read lock at publication. The symbol parser never runs under that lock.
+fn load_module_pdb<P: PlatformAPI>(
+    platform: &RwLock<P>,
+    pid: u32,
+    base: u64,
+    expected_id: Option<u64>,
+    path: &std::path::Path,
+    force: bool,
+) -> Result<crate::protocol::PdbLoadOutcome, SymbolError> {
+    let changed = || SymbolError::ModuleNotLoaded(format!("Module mapping at 0x{base:X} changed"));
+    let (symbols, module, id) = {
+        let p = platform.read().unwrap();
+        let symbols = p.symbols_handle().ok_or_else(|| SymbolError::SymbolsNotFound("Symbol manager not initialized".to_string()))?;
+        match p.module_mapping(pid, base) {
+            Some((module, id)) if expected_id.is_none_or(|wanted| wanted == id) => {
+                if !p.module_symbol_file_matches(pid, base) {
+                    return Err(SymbolError::ModuleNotLoaded(format!("Image file changed: {}", module.name)));
+                }
+                (symbols, module, Some(id))
+            }
+            _ if expected_id.is_some() => return Err(changed()),
+            _ => {
+                // Non-invasive Open and older callers have no instance to
+                // hand us. Keep the existing symbol-only behavior for them.
+                let module = p.list_modules(pid).ok()
+                    .and_then(|modules| modules.into_iter().find(|module| module.base == base))
+                    .ok_or_else(|| SymbolError::ModuleNotLoaded(format!("No module at base 0x{base:X}")))?;
+                (symbols, module, None)
+            }
+        }
+    };
+    symbols.load_pdb_from_path_if_current(&module, path, force, id, || {
+        let Some(id) = id else { return Ok(None) };
+        let p = platform.read().unwrap();
+        if !p.module_mapping(pid, base).is_some_and(|(_, actual)| actual == id)
+            || !p.module_symbol_file_matches(pid, base)
+        {
+            return Err(changed());
+        }
+        Ok(Some(p))
+    })
+}
+
 fn handle_connection<P>(stream: std::net::TcpStream, platform: Arc<RwLock<P>>)
 where
     P: PlatformAPI + Stepper + Send + Sync + 'static,
@@ -168,6 +212,25 @@ where
                 let mut p = platform.write().unwrap();
                 match p.remove_breakpoint(pid, addr) {
                     Ok(_) => DebuggerResponse::Ack,
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::GetModuleMapping { pid, module_base } => {
+                let p = platform.read().unwrap();
+                let mapping = p.module_mapping(pid, module_base).map(|(module, id)| (module, id, cfg!(windows)));
+                DebuggerResponse::ModuleMapping { mapping }
+            }
+            DebuggerRequest::ArmModuleBreakpoint { pid, module_base, mapping_id, addr } => {
+                let mut p = platform.write().unwrap();
+                match p.change_module_breakpoint(pid, module_base, mapping_id, addr, true) {
+                    Ok(applied) => DebuggerResponse::ModuleBreakpointChanged { applied },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::RemoveModuleBreakpoint { pid, module_base, mapping_id, addr } => {
+                let mut p = platform.write().unwrap();
+                match p.change_module_breakpoint(pid, module_base, mapping_id, addr, false) {
+                    Ok(applied) => DebuggerResponse::ModuleBreakpointChanged { applied },
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
@@ -323,6 +386,13 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
+            DebuggerRequest::ListMappedModules { pid } => {
+                let p = platform.read().unwrap();
+                match p.list_mapped_modules(pid) {
+                    Ok(modules) => DebuggerResponse::ModuleList { modules },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
             DebuggerRequest::GetProcessArchitecture { pid } => {
                 let p = platform.read().unwrap();
                 match p.process_architecture(pid) {
@@ -386,9 +456,8 @@ where
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }
-            DebuggerRequest::LoadPdbFromPath { pid, module_base, pdb_path, force } => {
-                let outcome = symbols_and_module_at(&platform, pid, module_base)
-                    .and_then(|(symbols, module)| symbols.load_pdb_from_path(&module, std::path::Path::new(&pdb_path), force));
+            DebuggerRequest::LoadPdbFromPath { pid, module_base, pdb_path, force, mapping_id } => {
+                let outcome = load_module_pdb(&platform, pid, module_base, mapping_id, std::path::Path::new(&pdb_path), force);
                 match outcome {
                     Ok(crate::protocol::PdbLoadOutcome::Loaded { symbol_count }) => DebuggerResponse::PdbLoaded { symbol_count },
                     Ok(crate::protocol::PdbLoadOutcome::Mismatch(info)) => DebuggerResponse::PdbMismatch(info),
@@ -464,6 +533,29 @@ where
                 let p = platform.read().unwrap();
                 match p.symbols_in_range(pid, start, len, max_results) {
                     Ok(symbols) => DebuggerResponse::ResolvedSymbolList { symbols },
+                    Err(e) => DebuggerResponse::Error { message: e.to_string() },
+                }
+            }
+            DebuggerRequest::ResolveModuleBreakpointSymbols { pid, module_base, names, wait } => {
+                let resolved = (|| {
+                    let (symbols, module, mapping_id) = {
+                        let p = platform.read().unwrap();
+                        let symbols = p.symbols_handle().ok_or_else(|| SymbolError::SymbolsNotFound("Symbol manager not initialized".into()))?;
+                        let (module, id) = p.module_mapping(pid, module_base)
+                            .ok_or_else(|| SymbolError::ModuleNotLoaded(format!("No module at base 0x{module_base:X}")))?;
+                        if !p.module_symbol_file_matches(pid, module_base) {
+                            return Err(SymbolError::ModuleNotLoaded(format!("Image file changed: {}", module.name)));
+                        }
+                        (symbols, module, id)
+                    };
+                    Ok(symbols.resolve_module_breakpoint_symbols(&module, mapping_id, &names, wait, |rva| {
+                        let Some(addr) = module.base.checked_add(u64::from(rva)) else { return false };
+                        platform.read().unwrap().module_trap_location(pid, module_base, mapping_id, addr)
+                            .is_ok_and(|owned| owned == Some(true))
+                    }))
+                })();
+                match resolved {
+                    Ok(results) => DebuggerResponse::ModuleBreakpointSymbols { results },
                     Err(e) => DebuggerResponse::Error { message: e.to_string() },
                 }
             }

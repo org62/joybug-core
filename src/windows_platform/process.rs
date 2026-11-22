@@ -267,7 +267,7 @@ pub(super) fn open_non_invasive(platform: &mut WindowsPlatform, pid: u32) -> Res
             symbol_manager.start_loading_symbols(&module);
         }
         if let Ok(process) = platform.get_process_mut(pid) {
-            process.module_manager_mut().add_module(module);
+            process.module_manager_mut().add_inferred_module(module);
         }
     }
 

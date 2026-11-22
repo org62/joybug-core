@@ -8,6 +8,8 @@
 #[cfg(windows)]
 mod utils;
 #[cfg(windows)]
+pub(crate) use utils::ImageFileId;
+#[cfg(windows)]
 mod thread_manager;
 #[cfg(windows)]
 mod thread_control;
@@ -603,6 +605,43 @@ impl PlatformAPI for WindowsPlatform {
         }
     }
 
+    fn list_mapped_modules(&self, pid: u32) -> Result<Vec<ModuleInfo>, PlatformError> {
+        utils::get_modules(pid).map_err(PlatformError::Other)
+    }
+
+    fn module_mapping(&self, pid: u32, module_base: u64) -> Option<(ModuleInfo, u64)> {
+        let (module, id) = self.get_process(pid).ok()?.module_manager().mapping_at(module_base)?;
+        Some((module.clone(), id))
+    }
+
+    fn module_symbol_file_matches(&self, pid: u32, base: u64) -> bool {
+        let Ok(process) = self.get_process(pid) else { return false };
+        let Some((module, _)) = process.module_manager().mapping_at(base) else { return false };
+        process.mapped_images.get(&base).is_some_and(|id| ImageFileId::at_path(&module.name) == Some(*id))
+            && base.checked_add(1).is_some_and(|end| {
+                memory::module_trap_region(process.handle(), base, base, end).is_ok_and(|region| region.is_some())
+            })
+    }
+
+    fn module_trap_location(
+        &self, pid: u32, base: u64, mapping_id: u64, addr: u64,
+    ) -> Result<Option<bool>, PlatformError> {
+        let Ok(process) = self.get_process(pid) else { return Ok(None) };
+        process.book.module_trap_location(base, mapping_id, addr, |end| {
+            memory::module_trap_region(process.handle(), base, addr, end)
+        })
+    }
+
+    fn change_module_breakpoint(
+        &mut self, pid: u32, base: u64, mapping_id: u64, addr: u64, arm: bool,
+    ) -> Result<bool, PlatformError> {
+        let Ok(process) = self.get_process_mut(pid) else { return Ok(false) };
+        let handle = process.handle();
+        process.book.change_module_breakpoint(&process.os, pid, base, mapping_id, addr, arm, |end| {
+            memory::module_trap_region(handle, base, addr, end)
+        })
+    }
+
     fn list_threads(&self, pid: u32) -> Result<Vec<ThreadInfo>, PlatformError> {
         thread_info::list_threads(self, pid)
     }
@@ -692,8 +731,10 @@ impl PlatformAPI for WindowsPlatform {
 
     fn retry_symbol_load(&self, pid: u32, module_base: u64) -> Result<(), SymbolError> {
         let module = self.module_at(pid, module_base)?;
-        self.symbols()?.retry_loading_symbols(&module);
-        Ok(())
+        if self.module_mapping(pid, module_base).is_some() && !self.module_symbol_file_matches(pid, module_base) {
+            return Err(SymbolError::ModuleNotLoaded(format!("Image file changed: {}", module.name)));
+        }
+        self.symbols()?.retry_loading_symbols(&module)
     }
 
     fn unload_module_symbols(&self, pid: u32, module_base: u64) -> Result<(), SymbolError> {

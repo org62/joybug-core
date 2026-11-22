@@ -1,11 +1,11 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 use crate::interfaces::{LineEntry, ModuleSymbol, ResolvedSymbol, SourceFileEntry, SourceLineRef, SymbolConfig, SymbolError};
-use crate::protocol::{ModuleInfo, ModuleSymbolStatus, PdbLoadOutcome, SymbolLoadState};
+use crate::protocol::{ModuleBreakpointSymbolResolution, ModuleInfo, ModuleSymbolStatus, PdbLoadOutcome, SymbolLoadState};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, Condvar, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{trace, warn, error};
 use crate::symbols::symbol_provider::ModuleLineTable;
 use crate::symbols::type_provider::ModuleTypeInfo;
@@ -41,6 +41,77 @@ pub struct ModuleSymbols {
     pub source: SymbolSource,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ImageStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    file_id: (u64, u64),
+    #[cfg(windows)]
+    file_id: Option<crate::windows_platform::ImageFileId>,
+}
+
+impl ImageStamp {
+    fn read(path: &str) -> Option<Self> {
+        #[cfg(not(windows))]
+        let metadata = std::fs::metadata(path).ok()?;
+        #[cfg(windows)]
+        let (metadata, file_id) = crate::windows_platform::ImageFileId::metadata_at_path(path)?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            file_id: (metadata.dev(), metadata.ino()),
+            #[cfg(windows)]
+            file_id,
+        })
+    }
+}
+
+#[derive(Default)]
+pub(super) struct PendingLoads {
+    automatic: HashMap<String, u64>,
+    /// Pending manual loads by path, grouped by guarded mapping (if supplied).
+    overrides: HashMap<String, Vec<(Option<u64>, usize)>>,
+    image_files: HashMap<String, Option<ImageStamp>>,
+    next_load: u64,
+}
+
+impl PendingLoads {
+    pub(super) fn contains(&self, path: &str) -> bool {
+        self.automatic.contains_key(path) || self.overrides.contains_key(path)
+    }
+
+    fn has_override(&self, path: &str, mapping: u64) -> bool {
+        self.overrides.get(path).is_some_and(|loads| {
+            loads.iter().any(|(id, _)| id.is_none_or(|id| id == mapping))
+        })
+    }
+
+    fn begin_override(&mut self, path: &str, mapping: Option<u64>) {
+        let loads = self.overrides.entry(path.to_owned()).or_default();
+        if let Some((_, count)) = loads.iter_mut().find(|(id, _)| *id == mapping) {
+            *count += 1;
+        } else {
+            loads.push((mapping, 1));
+        }
+    }
+
+    fn finish_override(&mut self, path: &str, mapping: Option<u64>) {
+        let loads = self.overrides.get_mut(path).unwrap();
+        let index = loads.iter().position(|(id, _)| *id == mapping).unwrap();
+        loads[index].1 -= 1;
+        if loads[index].1 == 0 {
+            loads.swap_remove(index);
+        }
+        if loads.is_empty() {
+            self.overrides.remove(path);
+        }
+    }
+}
+
 /// Result of a lazy per-module PDB parse (line table, type info), cached by
 /// module path.
 enum PdbArtifactState<T> {
@@ -52,7 +123,7 @@ enum PdbArtifactState<T> {
 /// Uses RVA-based storage for efficient sharing across processes
 pub struct SymbolManager {
     /// Store loaded symbols for fast access (module_path -> ModuleSymbols)
-    symbol_cache: Arc<Mutex<HashMap<String, ModuleSymbols>>>,
+    symbol_cache: Arc<Mutex<HashMap<String, Arc<ModuleSymbols>>>>,
 
     /// The file-format side: providers, fallbacks, debug-file parsers.
     backend: Arc<dyn SymbolBackend>,
@@ -70,7 +141,7 @@ pub struct SymbolManager {
     type_cache: Mutex<HashMap<String, PdbArtifactState<ModuleTypeInfo>>>,
 
     /// Set of modules currently being loaded
-    pending_loads: Arc<Mutex<HashSet<String>>>,
+    pending_loads: Arc<Mutex<PendingLoads>>,
     /// Modules whose symbol load failed (module_path -> error message).
     /// Failed modules are not retried automatically; retry is explicit.
     failed_loads: Arc<Mutex<HashMap<String, String>>>,
@@ -96,7 +167,16 @@ pub struct SymbolManager {
 struct SymbolLoadRequest {
     module: ModuleInfo,
     deny_error: Option<String>,
+    generation: u64,
+    image_file: Option<ImageStamp>,
 }
+#[derive(PartialEq, Eq)]
+enum LoadReason {
+    MappingObserved,
+    OnDemand,
+    Retry,
+}
+
 
 impl SymbolManager {
     /// A manager for PE/PDB modules.
@@ -105,8 +185,8 @@ impl SymbolManager {
     }
 
     pub fn new_with_backend(cfg: SymbolConfig, backend: Arc<dyn SymbolBackend>) -> Result<Self, SymbolError> {
-        let symbol_cache = Arc::new(Mutex::new(HashMap::<String, ModuleSymbols>::new()));
-        let pending_loads = Arc::new(Mutex::new(HashSet::new()));
+        let symbol_cache = Arc::new(Mutex::new(HashMap::<String, Arc<ModuleSymbols>>::new()));
+        let pending_loads = Arc::new(Mutex::new(PendingLoads::default()));
         let failed_loads = Arc::new(Mutex::new(HashMap::new()));
         let pending_cv = Arc::new(Condvar::new());
         let lines = LineTables::new(backend.clone(), symbol_cache.clone(), pending_loads.clone());
@@ -173,9 +253,17 @@ impl SymbolManager {
                         loaded.set((symbols.len() as u64, if matches!(source, SymbolSource::Pdb) { 1 } else { 2 }));
                         // Sort symbols by RVA for binary search
                         symbols.sort_by_key(|s| s.rva);
+                        // Never publish RVAs for a file replaced during this load.
+                        if ImageStamp::read(&module_path) != request.image_file {
+                            return;
+                        }
+                        let pending = pending_clone.lock().unwrap();
+                        if pending.automatic.get(&module_path) != Some(&request.generation) {
+                            return;
+                        }
                         let mut cache = cache_clone.lock().unwrap();
                         if cache.get(&module_path).is_none_or(|m| m.source.is_replaceable()) {
-                            cache.insert(module_path.clone(), ModuleSymbols { module_base, symbols, pdb_path, source });
+                            cache.insert(module_path.clone(), Arc::new(ModuleSymbols { module_base, symbols, pdb_path, source }));
                         }
                     };
 
@@ -196,7 +284,10 @@ impl SymbolManager {
                             }
                             Err(e) => {
                                 warn!(worker_id = i, module_path = %module_path, error = %e, "Symbol loading failed");
-                                failed_clone.lock().unwrap().insert(module_path.clone(), e.to_string());
+                                let pending = pending_clone.lock().unwrap();
+                                if pending.automatic.get(&module_path) == Some(&request.generation) {
+                                    failed_clone.lock().unwrap().insert(module_path.clone(), e.to_string());
+                                }
                                 Some(e.to_string())
                             }
                         },
@@ -225,7 +316,9 @@ impl SymbolManager {
                     // Remove from pending and notify waiters
                     {
                         let mut pending = pending_clone.lock().unwrap();
-                        pending.remove(&module_path);
+                        if pending.automatic.get(&module_path) == Some(&request.generation) {
+                            pending.automatic.remove(&module_path);
+                        }
                     }
                     cv_clone.notify_all();
 
@@ -278,91 +371,101 @@ impl SymbolManager {
 
     /// Start loading symbols for a module in the background
     pub fn start_loading_symbols(&self, module: &ModuleInfo) {
-        let module_path = module.name.clone();
+        let _ = self.request_symbol_load(module, ImageStamp::read(&module.name), LoadReason::MappingObserved);
+    }
 
-        // Check if already loaded
-        {
-            let cache = self.symbol_cache.lock().unwrap();
-            if cache.contains_key(&module_path) {
-                return;
+    fn request_symbol_load(&self, module: &ModuleInfo, stamp: Option<ImageStamp>, reason: LoadReason) -> bool {
+        let path = &module.name;
+        let mut pending = self.pending_loads.lock().unwrap();
+        if let Some(previous) = pending.image_files.get(path) {
+            if *previous != stamp {
+                if reason != LoadReason::MappingObserved {
+                    // Only a loader event can register a changed image.
+                    return false;
+                }
+                pending.automatic.remove(path);
+                self.symbol_cache.lock().unwrap().remove(path);
+                self.failed_loads.lock().unwrap().remove(path);
+                self.pdata_cache.lock().unwrap().remove(path);
+                self.type_cache.lock().unwrap().remove(path);
+                self.invalidate_line_table(path);
             }
         }
-
-        // A previous attempt failed: don't retry automatically (retry is explicit)
-        {
-            let failed = self.failed_loads.lock().unwrap();
-            if failed.contains_key(&module_path) {
-                return;
+        if pending.image_files.get(path) != Some(&stamp) {
+            pending.image_files.insert(path.clone(), stamp);
+        }
+        if reason == LoadReason::Retry {
+            let mut cache = self.symbol_cache.lock().unwrap();
+            if cache.get(path).is_some_and(|m| m.source.is_replaceable()) {
+                cache.remove(path);
             }
+            self.denied_loads.lock().unwrap().remove(&Self::short_name_lower(path));
+            self.failed_loads.lock().unwrap().remove(path);
+        }
+        if pending.automatic.contains_key(path)
+            || self.symbol_cache.lock().unwrap().contains_key(path)
+            || self.failed_loads.lock().unwrap().contains_key(path)
+        {
+            return true;
         }
 
-        // The client suppressed auto-download for this module (it failed in an
-        // earlier run). Record the failure so a UI can offer an explicit retry,
-        // but still enqueue the module so the worker loads PE export names as a
-        // fallback (skipping the download).
-        let deny_error = {
-            let denied = self.denied_loads.lock().unwrap();
-            denied.contains(&Self::short_name_lower(&module_path)).then(|| {
-                let msg = "symbol download skipped (failed in a previous run; retry to download again)".to_string();
-                self.failed_loads.lock().unwrap().insert(module_path.clone(), msg.clone());
-                msg
-            })
-        };
-
-        // Check if already pending
-        {
-            let mut pending = self.pending_loads.lock().unwrap();
-            if pending.contains(&module_path) {
-                return;
-            }
-            pending.insert(module_path.clone());
-        }
-
-        // Send to worker
-        if let Err(e) = self.worker_tx.send(SymbolLoadRequest { module: module.clone(), deny_error }) {
-            error!(module_path = %module_path, error = %e, "Failed to send symbol load request to worker");
-            // Remove from pending if send failed
-            let mut pending = self.pending_loads.lock().unwrap();
-            pending.remove(&module_path);
+        // A deny-listed image still contributes symbols readable without its
+        // debug file; do not run the downloading provider.
+        let deny_error = self.denied_loads.lock().unwrap().contains(&Self::short_name_lower(path)).then(|| {
+            let msg = "symbol download skipped (failed in a previous run; retry to download again)".to_string();
+            self.failed_loads.lock().unwrap().insert(path.clone(), msg.clone());
+            msg
+        });
+        let generation = pending.next_load;
+        pending.next_load = generation.wrapping_add(1);
+        pending.automatic.insert(path.clone(), generation);
+        if let Err(e) = self.worker_tx.send(SymbolLoadRequest { module: module.clone(), deny_error, generation, image_file: stamp }) {
+            error!(module_path = %path, error = %e, "Failed to send symbol load request to worker");
+            pending.automatic.remove(path);
             self.pending_cv.notify_all();
         }
+        true
     }
 
     /// Wait for symbol loading to complete for a module if it's in progress, with timeout
     fn wait_for_loading(&self, module_path: &str) -> Result<(), SymbolError> {
+        self.wait_for_pending(module_path, self.wait_timeout, |pending| pending.contains(module_path));
+        Ok(())
+    }
+
+    fn wait_for_pending(&self, module_path: &str, timeout: Duration, should_wait: impl Fn(&PendingLoads) -> bool) {
         let start = Instant::now();
         let mut pending = self.pending_loads.lock().unwrap();
         
         // A record only when there is something to wait for.
-        let mut span = if pending.contains(module_path) { crate::perf::span("symbols.wait_for_loading") } else { crate::perf::Span::off() };
+        let mut span = if should_wait(&pending) { crate::perf::span("symbols.wait_for_loading") } else { crate::perf::Span::off() };
         if span.is_live() {
             span.attr("module_key", crate::perf::path_key(module_path));
         }
-        while pending.contains(module_path) {
+        while should_wait(&pending) {
             let elapsed = start.elapsed();
-            if elapsed >= self.wait_timeout {
+            if elapsed >= timeout {
                 span.attr("timed_out", 1);
-                trace!(module_path, timeout_ms = self.wait_timeout.as_millis() as u64, "Timeout waiting for symbol loading");
-                return Ok(()); // Return Ok even on timeout to allow partial results
+                trace!(module_path, timeout_ms = timeout.as_millis() as u64, "Timeout waiting for symbol loading");
+                return;
             }
             
-            let remaining = self.wait_timeout - elapsed;
+            let remaining = timeout - elapsed;
             let (guard, timeout_result) = self.pending_cv.wait_timeout(pending, remaining).unwrap();
             pending = guard;
             if timeout_result.timed_out() {
                 span.attr("timed_out", 1);
-                trace!(module_path, timeout_ms = self.wait_timeout.as_millis() as u64, "Timeout waiting for symbol loading (cv)");
-                return Ok(());
+                trace!(module_path, timeout_ms = timeout.as_millis() as u64, "Timeout waiting for symbol loading (cv)");
+                return;
             }
         }
-        Ok(())
     }
 
     pub fn wait_for_all_loading(&self) {
         let start = Instant::now();
         let mut pending = self.pending_loads.lock().unwrap();
         
-        while !pending.is_empty() {
+        while !pending.automatic.is_empty() || !pending.overrides.is_empty() {
             let elapsed = start.elapsed();
             if elapsed >= self.wait_timeout {
                 trace!(timeout_ms = self.wait_timeout.as_millis() as u64, "Timeout waiting for all symbol loading");
@@ -382,8 +485,8 @@ impl SymbolManager {
     /// not requested. Single source of truth for every caller that needs to tell
     /// "no symbols" apart from "not ready yet". Returns the PDB path when loaded.
     fn load_state(&self, module_path: &str) -> (SymbolLoadState, Option<String>) {
-        let cache = self.symbol_cache.lock().unwrap();
         let pending = self.pending_loads.lock().unwrap();
+        let cache = self.symbol_cache.lock().unwrap();
         let failed = self.failed_loads.lock().unwrap();
 
         if let Some(cached) = cache.get(module_path) {
@@ -429,6 +532,40 @@ impl SymbolManager {
     /// a mismatch is returned as `PdbLoadOutcome::Mismatch`, not an error.
     /// A user-loaded PDB replaces any previously cached symbols for the module.
     pub fn load_pdb_from_path(&self, module: &ModuleInfo, pdb_path: &Path, force: bool) -> Result<PdbLoadOutcome, SymbolError> {
+        self.load_pdb_from_path_if_current(module, pdb_path, force, None, || Ok(()))
+    }
+
+    /// Obtain a short-lived guard for registering the override and again for
+    /// publishing it. The caller can use it to exclude module unload/remap;
+    /// opening and parsing the debug file holds no such guard.
+    pub(crate) fn load_pdb_from_path_if_current<G>(
+        &self, module: &ModuleInfo, pdb_path: &Path, force: bool,
+        mapping: Option<u64>,
+        guard: impl Fn() -> Result<G, SymbolError>,
+    ) -> Result<PdbLoadOutcome, SymbolError> {
+        let image_file = ImageStamp::read(&module.name);
+        {
+            let _mapping = guard()?;
+            let mut pending = self.pending_loads.lock().unwrap();
+            let expected = pending.image_files.entry(module.name.clone()).or_insert(image_file);
+            if *expected != image_file {
+                return Err(SymbolError::ModuleNotLoaded(format!("Image file changed: {}", module.name)));
+            }
+            pending.begin_override(&module.name, mapping);
+        }
+        let loaded = self.load_debug_file(module, pdb_path, force, image_file, guard);
+        self.pending_loads.lock().unwrap().finish_override(&module.name, mapping);
+        self.pending_cv.notify_all();
+        if matches!(loaded, Ok(PdbLoadOutcome::Loaded { .. })) {
+            self.lines.warm(&module.name);
+        }
+        loaded
+    }
+
+    fn load_debug_file<G>(
+        &self, module: &ModuleInfo, pdb_path: &Path, force: bool, image_file: Option<ImageStamp>,
+        guard: impl FnOnce() -> Result<G, SymbolError>,
+    ) -> Result<PdbLoadOutcome, SymbolError> {
         let mut symbols = match self.backend.load_debug_file(module, pdb_path, force)? {
             Ok(symbols) => symbols,
             Err(mismatch) => return Ok(PdbLoadOutcome::Mismatch(mismatch)),
@@ -436,22 +573,29 @@ impl SymbolManager {
         symbols.sort_by_key(|s| s.rva);
         let symbol_count = symbols.len();
 
-        {
+        let disk_file = ImageStamp::read(&module.name);
+        let mapping = guard()?;
+        let old_symbols = {
+            let pending = self.pending_loads.lock().unwrap();
+            if pending.image_files.get(&module.name) != Some(&image_file) || disk_file != image_file {
+                return Err(SymbolError::ModuleNotLoaded(format!("Image changed while loading symbols: {}", module.name)));
+            }
             let mut cache = self.symbol_cache.lock().unwrap();
-            cache.insert(module.name.clone(), ModuleSymbols {
+            cache.insert(module.name.clone(), Arc::new(ModuleSymbols {
                 module_base: module.base,
                 symbols,
                 pdb_path: Some(pdb_path.display().to_string()),
                 source: SymbolSource::Pdb,
-            });
-        }
+            }))
+        };
         self.failed_loads.lock().unwrap().remove(&module.name);
         self.denied_loads.lock().unwrap().remove(&Self::short_name_lower(&module.name));
         // The line/type tables came from the previous PDB. Types are re-parsed
         // on demand; the line table right away, in the background.
         self.invalidate_line_table(&module.name);
-        self.lines.warm(&module.name);
         self.type_cache.lock().unwrap().remove(&module.name);
+        drop(mapping);
+        drop(old_symbols);
 
         trace!(module_path = %module.name, pdb_path = %pdb_path.display(), symbol_count, force, "Loaded user-supplied PDB");
         Ok(PdbLoadOutcome::Loaded { symbol_count })
@@ -683,19 +827,12 @@ impl SymbolManager {
     }
 
     /// Retry a failed (or never-attempted) symbol download for a module.
-    pub fn retry_loading_symbols(&self, module: &ModuleInfo) {
-        // Evict a cached export-fallback stub so the retry re-attempts the real
-        // PDB download (`start_loading_symbols` early-returns on any cache hit).
-        // A real PDB is never evicted.
-        {
-            let mut cache = self.symbol_cache.lock().unwrap();
-            if cache.get(&module.name).is_some_and(|m| m.source.is_replaceable()) {
-                cache.remove(&module.name);
-            }
+    pub fn retry_loading_symbols(&self, module: &ModuleInfo) -> Result<(), SymbolError> {
+        if self.request_symbol_load(module, ImageStamp::read(&module.name), LoadReason::Retry) {
+            Ok(())
+        } else {
+            Err(SymbolError::ModuleNotLoaded(format!("Image file changed: {}", module.name)))
         }
-        self.denied_loads.lock().unwrap().remove(&Self::short_name_lower(&module.name));
-        self.failed_loads.lock().unwrap().remove(&module.name);
-        self.start_loading_symbols(module);
     }
 
     /// Lowercased file-name portion of a module path ("C:\\x\\Foo.DLL" -> "foo.dll").
@@ -726,6 +863,51 @@ impl SymbolManager {
         self.failed_loads.lock().unwrap().remove(module_path);
         self.denied_loads.lock().unwrap().remove(&Self::short_name_lower(module_path));
         trace!(module_path, "Unloaded module symbols and derived caches");
+    }
+
+    pub(crate) fn resolve_module_breakpoint_symbols(
+        &self, module: &ModuleInfo, mapping: u64, names: &[String], wait: bool, eligible: impl Fn(u32) -> bool,
+    ) -> Vec<ModuleBreakpointSymbolResolution> {
+        use ModuleBreakpointSymbolResolution::{Loading, Missing};
+
+        if names.is_empty() {
+            return Vec::new();
+        }
+        let stamp = ImageStamp::read(&module.name);
+        if !self.request_symbol_load(module, stamp, LoadReason::OnDemand) {
+            return vec![Missing; names.len()];
+        }
+        let path = module.name.as_str();
+        if wait {
+            // A manual load can finish before the automatic worker. Do not
+            // wait for that worker if the manual result is already cached.
+            // Leave generous headroom for decoding and lookup inside the
+            // background client's 30-second socket deadline.
+            self.wait_for_pending(path, self.wait_timeout.min(Duration::from_secs(10)), |pending| {
+                pending.has_override(path, mapping)
+                    || (pending.automatic.contains_key(path)
+                        && !self.symbol_cache.lock().unwrap().contains_key(path))
+            });
+        }
+        let ready = {
+            let pending = self.pending_loads.lock().unwrap();
+            if pending.image_files.get(path) != Some(&stamp) {
+                return vec![Missing; names.len()];
+            }
+            // Never use the existing cache during an explicit debug-file load.
+            if pending.has_override(path, mapping) {
+                return vec![Loading; names.len()];
+            }
+            let cached = self.symbol_cache.lock().unwrap().get(path).cloned();
+            if cached.is_none() && pending.automatic.contains_key(path) {
+                return vec![Loading; names.len()];
+            }
+            cached
+        };
+        match ready {
+            Some(ready) => exact_symbol_names(&ready.symbols, names, eligible),
+            None => vec![Missing; names.len()],
+        }
     }
 
     /// Find symbols across all loaded modules, returning up to max_results matches
@@ -1295,6 +1477,129 @@ impl SymbolManager {
         }
     }
 
+}
+
+/// Scan the ready table once. Provider duplicates at one RVA are one result;
+/// a second distinct eligible RVA is ambiguous, regardless of entry order.
+fn exact_symbol_names(
+    symbols: &[ModuleSymbol], names: &[String], eligible: impl Fn(u32) -> bool,
+) -> Vec<ModuleBreakpointSymbolResolution> {
+    use ModuleBreakpointSymbolResolution::{Ambiguous, Found, Missing};
+
+    let mut matches: HashMap<&str, _> = names.iter().map(|name| (name.as_str(), Missing)).collect();
+    for symbol in symbols {
+        if let Some(result) = matches.get_mut(symbol.name.as_str()) {
+            let rva = symbol.rva;
+            match *result {
+                Missing if eligible(rva) => *result = Found { rva },
+                Found { rva: first } if first != rva && eligible(rva) => *result = Ambiguous,
+                _ => {}
+            }
+        }
+    }
+    names.iter().map(|name| matches[name.as_str()]).collect()
+}
+
+#[cfg(test)]
+mod module_breakpoint_tests {
+    use super::*;
+    use crate::interfaces::SymbolProvider;
+    use ModuleBreakpointSymbolResolution::{Ambiguous, Found, Loading, Missing};
+
+    fn symbol(name: &str, rva: u32) -> ModuleSymbol {
+        ModuleSymbol { name: name.into(), rva, is_function: true }
+    }
+
+    #[test]
+    fn module_breakpoint_names_are_literal_ordered_and_unique_by_eligible_rva() {
+        let symbols = [
+            symbol("private", 0x10),
+            symbol("private", 0x10),
+            symbol("ambiguous", 0x20),
+            symbol("ambiguous", 0x30),
+            symbol("private", 0x80), // Not executable.
+            symbol("only_similar_name", 0x40),
+            symbol("a+b", 0x50),
+        ];
+        let names = ["ambiguous", "private", "Private", "similar_name", "a+b", "private", "*"]
+            .map(String::from);
+        assert_eq!(
+            exact_symbol_names(&symbols, &names, |rva| rva < 0x80),
+            [Ambiguous, Found { rva: 0x10 }, Missing, Missing, Found { rva: 0x50 }, Found { rva: 0x10 }, Missing],
+        );
+    }
+
+    struct BlockingOverride {
+        entered: mpsc::Sender<()>,
+        finish: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl SymbolBackend for BlockingOverride {
+        fn new_provider(&self, cfg: &SymbolConfig) -> Result<Box<dyn SymbolProvider>, SymbolError> {
+            PdbBackend.new_provider(cfg)
+        }
+        fn fallback_symbols(&self, _: &str) -> Result<Vec<ModuleSymbol>, String> { unreachable!() }
+        fn parse_lines(&self, _: &Path) -> Result<ModuleLineTable, SymbolError> { Ok(ModuleLineTable::default()) }
+        fn parse_types(&self, _: &Path) -> Result<ModuleTypeInfo, SymbolError> { unreachable!() }
+        fn function_table(&self, _: &str) -> Option<FunctionTable> { unreachable!() }
+        fn load_debug_file(
+            &self, _: &ModuleInfo, _: &Path, _: bool,
+        ) -> Result<Result<Vec<ModuleSymbol>, crate::protocol::PdbMismatchInfo>, SymbolError> {
+            self.entered.send(()).unwrap();
+            self.finish.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok(Ok(vec![symbol("name", 0x80)]))
+        }
+    }
+
+    #[test]
+    fn module_breakpoint_queries_ignore_fallback_while_override_loads() {
+        let (entered, entered_rx) = mpsc::channel();
+        let (finish, finish_rx) = mpsc::channel();
+        let backend = Arc::new(BlockingOverride { entered, finish: Mutex::new(finish_rx) });
+        let mut manager = SymbolManager::new_with_backend(SymbolConfig { offline: true, ..Default::default() }, backend).unwrap();
+        manager.wait_timeout = Duration::ZERO;
+        let target = ModuleInfo { base: 0x1000, size: Some(0x100), name: "first/fixture.dll".into() };
+        let other = ModuleInfo { base: 0x2000, size: Some(0x100), name: "other/fixture.dll".into() };
+        for (module, symbols) in [
+            (&target, vec![symbol("name", 0x10)]),
+            (&other, vec![symbol("name", 0x20), symbol("not_here", 0x30)]),
+        ] {
+            manager.symbol_cache.lock().unwrap().insert(module.name.clone(), Arc::new(ModuleSymbols {
+                module_base: module.base, symbols, pdb_path: None,
+                source: SymbolSource::Exports { error: "no automatic debug file".into() },
+            }));
+        }
+        let names = ["name".into(), "not_here".into()];
+        let query = |wait| manager.resolve_module_breakpoint_symbols(&target, 1, &names, wait, |_| true);
+        assert_eq!(query(false), [Found { rva: 0x10 }, Missing]);
+        let live = std::sync::RwLock::new(true);
+        thread::scope(|scope| {
+            let loading = scope.spawn(|| manager.load_pdb_from_path_if_current(&target, Path::new("fixture.pdb"), true, Some(1), || {
+                let live = live.read().unwrap();
+                if !*live {
+                    return Err(SymbolError::ModuleNotLoaded("superseded fixture mapping".into()));
+                }
+                Ok(live)
+            }));
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(query(false), [Loading, Loading]);
+            assert_eq!(manager.resolve_module_breakpoint_symbols(&target, 2, &names, false, |_| true),
+                [Found { rva: 0x10 }, Missing], "a replacement mapping does not inherit the in-flight override");
+            *live.try_write().expect("parsing must release the mapping guard") = false;
+            finish.send(()).unwrap();
+            assert!(matches!(loading.join().unwrap(), Err(SymbolError::ModuleNotLoaded(_))));
+        });
+        assert_eq!(query(false), [Found { rva: 0x10 }, Missing], "superseded parse did not replace the cache");
+        thread::scope(|scope| {
+            let loading = scope.spawn(|| manager.load_pdb_from_path(&target, Path::new("fixture.pdb"), false));
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(query(false), [Loading, Loading]);
+            assert_eq!(query(true), [Loading, Loading]); // A bounded wait may still time out.
+            finish.send(()).unwrap();
+            assert!(matches!(loading.join().unwrap().unwrap(), PdbLoadOutcome::Loaded { symbol_count: 1 }));
+        });
+        assert_eq!(query(false), [Found { rva: 0x80 }, Missing]);
+    }
 }
 
 /// Extract module name (without path or extension) from a full path.

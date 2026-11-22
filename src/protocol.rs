@@ -606,6 +606,9 @@ pub mod request_response {
             pdb_path: String,
             #[serde(default)]
             force: bool,
+            /// When supplied, never load a replacement image at the same base.
+            #[serde(default)]
+            mapping_id: Option<u64>,
         },
         RetrySymbolLoad {
             pid: u32,
@@ -1053,6 +1056,27 @@ pub mod request_response {
             size: usize,
             protect: u32,
         },
+        /// The exact currently registered module instance at this base.
+        GetModuleMapping { pid: u32, module_base: u64 },
+        /// Resolve literal provider names within one mapped image. `wait`
+        /// is for background clients; it can still time out with `Loading`.
+        ResolveModuleBreakpointSymbols {
+            pid: u32,
+            module_base: u64,
+            names: Vec<String>,
+            wait: bool,
+        },
+        /// Arm only if the specified module instance still owns the address.
+        ArmModuleBreakpoint {
+            pid: u32,
+            module_base: u64,
+            mapping_id: u64,
+            addr: u64,
+        },
+        /// Restore bytes only in the mapping in which the trap was armed.
+        RemoveModuleBreakpoint { pid: u32, module_base: u64, mapping_id: u64, addr: u64 },
+        /// Snapshot live mappings before attach publishes its individual load events.
+        ListMappedModules { pid: u32 },
     }
 
     /// Where a coverage target came from, so a UI can tell a PDB-named function
@@ -1324,6 +1348,11 @@ pub mod request_response {
         /// Reply to [`DebuggerRequest::ProtectMemory`]: the protection the
         /// first page of the range had.
         MemoryProtected { old_protect: u32 },
+        ModuleMapping { mapping: Option<(ModuleInfo, u64, bool)> },
+        /// One result per requested name, in input order.
+        ModuleBreakpointSymbols { results: Vec<ModuleBreakpointSymbolResolution> },
+        /// `false` means the mapping is gone or has been replaced.
+        ModuleBreakpointChanged { applied: bool },
     }
 
     #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1518,6 +1547,15 @@ pub mod request_response {
         /// Path of the PDB the symbols were loaded from, when loaded.
         pub pdb_path: Option<String>,
         pub line_info: LineInfoState,
+    }
+
+    /// Exact, case-sensitive name lookup within one mapped image.
+    #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+    pub enum ModuleBreakpointSymbolResolution {
+        Found { rva: u32 },
+        Loading,
+        Missing,
+        Ambiguous,
     }
 
     /// A resolved address → source line mapping, as returned by `ResolveAddressToLine`.

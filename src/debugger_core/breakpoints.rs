@@ -4,7 +4,7 @@
 
 use super::ops::ProcessOps;
 use crate::interfaces::{Architecture, PlatformError};
-use crate::protocol::StepKind;
+use crate::protocol::{ModuleInfo, StepKind};
 use std::collections::{HashMap, HashSet};
 use tracing::warn;
 
@@ -45,6 +45,8 @@ pub fn breakpoint_bytes(arch: Architecture) -> Vec<u8> {
 pub struct BreakpointTable {
     single_shot: HashMap<u64, Vec<u8>>,
     persistent: HashMap<u64, Vec<u8>>,
+    /// Guarded persistent traps by address -> the module mapping that armed them.
+    module_owners: HashMap<u64, u64>,
     tid_filters: HashMap<u64, Option<u32>>,
     /// Every address where a software breakpoint of ours was ever armed. When one
     /// is removed while the target runs, another thread can trap on the INT3 in
@@ -206,12 +208,25 @@ impl BreakpointTable {
             Some(original) => {
                 self.tid_filters.remove(&address);
                 self.internal.remove(&address);
+                self.module_owners.remove(&address);
                 Some(original)
             }
             // A step-over parks its saved bytes in the single-shot map; leave those.
             None if self.step_over.contains_key(&address) => None,
             None => self.single_shot.remove(&address),
         }
+    }
+
+    /// The image is already gone. Drop registrations without restoring bytes,
+    /// retaining only the history needed to recognize queued breakpoint hits.
+    pub(crate) fn forget_range(&mut self, gone: impl Fn(u64) -> bool) {
+        self.single_shot.retain(|&addr, _| !gone(addr));
+        self.persistent.retain(|&addr, _| !gone(addr));
+        self.module_owners.retain(|&addr, _| !gone(addr));
+        self.tid_filters.retain(|&addr, _| !gone(addr));
+        self.step_over.retain(|&addr, _| !gone(addr));
+        self.step_out.retain(|&addr, _| !gone(addr));
+        self.internal.retain(|&addr, _| !gone(addr));
     }
 
     /// Every armed breakpoint's address and original bytes (persistent and
@@ -230,6 +245,7 @@ impl BreakpointTable {
             .collect();
         self.tid_filters.clear();
         self.internal.clear();
+        self.module_owners.clear();
         all
     }
 
@@ -266,9 +282,10 @@ pub fn arm_single_shot<O: ProcessOps + ?Sized>(
 ) -> Result<(), PlatformError> {
     // `int3` on x86/x64, `BRK #0` on ARM64; save exactly the bytes it overwrites.
     let breakpoint_bytes = breakpoint_bytes(ops.arch());
-    let original_bytes = ops.read(pid, address, breakpoint_bytes.len())?;
+    let original_bytes = read_trap_original(ops, pid, address, breakpoint_bytes.len())?;
+    ops.write(pid, address, &breakpoint_bytes)?;
     bps.insert_single_shot(address, original_bytes);
-    ops.write(pid, address, &breakpoint_bytes)
+    Ok(())
 }
 
 /// Plant a persistent breakpoint at `address` (idempotent), optionally
@@ -284,9 +301,51 @@ pub fn arm_persistent<O: ProcessOps + ?Sized>(
         return Ok(());
     }
     let breakpoint_bytes = breakpoint_bytes(ops.arch());
-    let original_bytes = ops.read(pid, address, breakpoint_bytes.len())?;
+    let original_bytes = read_trap_original(ops, pid, address, breakpoint_bytes.len())?;
+    ops.write(pid, address, &breakpoint_bytes)?;
     bps.insert_persistent(address, original_bytes, tid);
-    ops.write(pid, address, &breakpoint_bytes)
+    Ok(())
+}
+
+fn read_trap_original(
+    ops: &(impl ProcessOps + ?Sized), pid: u32, address: u64, width: usize,
+) -> Result<Vec<u8>, PlatformError> {
+    let bytes = ops.read(pid, address, width)?;
+    if bytes.len() != width {
+        return Err(PlatformError::Other("Could not read the complete original instruction bytes".into()));
+    }
+    Ok(bytes)
+}
+
+/// The complete trap must fit in a known image and obey the target ISA's
+/// alignment. Returns its exclusive end for the live memory-region check.
+pub(crate) fn module_trap_end(module: &ModuleInfo, arch: Architecture, addr: u64) -> Result<u64, PlatformError> {
+    let width = if arch == Architecture::Arm64 { 4 } else { 1 };
+    if addr % width != 0 {
+        return Err(PlatformError::Other("Instruction address is not aligned for this target architecture".into()));
+    }
+    let image_end = module.size.and_then(|size| module.base.checked_add(size))
+        .ok_or_else(|| PlatformError::Other("Module bounds are unavailable".into()))?;
+    addr.checked_add(width).filter(|&end| addr >= module.base && end <= image_end)
+        .ok_or_else(|| PlatformError::Other("Breakpoint is outside the module's mapped image".into()))
+}
+
+pub(crate) fn change_module_trap<O: ProcessOps + ?Sized>(
+    bps: &mut BreakpointTable, ops: &O, pid: u32, addr: u64, mapping_id: u64, arm: bool,
+) -> Result<bool, PlatformError> {
+    if arm {
+        if bps.is_persistent(addr) || bps.has_single_shot(addr) || bps.has_step_over(addr) {
+            return Err(PlatformError::Other("Address already has a breakpoint".into()));
+        }
+        arm_persistent(bps, ops, pid, addr, None)?;
+        bps.module_owners.insert(addr, mapping_id);
+    } else {
+        if bps.module_owners.get(&addr) != Some(&mapping_id) {
+            return Ok(false);
+        }
+        remove_breakpoint(bps, ops, pid, addr)?;
+    }
+    Ok(true)
 }
 
 /// Restore the original instruction bytes for the persistent breakpoint at
@@ -391,13 +450,17 @@ pub fn remove_breakpoint<O: ProcessOps + ?Sized>(
     pid: u32,
     address: u64,
 ) -> Result<(), PlatformError> {
-    match bps.take_for_removal(address) {
-        Some(original) => ops.write(pid, address, &original),
-        None => {
-            warn!(address, "Breakpoint not found");
-            Ok(())
-        }
+    let original = bps.persistent.get(&address).or_else(|| {
+        if bps.has_step_over(address) { None } else { bps.single_shot.get(&address) }
+    });
+    if let Some(original) = original {
+        // A failed restore must leave the live trap registered for a retry.
+        ops.write(pid, address, original)?;
+        let _ = bps.take_for_removal(address);
+    } else {
+        warn!(address, "Breakpoint not found");
     }
+    Ok(())
 }
 
 /// Whether a breakpoint trap at `address` is a *stale* hit on a software
@@ -443,6 +506,123 @@ pub fn restore_all<O: ProcessOps + ?Sized>(bps: &mut BreakpointTable, ops: &O, p
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::debugger_core::hw_breakpoints::{InternalHardwareBreakpoint, X86DebugRegs};
+    use crate::debugger_core::DebugBook;
+    use crate::protocol::{HardwareBreakpointSize, HardwareBreakpointType, ThreadContext};
+    use std::cell::Cell;
+
+    struct CodeByte {
+        byte: Cell<u8>,
+        writes: Cell<usize>,
+        fail_next_write: Cell<bool>,
+    }
+
+    impl CodeByte {
+        fn new(byte: u8) -> Self {
+            Self { byte: Cell::new(byte), writes: Cell::new(0), fail_next_write: Cell::new(false) }
+        }
+    }
+
+    impl ProcessOps for CodeByte {
+        fn arch(&self) -> Architecture { Architecture::X64 }
+        fn read(&self, _: u32, _: u64, len: usize) -> Result<Vec<u8>, PlatformError> {
+            assert_eq!(len, 1);
+            Ok(vec![self.byte.get()])
+        }
+        fn write(&self, _: u32, _: u64, data: &[u8]) -> Result<(), PlatformError> {
+            self.writes.set(self.writes.get() + 1);
+            if self.fail_next_write.replace(false) {
+                return Err(PlatformError::OsError("injected write failure".into()));
+            }
+            assert_eq!(data.len(), 1);
+            self.byte.set(data[0]);
+            Ok(())
+        }
+        fn live_threads(&self, _: u32) -> Vec<u32> { unreachable!() }
+        fn freeze_thread(&self, _: u32, _: u32) -> Result<(), PlatformError> { unreachable!() }
+        fn thaw_thread(&self, _: u32, _: u32) -> Result<(), PlatformError> { unreachable!() }
+        fn get_context(&self, _: u32, _: u32) -> Result<ThreadContext, PlatformError> { unreachable!() }
+        fn set_context(&self, _: u32, _: u32, _: ThreadContext) -> Result<(), PlatformError> { unreachable!() }
+        fn modify_debug_regs(
+            &self, _: u32, _: u32, _: bool, _: &mut dyn FnMut(&mut dyn X86DebugRegs) -> bool,
+        ) -> Result<(), PlatformError> { unreachable!() }
+        fn apply_hw_bp(
+            &self, _: u32, _: u32, _: u8, _: u64, _: HardwareBreakpointType, _: HardwareBreakpointSize,
+        ) -> Result<(), PlatformError> { unreachable!() }
+        fn clear_hw_bp(&self, _: u32, _: u32, _: u8, _: HardwareBreakpointType) -> Result<(), PlatformError> { unreachable!() }
+        fn apply_all_hw_bps(&self, _: u32, _: u32, _: &[InternalHardwareBreakpoint]) -> Result<(), PlatformError> { unreachable!() }
+    }
+
+    #[test]
+    fn module_breakpoint_failed_arm_can_retry() {
+        let ops = CodeByte::new(0x90);
+        let mut bps = BreakpointTable::default();
+        let addr = 0x1020;
+        ops.fail_next_write.set(true);
+        assert!(arm_persistent(&mut bps, &ops, 1, addr, None).is_err());
+        assert!(!bps.is_persistent(addr));
+        assert!(!bps.ever_armed(addr));
+        arm_persistent(&mut bps, &ops, 1, addr, None).unwrap();
+        assert_eq!(ops.writes.get(), 2);
+        assert_eq!(ops.byte.get(), 0xcc);
+        assert_eq!(bps.persistent_original(addr).unwrap().as_slice(), &[0x90]);
+    }
+
+    #[test]
+    fn module_breakpoint_same_base_remap_rejects_stale_arm_and_remove() {
+        let ops = CodeByte::new(0x90);
+        let mut book = DebugBook::new(Architecture::X64);
+        let base = 0x1000;
+        let addr = base + 0x20;
+        let module = ModuleInfo { name: "fixture.dll".into(), base, size: Some(0x100) };
+        book.modules.add_module(module.clone());
+        let first = book.modules.mapping_at(base).unwrap().1;
+        assert!(book.change_module_breakpoint(&ops, 1, base, first, addr, true, |_| Ok(Some(true))).unwrap());
+        book.bps.insert_single_shot(addr + 1, vec![0x55]);
+        book.bps.insert_step_over(addr + 1, 7, StepKind::Over);
+        book.bps.insert_step_out(addr + 2, 7, addr + 2);
+        book.bps.insert_persistent(base - 1, vec![0x90], None);
+
+        book.unload_module(&ops, 1, base);
+        assert_eq!(ops.writes.get(), 1, "unload never restores bytes");
+        assert!(!book.bps.is_persistent(addr));
+        assert!(!book.bps.has_single_shot(addr + 1));
+        assert!(!book.bps.has_step_over(addr + 1));
+        assert!(!book.bps.has_step_out(addr + 2));
+        assert!(book.bps.ever_armed(addr));
+        assert!(book.bps.is_persistent(base - 1));
+
+        ops.byte.set(0x55);
+        book.modules.add_module(module);
+        let second = book.modules.mapping_at(base).unwrap().1;
+        assert_ne!(first, second);
+        assert!(!book.change_module_breakpoint(&ops, 1, base, first, addr, true, |_| unreachable!()).unwrap());
+        assert!(book.change_module_breakpoint(&ops, 1, base, second, addr, true, |_| Ok(Some(true))).unwrap());
+        assert!(book.change_module_breakpoint(&ops, 1, base, second, addr, true, |_| Ok(Some(true))).is_err(),
+            "a second arm cannot adopt an existing trap");
+        assert!(!book.change_module_breakpoint(&ops, 1, base, first, addr, false, |_| unreachable!()).unwrap());
+        assert_eq!(ops.byte.get(), 0xcc);
+        ops.fail_next_write.set(true);
+        assert!(book.change_module_breakpoint(&ops, 1, base, second, addr, false, |_| Ok(Some(true))).is_err());
+        assert!(book.bps.is_persistent(addr), "restore failure leaves ownership intact");
+        assert!(book.change_module_breakpoint(&ops, 1, base, second, addr, false, |_| Ok(Some(true))).unwrap());
+        assert_eq!(ops.byte.get(), 0x55, "only the new mapping's original byte is restored");
+    }
+
+    #[test]
+    fn module_breakpoint_trap_must_fit_known_image() {
+        let mut module = ModuleInfo { name: "fixture.dll".into(), base: 0x1000, size: Some(9) };
+        assert_eq!(module_trap_end(&module, Architecture::Arm64, 0x1004).unwrap(), 0x1008);
+        assert!(module_trap_end(&module, Architecture::Arm64, 0x1005).is_err());
+        assert!(module_trap_end(&module, Architecture::Arm64, 0x1008).is_err());
+        assert_eq!(module_trap_end(&module, Architecture::X64, 0x1008).unwrap(), 0x1009);
+        assert!(module_trap_end(&module, Architecture::X64, 0x1009).is_err());
+        module.size = None;
+        assert!(module_trap_end(&module, Architecture::X64, 0x1000).is_err());
+        module.base = u64::MAX;
+        module.size = Some(1);
+        assert!(module_trap_end(&module, Architecture::X64, u64::MAX).is_err());
+    }
 
     /// Real encodings taken from ARM64 ntdll syscall stubs, which are literally
     /// `svc #n; ret` - this is why a coverage breakpoint on a function entry can

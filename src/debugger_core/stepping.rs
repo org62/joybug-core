@@ -110,6 +110,18 @@ impl StepBook {
     pub fn is_stepping_over_other_thread(&self, tid: u32) -> bool {
         self.exclusive_stepper().is_some_and(|stepper| stepper != tid)
     }
+
+    /// Forget which trap to rearm, but let `pending_rearm` consume the
+    /// inevitable single-step event without exposing it as a user step.
+    pub(crate) fn forget_step_overs_in_range(&mut self, gone: impl Fn(u64) -> bool) -> bool {
+        let mut removed_exclusive = false;
+        self.stepping_over.retain(|_, (addr, exclusive)| {
+            let removed = gone(*addr);
+            removed_exclusive |= removed && *exclusive;
+            !removed
+        });
+        removed_exclusive
+    }
 }
 
 /// Begin a software-breakpoint step-over for `tid` at `address`: freeze every

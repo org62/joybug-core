@@ -519,6 +519,33 @@ pub trait PlatformAPI: Send + Sync {
     fn set_thread_context(&self, pid: u32, tid: u32, context: crate::protocol::ThreadContext) -> Result<(), PlatformError>;
     fn get_function_arguments(&self, pid: u32, tid: u32, count: usize) -> Result<Vec<u64>, PlatformError>;
     fn list_modules(&self, pid: u32) -> Result<Vec<ModuleInfo>, PlatformError>;
+    /// A snapshot for attach before the individual module events are delivered.
+    fn list_mapped_modules(&self, pid: u32) -> Result<Vec<ModuleInfo>, PlatformError> {
+        self.list_modules(pid)
+    }
+    /// A confirmed live mapping, with an identity that changes on reload.
+    fn module_mapping(&self, _pid: u32, _module_base: u64) -> Option<(ModuleInfo, u64)> {
+        None
+    }
+    /// Verify image instance, bounds, architecture and live memory ownership.
+    /// `None` means the mapping does not own the address; `Some` reports
+    /// whether the entire trap fits in executable memory.
+    fn module_trap_location(
+        &self, _pid: u32, _module_base: u64, _mapping_id: u64, _addr: u64,
+    ) -> Result<Option<bool>, PlatformError> {
+        Err(PlatformError::NotImplemented)
+    }
+    /// Whether the module's path still names the file providing its code.
+    fn module_symbol_file_matches(&self, _pid: u32, _module_base: u64) -> bool {
+        true
+    }
+    /// Arm or remove a persistent software trap in exactly this mapping.
+    /// Returns false when the mapping or trap ownership is gone.
+    fn change_module_breakpoint(
+        &mut self, _pid: u32, _module_base: u64, _mapping_id: u64, _addr: u64, _arm: bool,
+    ) -> Result<bool, PlatformError> {
+        Err(PlatformError::NotImplemented)
+    }
     fn list_threads(&self, pid: u32) -> Result<Vec<ThreadInfo>, PlatformError>;
     // Thread control. Suspend/resume return the *previous* suspend count.
     fn suspend_thread(&self, _pid: u32, _tid: u32) -> Result<u32, PlatformError> { Err(PlatformError::NotImplemented) }

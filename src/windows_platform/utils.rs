@@ -5,8 +5,8 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, MAX_PATH,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, GetFinalPathNameByHandleA, QueryDosDeviceW,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, GetFileInformationByHandle, GetFinalPathNameByHandleA, QueryDosDeviceW,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::ProcessStatus::GetMappedFileNameW;
 use windows_sys::Win32::System::Diagnostics::Debug::{
@@ -22,6 +22,43 @@ use windows_sys::Win32::System::SystemServices::{
 };
 use windows_sys::Win32::System::Threading::QueryFullProcessImageNameW;
 use windows_sys::core::PWSTR;
+
+/// Stable backing identity of a Windows image, not its replaceable pathname.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ImageFileId {
+    volume: u32,
+    index: u64,
+}
+
+impl ImageFileId {
+    pub(crate) fn of_handle(handle: HANDLE) -> Option<Self> {
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        (unsafe { GetFileInformationByHandle(handle, &mut info) } != 0).then(|| Self {
+            volume: info.dwVolumeSerialNumber,
+            index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        })
+    }
+
+    fn open_attributes(path: &str) -> std::io::Result<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().access_mode(FILE_READ_ATTRIBUTES).open(path)
+    }
+
+    pub(crate) fn at_path(path: &str) -> Option<Self> {
+        use std::os::windows::io::AsRawHandle;
+        let file = Self::open_attributes(path).ok()?;
+        Self::of_handle(file.as_raw_handle() as HANDLE)
+    }
+
+    pub(crate) fn metadata_at_path(path: &str) -> Option<(std::fs::Metadata, Option<Self>)> {
+        use std::os::windows::io::AsRawHandle;
+        let file = Self::open_attributes(path).ok()?;
+        Some((file.metadata().ok()?, Self::of_handle(file.as_raw_handle() as HANDLE)))
+    }
+}
 
 // `ntdll!NtQueryInformationThread`. Declared once here because a second,
 // signature-divergent declaration elsewhere in the crate is only caught at
@@ -397,7 +434,7 @@ pub fn get_module_size_from_address(process_handle: HANDLE, module_base: usize) 
     }
 
     // Get PE header offset
-    let nt_header_address = module_base + dos_header.e_lfanew as usize;
+    let nt_header_address = module_base.checked_add(usize::try_from(dos_header.e_lfanew).ok()?)?;
     let mut nt_headers: IMAGE_NT_HEADERS64 = unsafe { std::mem::zeroed() };
 
     // Read PE header

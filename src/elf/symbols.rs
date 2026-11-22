@@ -236,11 +236,10 @@ impl SymbolBackend for ElfBackend {
         Ok(Box::new(ElfSymbolProvider { offline: cfg.offline, ..Default::default() }))
     }
 
-    /// The provider already read the module's own tables (and its debug
-    /// file) in one go, so when that failed there is nothing left to fall
-    /// back to.
+    /// A deny-listed image skips the debug-file lookup, not its own symbol
+    /// table. For other load failures this normally fails for the same reason.
     fn fallback_symbols(&self, module_path: &str) -> Result<Vec<ModuleSymbol>, String> {
-        Err(format!("{module_path}: no symbol table in the module or a debug file"))
+        parse_elf_symbols(Path::new(module_path)).map(|(symbols, _)| symbols).map_err(|e| e.to_string())
     }
 
     fn parse_lines(&self, debug_file: &Path) -> Result<ModuleLineTable, SymbolError> {

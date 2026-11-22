@@ -527,6 +527,17 @@ pub(super) fn query_memory_region_unlocked(
             )));
         }
 
+        let result = query_memory_region_handle(handle, address);
+        windows_sys::Win32::Foundation::CloseHandle(handle);
+        result
+    }
+}
+
+pub(super) fn query_memory_region_handle(
+    handle: HANDLE,
+    address: u64,
+) -> Result<crate::protocol::MemoryRegionInfo, PlatformError> {
+    unsafe {
         let mut mem_info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
         let result = VirtualQueryEx(
             handle,
@@ -534,7 +545,6 @@ pub(super) fn query_memory_region_unlocked(
             &mut mem_info,
             std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
         );
-        windows_sys::Win32::Foundation::CloseHandle(handle);
 
         if result == 0 {
             let error = GetLastError();
@@ -562,6 +572,34 @@ pub(super) fn query_memory_region_unlocked(
             region_type: mem_info.Type,
         })
     }
+}
+
+/// Check the live allocation, not just the image's nominal PE bounds.
+pub(super) fn module_trap_region(handle: HANDLE, base: u64, addr: u64, end: u64) -> Result<Option<bool>, PlatformError> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_IMAGE, PAGE_GUARD};
+    let region = query_memory_region_handle(handle, addr)?;
+    let owned = region.state == MEM_COMMIT && region.region_type == MEM_IMAGE
+        && region.allocation_base == base && addr >= region.base_address
+        && region.base_address.checked_add(region.region_size).is_some_and(|limit| end <= limit);
+    Ok(owned.then_some(region.protect & 0xF0 != 0 && region.protect & PAGE_GUARD == 0))
+}
+
+/// Recover the image's allocation extent when its headers are unreadable.
+pub(super) fn mapped_image_size(handle: HANDLE, base: u64) -> Option<u64> {
+    use windows_sys::Win32::System::Memory::MEM_IMAGE;
+
+    let first = query_memory_region_handle(handle, base).ok()?;
+    if first.allocation_base != base || first.region_type != MEM_IMAGE {
+        return None;
+    }
+    let mut end = base.checked_add(first.region_size)?;
+    while let Ok(region) = query_memory_region_handle(handle, end) {
+        if region.allocation_base != base || region.region_size == 0 {
+            break;
+        }
+        end = end.checked_add(region.region_size)?;
+    }
+    (end > base).then_some(end - base)
 }
 
 pub(super) fn enumerate_memory_regions_unlocked(

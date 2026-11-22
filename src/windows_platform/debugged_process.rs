@@ -9,6 +9,7 @@ use crate::debugger_core::{breakpoints, coverage, stepping, DebugBook};
 pub(crate) use crate::debugger_core::hw_breakpoints::InternalHardwareBreakpoint;
 use crate::interfaces::{Architecture, PlatformError};
 use crate::protocol::StepKind;
+use std::collections::HashMap;
 use tracing::{error, warn};
 use windows_sys::Win32::Foundation::{FALSE, GetLastError, HANDLE};
 use windows_sys::Win32::System::Diagnostics::Debug::{EXCEPTION_RECORD, SymCleanup, SymInitialize};
@@ -44,6 +45,7 @@ impl std::fmt::Debug for LastException {
 pub(crate) struct DebuggedProcess {
     pub(super) os: WinProcess,
     pub(super) book: DebugBook,
+    pub(super) mapped_images: HashMap<u64, super::ImageFileId>,
     /// Set when a stop is reported as `DebugEvent::Exception`, dropped when the
     /// client continues. Breakpoint and step stops are the debugger's own and
     /// never land here: a dump taken at a breakpoint is not a crash dump.
@@ -67,6 +69,7 @@ impl DebuggedProcess {
         Ok(Self {
             os: WinProcess::new(pid, process_handle, architecture),
             book: DebugBook::new(architecture),
+            mapped_images: HashMap::new(),
             last_exception: None,
         })
     }

@@ -372,7 +372,7 @@ mod tests {
     use super::*;
 
     fn mapping(path: &str, write: bool, offset: u64, pages: u64) -> Mapping {
-        Mapping { start: 0x1000, end: 0x1000 + pages * PAGE, read: true, write, exec: false, shared: false, offset, path: path.to_string() }
+        Mapping { start: 0x1000, end: 0x1000 + pages * PAGE, read: true, write, exec: false, shared: false, offset, device: (0, 0), inode: 0, path: path.to_string() }
     }
 
     #[test]

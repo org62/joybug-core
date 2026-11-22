@@ -59,4 +59,51 @@ impl DebugBook {
             created_by_launch: false,
         }
     }
+
+    /// Called under the platform lock, with `mapped_code` checking the live
+    /// memory mapping using the same backend/process as the trap write.
+    pub(crate) fn change_module_breakpoint(
+        &mut self,
+        ops: &impl ops::ProcessOps,
+        pid: u32,
+        base: u64,
+        mapping_id: u64,
+        addr: u64,
+        arm: bool,
+        mapped_code: impl FnOnce(u64) -> Result<Option<bool>, crate::interfaces::PlatformError>,
+    ) -> Result<bool, crate::interfaces::PlatformError> {
+        let Some(executable) = self.module_trap_location(base, mapping_id, addr, mapped_code)? else { return Ok(false) };
+        if arm && !executable {
+            return Err(crate::interfaces::PlatformError::Other("Breakpoint is not in executable mapped memory".into()));
+        }
+        breakpoints::change_module_trap(&mut self.bps, ops, pid, addr, mapping_id, arm)
+    }
+
+    /// The eligibility check shared by exact-name lookup and trap mutation.
+    pub(crate) fn module_trap_location(
+        &self,
+        base: u64,
+        mapping_id: u64,
+        addr: u64,
+        mapped_code: impl FnOnce(u64) -> Result<Option<bool>, crate::interfaces::PlatformError>,
+    ) -> Result<Option<bool>, crate::interfaces::PlatformError> {
+        let Some((module, current_id)) = self.modules.mapping_at(base) else { return Ok(None) };
+        if current_id != mapping_id {
+            return Ok(None);
+        }
+        let end = breakpoints::module_trap_end(module, self.arch, addr)?;
+        mapped_code(end)
+    }
+
+    /// The loader has unmapped the image. Forget all its live software trap
+    /// bookkeeping, never writing saved instruction bytes back to its VAs.
+    pub(crate) fn unload_module(&mut self, ops: &impl ops::ProcessOps, pid: u32, base: u64) {
+        let Some(module) = self.modules.remove_module(base) else { return };
+        let gone = |addr: u64| addr.checked_sub(base).is_some_and(|rva| rva < module.size.unwrap_or(1));
+        self.bps.forget_range(gone);
+        self.coverage.deactivate_range(gone);
+        if self.steps.forget_step_overs_in_range(gone) {
+            stepping::resume_frozen_threads(&mut self.steps, ops, pid);
+        }
+    }
 }

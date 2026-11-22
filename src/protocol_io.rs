@@ -2,7 +2,7 @@ use crate::interfaces::{Architecture, Instruction, ModuleSymbol};
 use crate::pe_types::ModuleExtraInfo;
 pub use crate::protocol::{
     AddressLineInfo, DebuggerRequest, DebuggerResponse, DebugEvent, EmulationMode,
-    HardwareBreakpointSize, HardwareBreakpointType, MinidumpKind, ModuleInfo, ModuleSymbolStatus, NtBlockKind,
+    HardwareBreakpointSize, HardwareBreakpointType, MinidumpKind, ModuleBreakpointSymbolResolution, ModuleInfo, ModuleSymbolStatus, NtBlockKind,
     PdbLoadOutcome, PdbMismatchInfo, ProcessInfo, ScanCompareType, ScanRegionFilter, ScanValue,
     ScanValueType, StepAction, StepKind, StringEncodingFilter, StringHit, StringSortKey,
     SymbolLoadState, ThreadContext, ThreadInfo, ProcessObjects,
@@ -139,6 +139,9 @@ fn log_response(resp: &DebuggerResponse) {
         DebuggerResponse::WatchpointAccesses { accesses } => format!("WatchpointAccesses ({} entries)", accesses.len()),
         DebuggerResponse::AddressSymbol { .. } => "AddressSymbol".to_string(),
         DebuggerResponse::AddressSymbolBatch { results } => format!("AddressSymbolBatch ({} addresses)", results.len()),
+        DebuggerResponse::ModuleMapping { .. } => "ModuleMapping".to_string(),
+        DebuggerResponse::ModuleBreakpointSymbols { results } => format!("ModuleBreakpointSymbols ({} names)", results.len()),
+        DebuggerResponse::ModuleBreakpointChanged { applied } => format!("ModuleBreakpointChanged(applied={})", applied),
         DebuggerResponse::CallStack { .. } => "CallStack".to_string(),
         DebuggerResponse::FunctionArguments { .. } => "FunctionArguments".to_string(),
         DebuggerResponse::WideStringData { .. } => "WideStringData".to_string(),
@@ -958,7 +961,16 @@ impl<S> DebugSession<S> {
     }
 
     pub fn list_modules(&mut self, pid: u32) -> anyhow::Result<Vec<ModuleInfo>> {
-        let req = DebuggerRequest::ListModules { pid };
+        self.request_module_list(DebuggerRequest::ListModules { pid })
+    }
+
+    /// Snapshot modules already mapped in the target, including those whose
+    /// synthetic attach events have not reached the debug client yet.
+    pub fn list_mapped_modules(&mut self, pid: u32) -> anyhow::Result<Vec<ModuleInfo>> {
+        self.request_module_list(DebuggerRequest::ListMappedModules { pid })
+    }
+
+    fn request_module_list(&mut self, req: DebuggerRequest) -> anyhow::Result<Vec<ModuleInfo>> {
         let resp = self.send_and_receive(&req)?;
         if let DebuggerResponse::ModuleList { modules } = resp {
             Ok(modules)
@@ -1264,18 +1276,21 @@ impl<S> DebugSession<S> {
 
     /// Load symbols for a module from a user-supplied PDB file.
     /// Returns `Mismatch` (not an error) when the PDB doesn't match the PE and `force` is false.
+    /// Pass the image's captured mapping ID to guard against unload and reload.
     pub fn load_pdb_from_path(
         &mut self,
         pid: u32,
         module_base: u64,
         pdb_path: &str,
         force: bool,
+        mapping_id: Option<u64>,
     ) -> anyhow::Result<PdbLoadOutcome> {
         let req = DebuggerRequest::LoadPdbFromPath {
             pid,
             module_base,
             pdb_path: pdb_path.to_string(),
             force,
+            mapping_id,
         };
         match self.send_and_receive(&req)? {
             DebuggerResponse::PdbLoaded { symbol_count } => {
@@ -1614,6 +1629,68 @@ impl<S> DebugSession<S> {
                 "Unexpected response to SymbolsInRange: {:?}",
                 other
             )),
+        }
+    }
+
+    /// Get the current mapping and its opaque identity. The third component
+    /// indicates that the target uses Windows path rules.
+    pub fn get_module_mapping(
+        &mut self,
+        pid: u32,
+        module_base: u64,
+    ) -> anyhow::Result<Option<(ModuleInfo, u64, bool)>> {
+        match self.send_and_receive(&DebuggerRequest::GetModuleMapping { pid, module_base })? {
+            DebuggerResponse::ModuleMapping { mapping } => Ok(mapping),
+            DebuggerResponse::Error { message } => anyhow::bail!("Failed to get module mapping: {message}"),
+            other => anyhow::bail!("Unexpected response to GetModuleMapping: {other:?}"),
+        }
+    }
+
+    /// Resolve literal names in the specified module only, in input order.
+    /// Set `wait` only on a background connection; a timeout returns `Loading`.
+    pub fn resolve_module_breakpoint_symbols(
+        &mut self,
+        pid: u32,
+        module_base: u64,
+        names: Vec<String>,
+        wait: bool,
+    ) -> anyhow::Result<Vec<ModuleBreakpointSymbolResolution>> {
+        let count = names.len();
+        match self.send_and_receive(&DebuggerRequest::ResolveModuleBreakpointSymbols { pid, module_base, names, wait })? {
+            DebuggerResponse::ModuleBreakpointSymbols { results } if results.len() == count => Ok(results),
+            DebuggerResponse::Error { message } => anyhow::bail!("Failed to resolve module breakpoint symbols: {message}"),
+            other => anyhow::bail!("Unexpected response to ResolveModuleBreakpointSymbols: {other:?}"),
+        }
+    }
+
+    /// Plant a software trap only in the specified module instance. As with a
+    /// raw set request, hits are delivered through the debug loop's event handler.
+    pub fn arm_module_breakpoint(
+        &mut self,
+        pid: u32,
+        module_base: u64,
+        mapping_id: u64,
+        addr: u64,
+    ) -> anyhow::Result<bool> {
+        self.change_module_breakpoint(DebuggerRequest::ArmModuleBreakpoint { pid, module_base, mapping_id, addr })
+    }
+
+    /// Restore the bytes only if the specified module instance still exists.
+    pub fn remove_module_breakpoint(
+        &mut self,
+        pid: u32,
+        module_base: u64,
+        mapping_id: u64,
+        addr: u64,
+    ) -> anyhow::Result<bool> {
+        self.change_module_breakpoint(DebuggerRequest::RemoveModuleBreakpoint { pid, module_base, mapping_id, addr })
+    }
+
+    fn change_module_breakpoint(&mut self, request: DebuggerRequest) -> anyhow::Result<bool> {
+        match self.send_and_receive(&request)? {
+            DebuggerResponse::ModuleBreakpointChanged { applied } => Ok(applied),
+            DebuggerResponse::Error { message } => anyhow::bail!("{message}"),
+            other => anyhow::bail!("Unexpected module breakpoint response: {other:?}"),
         }
     }
 

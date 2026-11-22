@@ -899,7 +899,7 @@ impl LuaUserData for LuaDebugClient {
         methods.add_method("load_pdb", |lua, this, (pid, module_base, pdb_path, force): (u32, u64, String, Option<bool>)| {
             let mut client = this.inner.borrow_mut();
             let resp = client.send_and_receive(&DebuggerRequest::LoadPdbFromPath {
-                pid, module_base, pdb_path, force: force.unwrap_or(false),
+                pid, module_base, pdb_path, force: force.unwrap_or(false), mapping_id: None,
             }).map_err(|e| mlua::Error::external(e))?;
             match resp {
                 DebuggerResponse::PdbLoaded { symbol_count, .. } => {

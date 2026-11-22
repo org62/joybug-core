@@ -55,6 +55,17 @@ joybug-core = { git = "https://github.com/org62/joybug-core" }
 
 As a server — `jlua --listen 127.0.0.1:9000`. Clients speak the protocol in `src/protocol.rs`; `src/protocol_io.rs` has a ready-made client. Embedding the server in-process instead is a one-liner via `local_server::LocalServer`, which is what Joybug and jlua itself do for local sessions.
 
+Clients that defer software breakpoints can use `GetModuleMapping` to capture
+an image instance, then `ResolveModuleBreakpointSymbols` for a batch of exact,
+case-sensitive names in that image. Pass `wait: false` on the debug-loop
+connection; only a background connection should wait for symbols.
+`ArmModuleBreakpoint` and `RemoveModuleBreakpoint` use the captured mapping ID
+so a stale result cannot plant a trap or restore bytes in a replacement image
+at the same address.
+`LoadPdbFromPath` can take the same mapping ID to reject a manual debug-file
+load that races a remap. `ListMappedModules` snapshots already loaded images
+before attach replays their individual load events.
+
 ## Sandbox & ETW
 
 Both are always compiled — no feature flags — and both are Windows-only, as the rest of the crate already is.

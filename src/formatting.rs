@@ -222,6 +222,9 @@ impl std::fmt::Debug for DebuggerResponse {
                 .field("addresses", &results.len())
                 .field("resolved", &results.iter().filter(|r| r.is_some()).count())
                 .finish(),
+            DebuggerResponse::ModuleMapping { mapping } => f.debug_struct("ModuleMapping").field("mapping", mapping).finish(),
+            DebuggerResponse::ModuleBreakpointSymbols { results } => f.debug_struct("ModuleBreakpointSymbols").field("count", &results.len()).finish(),
+            DebuggerResponse::ModuleBreakpointChanged { applied } => f.debug_struct("ModuleBreakpointChanged").field("applied", applied).finish(),
             DebuggerResponse::AddressLine { info, pending } => f.debug_struct("AddressLine")
                 .field("info", &info.as_ref().map(|i| format!("{}:{} (rva 0x{:X})", i.file.path, i.line_entry.line_start, i.rva)))
                 .field("pending", pending)

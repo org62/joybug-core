@@ -93,6 +93,12 @@ impl CoverageBook {
         }
     }
 
+    pub(crate) fn deactivate_range(&mut self, gone: impl Fn(u64) -> bool) {
+        for (_, entry) in self.entries.iter_mut().filter(|(addr, _)| gone(**addr)) {
+            entry.active = false;
+        }
+    }
+
     /// Snapshot of every coverage breakpoint hit at least once (active or
     /// already auto-removed). Never-hit addresses are omitted - the client
     /// knows the armed set and fills zeros - so a poll doesn't serialize

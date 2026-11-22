@@ -86,6 +86,13 @@ pub fn wait_for_debug_event_blocking() -> Result<DEBUG_EVENT, PlatformError> {
     Ok(debug_event)
 }
 
+fn loaded_image_size(handle: HANDLE, base: u64) -> Option<u64> {
+    utils::get_module_size_from_address(handle, base as usize)
+        .filter(|&size| size != 0)
+        .map(|size| size as u64)
+        .or_else(|| super::memory::mapped_image_size(handle, base))
+}
+
 pub(super) fn handle_create_process_event(
     platform: &mut WindowsPlatform,
     debug_event: &DEBUG_EVENT,
@@ -130,9 +137,7 @@ pub(super) fn handle_create_process_event(
     let h_process = process.handle();
 
     // Refresh the module list now that the process is created
-    let size_of_image =
-        utils::get_module_size_from_address(h_process, info.lpBaseOfImage as usize)
-            .map(|sz| sz as u64);
+    let size_of_image = loaded_image_size(h_process, info.lpBaseOfImage as u64);
             
     // Load the module into the symbol handler
     let c_name = CString::new(image_file_name.as_str()).unwrap();
@@ -144,6 +149,7 @@ pub(super) fn handle_create_process_event(
         }
     }
     
+    let backing = super::ImageFileId::of_handle(info.hFile).or_else(|| super::ImageFileId::at_path(&image_file_name));
     // Now that we're done with hFile, close it.
     unsafe {
         CloseHandle(info.hFile);
@@ -151,6 +157,7 @@ pub(super) fn handle_create_process_event(
 
     // Clear its managers
     process.module_manager_mut().clear();
+    process.mapped_images.clear();
     process.thread_manager_mut().clear();
     
     let main_module = ModuleInfo {
@@ -162,6 +169,9 @@ pub(super) fn handle_create_process_event(
     {
         let process = platform.get_process_mut(pid)?;
         process.module_manager_mut().add_module(main_module.clone());
+        if let Some(backing) = backing {
+            process.mapped_images.insert(main_module.base, backing);
+        }
     }
 
     // Parse and cache extra module info for main module
@@ -172,8 +182,10 @@ pub(super) fn handle_create_process_event(
     }
 
     // Start loading symbols for the main executable in the background
-    if let Some(ref symbol_manager) = platform.symbol_manager {
-        symbol_manager.start_loading_symbols(&main_module);
+    if let Some(symbol_manager) = &platform.symbol_manager {
+        if backing.is_none_or(|id| super::ImageFileId::at_path(&main_module.name) == Some(id)) {
+            symbol_manager.start_loading_symbols(&main_module);
+        }
     }
 
     // --- SPECIAL-CASE NTDLL SYMBOLS HACK ------------------------------------------------------
@@ -204,7 +216,7 @@ pub(super) fn handle_create_process_event(
         let ntdll_module_cloned = ntdll_module.clone();
         {
             let process = platform.get_process_mut(pid)?;
-            process.module_manager_mut().add_module(ntdll_module_cloned.clone());
+            process.module_manager_mut().add_inferred_module(ntdll_module_cloned.clone());
         }
 
         // Parse and cache extra info for synthetic ntdll entry as well
@@ -659,12 +671,9 @@ pub fn handle_debug_event(
                 .or_else(|| utils::get_mapped_file_path(h_process, info.lpBaseOfDll as usize))
                 .unwrap_or_else(|| "<unknown>".to_string());
 
-            let size_of_dll =
-                utils::get_module_size_from_address(h_process, info.lpBaseOfDll as usize)
-                    .map(|sz| sz as u64);
+            let size_of_dll = loaded_image_size(h_process, info.lpBaseOfDll as u64);
             if size_of_dll.is_none() {
-                error!("Failed to get size of DLL");
-                return Err(PlatformError::OsError("Failed to get size of DLL".to_string()));
+                warn!(pid = debug_event.dwProcessId, base = info.lpBaseOfDll as u64, "DLL image bounds unavailable");
             }
 
             // Load module into symbol handler
@@ -677,6 +686,7 @@ pub fn handle_debug_event(
                 }
             }
 
+            let backing = super::ImageFileId::of_handle(info.hFile).or_else(|| super::ImageFileId::at_path(&dll_name));
             // now close handle
             unsafe {
                 CloseHandle(info.hFile);
@@ -691,6 +701,9 @@ pub fn handle_debug_event(
             {
                 let process = platform.get_process_mut(debug_event.dwProcessId)?;
                 process.module_manager_mut().add_module(module_info.clone());
+                if let Some(backing) = backing {
+                    process.mapped_images.insert(module_info.base, backing);
+                }
             }
 
             // Parse and cache extra info for the loaded DLL
@@ -708,8 +721,10 @@ pub fn handle_debug_event(
             // }
 
             // Start loading symbols for the newly loaded module in the background
-            if let Some(ref symbol_manager) = platform.symbol_manager {
-                symbol_manager.start_loading_symbols(&module_info);
+            if let Some(symbol_manager) = &platform.symbol_manager {
+                if backing.is_none_or(|id| super::ImageFileId::at_path(&module_info.name) == Some(id)) {
+                    symbol_manager.start_loading_symbols(&module_info);
+                }
             }
 
             trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, base_of_dll = %format!("0x{:X}", info.lpBaseOfDll as u64), dll_name = ?dll_name, size_of_dll = %format!("{:X?}", size_of_dll), "DllLoaded event");
@@ -726,8 +741,8 @@ pub fn handle_debug_event(
             trace!(pid = debug_event.dwProcessId, tid = debug_event.dwThreadId, base_of_dll = %format!("0x{:X}", info.lpBaseOfDll as u64), "DllUnloaded event");
             
             if let Ok(process) = platform.get_process_mut(debug_event.dwProcessId) {
-                // Unload from our manager
-                process.module_manager_mut().remove_module(info.lpBaseOfDll as u64);
+                process.mapped_images.remove(&(info.lpBaseOfDll as u64));
+                process.book.unload_module(&process.os, debug_event.dwProcessId, info.lpBaseOfDll as u64);
                 // Unload from symbol handler
                 {
                     let _lock = super::dbghelp::DBGHELP_LOCK.lock().unwrap();

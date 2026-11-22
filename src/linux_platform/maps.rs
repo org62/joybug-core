@@ -24,9 +24,43 @@ pub struct Mapping {
     pub exec: bool,
     pub shared: bool,
     pub offset: u64,
+    pub(crate) device: (u64, u64),
+    pub(crate) inode: u64,
     /// The backing file (`(deleted)` suffix kept), or the pseudo path such as
     /// `[heap]`, `[stack]`, `[vdso]`; empty for anonymous memory.
     pub path: String,
+}
+
+/// The kernel's backing identity, independent of a file being renamed or
+/// deleted after `mmap`. The vDSO is the only synthetic image we register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageBacking {
+    File { device: (u64, u64), inode: u64 },
+    Vdso,
+}
+
+impl ImageBacking {
+    pub(crate) fn of(mapping: &Mapping) -> Option<Self> {
+        if mapping.inode != 0 {
+            Some(Self::File { device: mapping.device, inode: mapping.inode })
+        } else if mapping.path == "[vdso]" {
+            Some(Self::Vdso)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn matches_file(self, path: &str) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        match self {
+            Self::Vdso => path == "[vdso]",
+            Self::File { device, inode } => fs::metadata(path).is_ok_and(|meta| {
+                let dev = meta.dev() as libc::dev_t;
+                let actual_device = (u64::from(libc::major(dev)), u64::from(libc::minor(dev)));
+                device == actual_device && inode == meta.ino()
+            }),
+        }
+    }
 }
 
 impl Mapping {
@@ -73,8 +107,8 @@ fn parse_line(line: &str) -> Option<Mapping> {
     let range = fields.next()?;
     let perms = fields.next()?;
     let offset = fields.next()?;
-    let _dev = fields.next()?;
-    let _inode = fields.next()?;
+    let (major, minor) = fields.next()?.split_once(':')?;
+    let inode = fields.next()?.parse().ok()?;
     let path = fields.next().unwrap_or("").trim_start().to_string();
     let (start, end) = range.split_once('-')?;
     let perms = perms.as_bytes();
@@ -86,6 +120,8 @@ fn parse_line(line: &str) -> Option<Mapping> {
         exec: perms.get(2) == Some(&b'x'),
         shared: perms.get(3) == Some(&b's'),
         offset: u64::from_str_radix(offset, 16).ok()?,
+        device: (u64::from_str_radix(major, 16).ok()?, u64::from_str_radix(minor, 16).ok()?),
+        inode,
         path,
     })
 }
@@ -180,9 +216,20 @@ mod tests {
     }
 
     #[test]
+    fn module_breakpoint_backing_survives_rename_but_not_replacement_inode() {
+        let rows = parse_maps("\
+1000-2000 r-xp 00000000 08:01 1234 /opt/libsample.so
+1000-2000 r-xp 00000000 08:01 1234 /opt/renamed.so (deleted)
+1000-2000 r-xp 00000000 08:01 5678 /opt/libsample.so
+");
+        assert_eq!(ImageBacking::of(&rows[0]), ImageBacking::of(&rows[1]));
+        assert_ne!(ImageBacking::of(&rows[0]), ImageBacking::of(&rows[2]));
+    }
+
+    #[test]
     fn protections_map_back_to_prot_bits() {
         for (read, write, exec) in [(false, false, false), (true, false, false), (true, true, false), (false, false, true), (true, false, true), (true, true, true)] {
-            let m = Mapping { start: 0, end: 0x1000, read, write, exec, shared: false, offset: 0, path: String::new() };
+            let m = Mapping { start: 0, end: 0x1000, read, write, exec, shared: false, offset: 0, device: (0, 0), inode: 0, path: String::new() };
             let prot = prot_from_protect(m.protect()).unwrap();
             assert_eq!((prot & 1 != 0, prot & 2 != 0, prot & 4 != 0), (read, write, exec));
         }

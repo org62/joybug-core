@@ -52,6 +52,7 @@ use tracer::{StopKind, Tracer};
 pub struct LinuxProcess {
     pub(crate) os: LinuxOps,
     pub(crate) book: DebugBook,
+    mapped_images: HashMap<u64, maps::ImageBacking>,
     /// The last reported signal per thread, delivered on `pass_exception`.
     pub(crate) last_fault: HashMap<u32, PendingSignal>,
     /// Children it forks are debugged too (`launch` with `debug_children`;
@@ -76,10 +77,11 @@ pub struct LinuxProcess {
 }
 
 impl LinuxProcess {
-    fn new(os: LinuxOps, book: DebugBook, exe: PathBuf, open_only: bool) -> Self {
+    fn new(os: LinuxOps, book: DebugBook, mapped_images: HashMap<u64, maps::ImageBacking>, exe: PathBuf, open_only: bool) -> Self {
         Self {
             os,
             book,
+            mapped_images,
             last_fault: HashMap::new(),
             debug_children: false,
             pending_fork: None,
@@ -91,6 +93,35 @@ impl LinuxProcess {
             exe,
         }
     }
+}
+
+fn register_module(
+    book: &mut DebugBook,
+    images: &mut HashMap<u64, maps::ImageBacking>,
+    maps: &[maps::Mapping],
+    symbols: Option<&SymbolManager>,
+    module: ModuleInfo,
+) {
+    let image = maps.iter().find(|m| m.start <= module.base && module.base < m.end).and_then(maps::ImageBacking::of);
+    if let Some(image) = image {
+        images.insert(module.base, image);
+        if let Some(symbols) = symbols.filter(|_| image.matches_file(&module.name)) {
+            symbols.start_loading_symbols(&module);
+        }
+    } else {
+        images.remove(&module.base);
+    }
+    book.modules.add_module(module);
+}
+
+fn mapped_trap_region(pid: u32, image: Option<&maps::ImageBacking>, addr: u64, end: u64) -> Result<Option<bool>, PlatformError> {
+    let Some(&image) = image else { return Ok(None) };
+    let maps = match maps::read_maps(pid) {
+        Ok(maps) => maps,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(PlatformError::OsError(format!("/proc/{pid}/maps: {e}"))),
+    };
+    Ok(maps.iter().find(|m| m.start <= addr && end <= m.end && maps::ImageBacking::of(m) == Some(image)).map(|m| m.exec))
 }
 
 /// A signal whose stop was reported as an `Exception` and is waiting for the
@@ -132,6 +163,7 @@ struct ImageProbe {
     /// `load_bias + layout.min_vaddr`.
     base: u64,
     vdso: Option<(u64, u64)>,
+    maps: Vec<maps::Mapping>,
 }
 
 fn probe_image(pid: u32) -> Result<ImageProbe, PlatformError> {
@@ -155,7 +187,7 @@ fn probe_image(pid: u32) -> Result<ImageProbe, PlatformError> {
     };
     let base = load_bias.wrapping_add(layout.min_vaddr);
     let vdso = maps::vdso_range(&maps);
-    Ok(ImageProbe { exe, layout, at_entry, at_base, load_bias, base, vdso })
+    Ok(ImageProbe { exe, layout, at_entry, at_base, load_bias, base, vdso, maps })
 }
 
 /// Arm the loader hook (`_dl_debug_state` in the interpreter, which ld.so
@@ -302,18 +334,13 @@ impl LinuxPlatform {
         book.created_by_launch = created_by_launch;
         let exe_str = probe.exe.display().to_string();
         let main_module = ModuleInfo { name: exe_str.clone(), base, size: Some(size) };
-        book.modules.add_module(main_module.clone());
-        if let Some(sm) = &self.symbol_manager {
-            sm.start_loading_symbols(&main_module);
-        }
+        let mut mapped_images = HashMap::new();
+        register_module(&mut book, &mut mapped_images, &probe.maps, self.symbol_manager.as_deref(), main_module.clone());
         // The loader lists the executable under its load bias (0 unless PIE).
         os.note_known_module(load_bias, main_module);
 
         for m in arm_loader_hook(&mut book.bps, &os, pid, &probe) {
-            book.modules.add_module(m.clone());
-            if let Some(sm) = &self.symbol_manager {
-                sm.start_loading_symbols(&m);
-            }
+            register_module(&mut book, &mut mapped_images, &probe.maps, self.symbol_manager.as_deref(), m);
         }
         if created_by_launch {
             // The entry hook becomes the `InitialBreakpoint`, once the loader
@@ -331,7 +358,7 @@ impl LinuxPlatform {
             size_of_image: Some(size),
             start_address: at_entry,
         };
-        self.processes.insert(pid, LinuxProcess::new(os, book, probe.exe, false));
+        self.processes.insert(pid, LinuxProcess::new(os, book, mapped_images, probe.exe, false));
         Ok(event)
     }
 
@@ -346,15 +373,12 @@ impl LinuxPlatform {
             }
             DebugEvent::DllLoaded { dll_name: Some(name), base_of_dll, size_of_dll, .. } => {
                 let m = ModuleInfo { name: name.clone(), base: *base_of_dll, size: *size_of_dll };
-                process.book.modules.add_module(m.clone());
-                // Includes `[vdso]`: its image was registered with the symbol
-                // loader when the process was set up.
-                if let Some(sm) = &self.symbol_manager {
-                    sm.start_loading_symbols(&m);
-                }
+                let maps = maps::read_maps(pid).unwrap_or_default();
+                register_module(&mut process.book, &mut process.mapped_images, &maps, self.symbol_manager.as_deref(), m);
             }
             DebugEvent::DllUnloaded { base_of_dll, .. } => {
-                process.book.modules.remove_module(*base_of_dll);
+                process.mapped_images.remove(base_of_dll);
+                process.book.unload_module(&process.os, pid, *base_of_dll);
             }
             _ => {}
         }
@@ -695,6 +719,7 @@ impl LinuxPlatform {
         }
         // Forget everything that referred to the old address space.
         book.modules.clear();
+        process.mapped_images.clear();
         let _ = book.bps.drain_all();
         book.bps.clear_step_over();
         book.bps.clear_step_out();
@@ -950,6 +975,7 @@ impl PlatformAPI for LinuxPlatform {
         let vdso = maps::vdso_range(&maps);
         let os = LinuxOps::new(pid, self.tracer.clone(), mem, threads, vdso, 0);
         let mut book = DebugBook::new(Architecture::X64);
+        let mut mapped_images = HashMap::new();
         book.has_hit_initial_breakpoint = true;
         // Every ELF mapped from a file at offset 0 is a module; its first
         // mapping is the image base (the lowest PT_LOAD is page-aligned).
@@ -966,20 +992,14 @@ impl PlatformAPI for LinuxPlatform {
             let Ok(layout) = elf::read_layout(path) else { continue };
             let name = path.display().to_string();
             let module = ModuleInfo { name, base: m.start, size: Some(layout.size) };
-            book.modules.add_module(module.clone());
-            if let Some(sm) = &self.symbol_manager {
-                sm.start_loading_symbols(&module);
-            }
+            register_module(&mut book, &mut mapped_images, &maps, self.symbol_manager.as_deref(), module);
         }
         if let Some((vbase, vsize)) = vdso {
             register_vdso_image(&os, vbase, vsize);
             let m = ModuleInfo { name: "[vdso]".to_string(), base: vbase, size: Some(vsize) };
-            book.modules.add_module(m.clone());
-            if let Some(sm) = &self.symbol_manager {
-                sm.start_loading_symbols(&m);
-            }
+            register_module(&mut book, &mut mapped_images, &maps, self.symbol_manager.as_deref(), m);
         }
-        self.processes.insert(pid, LinuxProcess::new(os, book, exe, true));
+        self.processes.insert(pid, LinuxProcess::new(os, book, mapped_images, exe, true));
         Ok(())
     }
 
@@ -1183,6 +1203,67 @@ impl PlatformAPI for LinuxPlatform {
         Ok(self.process(pid)?.book.modules.list_modules())
     }
 
+    fn list_mapped_modules(&self, pid: u32) -> Result<Vec<ModuleInfo>, PlatformError> {
+        let process = self.process(pid)?;
+        // Attach just walked the complete link map; its DLL events are still
+        // queued when the caller receives ProcessCreated.
+        Ok(process.os.loader.lock().unwrap().known.values().cloned().collect())
+    }
+
+    fn module_mapping(&self, pid: u32, module_base: u64) -> Option<(ModuleInfo, u64)> {
+        let process = self.process(pid).ok()?;
+        if process.exec_pending || process.exited.is_some() {
+            return None;
+        }
+        let (module, id) = process.book.modules.mapping_at(module_base)?;
+        Some((module.clone(), id))
+    }
+
+    fn module_symbol_file_matches(&self, pid: u32, base: u64) -> bool {
+        let Ok(process) = self.process(pid) else { return false };
+        if process.exec_pending || process.exited.is_some() {
+            return false;
+        }
+        let Some((module, _)) = process.book.modules.mapping_at(base) else { return false };
+        let Some(image) = process.mapped_images.get(&base).filter(|image| image.matches_file(&module.name)) else {
+            return false;
+        };
+        base.checked_add(1).is_some_and(|end| {
+            mapped_trap_region(pid, Some(image), base, end).is_ok_and(|region| region.is_some())
+        })
+    }
+
+    fn module_trap_location(
+        &self, pid: u32, base: u64, mapping_id: u64, addr: u64,
+    ) -> Result<Option<bool>, PlatformError> {
+        let Ok(process) = self.process(pid) else { return Ok(None) };
+        if process.exec_pending || process.exited.is_some() {
+            return Ok(None);
+        }
+        process.book.module_trap_location(base, mapping_id, addr, |end| {
+            mapped_trap_region(pid, process.mapped_images.get(&base), addr, end)
+        })
+    }
+
+    fn change_module_breakpoint(
+        &mut self, pid: u32, base: u64, mapping_id: u64, addr: u64, arm: bool,
+    ) -> Result<bool, PlatformError> {
+        let Ok(process) = self.process_mut(pid) else { return Ok(false) };
+        if process.exec_pending || process.exited.is_some() {
+            return Ok(false);
+        }
+        if process.open_only {
+            return Err(PlatformError::Other("Software breakpoints require a debugged process".into()));
+        }
+        if process.vfork_lifted {
+            return Err(PlatformError::Other("Cannot change breakpoints while a vfork child shares this address space".into()));
+        }
+        let image = process.mapped_images.get(&base);
+        process.book.change_module_breakpoint(&process.os, pid, base, mapping_id, addr, arm, |end| {
+            mapped_trap_region(pid, image, addr, end)
+        })
+    }
+
     fn list_threads(&self, pid: u32) -> Result<Vec<ThreadInfo>, PlatformError> {
         let mut rows = self.process(pid)?.os.threads.lock().unwrap().list_threads();
         for row in &mut rows {
@@ -1237,8 +1318,10 @@ impl PlatformAPI for LinuxPlatform {
 
     fn retry_symbol_load(&self, pid: u32, module_base: u64) -> Result<(), SymbolError> {
         let module = self.module_at(pid, module_base)?;
-        self.symbols()?.retry_loading_symbols(&module);
-        Ok(())
+        if !self.module_symbol_file_matches(pid, module_base) {
+            return Err(SymbolError::ModuleNotLoaded(format!("Image file changed: {}", module.name)));
+        }
+        self.symbols()?.retry_loading_symbols(&module)
     }
 
     fn unload_module_symbols(&self, pid: u32, module_base: u64) -> Result<(), SymbolError> {

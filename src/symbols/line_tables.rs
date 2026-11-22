@@ -17,7 +17,7 @@ use std::thread;
 use tracing::warn;
 
 use super::backend::SymbolBackend;
-use super::symbol_manager::ModuleSymbols;
+use super::symbol_manager::{ModuleSymbols, PendingLoads};
 use super::symbol_provider::ModuleLineTable;
 use crate::interfaces::SymbolError;
 use crate::protocol::LineInfoState;
@@ -53,9 +53,9 @@ pub enum LineTableLookup {
 pub(super) struct LineTables {
     backend: Arc<dyn SymbolBackend>,
     /// The symbol manager's loaded symbols: where a module's debug file path is.
-    symbols: Arc<Mutex<HashMap<String, ModuleSymbols>>>,
+    symbols: Arc<Mutex<HashMap<String, Arc<ModuleSymbols>>>>,
     /// Modules whose symbols are still loading.
-    symbols_pending: Arc<Mutex<HashSet<String>>>,
+    symbols_pending: Arc<Mutex<PendingLoads>>,
     tables: Mutex<HashMap<String, State>>,
     /// Signalled whenever a `tables` entry leaves `Parsing`.
     parsed: Condvar,
@@ -71,8 +71,8 @@ pub(super) struct LineTables {
 impl LineTables {
     pub fn new(
         backend: Arc<dyn SymbolBackend>,
-        symbols: Arc<Mutex<HashMap<String, ModuleSymbols>>>,
-        symbols_pending: Arc<Mutex<HashSet<String>>>,
+        symbols: Arc<Mutex<HashMap<String, Arc<ModuleSymbols>>>>,
+        symbols_pending: Arc<Mutex<PendingLoads>>,
     ) -> Arc<Self> {
         let (warm_queue, queued) = mpsc::channel::<String>();
         let tables = Arc::new(Self {

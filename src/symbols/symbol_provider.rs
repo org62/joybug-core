@@ -371,6 +371,12 @@ pub fn parse_pdb_matching_pe(
     pdb_path: &Path,
 ) -> Result<std::result::Result<Vec<ModuleSymbol>, PdbMismatchInfo>, SymbolError> {
     let pe_id = extract_pdb_identifier_from_file(module_path)?;
+    parse_identified_pdb(&pe_id, pdb_path)
+}
+
+fn parse_identified_pdb(
+    pe_id: &PdbIdentifier, pdb_path: &Path,
+) -> Result<Result<Vec<ModuleSymbol>, PdbMismatchInfo>, SymbolError> {
 
     let mut pdb_parser = open_pdb(pdb_path)?;
     let info = pdb_parser.pdb_information()
@@ -395,12 +401,10 @@ pub fn parse_pdb_matching_pe(
 fn extract_symbols(pdb_parser: &mut PDB<'static, File>, pdb_path: &Path) -> Result<Vec<ModuleSymbol>, SymbolError> {
         trace!(path = %pdb_path.display(), "Parsing PDB file");
 
-        // Use a HashMap to deduplicate symbols by name.
-        // Procedure symbols from DBI modules are inserted first (Phase 1),
-        // then public/global symbols (Phase 2). Using or_insert() means
-        // procedure symbols take priority over public symbols with the same name,
-        // matching WinDbg's resolution behavior for private functions.
-        let mut symbols_map: HashMap<String, ModuleSymbol> = HashMap::new();
+        // Keep distinct addresses with the same name (e.g. a file-local
+        // function from two compilands). Prefer the DBI procedure record over
+        // a public duplicate at the *same* address.
+        let mut symbols_map: HashMap<(String, u32), bool> = HashMap::new();
 
         let address_map = pdb_parser.address_map()
             .map_err(|e| SymbolError::PdbParsingFailed(format!("PDB address_map from {}: {}", pdb_path.display(), e)))?;
@@ -463,8 +467,8 @@ fn extract_symbols(pdb_parser: &mut PDB<'static, File>, pdb_path: &Path) -> Resu
         }
 
         // Phase 2: Parse public and procedure symbols from the global symbol stream.
-        // Public symbols provide exported function names. Using or_insert() ensures
-        // procedure symbols from Phase 1 are not overwritten.
+        // Public symbols provide exported function names; DBI records at the
+        // same address are not overwritten.
         let global_symbols = pdb_parser.global_symbols()
             .map_err(|e| SymbolError::PdbParsingFailed(format!("PDB global_symbols from {}: {}", pdb_path.display(), e)))?;
 
@@ -500,19 +504,19 @@ fn extract_symbols(pdb_parser: &mut PDB<'static, File>, pdb_path: &Path) -> Resu
             }
         }
 
-        let symbols_vec: Vec<ModuleSymbol> = symbols_map.into_values().collect();
+        let symbols_vec: Vec<ModuleSymbol> = symbols_map.into_iter()
+            .map(|((name, rva), is_function)| ModuleSymbol { name, rva, is_function })
+            .collect();
         trace!(count = symbols_vec.len(), "Successfully parsed symbols from PDB");
         Ok(symbols_vec)
 }
 
-/// Helper to demangle a symbol name and insert it into the symbols map.
-/// Uses `or_insert` so the first occurrence wins (procedure symbols from DBI
-/// modules take priority over later public symbols with the same name).
+/// Demangle a symbol name and merge duplicate records for the same location.
 fn insert_symbol(
     name_str: &str,
     offset: PdbInternalSectionOffset,
     address_map: &AddressMap,
-    symbols_map: &mut HashMap<String, ModuleSymbol>,
+    symbols_map: &mut HashMap<(String, u32), bool>,
     is_function: bool,
 ) {
     // Skip symbols whose section offset does not map to a valid RVA (e.g. TLS/absolute
@@ -529,11 +533,7 @@ fn insert_symbol(
         name_str.to_string()
     };
 
-    symbols_map.entry(demangled_name.clone()).or_insert(ModuleSymbol {
-        name: demangled_name,
-        rva,
-        is_function,
-    });
+    symbols_map.entry((demangled_name, rva)).or_insert(is_function);
 }
 
 impl SymbolProvider for WindowsSymbolProvider {
@@ -549,11 +549,6 @@ impl SymbolProvider for WindowsSymbolProvider {
     ) -> Result<(), SymbolError> {
         trace!(module_path = module_path_str, module_base = format!("0x{:X}", module_base), "Loading symbols for module");
 
-        if self.loaded_modules.contains_key(module_path_str) {
-            trace!(module_path = module_path_str, "Symbols already loaded for module");
-            return Ok(());
-        }
-
         let module_path = Path::new(module_path_str);
 
         // Extract PDB identifier from the PE file
@@ -562,23 +557,31 @@ impl SymbolProvider for WindowsSymbolProvider {
 
         trace!(pdb_name = %pdb_identifier.name, pdb_guid = %pdb_identifier.guid, pdb_age = pdb_identifier.age, symsrv_id = %symsrv_id, "Extracted PDB identifier");
 
-        // First, check if PDB exists in the same directory as the executable
-        let pdb_path = if let Some(parent_dir) = module_path.parent() {
-            let local_pdb_path = parent_dir.join(&pdb_identifier.name);
-            if local_pdb_path.exists() {
-                trace!(path = %local_pdb_path.display(), "Found PDB in same directory as executable");
-                local_pdb_path
-            } else {
-                // Fall back to symsrv download
-                self.internal_fetch_pdb(&pdb_identifier.name, &symsrv_id)?
-            }
-        } else {
-            // No parent directory, fall back to symsrv download
-            self.internal_fetch_pdb(&pdb_identifier.name, &symsrv_id)?
+        let symbols_from = |pdb_path: &Path| {
+            parse_identified_pdb(&pdb_identifier, pdb_path)?.map_err(|_| {
+                SymbolError::PdbNotFound(format!("{} does not match {}", pdb_path.display(), module_path.display()))
+            })
         };
-
-        // Parse the PDB file
-        let symbols = parse_pdb_to_symbols(&pdb_path)?;
+        // A same-name adjacent PDB may belong to an older build. Do not
+        // publish its addresses; try the identity-keyed symbol store instead.
+        let adjacent = module_path.parent().map(|dir| dir.join(&pdb_identifier.name));
+        let local = adjacent.filter(|file| file.is_file()).and_then(|path| {
+            match symbols_from(&path) {
+                Ok(symbols) => Some((path, symbols)),
+                Err(e) => {
+                    trace!(error = %e, "Ignoring unmatched or unreadable adjacent PDB");
+                    None
+                }
+            }
+        });
+        let (pdb_path, symbols) = match local {
+            Some(loaded) => loaded,
+            None => {
+                let path = self.internal_fetch_pdb(&pdb_identifier.name, &symsrv_id)?;
+                let symbols = symbols_from(&path)?;
+                (path, symbols)
+            }
+        };
 
         // Store the symbols
         trace!(module_path = module_path_str, symbol_count = symbols.len(), "Successfully loaded symbols for module");
